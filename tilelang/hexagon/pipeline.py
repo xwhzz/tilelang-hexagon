@@ -17,13 +17,16 @@ from tilelang.backend.pass_pipeline import PassPipeline, register_pipeline
 from tilelang.cpu.pipeline import CPUPassPipelineBody
 from tilelang.tileop.gemm.registry import register_gemm_impl
 from tilelang.cpu.op.gemm.gemm_scalar import GEMM_INST_SCALAR, GemmScalar
+from tilelang.hexagon.gemm_hmx import GEMM_INST_HMX, GemmHMX
 
 register_pipeline(PassPipeline("hexagon", CPUPassPipelineBody))
 
-# Lower T.gemm on Hexagon via the generic scalar triple-loop for now (the C++
-# hexagon GemmImpl selects "cpu.scalar"); hexagon-clang auto-vectorizes it onto
-# HVX.  Routing T.gemm onto the HMX matrix engine (Crouton layout + HMX template)
-# is the next step.
+# The C++ hexagon GemmImpl (src/hexagon/op/gemm.cc) selects "hexagon.hmx" for fp16
+# 32-multiple gemms (-> GemmHMX: Crouton VTCM operands + HMX MAC), else "cpu.scalar"
+# (-> GemmScalar: a triple loop hexagon-clang auto-vectorizes onto HVX).
 register_gemm_impl(
     "hexagon.scalar", GEMM_INST_SCALAR, lambda t: t.kind.name == "hexagon", GemmScalar
+)
+register_gemm_impl(
+    "hexagon.hmx", GEMM_INST_HMX, lambda t: t.kind.name == "hexagon", GemmHMX
 )

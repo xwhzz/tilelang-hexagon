@@ -108,6 +108,11 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // Clear previous generated state and reserve keywords.
   this->InitFuncState(f);
   ReserveKeywordsAsUnique();
+  // Reserve the first 2KB VTCM tile (offset 0) for the HMX output scales that
+  // tl_hexagon_hmx_mac_f16 writes at tl_vtcm_base()+0; alloc_shared buffers start
+  // above it, so operands and scales can never overlap regardless of the runtime
+  // VTCM size.  (Non-HMX shared kernels just leave the first tile unused.)
+  vtcm_offset_ = 2048;
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
@@ -156,24 +161,42 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
 }
 
 void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
-  // Stack-local allocation (e.g. fragments / small scratch).  VTCM-scoped
-  // allocations are lowered to an explicit arena by a later pass + the runtime
-  // prologue; until then this handles constant-size local buffers.
   std::string vid = AllocVarID(op->buffer->data.get());
-  this->PrintIndent();
-
-  PrintType(op->buffer->dtype, stream);
   const auto &shape = op->buffer->shape;
   size_t constant_size = 1;
   for (const auto &dim : shape) {
     const IntImmNode *dim_imm = dim.as<IntImmNode>();
-    ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+    ICHECK(dim_imm) << "Can only handle constant size allocation for now";
     constant_size *= dim_imm->value;
   }
-  ICHECK_GT(constant_size, 0)
-      << "Can only handle constant size stack allocation for now";
+  ICHECK_GT(constant_size, 0) << "Can only handle constant size allocation";
 
-  stream << ' ' << vid << '[' << constant_size << "];\n";
+  std::string scope = GetPtrStorageScope(op->buffer->data);
+  bool is_shared = scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
+
+  this->PrintIndent();
+  if (is_shared) {
+    // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and HVX
+    // wants its scratch there, so a `shared` tile cannot live on the stack.
+    // Assign a compile-time byte offset into the one session-acquired VTCM arena
+    // (tl_vtcm_base()).  Shared buffers are declared inside the serialized block
+    // loop, so a *fixed* offset (reused across block iterations) is correct —
+    // not a runtime bump that would overrun.
+    size_t nbytes = constant_size * op->buffer->dtype.bytes();
+    size_t offset = vtcm_offset_;
+    // 2048-byte align == one HMX Crouton tile, also HVX(128B)-aligned.
+    vtcm_offset_ += (nbytes + size_t(2047)) & ~size_t(2047);
+    ICHECK_LE(vtcm_offset_, size_t(8) << 20)
+        << "alloc_shared total exceeds 8MB VTCM (" << vtcm_offset_ << " bytes)";
+    PrintType(op->buffer->dtype, stream);
+    stream << "* " << vid << " = (";
+    PrintType(op->buffer->dtype, stream);
+    stream << "*)((char*)tl_vtcm_base() + " << offset << ");\n";
+  } else {
+    // Stack-local (fragments / small scratch).
+    PrintType(op->buffer->dtype, stream);
+    stream << ' ' << vid << '[' << constant_size << "];\n";
+  }
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
 }
 

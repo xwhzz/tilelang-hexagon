@@ -9,6 +9,7 @@
  */
 
 #include "op/gemm.h"
+#include "op/utils.h" // IsSharedBuffer
 #include "support/check.h"
 
 #include "backend/common/target_utils.h"
@@ -23,14 +24,25 @@ namespace hexagon {
 
 namespace {
 constexpr const char *kHexagonScalar = "cpu.scalar";
+constexpr const char *kHexagonHMX = "hexagon.hmx";
 } // namespace
 
 struct Gemm {
   static String SelectInst(const GemmNode &op, int block_size, Target target) {
-    (void)op;
     (void)block_size;
     (void)target;
-    return kHexagonScalar;
+    // Route to HMX only for the validated GemmHMX surface: fp16, 32-multiple,
+    // 2D, shared-shared (SS), overwrite (clear_accum is a compile-time true).
+    // Everything else falls back to the scalar loop hexagon-clang auto-vectorizes
+    // onto HVX — crucially the DEFAULT clear_accum=false (the accumulate K-loop
+    // pattern) and fragment/sub-rank operands, which GemmHMX can't lower yet.
+    bool hmx_ok = op.a_->dtype == DataType::Float(16) &&
+                  op.b_->dtype == DataType::Float(16) && op.m_ % 32 == 0 &&
+                  op.n_ % 32 == 0 && op.k_ % 32 == 0 && op.a_->shape.size() == 2 &&
+                  op.b_->shape.size() == 2 && op.c_->shape.size() == 2 &&
+                  IsSharedBuffer(op.a_) && IsSharedBuffer(op.b_) &&
+                  IsSharedBuffer(op.c_) && is_one(op.clearAccum_);
+    return hmx_ok ? String(kHexagonHMX) : String(kHexagonScalar);
   }
 
   static std::pair<int, int>
@@ -52,8 +64,7 @@ struct Gemm {
   }
 
   static String InstructionKind(String gemm_inst) {
-    (void)gemm_inst;
-    return "scalar";
+    return gemm_inst == kHexagonHMX ? String("hmx") : String("scalar");
   }
 };
 

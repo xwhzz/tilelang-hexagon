@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <tl_templates/hexagon/vtcm.h> // unified VTCM arena (shared with alloc_shared)
 
 #define TL_HMX_INLINE static inline __attribute__((unused, always_inline))
 
@@ -56,30 +57,11 @@ TL_HMX_INLINE void tl_hmx_power_reset(void) {
 }
 
 // ------------------------------ VTCM --------------------------------------
-static uint8_t *tl_hmx_vtcm_base;
-static int tl_hmx_vtcm_ctx;
-static unsigned int tl_hmx_vtcm_total; // bytes of VTCM acquired (capacity guard)
-TL_HMX_INLINE void tl_hmx_vtcm_setup(void) {
-  unsigned int avail, total;
-  compute_res_vtcm_page_t avail_pg, total_pg;
-  if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg))
-    return;
-  compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-  HAP_compute_res_attr_set_vtcm_param(&req, total, 1);
-  tl_hmx_vtcm_ctx = HAP_compute_res_acquire(&req, 10000);
-  if (!tl_hmx_vtcm_ctx)
-    return;
-  tl_hmx_vtcm_base = (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&req);
-  tl_hmx_vtcm_total = total;
-}
-TL_HMX_INLINE void tl_hmx_vtcm_reset(void) {
-  if (tl_hmx_vtcm_ctx)
-    HAP_compute_res_release(tl_hmx_vtcm_ctx);
-  tl_hmx_vtcm_ctx = 0;
-  tl_hmx_vtcm_base = NULL;
-  tl_hmx_vtcm_total = 0;
-}
+// Delegated to the shared tl_vtcm arena (vtcm.h) so HMX scratch and alloc_shared
+// operands draw from one acquisition — no double-acquire when a T.gemm kernel
+// has its operands in VTCM and also drives HMX.
+TL_HMX_INLINE void tl_hmx_vtcm_setup(void) { tl_vtcm_acquire(); }
+TL_HMX_INLINE void tl_hmx_vtcm_reset(void) { tl_vtcm_release(); }
 
 // ------------------------------ HMX lock ----------------------------------
 static int tl_hmx_ctx;
@@ -127,6 +109,15 @@ TL_HMX_INLINE void tl_hmx_unit_release(void) {
 TL_HMX_INLINE void tl_hmx_clear_acc(void) { asm volatile("mxclracc.hf"); }
 TL_HMX_INLINE void tl_hmx_set_scales(const void *s) {
   asm volatile("bias = mxmem2(%0)" ::"r"(s));
+}
+// Fill a 256-byte HMX output-scale region: per-column scale = fp16 1.0 (u32 low
+// half == 0x3c00), per-column bias = 0.  Single source for the u32 scale-word
+// layout shared by all three HMX entry points (matmul / mac / bench).
+TL_HMX_INLINE void tl_hmx_fill_unit_scales(uint32_t *s) {
+  for (int i = 0; i < 32; ++i)
+    s[i] = 0x00003c00u;
+  for (int i = 32; i < 64; ++i)
+    s[i] = 0u;
 }
 TL_HMX_INLINE void tl_hmx_mac_tiles(const __fp16 *a, const __fp16 *w, size_t n) {
   size_t lim = n * TL_HMX_TILE_BYTES - 1;
@@ -193,7 +184,7 @@ static void tl_hmx_session_init(void) {
   tl_hmx_power_setup();
   tl_hmx_vtcm_setup();
   tl_hmx_setup();
-  if (tl_hmx_vtcm_base) {
+  if (tl_vtcm_base_ptr) {
     tl_hmx_enable();
     tl_hmx_unit_acquire();
     tl_hmx_inited = 1;
@@ -221,6 +212,27 @@ static void tl_hmx_session_deinit(void) {
 // returns -2, the generated kernel discards the rc, and the caller gets zeros.
 static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 
+// T.gemm entry: operands are ALREADY Crouton-packed in VTCM (written there by a
+// layout-aware T.copy via the Crouton tilelang Layout), so this does ONLY the HMX
+// MAC — no pack/unpack.  A: M×K row-tile-major Crouton; B: K×N col-tile-major
+// Crouton; C: M×N row-tile-major Crouton (the HMX store order).  Returns 0 on ok.
+static int tl_hexagon_hmx_mac_f16(__fp16 *C, const __fp16 *A, const __fp16 *B,
+                                  int M, int N, int K) {
+  if (M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) || (N % TL_HMX_T) ||
+      (K % TL_HMX_T))
+    return -1;
+  tl_hmx_session_init(); // power + HMX lock + ensure VTCM (all idempotent)
+  if (!tl_vtcm_base_ptr)
+    return -2;
+  // Scales live in the codegen-reserved first VTCM tile (offset 0); alloc_shared
+  // operands start above it (vtcm_offset_ begins at 2048 in the codegen), so they
+  // never overlap regardless of the runtime VTCM size.
+  uint32_t *scales = (uint32_t *)tl_vtcm_base_ptr;
+  tl_hmx_fill_unit_scales(scales);
+  tl_hmx_matmul_tiles(C, A, B, M, N, K, (const __fp16 *)scales);
+  return 0;
+}
+
 // Public entry called by generated kernels.  Returns 0 on success.  Acquires the
 // session lazily if _open didn't; teardown belongs to the session (at _close).
 static int tl_hexagon_hmx_matmul_f16(__fp16 *C, const __fp16 *A,
@@ -230,7 +242,7 @@ static int tl_hexagon_hmx_matmul_f16(__fp16 *C, const __fp16 *A,
     return -1;
 
   tl_hmx_session_init();
-  if (!tl_hmx_vtcm_base)
+  if (!tl_vtcm_base_ptr)
     return -2;
 
   // VTCM arena: A tiles | B tiles | C tiles | scales(256B).
@@ -238,16 +250,13 @@ static int tl_hexagon_hmx_matmul_f16(__fp16 *C, const __fp16 *A,
   size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
   size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
   // Bail before writing if the arena won't fit, else pack_* overruns VTCM.
-  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 256u > (size_t)tl_hmx_vtcm_total)
+  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 256u > (size_t)tl_vtcm_total)
     return -3;
-  __fp16 *a_t = (__fp16 *)tl_hmx_vtcm_base;
+  __fp16 *a_t = (__fp16 *)tl_vtcm_base_ptr;
   __fp16 *b_t = a_t + a_sz;
   __fp16 *c_t = b_t + b_sz;
   uint32_t *scales = (uint32_t *)(c_t + c_sz);
-  for (int i = 0; i < 32; ++i)
-    scales[i] = 0x00003c00u; // per-column scale = fp16 1.0 (low half)
-  for (int i = 32; i < 64; ++i)
-    scales[i] = 0u; // per-column bias = 0
+  tl_hmx_fill_unit_scales(scales);
 
   tl_hmx_pack_A(a_t, A, M, K);
   tl_hmx_pack_B(b_t, B, K, N);
@@ -273,7 +282,7 @@ static int tl_hexagon_hmx_matmul_f16_bench(__fp16 *C, const __fp16 *A,
   tl_hmx_power_setup();
   tl_hmx_vtcm_setup();
   tl_hmx_setup();
-  if (!tl_hmx_vtcm_base) {
+  if (!tl_vtcm_base_ptr) {
     tl_hmx_reset();
     tl_hmx_vtcm_reset();
     tl_hmx_power_reset();
@@ -283,20 +292,17 @@ static int tl_hexagon_hmx_matmul_f16_bench(__fp16 *C, const __fp16 *A,
   size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
   size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
   size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 256u > (size_t)tl_hmx_vtcm_total) {
+  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 256u > (size_t)tl_vtcm_total) {
     tl_hmx_reset();
     tl_hmx_vtcm_reset();
     tl_hmx_power_reset();
     return -3;
   }
-  __fp16 *a_t = (__fp16 *)tl_hmx_vtcm_base;
+  __fp16 *a_t = (__fp16 *)tl_vtcm_base_ptr;
   __fp16 *b_t = a_t + a_sz;
   __fp16 *c_t = b_t + b_sz;
   uint32_t *scales = (uint32_t *)(c_t + c_sz);
-  for (int i = 0; i < 32; ++i)
-    scales[i] = 0x00003c00u;
-  for (int i = 32; i < 64; ++i)
-    scales[i] = 0u;
+  tl_hmx_fill_unit_scales(scales);
 
   tl_hmx_enable();
   tl_hmx_unit_acquire();

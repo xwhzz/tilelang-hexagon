@@ -50,6 +50,10 @@ private:
   /*! \brief names of the kernel functions emitted in this module */
   ffi::Array<ffi::String> function_names_;
 
+  /*! \brief compile-time bump offset (bytes) for placing alloc_shared buffers
+   *  in the VTCM arena; reset per function in AddFunction. */
+  size_t vtcm_offset_ = 0;
+
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,
                                    std::ostream &os); // NOLINT(*)

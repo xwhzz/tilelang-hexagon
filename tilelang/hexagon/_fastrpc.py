@@ -118,26 +118,35 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
             call_args.append(f"({pl.ctype}*){pl.name}")
     # Pull in the HMX matmul runtime only when the kernel calls into it (it
     # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
+    # alloc_shared buffers lower to `tl_vtcm_base()` offsets — pull in the VTCM
+    # arena header when the kernel uses shared memory (same lazy-include scheme).
+    uses_vtcm = "tl_vtcm" in kernel_source
+    vtcm_include = "#include <tl_templates/hexagon/vtcm.h>\n" if uses_vtcm else ""
     hmx = "tl_hexagon_hmx" in kernel_source
     hmx_include = "#include <tl_templates/hexagon/hmx.h>\n" if hmx else ""
-    # Acquire/release the HMX+VTCM session at _open/_close (the matmul also inits
+    # Acquire/release the HMX session at _open/_close (the matmul also inits
     # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).
+    # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
+    # vtcm_check only apply to non-HMX shared kernels (avoids a double release).
     hmx_open = "tl_hmx_session_init(); " if hmx else ""
     hmx_close = "tl_hmx_session_deinit(); " if hmx else ""
+    vtcm_close = "tl_vtcm_release(); " if (uses_vtcm and not hmx) else ""
     # Fail _open loudly if HMX/VTCM couldn't be acquired (e.g. a leaked agent
     # still holds VTCM) rather than running and returning silent zeros — the
-    # kernel discards the matmul rc, so this is the only place to surface it.
+    # kernel discards return codes, so _open is the only place to surface it.
     hmx_check = "if (!tl_hmx_session_ok()) return AEE_EFAILED; " if hmx else ""
+    vtcm_check = "if (!tl_vtcm_base()) return AEE_EFAILED; " if (uses_vtcm and not hmx) else ""
     return (
         "// Auto-generated FastRPC skel impl for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
+        f"{vtcm_include}"
         f"{hmx_include}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
         "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
-        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}{hmx_check}return AEE_SUCCESS; }}\n"
-        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}return AEE_SUCCESS; }}\n\n"
+        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}{hmx_check}{vtcm_check}return AEE_SUCCESS; }}\n"
+        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}{vtcm_close}return AEE_SUCCESS; }}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
         f"  {kernel_name}({', '.join(call_args)});\n"
         "  return AEE_SUCCESS;\n}\n\n"
