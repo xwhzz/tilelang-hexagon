@@ -192,10 +192,42 @@ TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
 }
 TL_HMX_INLINE void tl_hmx_unpack_C(__fp16 *C, const __fp16 *t, int M, int N) {
   int NT = N / TL_HMX_T;
+  if ((N & 63) == 0) { // HVX: vdeal de-interleaves a row-pair span back to 2 rows
+    for (int mt = 0; mt < M / TL_HMX_T; ++mt)
+      for (int r = 0; r < TL_HMX_T / 2; ++r) {
+        HVX_Vector *o0 = (HVX_Vector *)(C + (size_t)(mt * TL_HMX_T + 2 * r) * N);
+        HVX_Vector *o1 = (HVX_Vector *)(C + (size_t)(mt * TL_HMX_T + 2 * r + 1) * N);
+        for (int nc = 0; nc < N / 64; ++nc) {
+          HVX_Vector lo = ((const HVX_Vector *)(t + (size_t)(mt * NT + 2 * nc) * TL_HMX_TILE_ELMS))[r];
+          HVX_Vector hi = ((const HVX_Vector *)(t + (size_t)(mt * NT + 2 * nc + 1) * TL_HMX_TILE_ELMS))[r];
+          HVX_VectorPair vp = Q6_W_vdeal_VVR(hi, lo, -2);
+          o0[nc] = Q6_V_lo_W(vp);
+          o1[nc] = Q6_V_hi_W(vp);
+        }
+      }
+    return;
+  }
   for (int m = 0; m < M; ++m)
     for (int n = 0; n < N; ++n)
       C[m * N + n] = t[((m / TL_HMX_T) * NT + n / TL_HMX_T) * TL_HMX_TILE_ELMS +
                        tl_hmx_cpos(m % TL_HMX_T, n % TL_HMX_T)];
+}
+// Scalar transposed packs (HVX would need strided/gathered source loads): A
+// stored [K,M] (trans_a) / B stored [N,K] (trans_b).  Common gemms have
+// trans_a=false; trans_b=true is the linear-layer / attention QKᵀ form.
+TL_HMX_INLINE void tl_hmx_pack_A_T(__fp16 *t, const __fp16 *A, int M, int K) {
+  int KT = K / TL_HMX_T;
+  for (int m = 0; m < M; ++m)
+    for (int k = 0; k < K; ++k)
+      t[((m / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
+        tl_hmx_cpos(m % TL_HMX_T, k % TL_HMX_T)] = A[(size_t)k * M + m];
+}
+TL_HMX_INLINE void tl_hmx_pack_B_T(__fp16 *t, const __fp16 *B, int K, int N) {
+  int KT = K / TL_HMX_T;
+  for (int k = 0; k < K; ++k)
+    for (int n = 0; n < N; ++n)
+      t[((n / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
+        tl_hmx_cpos(k % TL_HMX_T, n % TL_HMX_T)] = B[(size_t)n * K + k];
 }
 TL_HMX_INLINE void tl_hmx_matmul_tiles(__fp16 *c, const __fp16 *a,
                                        const __fp16 *b, int M, int N, int K,
@@ -252,24 +284,41 @@ static void tl_hmx_session_deinit(void) {
 // returns -2, the generated kernel discards the rc, and the caller gets zeros.
 static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 
-// T.gemm entry: operands are ALREADY Crouton-packed in VTCM (written there by a
-// layout-aware T.copy via the Crouton tilelang Layout), so this does ONLY the HMX
-// MAC — no pack/unpack.  A: M×K row-tile-major Crouton; B: K×N col-tile-major
-// Crouton; C: M×N row-tile-major Crouton (the HMX store order).  Returns 0 on ok.
-static int tl_hexagon_hmx_mac_f16(__fp16 *C, const __fp16 *A, const __fp16 *B,
-                                  int M, int N, int K) {
+// T.gemm (Level-1) entry: operands are ROW-MAJOR in VTCM (loaded by a fast,
+// auto-vectorized T.copy).  HVX-pack them to Crouton scratch, MAC, then HVX-unpack
+// the result back to row-major C — so the surrounding copies AND elementwise ops
+// (softmax) stay vectorizable.  The Crouton scratch grows TOP-DOWN from the end of
+// VTCM while alloc_shared operands grow bottom-up, so they don't collide for any
+// kernel that fits.  trans_a/trans_b: operand stored transposed ([K,M] / [N,K]),
+// using the scalar transposed pack.  Returns 0 on ok.
+static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int M,
+                               int N, int K, int trans_a, int trans_b) {
   if (M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) || (N % TL_HMX_T) ||
       (K % TL_HMX_T))
     return -1;
   tl_hmx_session_init(); // power + HMX lock + ensure VTCM (all idempotent)
   if (!tl_vtcm_base_ptr)
     return -2;
-  // Scales live in the codegen-reserved first VTCM tile (offset 0); alloc_shared
-  // operands start above it (vtcm_offset_ begins at 2048 in the codegen), so they
-  // never overlap regardless of the runtime VTCM size.
-  uint32_t *scales = (uint32_t *)tl_vtcm_base_ptr;
+  size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 2048u > (size_t)tl_vtcm_total)
+    return -3;
+  uint32_t *scales = (uint32_t *)tl_vtcm_base_ptr; // reserved first tile
   tl_hmx_fill_unit_scales(scales);
-  tl_hmx_matmul_tiles(C, A, B, M, N, K, (const __fp16 *)scales);
+  __fp16 *c_t = (__fp16 *)(tl_vtcm_base_ptr + (size_t)tl_vtcm_total) - c_sz;
+  __fp16 *b_t = c_t - b_sz;
+  __fp16 *a_t = b_t - a_sz;
+  if (trans_a)
+    tl_hmx_pack_A_T(a_t, A, M, K);
+  else
+    tl_hmx_pack_A(a_t, A, M, K);
+  if (trans_b)
+    tl_hmx_pack_B_T(b_t, B, K, N);
+  else
+    tl_hmx_pack_B(b_t, B, K, N);
+  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)scales);
+  tl_hmx_unpack_C(C, c_t, M, N);
   return 0;
 }
 
