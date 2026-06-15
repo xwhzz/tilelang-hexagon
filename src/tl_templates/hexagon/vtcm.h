@@ -22,6 +22,13 @@ static uint8_t *tl_vtcm_base_ptr;  // base of the acquired VTCM region
 static unsigned int tl_vtcm_total; // bytes acquired (capacity guard)
 static int tl_vtcm_ctx;            // HAP_compute_res handle
 
+// Bottom-up high-water mark of alloc_shared VTCM usage for the CURRENT kernel, in
+// bytes from tl_vtcm_base_ptr.  The codegen publishes it (one monotonic assignment
+// per shared buffer, all emitted before the compute that uses them), so a runtime
+// that carves scratch TOP-DOWN from the arena end (the HMX gemm) knows how far the
+// live shared tiles reach and can refuse rather than overlap them.
+static unsigned int tl_vtcm_shared_high_water;
+
 // Acquire the full VTCM region once.  Idempotent: a second call is a no-op while
 // a region is held, so alloc_shared kernels and (later) the HMX path can share
 // the same arena without double-acquiring.

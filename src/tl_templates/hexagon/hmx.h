@@ -285,12 +285,18 @@ static void tl_hmx_session_deinit(void) {
 static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 
 // T.gemm (Level-1) entry: operands are ROW-MAJOR in VTCM (loaded by a fast,
-// auto-vectorized T.copy).  HVX-pack them to Crouton scratch, MAC, then HVX-unpack
-// the result back to row-major C — so the surrounding copies AND elementwise ops
-// (softmax) stay vectorizable.  The Crouton scratch grows TOP-DOWN from the end of
-// VTCM while alloc_shared operands grow bottom-up, so they don't collide for any
-// kernel that fits.  trans_a/trans_b: operand stored transposed ([K,M] / [N,K]),
-// using the scalar transposed pack.  Returns 0 on ok.
+// auto-vectorized T.copy).  HVX-pack them to a Crouton scratch, MAC, then HVX-
+// unpack the result back to row-major C — so the surrounding copies AND elementwise
+// ops (softmax) stay vectorizable.  The Crouton scratch grows TOP-DOWN from the end
+// of VTCM while the row-major alloc_shared tiles grow bottom-up.  A Crouton tile
+// holds the same element count as its row-major source, so the scratch is the SAME
+// size as the operands and the two together need ~2x the operand bytes — a flat
+// "scratch fits in VTCM" check is NOT enough.  We refuse (-3) if the scratch base
+// would underflow into the live shared tiles: the codegen publishes their bottom
+// high-water (tl_vtcm_shared_high_water), which covers the operands AND any sibling
+// alloc_shared buffers, rather than silently corrupt them.
+// trans_a/trans_b: operand stored transposed ([K,M] / [N,K]), scalar transposed
+// pack.  Returns 0 on ok.
 static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int M,
                                int N, int K, int trans_a, int trans_b) {
   if (M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) || (N % TL_HMX_T) ||
@@ -302,13 +308,24 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
   size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
   size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
   size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 2048u > (size_t)tl_vtcm_total)
+  // Arena top, floored to a 2KB Crouton tile so the scratch tiles stay 128-byte
+  // (HVX) aligned even if the granted VTCM total isn't tile-aligned.
+  size_t top = (size_t)tl_vtcm_total & ~(size_t)(TL_HMX_TILE_BYTES - 1);
+  __fp16 *c_t = (__fp16 *)(tl_vtcm_base_ptr + top) - c_sz;
+  __fp16 *b_t = c_t - b_sz;
+  __fp16 *a_t = b_t - a_sz;
+  // Refuse if the scratch base would underflow into the live shared tiles.  The
+  // codegen-published bottom high-water covers the operands and any sibling
+  // alloc_shared buffers; the scale tile at base+0 is always reserved.  Catches the
+  // large gemm the old scratch-only check missed (e.g. M=N=K>=864 on 8MB VTCM,
+  // where operands+scratch exceed VTCM though the scratch alone fits).
+  const uint8_t *floor = tl_vtcm_base_ptr + tl_vtcm_shared_high_water;
+  if (floor < tl_vtcm_base_ptr + TL_HMX_TILE_BYTES)
+    floor = tl_vtcm_base_ptr + TL_HMX_TILE_BYTES;
+  if ((const uint8_t *)a_t < floor)
     return -3;
   uint32_t *scales = (uint32_t *)tl_vtcm_base_ptr; // reserved first tile
   tl_hmx_fill_unit_scales(scales);
-  __fp16 *c_t = (__fp16 *)(tl_vtcm_base_ptr + (size_t)tl_vtcm_total) - c_sz;
-  __fp16 *b_t = c_t - b_sz;
-  __fp16 *a_t = b_t - a_sz;
   if (trans_a)
     tl_hmx_pack_A_T(a_t, A, M, K);
   else

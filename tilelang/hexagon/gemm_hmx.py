@@ -44,9 +44,16 @@ class GemmHMX(GemmBase):
         # matches the buffer when the region spans the whole buffer — reject a
         # sub-region gemm loudly rather than silently corrupt.
         def _full(region, buf):
-            return all(int(r.min) == 0 for r in region.region) and \
-                int(region.region[0].extent) == int(buf.shape[0]) and \
-                int(region.region[1].extent) == int(buf.shape[1])
+            # A symbolic region min/extent (e.g. a strided sub-region A_sh[ko*64:...]
+            # inside a serial loop) is by definition not a static full-buffer span;
+            # int() would raise TypeError, so treat non-const as "not full" and let
+            # the NotImplementedError below report it cleanly.
+            try:
+                return all(int(r.min) == 0 for r in region.region) and \
+                    int(region.region[0].extent) == int(buf.shape[0]) and \
+                    int(region.region[1].extent) == int(buf.shape[1])
+            except (TypeError, ValueError):
+                return False
         if not (_full(self.ARegion, A_buf) and _full(self.BRegion, B_buf) and _full(self.CRegion, C_buf)):
             raise NotImplementedError(
                 "GemmHMX: sub-region gemm (operands that don't span their whole "

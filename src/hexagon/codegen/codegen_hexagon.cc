@@ -109,7 +109,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   this->InitFuncState(f);
   ReserveKeywordsAsUnique();
   // Reserve the first 2KB VTCM tile (offset 0) for the HMX output scales that
-  // tl_hexagon_hmx_mac_f16 writes at tl_vtcm_base()+0; alloc_shared buffers start
+  // tl_hexagon_hmx_gemm writes at tl_vtcm_base()+0; alloc_shared buffers start
   // above it, so operands and scales can never overlap regardless of the runtime
   // VTCM size.  (Non-HMX shared kernels just leave the first tile unused.)
   vtcm_offset_ = 2048;
@@ -192,6 +192,12 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
     stream << "*)((char*)tl_vtcm_base() + " << offset << ");\n";
+    // Publish the running bottom high-water so a top-down VTCM consumer (the HMX
+    // gemm scratch) won't overlap this (and prior) live shared tiles.  Monotonic
+    // and emitted before the compute, so the value seen at the gemm call is the
+    // end of all currently-live shared buffers.
+    this->PrintIndent();
+    stream << "tl_vtcm_shared_high_water = " << vtcm_offset_ << "u;\n";
   } else {
     // Stack-local (fragments / small scratch).
     PrintType(op->buffer->dtype, stream);
