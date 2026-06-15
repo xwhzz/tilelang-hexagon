@@ -20,7 +20,9 @@ from tilelang.backend.pass_pipeline import resolve_pipeline
 
 
 def is_cpu_device_backend(target: Target):
-    return target.kind.name == "c"
+    # Hexagon kernels are emitted as sequential C (like the CPU "c" backend);
+    # treat them the same way for the host/device split.
+    return target.kind.name in ("c", "hexagon")
 
 
 def has_device_kernel_launch(attrs) -> bool:
@@ -34,7 +36,7 @@ def is_device_call_c_device(func: tirx.PrimFunc):
     is_cpacked = calling_conv == CallingConv.C_PACKED_FUNC
 
     # Check if it's a C target
-    if "target" in attrs and attrs["target"].kind.name == "c" and not is_cpacked:
+    if "target" in attrs and attrs["target"].kind.name in ("c", "hexagon") and not is_cpacked:
         return True
 
     return has_device_kernel_launch(attrs)
@@ -239,6 +241,8 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
     elif target.kind.name == "metal":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_metal")(device_mod, target)
+    elif target.kind.name == "hexagon":
+        device_mod = tvm.ffi.get_global_func("target.build.tilelang_hexagon")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
 
@@ -263,6 +267,8 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
         device_mod = tvm.ffi.get_global_func("target.build.webgpu")(device_mod, target)
     elif target.kind.name == "metal":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_metal")(device_mod, target)
+    elif target.kind.name == "hexagon":
+        device_mod = tvm.ffi.get_global_func("target.build.tilelang_hexagon")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
 

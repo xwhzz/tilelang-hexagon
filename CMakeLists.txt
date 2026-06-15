@@ -369,6 +369,7 @@ file(GLOB TILE_LANG_SRCS
   src/transform/pipeline/*.cc
   src/op/*.cc
   src/cpu/op/*.cc
+  src/hexagon/op/*.cc
   src/cuda/op/copy_analysis.cc
   src/metal/op/*.cc
   src/webgpu/op/*.cc
@@ -392,6 +393,14 @@ list(APPEND TILE_LANG_SRCS
 # is available for cross-compilation on Linux/Windows.
 list(APPEND TILE_LANG_SRCS
   src/backend/common/codegen/codegen_metal.cc
+)
+# Hexagon NPU codegen is pure C++ source generation (no Hexagon SDK needed at
+# tilelang build time); always compile it so that "target.build.tilelang_hexagon"
+# is available.  Compilation of the generated source to a cDSP skel is done by
+# the Python adapter using the Hexagon SDK.
+list(APPEND TILE_LANG_SRCS
+  src/hexagon/codegen/codegen_hexagon.cc
+  src/hexagon/codegen/rt_mod_hexagon.cc
 )
 # Track if the user explicitly selected a backend via cache options.
 set(TILELANG_BACKEND_USER_SELECTED OFF)

@@ -26,6 +26,9 @@ bool TargetIsMetal(Target target) {
 bool TargetIsCPU(Target target) {
   return target->GetTargetDeviceType() == kDLCPU;
 }
+bool TargetIsHexagon(Target target) {
+  return target->GetTargetDeviceType() == kDLHexagon;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<String>("arch");

@@ -213,5 +213,9 @@ if not env.is_light_import():
     from . import cuda as cuda  # noqa: F401
     from . import rocm as rocm  # noqa: F401
     from . import metal as metal  # noqa: F401
+    # Register the Hexagon lowering pipeline.  We import the submodule directly
+    # (not the package) so the lean build/deploy harness in tilelang.hexagon
+    # stays importable without the tilelang native library.
+    from .hexagon import pipeline as _hexagon_pipeline  # noqa: F401
 
 del _lazy_load_lib

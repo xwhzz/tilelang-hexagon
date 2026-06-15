@@ -41,6 +41,8 @@ def allowed_backends_for_target(target: Target, *, include_unavailable: bool = T
         allowed = ["tvm_ffi", "torch"]
     elif kind == "c":  # CPU C backend
         allowed = ["cython", "tvm_ffi"]
+    elif kind == "hexagon":  # Qualcomm Hexagon NPU via FastRPC
+        allowed = ["hexagon"]
     else:
         # Fallback: prefer portable hosts
         allowed = ["cython", "tvm_ffi"]

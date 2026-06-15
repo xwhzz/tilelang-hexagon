@@ -24,6 +24,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "llvm": "LLVM CPU target. Use dict options such as {'kind': 'llvm', 'mcpu': 'native'}.",
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
+    "hexagon": "Qualcomm Hexagon NPU (cDSP): HMX/HVX kernels compiled with the Hexagon SDK and deployed over FastRPC.",
     "cutedsl": "CuTe DSL GPU target. Use dict options such as {'kind': 'cutedsl', 'arch': 'sm_90'}.",
 }
 
@@ -326,6 +327,10 @@ def target_is_hip(target: Target) -> bool:
 
 def target_is_metal(target: Target) -> bool:
     return _ffi_api.TargetIsMetal(target)
+
+
+def target_is_hexagon(target: Target) -> bool:
+    return target.kind.name == "hexagon"
 
 
 def target_is_volta(target: Target) -> bool:

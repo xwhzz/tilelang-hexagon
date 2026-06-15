@@ -329,6 +329,16 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend == "hexagon":
+            from tilelang.hexagon.adapter import HexagonKernelAdapter
+
+            adapter = HexagonKernelAdapter(
+                params=artifact.params,
+                result_idx=out_idx,
+                target=target,
+                kernel_source=artifact.kernel_source,
+                verbose=verbose,
+            )
         else:
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
