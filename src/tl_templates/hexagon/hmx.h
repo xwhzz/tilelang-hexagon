@@ -15,6 +15,7 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 #include <HAP_power.h>
+#include <hexagon_types.h> // HVX_Vector + Q6_* intrinsics (needs -mhvx)
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -136,8 +137,30 @@ TL_HMX_INLINE void tl_hmx_store_tile(__fp16 *o) {
 TL_HMX_INLINE int tl_hmx_cpos(int i, int j) {
   return (i & ~1) * 32 + j * 2 + (i & 1);
 }
+// Crouton's intra-tile layout IS a row-pair interleave, so one HVX `vshuff` of
+// two source rows produces a whole 64-element row-pair span (lo half -> the even
+// tile, hi half -> the next tile).  ~64x the scalar element-by-element pack.  The
+// 64-column chunk spans 2 tiles, so the contiguous dim must be a 64-multiple;
+// otherwise fall back to the scalar pack.
 TL_HMX_INLINE void tl_hmx_pack_A(__fp16 *t, const __fp16 *A, int M, int K) {
   int KT = K / TL_HMX_T;
+  if ((K & 63) == 0) {
+    for (int mt = 0; mt < M / TL_HMX_T; ++mt)
+      for (int r = 0; r < TL_HMX_T / 2; ++r) { // 16 row-pairs per tile
+        const HVX_Vector *r0 =
+            (const HVX_Vector *)(A + (size_t)(mt * TL_HMX_T + 2 * r) * K);
+        const HVX_Vector *r1 =
+            (const HVX_Vector *)(A + (size_t)(mt * TL_HMX_T + 2 * r + 1) * K);
+        for (int kc = 0; kc < K / 64; ++kc) { // 64 cols == 2 k-tiles
+          HVX_VectorPair vp = Q6_W_vshuff_VVR(r1[kc], r0[kc], -2);
+          ((HVX_Vector *)(t + (size_t)(mt * KT + 2 * kc) * TL_HMX_TILE_ELMS))[r] =
+              Q6_V_lo_W(vp);
+          ((HVX_Vector *)(t + (size_t)(mt * KT + 2 * kc + 1) * TL_HMX_TILE_ELMS))[r] =
+              Q6_V_hi_W(vp);
+        }
+      }
+    return;
+  }
   for (int m = 0; m < M; ++m)
     for (int k = 0; k < K; ++k)
       t[((m / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
@@ -145,6 +168,23 @@ TL_HMX_INLINE void tl_hmx_pack_A(__fp16 *t, const __fp16 *A, int M, int K) {
 }
 TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
   int KT = K / TL_HMX_T;
+  if ((N & 63) == 0) { // col-tile-major: cpos(k,n) interleaves K row-pairs over N
+    for (int kt = 0; kt < KT; ++kt)
+      for (int r = 0; r < TL_HMX_T / 2; ++r) { // 16 k-row-pairs per k-tile
+        const HVX_Vector *r0 =
+            (const HVX_Vector *)(B + (size_t)(kt * TL_HMX_T + 2 * r) * N);
+        const HVX_Vector *r1 =
+            (const HVX_Vector *)(B + (size_t)(kt * TL_HMX_T + 2 * r + 1) * N);
+        for (int nc = 0; nc < N / 64; ++nc) { // 64 cols == 2 n-tiles
+          HVX_VectorPair vp = Q6_W_vshuff_VVR(r1[nc], r0[nc], -2);
+          ((HVX_Vector *)(t + (size_t)((2 * nc) * KT + kt) * TL_HMX_TILE_ELMS))[r] =
+              Q6_V_lo_W(vp);
+          ((HVX_Vector *)(t + (size_t)((2 * nc + 1) * KT + kt) * TL_HMX_TILE_ELMS))[r] =
+              Q6_V_hi_W(vp);
+        }
+      }
+    return;
+  }
   for (int k = 0; k < K; ++k)
     for (int n = 0; n < N; ++n)
       t[((n / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
