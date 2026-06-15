@@ -111,6 +111,7 @@ class JITKernel(Generic[_P, _T]):
             "nvrtc",
             "torch",
             "cutedsl",
+            "hexagon",
         ], f"Invalid execution backend. {execution_backend}"
         if execution_backend == "cython":
             from tilelang.contrib.cc import get_cplus_compiler

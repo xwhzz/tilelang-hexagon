@@ -216,6 +216,11 @@ static void tl_hmx_session_deinit(void) {
   tl_hmx_inited = 0;
 }
 
+// Did the session actually acquire VTCM/HMX?  The FastRPC _open uses this to
+// fail loudly when (e.g.) a leaked agent still holds VTCM — otherwise the matmul
+// returns -2, the generated kernel discards the rc, and the caller gets zeros.
+static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
+
 // Public entry called by generated kernels.  Returns 0 on success.  Acquires the
 // session lazily if _open didn't; teardown belongs to the session (at _close).
 static int tl_hexagon_hmx_matmul_f16(__fp16 *C, const __fp16 *A,

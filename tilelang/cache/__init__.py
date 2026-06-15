@@ -15,6 +15,7 @@ from tilelang.jit.adapter.cython.kernel_cache import CythonKernelCache
 from tilelang.jit.adapter.nvrtc.kernel_cache import NVRTCKernelCache
 from tilelang.jit.adapter.torch.kernel_cache import TorchKernelCache
 from tilelang.jit.adapter.kernel_cache import TVMFFIKernelCache
+from tilelang.hexagon.kernel_cache import HexagonKernelCache
 
 if TYPE_CHECKING:
     from .kernel_cache import KernelCache
@@ -26,6 +27,7 @@ _dispatch_map: dict[str, KernelCache] = {
     "nvrtc": NVRTCKernelCache(),
     "cutedsl": CuTeDSLKernelCache(),
     "torch": TorchKernelCache(),
+    "hexagon": HexagonKernelCache(),
 }
 
 

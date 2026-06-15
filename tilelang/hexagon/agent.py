@@ -14,6 +14,7 @@ generated agent, so only raw bytes cross the wire.
 
 from __future__ import annotations
 
+import atexit
 import os
 import select
 import socket
@@ -67,6 +68,10 @@ class HexagonAgentSession:
                                       stderr=subprocess.STDOUT, text=True)
         self._wait_ready(ready_timeout)
         self._sock = self._connect()
+        # __del__ isn't guaranteed to run at interpreter shutdown, so register an
+        # explicit exit hook — otherwise the on-device agent leaks: it keeps
+        # holding the full VTCM, starving the next agent into silent zeros.
+        atexit.register(self.close)
 
     # ---- lifecycle --------------------------------------------------------
     def _sh(self, cmd: str):
@@ -110,13 +115,22 @@ class HexagonAgentSession:
         raise RuntimeError("could not connect to Hexagon agent socket")
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            atexit.unregister(self.close)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._sock.sendall(b"\x02")  # shutdown
             self._sock.close()
         except Exception:  # noqa: BLE001
             pass
         try:
-            self._sh(f"pkill -f {self._exe_name}")
+            # Match exe name AND port so concurrent adapters for the same kernel
+            # (distinct ports, see HexagonKernelAdapter) don't kill each other.
+            self._sh(f"pkill -f '{self._exe_name} {self.device_port}'")
         except Exception:  # noqa: BLE001
             pass
         try:

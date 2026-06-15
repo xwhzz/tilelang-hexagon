@@ -124,6 +124,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).
     hmx_open = "tl_hmx_session_init(); " if hmx else ""
     hmx_close = "tl_hmx_session_deinit(); " if hmx else ""
+    # Fail _open loudly if HMX/VTCM couldn't be acquired (e.g. a leaked agent
+    # still holds VTCM) rather than running and returning silent zeros — the
+    # kernel discards the matmul rc, so this is the only place to surface it.
+    hmx_check = "if (!tl_hmx_session_ok()) return AEE_EFAILED; " if hmx else ""
     return (
         "// Auto-generated FastRPC skel impl for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n"
@@ -132,7 +136,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
         "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
-        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}return AEE_SUCCESS; }}\n"
+        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}{hmx_check}return AEE_SUCCESS; }}\n"
         f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}return AEE_SUCCESS; }}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
         f"  {kernel_name}({', '.join(call_args)});\n"
