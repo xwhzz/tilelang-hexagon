@@ -72,6 +72,7 @@ public:
 
   void SetHostFuncSignature(const tirx::PrimFunc &func) {
     host_buffer_map_ = func->buffer_map;
+    host_params_ = func->params;
   }
 
   tirx::Stmt VisitStmt_(const tirx::AttrStmtNode *op) final {
@@ -111,6 +112,9 @@ public:
 private:
   bool found_device_region_{false};
   Map<tirx::Var, tirx::Buffer> host_buffer_map_;
+  // Ordered host signature (original PrimFunc param order); used to keep the
+  // device kernel signature in declaration order for direct-call targets.
+  Array<tirx::Var> host_params_;
   Array<tirx::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
   Optional<String> code_block_source_{std::nullopt};
@@ -127,6 +131,32 @@ private:
                 };
                 return sort_key(a) < sort_key(b);
               });
+  }
+
+  // Order device params to match the original host signature (declaration
+  // order).  GPU targets reorder args through the generated host wrapper, but
+  // direct-call targets (Hexagon: the FastRPC skel calls the kernel by position
+  // from the def-ordered KernelParams) need the device signature to stay in the
+  // original order, or operands get silently transposed/permuted.
+  void OrderByHostParams(std::vector<tirx::Var> *params) const {
+    std::unordered_map<const tirx::VarNode *, int> order;
+    int idx = 0;
+    for (const auto &hp : host_params_) {
+      if (host_buffer_map_.count(hp)) {
+        order[host_buffer_map_[hp]->data.get()] = idx; // buffer data var
+      }
+      order.emplace(hp.get(), idx); // scalar params keyed by the var itself
+      ++idx;
+    }
+    int n = static_cast<int>(host_params_.size());
+    std::stable_sort(params->begin(), params->end(),
+                     [&](const tirx::Var &a, const tirx::Var &b) {
+                       int ka = order.count(a.get()) ? order[a.get()] : n;
+                       int kb = order.count(b.get()) ? order[b.get()] : n;
+                       if (ka != kb)
+                         return ka < kb;
+                       return a->name_hint < b->name_hint;
+                     });
   }
 
   std::tuple<Array<tirx::Var>, Array<tirx::Buffer>>
@@ -281,7 +311,11 @@ private:
 
       std::vector<tirx::Var> params{use_def.undefined_.begin(),
                                     use_def.undefined_.end()};
-      SortDeviceParams(&params);
+      if (device_target->GetTargetDeviceType() == kDLHexagon) {
+        OrderByHostParams(&params); // direct-call ABI: keep declaration order
+      } else {
+        SortDeviceParams(&params);
+      }
       return {Array<tirx::Var>(params.begin(), params.end()),
               use_def.undefined_buffers_};
     }();
