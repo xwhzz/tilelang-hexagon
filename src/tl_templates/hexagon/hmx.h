@@ -113,7 +113,8 @@ TL_HMX_INLINE void tl_hmx_set_scales(const void *s) {
 }
 // Fill a 256-byte HMX output-scale region: per-column scale = fp16 1.0 (u32 low
 // half == 0x3c00), per-column bias = 0.  Single source for the u32 scale-word
-// layout shared by all three HMX entry points (matmul / mac / bench).
+// layout, filled once per session (tl_hmx_session_init) for the gemm/matmul path
+// and inline by the standalone bench.
 TL_HMX_INLINE void tl_hmx_fill_unit_scales(uint32_t *s) {
   for (int i = 0; i < 32; ++i)
     s[i] = 0x00003c00u;
@@ -136,6 +137,26 @@ TL_HMX_INLINE void tl_hmx_store_tile(__fp16 *o) {
 // Crouton 32x32 tile layout: (row i, col j) -> (i&~1)*32 + j*2 + (i&1).
 TL_HMX_INLINE int tl_hmx_cpos(int i, int j) {
   return (i & ~1) * 32 + j * 2 + (i & 1);
+}
+// Element offset of operand coord (r,c) in a Crouton-tiled scratch whose tile grid
+// is `ntc` tiles wide.  `swap` selects the col-tile-major B intra-tile order
+// (cpos(c,r)) vs the row-tile-major A/C order (cpos(r,c)).  One source of truth for
+// the tile addressing, used by every scalar pack/unpack fallback below.
+TL_HMX_INLINE size_t tl_hmx_off(int r, int c, int ntc, int swap) {
+  size_t tile = ((size_t)(r / TL_HMX_T) * ntc + c / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  int pr = r % TL_HMX_T, pc = c % TL_HMX_T;
+  return tile + (swap ? tl_hmx_cpos(pc, pr) : tl_hmx_cpos(pr, pc));
+}
+// Scalar Crouton pack: source logical element (i,j) lives at src[i*si + j*sj], over
+// an R x C logical shape, into a tile grid `ntc` wide; `swap` picks the B intra-tile
+// order.  The HVX fast paths (pack_A/pack_B) handle the common 64-multiple case;
+// this covers the remainder AND the transposed operands (whose strided source would
+// need gathered HVX loads), so all four scalar packs share one body.
+TL_HMX_INLINE void tl_hmx_pack_scalar(__fp16 *t, const __fp16 *src, int R, int C,
+                                      int ntc, int si, int sj, int swap) {
+  for (int i = 0; i < R; ++i)
+    for (int j = 0; j < C; ++j)
+      t[tl_hmx_off(i, j, ntc, swap)] = src[(size_t)i * si + (size_t)j * sj];
 }
 // Crouton's intra-tile layout IS a row-pair interleave, so one HVX `vshuff` of
 // two source rows produces a whole 64-element row-pair span (lo half -> the even
@@ -161,10 +182,7 @@ TL_HMX_INLINE void tl_hmx_pack_A(__fp16 *t, const __fp16 *A, int M, int K) {
       }
     return;
   }
-  for (int m = 0; m < M; ++m)
-    for (int k = 0; k < K; ++k)
-      t[((m / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
-        tl_hmx_cpos(m % TL_HMX_T, k % TL_HMX_T)] = A[m * K + k];
+  tl_hmx_pack_scalar(t, A, M, K, KT, K, 1, 0); // A[m*K+k], row-tile-major
 }
 TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
   int KT = K / TL_HMX_T;
@@ -185,10 +203,7 @@ TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
       }
     return;
   }
-  for (int k = 0; k < K; ++k)
-    for (int n = 0; n < N; ++n)
-      t[((n / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
-        tl_hmx_cpos(k % TL_HMX_T, n % TL_HMX_T)] = B[k * N + n];
+  tl_hmx_pack_scalar(t, B, N, K, KT, 1, N, 1); // B[k*N+n], col-tile-major (swap)
 }
 TL_HMX_INLINE void tl_hmx_unpack_C(__fp16 *C, const __fp16 *t, int M, int N) {
   int NT = N / TL_HMX_T;
@@ -209,25 +224,18 @@ TL_HMX_INLINE void tl_hmx_unpack_C(__fp16 *C, const __fp16 *t, int M, int N) {
   }
   for (int m = 0; m < M; ++m)
     for (int n = 0; n < N; ++n)
-      C[m * N + n] = t[((m / TL_HMX_T) * NT + n / TL_HMX_T) * TL_HMX_TILE_ELMS +
-                       tl_hmx_cpos(m % TL_HMX_T, n % TL_HMX_T)];
+      C[(size_t)m * N + n] = t[tl_hmx_off(m, n, NT, 0)];
 }
-// Scalar transposed packs (HVX would need strided/gathered source loads): A
-// stored [K,M] (trans_a) / B stored [N,K] (trans_b).  Common gemms have
-// trans_a=false; trans_b=true is the linear-layer / attention QKᵀ form.
+// Scalar transposed packs (HVX would need strided/gathered source loads): A stored
+// [K,M] (trans_a) / B stored [N,K] (trans_b).  trans_a=false is the usual case;
+// trans_b=true is the common linear-layer / attention QKᵀ form, so this scalar pack
+// is on the hot path for those — an HVX transposed pack is a tracked follow-up.
+// Both reduce to the shared scalar packer with a swapped source stride.
 TL_HMX_INLINE void tl_hmx_pack_A_T(__fp16 *t, const __fp16 *A, int M, int K) {
-  int KT = K / TL_HMX_T;
-  for (int m = 0; m < M; ++m)
-    for (int k = 0; k < K; ++k)
-      t[((m / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
-        tl_hmx_cpos(m % TL_HMX_T, k % TL_HMX_T)] = A[(size_t)k * M + m];
+  tl_hmx_pack_scalar(t, A, M, K, K / TL_HMX_T, 1, M, 0); // A[k*M+m], row-tile-major
 }
 TL_HMX_INLINE void tl_hmx_pack_B_T(__fp16 *t, const __fp16 *B, int K, int N) {
-  int KT = K / TL_HMX_T;
-  for (int k = 0; k < K; ++k)
-    for (int n = 0; n < N; ++n)
-      t[((n / TL_HMX_T) * KT + k / TL_HMX_T) * TL_HMX_TILE_ELMS +
-        tl_hmx_cpos(k % TL_HMX_T, n % TL_HMX_T)] = B[(size_t)n * K + k];
+  tl_hmx_pack_scalar(t, B, N, K, K / TL_HMX_T, K, 1, 1); // B[n*K+k], col-tile (swap)
 }
 TL_HMX_INLINE void tl_hmx_matmul_tiles(__fp16 *c, const __fp16 *a,
                                        const __fp16 *b, int M, int N, int K,
@@ -259,6 +267,10 @@ static void tl_hmx_session_init(void) {
   if (tl_vtcm_base_ptr) {
     tl_hmx_enable();
     tl_hmx_unit_acquire();
+    // The HMX output scales are constant (unit scale / zero bias) and live in the
+    // reserved first VTCM tile (base+0); fill them once here rather than on every
+    // gemm call.  The gemm/matmul entries read them from base+0.
+    tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr);
     tl_hmx_inited = 1;
   } else {
     // VTCM acquire failed: release the HMX ctx and drop the rail off TURBO so a
@@ -324,8 +336,6 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
     floor = tl_vtcm_base_ptr + TL_HMX_TILE_BYTES;
   if ((const uint8_t *)a_t < floor)
     return -3;
-  uint32_t *scales = (uint32_t *)tl_vtcm_base_ptr; // reserved first tile
-  tl_hmx_fill_unit_scales(scales);
   if (trans_a)
     tl_hmx_pack_A_T(a_t, A, M, K);
   else
@@ -334,41 +344,21 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
     tl_hmx_pack_B_T(b_t, B, K, N);
   else
     tl_hmx_pack_B(b_t, B, K, N);
-  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)scales);
+  // Scales were filled once in tl_hmx_session_init, in the reserved base+0 tile.
+  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)tl_vtcm_base_ptr);
   tl_hmx_unpack_C(C, c_t, M, N);
   return 0;
 }
 
-// Public entry called by generated kernels.  Returns 0 on success.  Acquires the
-// session lazily if _open didn't; teardown belongs to the session (at _close).
+// Public entry called by generated kernels (the call_extern matmul path), where
+// A/B/C are GLOBAL (DDR rpcmem) rather than VTCM-resident.  Identical to the
+// T.gemm path with no transpose, so it just delegates: the bottom high-water is 0
+// (no alloc_shared tiles), leaving the whole VTCM free for the top-down scratch.
+// Acquires the session lazily if _open didn't; teardown belongs to _close.
 static int tl_hexagon_hmx_matmul_f16(__fp16 *C, const __fp16 *A,
                                      const __fp16 *B, int M, int N, int K) {
-  if (M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) || (N % TL_HMX_T) ||
-      (K % TL_HMX_T))
-    return -1;
-
-  tl_hmx_session_init();
-  if (!tl_vtcm_base_ptr)
-    return -2;
-
-  // VTCM arena: A tiles | B tiles | C tiles | scales(256B).
-  size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  // Bail before writing if the arena won't fit, else pack_* overruns VTCM.
-  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) + 256u > (size_t)tl_vtcm_total)
-    return -3;
-  __fp16 *a_t = (__fp16 *)tl_vtcm_base_ptr;
-  __fp16 *b_t = a_t + a_sz;
-  __fp16 *c_t = b_t + b_sz;
-  uint32_t *scales = (uint32_t *)(c_t + c_sz);
-  tl_hmx_fill_unit_scales(scales);
-
-  tl_hmx_pack_A(a_t, A, M, K);
-  tl_hmx_pack_B(b_t, B, K, N);
-  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)scales);
-  tl_hmx_unpack_C(C, c_t, M, N);
-  return 0;
+  tl_vtcm_shared_high_water = 0;
+  return tl_hexagon_hmx_gemm(C, A, B, M, N, K, 0, 0);
 }
 
 // Benchmark variant: acquire + Crouton-pack once, then time `iters` HMX matmuls
