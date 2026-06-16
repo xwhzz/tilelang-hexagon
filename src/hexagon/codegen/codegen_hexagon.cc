@@ -122,35 +122,105 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
 
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
-  this->PrintFuncPrefix(stream);
-  CodeGenC::PrintType(f->ret_type, stream);
-  this->PrintExtraAttrs(f, stream);
-  this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
+  // Worker-pool mode: `hexagon.num_workers` > 0 fans the grid's outermost block
+  // loop across HW threads via tl_parallel instead of a serial for-loop.
+  wp_num_workers_ = 0;
+  if (auto nw = f->GetAttr<Integer>("hexagon.num_workers")) {
+    wp_num_workers_ = static_cast<int>(nw.value()->value);
+  }
 
+  // Pre-assign param ids and register handle element types (needed before the body
+  // is emitted, and reused by the worker-pool args struct / unpack / signature).
+  std::vector<std::string> pvids;
+  pvids.reserve(f->params.size());
   for (size_t i = 0; i < f->params.size(); ++i) {
     tirx::Var v = f->params[i];
-    std::string vid = AllocVarID(v.get());
-    if (i != 0)
-      stream << ", ";
+    pvids.push_back(AllocVarID(v.get()));
     if (v.dtype().is_handle()) {
-      auto it = alloc_storage_scope_.find(v.get());
-      if (it != alloc_storage_scope_.end()) {
-        PrintStorageScope(it->second, stream);
-      }
-      CodeGenC::PrintType(GetType(v), stream);
       if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
         if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
           RegisterHandleType(v.get(), prim->dtype);
         }
       }
-      if (no_alias) {
-        PrintRestrict(v, stream);
-      }
-    } else {
-      CodeGenC::PrintType(GetType(v), stream);
     }
-    stream << ' ' << vid;
   }
+
+  // Emit the parameter signature list (storage scope + type + restrict).
+  auto emit_signature = [&]() {
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      tirx::Var v = f->params[i];
+      if (i != 0)
+        stream << ", ";
+      if (v.dtype().is_handle()) {
+        auto it = alloc_storage_scope_.find(v.get());
+        if (it != alloc_storage_scope_.end())
+          PrintStorageScope(it->second, stream);
+        CodeGenC::PrintType(GetType(v), stream);
+        if (no_alias)
+          PrintRestrict(v, stream);
+      } else {
+        CodeGenC::PrintType(GetType(v), stream);
+      }
+      stream << ' ' << pvids[i];
+    }
+  };
+
+  std::string name = static_cast<std::string>(global_symbol.value());
+
+  if (wp_num_workers_ > 0) {
+    // (1) args struct: one plain field per kernel parameter.
+    stream << "typedef struct {\n";
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      stream << "  ";
+      CodeGenC::PrintType(GetType(f->params[i]), stream);
+      stream << " " << pvids[i] << ";\n";
+    }
+    stream << "} " << name << "_args_t;\n";
+    // (2) worker callback: unpack params into same-named locals (so the body emits
+    //     unchanged), then run the grid with the OUTERMOST block loop strided across
+    //     workers (wp_outermost_pending_ tells the AttrStmt handler).
+    stream << "static void " << name
+           << "_worker(void* tl_p, int tl_wid, int tl_nw) {\n";
+    stream << "  " << name << "_args_t* tl_a = (" << name << "_args_t*)tl_p;\n";
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      stream << "  ";
+      CodeGenC::PrintType(GetType(f->params[i]), stream);
+      stream << " " << pvids[i] << " = tl_a->" << pvids[i] << ";\n";
+    }
+    this->PreFunctionBody(f);
+    wp_emit_ = true;
+    wp_outermost_pending_ = true;
+    int worker_scope = this->BeginScope();
+    this->PrintStmt(f->body);
+    this->EndScope(worker_scope);
+    wp_emit_ = false;
+    wp_outermost_pending_ = false;
+    stream << "}\n";
+    // (3) entry: build the args struct and dispatch (workers capped by HW threads).
+    this->PrintFuncPrefix(stream);
+    CodeGenC::PrintType(f->ret_type, stream);
+    this->PrintExtraAttrs(f, stream);
+    stream << " " << name << "(";
+    emit_signature();
+    stream << ") {\n";
+    stream << "  " << name << "_args_t tl_args = {";
+    for (size_t i = 0; i < f->params.size(); ++i)
+      stream << (i ? ", " : " ") << pvids[i];
+    stream << " };\n";
+    stream << "  int tl_nw = tl_num_workers();\n";
+    stream << "  if (tl_nw > " << wp_num_workers_ << ") tl_nw = " << wp_num_workers_
+           << ";\n";
+    stream << "  tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
+    stream << "}\n\n";
+    return;
+  }
+
+  // Serial path (single HW thread): the grid lowers to nested for-loops.
+  this->PrintFuncPrefix(stream);
+  CodeGenC::PrintType(f->ret_type, stream);
+  this->PrintExtraAttrs(f, stream);
+  stream << " " << name << "(";
+  emit_signature();
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
@@ -174,6 +244,13 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
   std::string scope = GetPtrStorageScope(op->buffer->data);
   bool is_shared = scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
 
+  if (is_shared && wp_emit_) {
+    LOG(FATAL) << "CodeGenTileLangHexagon: alloc_shared inside a hexagon.num_workers "
+                  "(worker-pool) kernel is not supported yet — concurrent workers each "
+                  "need a private VTCM partition (the next increment). Use the "
+                  "worker-pool only for HVX kernels without shared memory for now, or "
+                  "drop the hexagon.num_workers attr.";
+  }
   this->PrintIndent();
   if (is_shared) {
     // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and HVX
@@ -240,8 +317,16 @@ void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
       PrintIndent();
       stream << "int " << vid << " = 0;\n";
       PrintIndent();
-      stream << "for (" << vid << " = 0; " << vid << " < " << extent
-             << "; ++" << vid << ") {\n";
+      if (wp_emit_ && wp_outermost_pending_) {
+        // Worker-pool: the OUTERMOST block loop is distributed across HW threads
+        // (each worker takes a strided slice); inner thread loops stay serial.
+        wp_outermost_pending_ = false;
+        stream << "for (" << vid << " = tl_wid; " << vid << " < " << extent << "; "
+               << vid << " += tl_nw) {\n";
+      } else {
+        stream << "for (" << vid << " = 0; " << vid << " < " << extent << "; ++"
+               << vid << ") {\n";
+      }
       int scope = this->BeginScope();
       this->PrintStmt(op->body);
       this->EndScope(scope);

@@ -66,6 +66,7 @@ public:
     }
   }
 
+  void SetNumWorkers(Integer n) { num_workers_ = std::move(n); }
   void SetClusterDims(Array<Integer> cluster_dims) {
     cluster_dims_ = std::move(cluster_dims);
   }
@@ -117,6 +118,7 @@ private:
   Array<tirx::Var> host_params_;
   Array<tirx::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
+  Optional<Integer> num_workers_{std::nullopt};
   Optional<String> code_block_source_{std::nullopt};
   Optional<String> code_block_entry_name_{std::nullopt};
 
@@ -406,6 +408,9 @@ private:
     if (cluster_dims_.defined()) {
       device_attrs.Set("cluster_dims", cluster_dims_.value());
     }
+    if (num_workers_.defined()) {
+      device_attrs.Set("hexagon.num_workers", num_workers_.value());
+    }
     if (code_block_source_) {
       device_attrs.Set(tl::attr::kCodeBlockSource, code_block_source_.value());
     }
@@ -465,6 +470,13 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
   if (auto opt = func->GetAttr<Array<Integer>>("cluster_dims")) {
     splitter.SetClusterDims(opt.value());
     func = tvm::WithoutAttr(std::move(func), "cluster_dims");
+  }
+  // Propagate the Hexagon worker-pool hint (number of HW threads to fan the grid
+  // across) from the host func to the device kernel so the codegen can emit the
+  // tl_parallel dispatch instead of a serial block loop.
+  if (auto opt = func->GetAttr<Integer>("hexagon.num_workers")) {
+    splitter.SetNumWorkers(opt.value());
+    func = tvm::WithoutAttr(std::move(func), "hexagon.num_workers");
   }
 
   if (auto body = splitter(func->body); !body.same_as(func->body)) {

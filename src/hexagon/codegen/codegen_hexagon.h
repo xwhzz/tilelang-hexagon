@@ -54,6 +54,13 @@ private:
    *  in the VTCM arena; reset per function in AddFunction. */
   size_t vtcm_offset_ = 0;
 
+  /*! \brief worker-pool (multithreaded grid) state, set per function.  When the
+   *  device func carries `hexagon.num_workers` > 0, the outermost block loop is
+   *  distributed across HW threads via tl_parallel rather than a serial loop. */
+  int wp_num_workers_ = 0;            // requested worker count (0 = serial / off)
+  bool wp_emit_ = false;             // currently emitting inside the worker callback
+  bool wp_outermost_pending_ = false; // next thread_extent is the (strided) block loop
+
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,
                                    std::ostream &os); // NOLINT(*)

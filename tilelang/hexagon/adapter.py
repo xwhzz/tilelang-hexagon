@@ -26,7 +26,9 @@ from .build import build_cmake_fastrpc
 from .device import AdbConnection, HexagonConnection
 from .env import HexagonSDK
 
-_KERNEL_RE = re.compile(r"\bvoid\s+(\w+)\s*\(")
+# The kernel entry is the non-static `void name(...)`; skip `static void` helpers
+# (e.g. the worker-pool callback `<name>_worker` emitted before the entry).
+_KERNEL_RE = re.compile(r"(?<!static )\bvoid\s+(\w+)\s*\(")
 
 
 def _kernel_name(source: str) -> str:

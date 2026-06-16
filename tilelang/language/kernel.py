@@ -270,6 +270,7 @@ def Kernel(
     cluster_dims: int | tuple[int, int, int] | list[int] | None = None,
     is_cpu: bool = False,
     prelude: str | None = None,
+    num_workers: int | None = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
 
@@ -341,6 +342,12 @@ def Kernel(
     cluster_dims = _normalize_cluster_dims(cluster_dims)
     if cluster_dims is not None:
         attrs["cluster_dims"] = cluster_dims
+
+    # Hexagon: fan the grid's outermost block loop across this many HW threads
+    # (the worker pool).  Propagated to the device func like cluster_dims and read
+    # by CodeGenTileLangHexagon; ignored by other targets.
+    if num_workers is not None:
+        attrs["hexagon.num_workers"] = num_workers
 
     return _ffi_api.KernelLaunch(blocks, threads, attrs)
 
