@@ -189,9 +189,15 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
         std::string sc = GetPtrStorageScope(a->buffer->data);
         if (sc == "shared" || sc == "shared.dyn" || sc == "shared.tmem") {
           size_t n = 1;
-          for (const auto &d : a->buffer->shape)
-            if (const auto *imm = d.as<IntImmNode>())
-              n *= static_cast<size_t>(imm->value);
+          for (const auto &d : a->buffer->shape) {
+            const auto *imm = d.as<IntImmNode>();
+            // Match the emission's static-shape requirement (the ICHECK in
+            // VisitStmt_(AllocBufferNode)) so this pre-pass sum can never diverge
+            // from the per-alloc vtcm_offset_ bump (a divergence would overlap or
+            // waste worker regions).
+            ICHECK(imm) << "worker-pool alloc_shared requires a static shape";
+            n *= static_cast<size_t>(imm->value);
+          }
           wp_stride_ += (n * a->buffer->dtype.bytes() + size_t(2047)) & ~size_t(2047);
         }
       }
@@ -246,14 +252,20 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
            << ";\n";
     if (wp_stride_ > 0) {
       // Cap workers so nw private VTCM regions (wp_stride_ bytes each) fit alongside
-      // the reserved scale tile.  Acquire VTCM here so tl_vtcm_total is known.
+      // the reserved scale tile.  The compile-time guard above is against an 8MB
+      // constant; here we check the ACTUAL runtime grant.  If not even one region
+      // fits (smaller SKU / partial VTCM grant), skip the dispatch rather than let a
+      // worker write past the arena.
       stream << "  tl_vtcm_acquire();\n";
-      stream << "  { unsigned tl_cap = (tl_vtcm_total > 2048u) ? (unsigned)("
-             << "(tl_vtcm_total - 2048u) / " << wp_stride_ << "u) : 1u;\n";
-      stream << "    if (tl_cap < 1u) tl_cap = 1u;\n";
-      stream << "    if ((unsigned)tl_nw > tl_cap) tl_nw = (int)tl_cap; }\n";
+      stream << "  if ((size_t)tl_vtcm_total >= 2048u + " << wp_stride_ << "u) {\n";
+      stream << "    unsigned tl_cap = (unsigned)((tl_vtcm_total - 2048u) / "
+             << wp_stride_ << "u);\n";
+      stream << "    if ((unsigned)tl_nw > tl_cap) tl_nw = (int)tl_cap;\n";
+      stream << "    tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
+      stream << "  }\n";
+    } else {
+      stream << "  tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
     }
-    stream << "  tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
     stream << "}\n\n";
     return;
   }
