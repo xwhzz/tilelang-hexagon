@@ -5,6 +5,7 @@
 #include "support/check.h"
 
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/stmt_functor.h> // PostOrderVisit (per-worker VTCM pre-pass)
 
 #include <string>
 #include <utility>
@@ -129,6 +130,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   wp_num_workers_ = 0;
   wp_emit_ = false;
   wp_outermost_pending_ = false;
+  wp_stride_ = 0;
   if (auto nw = f->GetAttr<Integer>("hexagon.num_workers")) {
     wp_num_workers_ = static_cast<int>(nw.value()->value);
   }
@@ -179,6 +181,21 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   std::string name = static_cast<std::string>(global_symbol.value());
 
   if (wp_num_workers_ > 0) {
+    // Pre-pass: the per-worker VTCM stride = total 2048-aligned alloc_shared bytes,
+    // so each worker (wid) gets a disjoint slice `base + offset_i + wid*wp_stride_`.
+    wp_stride_ = 0;
+    tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &node) {
+      if (const auto *a = node.as<AllocBufferNode>()) {
+        std::string sc = GetPtrStorageScope(a->buffer->data);
+        if (sc == "shared" || sc == "shared.dyn" || sc == "shared.tmem") {
+          size_t n = 1;
+          for (const auto &d : a->buffer->shape)
+            if (const auto *imm = d.as<IntImmNode>())
+              n *= static_cast<size_t>(imm->value);
+          wp_stride_ += (n * a->buffer->dtype.bytes() + size_t(2047)) & ~size_t(2047);
+        }
+      }
+    });
     // (1) args struct: one plain field per kernel parameter.
     stream << "typedef struct {\n";
     for (size_t i = 0; i < f->params.size(); ++i) {
@@ -227,6 +244,15 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
     stream << "  int tl_nw = tl_num_workers();\n";
     stream << "  if (tl_nw > " << wp_num_workers_ << ") tl_nw = " << wp_num_workers_
            << ";\n";
+    if (wp_stride_ > 0) {
+      // Cap workers so nw private VTCM regions (wp_stride_ bytes each) fit alongside
+      // the reserved scale tile.  Acquire VTCM here so tl_vtcm_total is known.
+      stream << "  tl_vtcm_acquire();\n";
+      stream << "  { unsigned tl_cap = (tl_vtcm_total > 2048u) ? (unsigned)("
+             << "(tl_vtcm_total - 2048u) / " << wp_stride_ << "u) : 1u;\n";
+      stream << "    if (tl_cap < 1u) tl_cap = 1u;\n";
+      stream << "    if ((unsigned)tl_nw > tl_cap) tl_nw = (int)tl_cap; }\n";
+    }
     stream << "  tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
     stream << "}\n\n";
     return;
@@ -261,13 +287,6 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
   std::string scope = GetPtrStorageScope(op->buffer->data);
   bool is_shared = scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
 
-  if (is_shared && wp_emit_) {
-    LOG(FATAL) << "CodeGenTileLangHexagon: alloc_shared inside a hexagon.num_workers "
-                  "(worker-pool) kernel is not supported yet — concurrent workers each "
-                  "need a private VTCM partition (the next increment). Use the "
-                  "worker-pool only for HVX kernels without shared memory for now, or "
-                  "drop the hexagon.num_workers attr.";
-  }
   this->PrintIndent();
   if (is_shared) {
     // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and HVX
@@ -285,13 +304,21 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
-    stream << "*)((char*)tl_vtcm_base() + " << offset << ");\n";
+    stream << "*)((char*)tl_vtcm_base() + " << offset;
+    if (wp_emit_) {
+      // Worker-pool: each worker (tl_wid) gets a disjoint VTCM slice of wp_stride_
+      // bytes, so concurrent blocks never share a buffer.
+      stream << " + (size_t)tl_wid * " << wp_stride_ << "u";
+    }
+    stream << ");\n";
     // Publish the running bottom high-water so a top-down VTCM consumer (the HMX
-    // gemm scratch) won't overlap this (and prior) live shared tiles.  Monotonic
-    // and emitted before the compute, so the value seen at the gemm call is the
-    // end of all currently-live shared buffers.
-    this->PrintIndent();
-    stream << "tl_vtcm_shared_high_water = " << vtcm_offset_ << "u;\n";
+    // gemm scratch) won't overlap this (and prior) live shared tiles.  Skipped in
+    // worker-pool mode: the gemm is rejected there (its global scratch can't be
+    // per-worker yet), so the value is unused and would be a racy cross-worker write.
+    if (!wp_emit_) {
+      this->PrintIndent();
+      stream << "tl_vtcm_shared_high_water = " << vtcm_offset_ << "u;\n";
+    }
   } else {
     // Stack-local (fragments / small scratch).
     PrintType(op->buffer->dtype, stream);
@@ -309,6 +336,25 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
   os << "((";
   PrintType(op->dtype, os);
   os << ")(" << v << "))";
+}
+
+void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  // A worker-pool kernel can't run an HMX gemm/matmul: tl_hexagon_hmx_gemm carves
+  // its Crouton scratch from the GLOBAL VTCM top, which would collide across the
+  // concurrent workers (per-worker gemm scratch is the next increment).  Detect the
+  // call by its extern name and reject loudly rather than silently corrupt.
+  if (wp_emit_ && !op->args.empty()) {
+    if (const auto *s = op->args[0].as<StringImmNode>()) {
+      if (s->value.find("tl_hexagon_hmx") == 0) {
+        LOG(FATAL) << "CodeGenTileLangHexagon: T.gemm / HMX matmul inside a "
+                      "hexagon.num_workers kernel is not supported yet — the HMX "
+                      "scratch is carved from global VTCM and would collide across "
+                      "workers.";
+      }
+    }
+  }
+  CodeGenC::VisitExpr_(op, os);
 }
 
 void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {

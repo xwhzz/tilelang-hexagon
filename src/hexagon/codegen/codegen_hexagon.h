@@ -43,6 +43,8 @@ public:
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
   void VisitExpr_(const MinNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
+  // Reject HMX gemm/matmul calls inside a worker-pool kernel (scratch is global).
+  void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
 
@@ -60,6 +62,7 @@ private:
   int wp_num_workers_ = 0;            // requested worker count (0 = serial / off)
   bool wp_emit_ = false;             // currently emitting inside the worker callback
   bool wp_outermost_pending_ = false; // next thread_extent is the (strided) block loop
+  size_t wp_stride_ = 0;             // per-worker VTCM region size (total shared bytes)
 
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,
