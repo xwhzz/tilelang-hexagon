@@ -124,6 +124,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     vtcm_include = "#include <tl_templates/hexagon/vtcm.h>\n" if uses_vtcm else ""
     hmx = "tl_hexagon_hmx" in kernel_source
     hmx_include = "#include <tl_templates/hexagon/hmx.h>\n" if hmx else ""
+    # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
+    # the multithreaded HMX path; include it directly for a non-HMX worker kernel.
+    uses_worker = "tl_hexagon_worker" in kernel_source and not hmx
+    worker_include = "#include <tl_templates/hexagon/worker.h>\n" if uses_worker else ""
     # Acquire/release the HMX session at _open/_close (the matmul also inits
     # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).
     # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
@@ -141,6 +145,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         "#include <AEEStdErr.h>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
         f"{vtcm_include}"
+        f"{worker_include}"
         f"{hmx_include}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
