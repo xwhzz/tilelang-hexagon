@@ -254,7 +254,9 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
       // the session thread (worker 0 / inline fallback) which session_init already
       // enabled — keyed on tid so it's exactly once per thread.
       stream << "  int tl_en = (qurt_thread_get_id() != tl_hmx_session_tid);\n";
-      stream << "  if (tl_en) tl_hmx_enable();\n";
+      // Refuse (skip this worker's blocks) rather than run MACs with HMX unlocked if
+      // the per-thread enable fails — mirrors the template-path worker.
+      stream << "  if (tl_en && tl_hmx_enable() != 0) return;\n";
     }
     this->PreFunctionBody(f);
     wp_emit_ = true;
@@ -362,8 +364,9 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     stream << ");\n";
     // Publish the running bottom high-water so a top-down VTCM consumer (the HMX
     // gemm scratch) won't overlap this (and prior) live shared tiles.  Skipped in
-    // worker-pool mode: the gemm is rejected there (its global scratch can't be
-    // per-worker yet), so the value is unused and would be a racy cross-worker write.
+    // worker-pool mode: the per-worker gemm (tl_hexagon_hmx_gemm_mt) uses the
+    // codegen-passed op_floor for its own slice, not this global high-water, so the
+    // value is unused there and would be a racy cross-worker write.
     if (!wp_emit_) {
       this->PrintIndent();
       stream << "tl_vtcm_shared_high_water = " << vtcm_offset_ << "u;\n";
@@ -389,10 +392,11 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
-  // A worker-pool kernel can't run an HMX gemm/matmul: tl_hexagon_hmx_gemm carves
-  // its Crouton scratch from the GLOBAL VTCM top, which would collide across the
-  // concurrent workers (per-worker gemm scratch is the next increment).  Detect the
-  // call by its extern name and reject loudly rather than silently corrupt.
+  // In a worker-pool kernel a T.gemm (tl_hexagon_hmx_gemm) is REWRITTEN to the
+  // region-aware tl_hexagon_hmx_gemm_mt so its Crouton scratch lives in THIS
+  // worker's VTCM slice (the plain entry carves from the global VTCM top, which
+  // would collide across workers).  Any OTHER tl_hexagon_hmx* call has no per-worker
+  // variant (global scratch) and is rejected loudly.
   if (wp_emit_ && !op->args.empty()) {
     if (const auto *s = op->args[0].as<StringImmNode>()) {
       if (s->value == "tl_hexagon_hmx_gemm") {
