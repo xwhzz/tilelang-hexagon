@@ -125,8 +125,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     hmx = "tl_hexagon_hmx" in kernel_source
     hmx_include = "#include <tl_templates/hexagon/hmx.h>\n" if hmx else ""
     # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
-    # the multithreaded HMX path; include it directly for a non-HMX worker kernel.
-    uses_worker = "tl_hexagon_worker" in kernel_source and not hmx
+    # the multithreaded HMX path; include it directly for a non-HMX worker kernel
+    # (keyed on the public symbol prefix or a direct tl_parallel call).
+    uses_worker = ("tl_hexagon_worker" in kernel_source
+                   or "tl_parallel" in kernel_source) and not hmx
     worker_include = "#include <tl_templates/hexagon/worker.h>\n" if uses_worker else ""
     # Acquire/release the HMX session at _open/_close (the matmul also inits
     # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).

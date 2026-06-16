@@ -79,9 +79,13 @@ TL_HMX_INLINE void tl_hmx_reset(void) {
     HAP_compute_res_release(tl_hmx_ctx);
   tl_hmx_ctx = 0;
 }
-TL_HMX_INLINE void tl_hmx_enable(void) {
-  if (tl_hmx_ctx)
-    HAP_compute_res_hmx_lock2(tl_hmx_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+// Per-thread HMX SHARED enable: each thread that issues HMX MACs must call this
+// once.  Returns 0 if this thread now holds the lock, non-zero on failure (incl. no
+// ctx) so callers can refuse rather than run MACs with HMX unlocked.
+TL_HMX_INLINE int tl_hmx_enable(void) {
+  if (!tl_hmx_ctx)
+    return -1;
+  return HAP_compute_res_hmx_lock2(tl_hmx_ctx, HAP_COMPUTE_RES_HMX_SHARED);
 }
 TL_HMX_INLINE void tl_hmx_disable(void) {
   if (tl_hmx_ctx)
@@ -99,6 +103,11 @@ TL_HMX_INLINE void tl_hmx_unit_acquire(void) {
                "3:"
                : "+r"(lp)::"p0", "r0");
 }
+// Release with a plain volatile store (matching htp-ops-lib's hmx_mgr).  No extra
+// barrier is needed: the only state the lock guards is the HMX accumulator, which
+// the next holder unconditionally re-clears (mxclracc) before use, and every worker
+// reads its accumulator out to its OWN VTCM region — so no worker depends on
+// another's in-flight accumulator/VTCM writes being visible at release time.
 TL_HMX_INLINE void tl_hmx_unit_release(void) {
   *(volatile int *)&tl_hmx_spin = 0;
 }
@@ -264,20 +273,30 @@ TL_HMX_INLINE void tl_hmx_matmul_tiles(__fp16 *c, const __fp16 *a,
 // Persistent session resources: power/VTCM/HMX are acquired once and held across
 // many matmuls.  The generated FastRPC _open handler calls init; _close calls
 // deinit.  In the per-call (one-shot) path the first matmul inits lazily.
+// NOTE: the check-then-set of these globals is NOT internally synchronized; it is
+// safe because every caller invokes it single-threaded BEFORE tl_parallel spawns
+// workers (so the scales tile is fully written before any worker's MAC reads it).
+// A future persistent/cross-kernel pool that could init from two threads must add
+// a lock here.
 static int tl_hmx_inited;
+static qurt_thread_t tl_hmx_session_tid; // thread whose HMX SHARED enable session_init holds
 static void tl_hmx_session_init(void) {
   if (tl_hmx_inited)
     return;
   tl_hmx_power_setup();
   tl_hmx_vtcm_setup();
   tl_hmx_setup();
-  if (tl_vtcm_base_ptr) {
-    tl_hmx_enable(); // per-thread HMX SHARED enable (workers enable themselves too)
+  // Require BOTH the VTCM grant AND a successful per-thread HMX enable (which needs
+  // the ctx from tl_hmx_setup): otherwise tear everything down so tl_hmx_session_ok()
+  // reports failure loudly, rather than marking the session ready while enable was a
+  // silent no-op (ctx==0) and every later MAC runs with HMX never locked.
+  if (tl_vtcm_base_ptr && tl_hmx_enable() == 0) {
     // The HMX output scales are constant (unit scale / zero bias) and live in the
     // reserved first VTCM tile (base+0); fill them once here rather than on every
     // gemm call.  The gemm/matmul entries read them from base+0.  The accumulator
     // spinlock is NOT held here — it is taken per-MAC inside tl_hmx_matmul_tiles.
     tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr);
+    tl_hmx_session_tid = qurt_thread_get_id(); // this enable is bound to this thread
     tl_hmx_inited = 1;
   } else {
     // VTCM acquire failed: release the HMX ctx and drop the rail off TURBO so a
@@ -290,7 +309,6 @@ static void tl_hmx_session_init(void) {
 static void tl_hmx_session_deinit(void) {
   if (!tl_hmx_inited)
     return;
-  tl_hmx_unit_release();
   tl_hmx_disable();
   tl_hmx_reset();
   tl_hmx_vtcm_reset();
@@ -466,6 +484,7 @@ typedef struct {
   const __fp16 *B;
   int batch, M, N, K;
   size_t region_bytes; // per-worker VTCM slice
+  int *err;            // first non-zero matmul rc, if any (defense-in-depth)
 } tl_mm_batched_ctx_t;
 
 // Choose the worker count and per-worker VTCM region for a batched matmul.  nw is
@@ -480,6 +499,8 @@ TL_HMX_INLINE int tl_mm_plan_workers(int batch, int M, int N, int K,
                    (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) +
                    (size_t)(M / TL_HMX_T) * (N / TL_HMX_T)) *
                   TL_HMX_TILE_ELMS * sizeof(__fp16);
+  if (tl_vtcm_total <= TL_HMX_TILE_BYTES)
+    return 0; // too small even for the scale tile (guard the unsigned subtraction)
   size_t avail = (size_t)tl_vtcm_total - TL_HMX_TILE_BYTES; // minus the scale tile
   if (per_mm == 0 || per_mm > avail)
     return 0;
@@ -500,17 +521,28 @@ TL_HMX_INLINE int tl_mm_plan_workers(int batch, int M, int N, int K,
 // enabled in session_init), so only the spawned 1..nw-1 enable/disable themselves.
 static void tl_mm_batched_worker(void *vctx, int wid, int nw) {
   tl_mm_batched_ctx_t *c = (tl_mm_batched_ctx_t *)vctx;
-  if (wid != 0)
-    tl_hmx_enable();
+  // HMX lock2(SHARED) is per-thread, exactly one per thread.  The session thread
+  // (already enabled by session_init) runs worker 0 in the common single-thread
+  // FastRPC case, and also runs any worker that fell back to inline after a spawn
+  // failure — those must NOT re-lock.  Only a distinct (spawned) thread enables
+  // itself; if it can't acquire HMX it refuses rather than run MACs unlocked.
+  int en = (qurt_thread_get_id() != tl_hmx_session_tid);
+  if (en && tl_hmx_enable() != 0) {
+    *c->err = -4; // couldn't lock HMX on this thread
+    return;
+  }
   uint8_t *region =
       tl_vtcm_base_ptr + TL_HMX_TILE_BYTES + (size_t)wid * c->region_bytes;
   size_t mk = (size_t)c->M * c->K, kn = (size_t)c->K * c->N,
          mn = (size_t)c->M * c->N;
-  for (int b = wid; b < c->batch; b += nw)
-    tl_hmx_matmul_in_region(c->C + (size_t)b * mn, c->A + (size_t)b * mk,
-                            c->B + (size_t)b * kn, c->M, c->N, c->K, region,
-                            c->region_bytes);
-  if (wid != 0)
+  for (int b = wid; b < c->batch; b += nw) {
+    int rc = tl_hmx_matmul_in_region(c->C + (size_t)b * mn, c->A + (size_t)b * mk,
+                                     c->B + (size_t)b * kn, c->M, c->N, c->K,
+                                     region, c->region_bytes);
+    if (rc != 0)
+      *c->err = rc; // benign race: any failure marks the batch failed
+  }
+  if (en)
     tl_hmx_disable();
 }
 
@@ -527,13 +559,15 @@ static int tl_hexagon_hmx_matmul_batched_mt(__fp16 *C, const __fp16 *A,
   tl_hmx_session_init();
   if (!tl_vtcm_base_ptr)
     return -2;
+  tl_vtcm_shared_high_water = 0; // operands are DDR, no bottom alloc_shared (hygiene)
   size_t region_bytes;
   int nw = tl_mm_plan_workers(batch, M, N, K, &region_bytes);
   if (nw == 0)
     return -3; // one matmul doesn't fit VTCM
-  tl_mm_batched_ctx_t ctx = {C, A, B, batch, M, N, K, region_bytes};
+  int err = 0;
+  tl_mm_batched_ctx_t ctx = {C, A, B, batch, M, N, K, region_bytes, &err};
   tl_parallel(tl_mm_batched_worker, &ctx, nw);
-  return 0;
+  return err;
 }
 
 // Bench: time the batched matmul multithreaded (nw workers) vs single-threaded,
@@ -556,8 +590,9 @@ static int tl_hexagon_hmx_matmul_batched_mt_bench(__fp16 *C, const __fp16 *A,
     return -3;
   size_t rb_st = ((size_t)tl_vtcm_total - TL_HMX_TILE_BYTES) &
                  ~(size_t)(TL_HMX_TILE_BYTES - 1);
-  tl_mm_batched_ctx_t ctx_mt = {C, A, B, batch, M, N, K, rb_mt};
-  tl_mm_batched_ctx_t ctx_st = {C, A, B, batch, M, N, K, rb_st};
+  int err = 0;
+  tl_mm_batched_ctx_t ctx_mt = {C, A, B, batch, M, N, K, rb_mt, &err};
+  tl_mm_batched_ctx_t ctx_st = {C, A, B, batch, M, N, K, rb_st, &err};
 
   unsigned long long t0 = HAP_perf_get_qtimer_count();
   for (int it = 0; it < iters; ++it)

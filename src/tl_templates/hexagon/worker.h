@@ -67,6 +67,7 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
   }
   qurt_thread_t th[TL_MAX_WORKERS];
   tl_worker_arg_t args[TL_MAX_WORKERS];
+  int spawned[TL_MAX_WORKERS] = {0}; // whether thread w actually started
   int prio = qurt_thread_get_priority(qurt_thread_get_id());
   for (int w = 1; w < nw; ++w) {
     args[w].fn = fn;
@@ -78,13 +79,20 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
     qurt_thread_attr_set_stack_addr(&attr, blob + (size_t)TL_WORKER_STACK_SZ * (w - 1));
     qurt_thread_attr_set_stack_size(&attr, TL_WORKER_STACK_SZ);
     qurt_thread_attr_set_priority(&attr, prio);
-    qurt_thread_create(&th[w], &attr, tl_worker_entry, &args[w]);
+    // On spawn failure th[w] is left indeterminate; record success so we don't
+    // join a garbage handle, and run that worker's slice inline below (else its
+    // share of the work would be silently dropped).
+    spawned[w] = (qurt_thread_create(&th[w], &attr, tl_worker_entry, &args[w]) == QURT_EOK);
   }
   fn(ctx, 0, nw); // worker 0 on the calling thread
-  for (int w = 1; w < nw; ++w) {
-    int status;
-    qurt_thread_join(th[w], &status);
-  }
+  for (int w = 1; w < nw; ++w)
+    if (!spawned[w])
+      fn(ctx, w, nw); // failed to spawn -> run its slice inline
+  for (int w = 1; w < nw; ++w)
+    if (spawned[w]) {
+      int status;
+      qurt_thread_join(th[w], &status);
+    }
   free(blob);
   return 0;
 }
