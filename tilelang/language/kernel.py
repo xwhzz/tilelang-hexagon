@@ -345,8 +345,13 @@ def Kernel(
 
     # Hexagon: fan the grid's outermost block loop across this many HW threads
     # (the worker pool).  Propagated to the device func like cluster_dims and read
-    # by CodeGenTileLangHexagon; ignored by other targets.
+    # by CodeGenTileLangHexagon; ignored by other targets.  Validate here so a typo
+    # raises a clean ValueError instead of a downstream LOG(FATAL) / silent serial
+    # fallback (bool is rejected explicitly — it is an int subclass).
     if num_workers is not None:
+        if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
+            raise ValueError(
+                f"T.Kernel(num_workers=...) must be a positive int, got {num_workers!r}")
         attrs["hexagon.num_workers"] = num_workers
 
     return _ffi_api.KernelLaunch(blocks, threads, attrs)

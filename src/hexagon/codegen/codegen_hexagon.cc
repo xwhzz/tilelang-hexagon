@@ -123,10 +123,21 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
   // Worker-pool mode: `hexagon.num_workers` > 0 fans the grid's outermost block
-  // loop across HW threads via tl_parallel instead of a serial for-loop.
+  // loop across HW threads via tl_parallel instead of a serial for-loop.  Reset the
+  // per-emit flags too (defensive: an exception mid-emit on a prior function must
+  // not leak state into this one).
   wp_num_workers_ = 0;
+  wp_emit_ = false;
+  wp_outermost_pending_ = false;
   if (auto nw = f->GetAttr<Integer>("hexagon.num_workers")) {
     wp_num_workers_ = static_cast<int>(nw.value()->value);
+  }
+  // Reserve the worker callback's fixed identifiers BEFORE assigning param ids, so a
+  // kernel parameter named e.g. "tl_nw" can't collide with them (mirrors how the
+  // CUDA backend reserves its runtime helper names).
+  if (wp_num_workers_ > 0) {
+    for (const char *nm : {"tl_p", "tl_a", "tl_args", "tl_wid", "tl_nw"})
+      name_supply_->ReserveName(nm);
   }
 
   // Pre-assign param ids and register handle element types (needed before the body
@@ -194,6 +205,12 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
     this->PrintStmt(f->body);
     this->EndScope(worker_scope);
     wp_emit_ = false;
+    // The body must have contained a blockIdx.x loop for the stride to attach to;
+    // otherwise tl_parallel would run the WHOLE grid on every worker (duplicated
+    // work + a write race on the outputs).  Reject that loudly.
+    ICHECK(!wp_outermost_pending_)
+        << "CodeGenTileLangHexagon: a hexagon.num_workers kernel must have a "
+           "blockIdx.x grid loop to distribute across workers, but none was found.";
     wp_outermost_pending_ = false;
     stream << "}\n";
     // (3) entry: build the args struct and dispatch (workers capped by HW threads).
@@ -317,9 +334,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
       PrintIndent();
       stream << "int " << vid << " = 0;\n";
       PrintIndent();
-      if (wp_emit_ && wp_outermost_pending_) {
-        // Worker-pool: the OUTERMOST block loop is distributed across HW threads
-        // (each worker takes a strided slice); inner thread loops stay serial.
+      if (wp_emit_ && wp_outermost_pending_ && iv->thread_tag == "blockIdx.x") {
+        // Worker-pool: distribute the blockIdx.x grid loop across HW threads (each
+        // worker takes a strided slice); inner thread loops stay serial.  Gating on
+        // the tag (not just "first tagged") keeps the stride on the block dim.
         wp_outermost_pending_ = false;
         stream << "for (" << vid << " = tl_wid; " << vid << " < " << extent << "; "
                << vid << " += tl_nw) {\n";
