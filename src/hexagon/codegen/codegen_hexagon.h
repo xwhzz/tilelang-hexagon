@@ -62,7 +62,10 @@ private:
   int wp_num_workers_ = 0;            // requested worker count (0 = serial / off)
   bool wp_emit_ = false;             // currently emitting inside the worker callback
   bool wp_outermost_pending_ = false; // next thread_extent is the (strided) block loop
-  size_t wp_stride_ = 0;             // per-worker VTCM region size (total shared bytes)
+  size_t wp_stride_ = 0;       // per-worker VTCM region = wp_operand_bytes_ + gemm scratch
+  size_t wp_operand_bytes_ = 0; // per-worker alloc_shared bytes (operand high-water)
+  size_t wp_gemm_scratch_ = 0;  // per-worker HMX gemm Crouton scratch bytes (max over gemms)
+  bool wp_uses_hmx_ = false;    // a T.gemm->HMX appears in the body (workers enable HMX)
 
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,

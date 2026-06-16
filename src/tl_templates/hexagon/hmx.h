@@ -375,6 +375,46 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
   return 0;
 }
 
+// Worker-pool T.gemm: like tl_hexagon_hmx_gemm, but the Crouton scratch is carved
+// TOP-DOWN from `region_end` (the top of THIS worker's VTCM slice) and must stay
+// above `op_floor` (this worker's operand high-water), so concurrent workers' gemms
+// use DISJOINT scratch.  The HVX pack/unpack run in parallel (each worker's own
+// scratch); only the HMX MAC serializes on the accumulator spinlock.  Operands are
+// row-major in the worker's slice; scales are the shared base+0 tile.  The session
+// (power/VTCM/HMX acquire + scales) is already up from _open, and each worker has
+// enabled HMX for its own thread before calling this.  Returns 0 on ok.
+static int tl_hexagon_hmx_gemm_mt(__fp16 *C, const __fp16 *A, const __fp16 *B,
+                                  int M, int N, int K, int trans_a, int trans_b,
+                                  void *region_end, void *op_floor) {
+  if (M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) || (N % TL_HMX_T) ||
+      (K % TL_HMX_T))
+    return -1;
+  if (!tl_vtcm_base_ptr)
+    return -2;
+  size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
+  // Scratch grows down from this worker's region top (floored to a 2KB tile so the
+  // HVX scratch accesses stay 128-byte aligned).
+  uintptr_t top = (uintptr_t)region_end & ~(uintptr_t)(TL_HMX_TILE_BYTES - 1);
+  __fp16 *c_t = (__fp16 *)top - c_sz;
+  __fp16 *b_t = c_t - b_sz;
+  __fp16 *a_t = b_t - a_sz;
+  if ((const uint8_t *)a_t < (const uint8_t *)op_floor)
+    return -3; // scratch would underflow into this worker's live operands
+  if (trans_a)
+    tl_hmx_pack_A_T(a_t, A, M, K);
+  else
+    tl_hmx_pack_A(a_t, A, M, K);
+  if (trans_b)
+    tl_hmx_pack_B_T(b_t, B, K, N);
+  else
+    tl_hmx_pack_B(b_t, B, K, N);
+  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)tl_vtcm_base_ptr);
+  tl_hmx_unpack_C(C, c_t, M, N);
+  return 0;
+}
+
 // Public entry called by generated kernels (the call_extern matmul path), where
 // A/B/C are GLOBAL (DDR rpcmem) rather than VTCM-resident.  Identical to the
 // T.gemm path with no transpose, so it just delegates: the bottom high-water is 0

@@ -138,7 +138,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // kernel parameter named e.g. "tl_nw" can't collide with them (mirrors how the
   // CUDA backend reserves its runtime helper names).
   if (wp_num_workers_ > 0) {
-    for (const char *nm : {"tl_p", "tl_a", "tl_args", "tl_wid", "tl_nw"})
+    for (const char *nm : {"tl_p", "tl_a", "tl_args", "tl_wid", "tl_nw", "tl_en"})
       name_supply_->ReserveName(nm);
   }
 
@@ -181,9 +181,13 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   std::string name = static_cast<std::string>(global_symbol.value());
 
   if (wp_num_workers_ > 0) {
-    // Pre-pass: the per-worker VTCM stride = total 2048-aligned alloc_shared bytes,
-    // so each worker (wid) gets a disjoint slice `base + offset_i + wid*wp_stride_`.
-    wp_stride_ = 0;
+    // Pre-pass: size each worker's private VTCM region.  It holds the alloc_shared
+    // operands at the bottom (wp_operand_bytes_) and the HMX gemm's Crouton scratch
+    // at the top (wp_gemm_scratch_, max over gemms — scratch is reused per gemm), so
+    // wp_stride_ = operands + scratch and worker w owns [2048+w*stride, 2048+(w+1)*stride).
+    wp_operand_bytes_ = 0;
+    wp_gemm_scratch_ = 0;
+    wp_uses_hmx_ = false;
     tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &node) {
       if (const auto *a = node.as<AllocBufferNode>()) {
         std::string sc = GetPtrStorageScope(a->buffer->data);
@@ -198,10 +202,34 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
             ICHECK(imm) << "worker-pool alloc_shared requires a static shape";
             n *= static_cast<size_t>(imm->value);
           }
-          wp_stride_ += (n * a->buffer->dtype.bytes() + size_t(2047)) & ~size_t(2047);
+          wp_operand_bytes_ +=
+              (n * a->buffer->dtype.bytes() + size_t(2047)) & ~size_t(2047);
+        }
+      } else if (const auto *call = node.as<CallNode>()) {
+        // T.gemm->HMX lowers to tl_hexagon_hmx_gemm(C,A,B,M,N,K,ta,tb); it needs
+        // Crouton scratch (a_sz+b_sz+c_sz tiles) in this worker's region — size it
+        // from M=args[4]/N=args[5]/K=args[6] and keep the max.
+        if (!call->args.empty()) {
+          if (const auto *s = call->args[0].as<StringImmNode>()) {
+            if (s->value == "tl_hexagon_hmx_gemm") {
+              wp_uses_hmx_ = true;
+              auto cdim = [&](size_t i) -> size_t {
+                const auto *imm = call->args[i].as<IntImmNode>();
+                ICHECK(imm) << "worker-pool T.gemm requires static M/N/K";
+                return static_cast<size_t>(imm->value);
+              };
+              size_t M = cdim(4), N = cdim(5), K = cdim(6);
+              size_t tiles = (M / 32) * (K / 32) + (N / 32) * (K / 32) +
+                             (M / 32) * (N / 32);
+              size_t sc_bytes = tiles * 1024u * 2u; // tile elems * sizeof(fp16)
+              if (sc_bytes > wp_gemm_scratch_)
+                wp_gemm_scratch_ = sc_bytes;
+            }
+          }
         }
       }
     });
+    wp_stride_ = wp_operand_bytes_ + wp_gemm_scratch_;
     // (1) args struct: one plain field per kernel parameter.
     stream << "typedef struct {\n";
     for (size_t i = 0; i < f->params.size(); ++i) {
@@ -221,6 +249,13 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
       CodeGenC::PrintType(GetType(f->params[i]), stream);
       stream << " " << pvids[i] << " = tl_a->" << pvids[i] << ";\n";
     }
+    if (wp_uses_hmx_) {
+      // Each worker enables HMX for its OWN thread (per-thread SHARED lock), except
+      // the session thread (worker 0 / inline fallback) which session_init already
+      // enabled — keyed on tid so it's exactly once per thread.
+      stream << "  int tl_en = (qurt_thread_get_id() != tl_hmx_session_tid);\n";
+      stream << "  if (tl_en) tl_hmx_enable();\n";
+    }
     this->PreFunctionBody(f);
     wp_emit_ = true;
     wp_outermost_pending_ = true;
@@ -235,6 +270,8 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
         << "CodeGenTileLangHexagon: a hexagon.num_workers kernel must have a "
            "blockIdx.x grid loop to distribute across workers, but none was found.";
     wp_outermost_pending_ = false;
+    if (wp_uses_hmx_)
+      stream << "  if (tl_en) tl_hmx_disable();\n";
     stream << "}\n";
     // (3) entry: build the args struct and dispatch (workers capped by HW threads).
     this->PrintFuncPrefix(stream);
@@ -358,11 +395,28 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
   // call by its extern name and reject loudly rather than silently corrupt.
   if (wp_emit_ && !op->args.empty()) {
     if (const auto *s = op->args[0].as<StringImmNode>()) {
+      if (s->value == "tl_hexagon_hmx_gemm") {
+        // Rewrite T.gemm to the region-aware worker variant: its Crouton scratch
+        // lives in THIS worker's VTCM slice, not the global top, so concurrent
+        // workers' gemms don't collide.  Append the worker's region end and operand
+        // floor (region = [2048+wid*stride, 2048+(wid+1)*stride), operands fill the
+        // bottom wp_operand_bytes_, scratch the rest).
+        os << "tl_hexagon_hmx_gemm_mt(";
+        for (size_t i = 1; i < op->args.size(); ++i) { // C,A,B,M,N,K,ta,tb
+          if (i > 1)
+            os << ", ";
+          os << PrintExpr(op->args[i]);
+        }
+        os << ", (char*)tl_vtcm_base() + 2048u + (size_t)(tl_wid + 1) * "
+           << wp_stride_ << "u"; // region_end (top of this worker's slice)
+        os << ", (char*)tl_vtcm_base() + 2048u + (size_t)tl_wid * " << wp_stride_
+           << "u + " << wp_operand_bytes_ << "u)"; // op_floor (operand high-water)
+        return;
+      }
       if (s->value.find("tl_hexagon_hmx") == 0) {
-        LOG(FATAL) << "CodeGenTileLangHexagon: T.gemm / HMX matmul inside a "
-                      "hexagon.num_workers kernel is not supported yet — the HMX "
-                      "scratch is carved from global VTCM and would collide across "
-                      "workers.";
+        LOG(FATAL) << "CodeGenTileLangHexagon: this HMX call inside a "
+                      "hexagon.num_workers kernel is unsupported — only T.gemm "
+                      "(tl_hexagon_hmx_gemm) has a per-worker scratch variant.";
       }
     }
   }
