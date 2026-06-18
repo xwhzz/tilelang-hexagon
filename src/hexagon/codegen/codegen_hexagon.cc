@@ -429,9 +429,10 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
 
 void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
   // The lowered kernel keeps the GPU launch as nested `thread_extent` attrs
-  // (blockIdx/threadIdx).  A Hexagon kernel runs on a single (for M1) thread,
-  // so we serialize the whole grid into nested loops, binding each thread var
-  // to its loop index.  (Mapping blocks onto a worker pool is an M3 concern.)
+  // (blockIdx/threadIdx); we serialize the grid into nested C loops, binding each
+  // thread var to its loop index.  In worker-pool mode (hexagon.num_workers > 0,
+  // set up in AddFunction) the outermost blockIdx.x loop is instead STRIDED across
+  // HW threads (`bx = tl_wid; bx += tl_nw`); inner thread loops stay serial.
   if (op->attr_key == "thread_extent") {
     const IterVarNode *iv = op->node.as<IterVarNode>();
     ICHECK(iv != nullptr) << "thread_extent attr expects an IterVar node";

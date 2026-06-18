@@ -1,16 +1,26 @@
 #pragma once
-// HMX FP16 matmul runtime for tilelang-generated Hexagon kernels.
+// HMX FP16 matmul runtime for tilelang-generated Hexagon kernels.  All the HMX/HVX/
+// VTCM/Crouton hardware intimacy lives here; the codegen stays a thin C emitter that
+// just calls into it.  Distilled from the verified mini-htp / htp-ops-lib recipes.
 //
-// Provides `tl_hexagon_hmx_matmul_f16(C, A, B, M, N, K)`: a self-contained
-// C[M,N] = A[M,K] * B[K,N] on the HMX matrix engine, faithfully distilled from
-// the verified mini-htp recipe (power-up, VTCM acquire, HMX lock, Crouton
-// tile pack/unpack, MAC over K-tiles).  M, N, K must be multiples of 32 and the
-// tiled operands must fit in VTCM.  Resources are acquired/released per call
-// (correctness first; hoisting setup is a perf concern).
+// What the codegen-generated kernels actually call (the PRODUCTION path):
+//   tl_hexagon_hmx_gemm(C,A,B,M,N,K,ta,tb)              <- a serial/tiled T.gemm; operands
+//       are row-major in VTCM (alloc_shared), HVX-packed to a top-of-VTCM Crouton
+//       scratch, MAC'd, HVX-unpacked.  Scratch guarded by the codegen high-water.
+//   tl_hexagon_hmx_gemm_mt(...,region_end,op_floor)     <- a T.gemm inside a worker-pool
+//       kernel; scratch lives in THIS worker's VTCM slice (per-worker region bounds
+//       supplied by the codegen) so concurrent workers don't collide.
+// Shared building blocks: the session (power/VTCM/HMX acquire + unit-scale fill), the
+// HVX Crouton pack/unpack (tl_hmx_pack_A/B, unpack_C, the transposed/scalar variants),
+// tl_hmx_matmul_tiles (the mxclracc->mxmem MAC, under the accumulator spinlock).
 //
-// Compiled as part of the FastRPC skel (.cc) with the Hexagon SDK on the include
-// path and -mhmx; it pulls in HAP headers, so it is only included by kernels
-// that actually call into HMX.
+// Also kept (NOT the DSL path): tl_hexagon_hmx_matmul_f16 / _f16_bench — a raw
+// call_extern matmul + its qtimer HMX-throughput reference (~17 TFLOPS); useful to
+// exercise the MAC in isolation.  (The earlier template-level batched worker pool was
+// retired once the idiomatic codegen worker pool superseded it — see git history.)
+//
+// Compiled into the FastRPC skel (.cc) with the Hexagon SDK on the include path and
+// -mhmx; it pulls in HAP headers, so it is only included by kernels that use HMX.
 #include <HAP_compute_res.h>
 #include <HAP_farf.h>
 #include <HAP_perf.h>
@@ -491,167 +501,5 @@ static int tl_hexagon_hmx_matmul_f16_bench(__fp16 *C, const __fp16 *A,
   }
   FARF(ALWAYS, "HMX bench %dx%dx%d x%d iters: %.3f us/iter, %.1f GFLOPS", M, N, K,
        iters, us, gflops);
-  return 0;
-}
-
-// =================== multithreaded (worker-pool) HMX =======================
-// One matmul (operands in global DDR) whose Crouton scratch is bump-allocated from
-// a caller-owned VTCM `region`, so concurrent workers each use a DISJOINT slice and
-// never collide.  Scales are the shared base+0 tile (filled once in session_init).
-// The MAC inside tl_hmx_matmul_tiles takes the HMX accumulator spinlock, so workers
-// serialize there while their HVX pack/unpack run in parallel.
-TL_HMX_INLINE int tl_hmx_matmul_in_region(__fp16 *C, const __fp16 *A,
-                                          const __fp16 *B, int M, int N, int K,
-                                          uint8_t *region, size_t region_bytes) {
-  size_t a_sz = (size_t)(M / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  size_t b_sz = (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  size_t c_sz = (size_t)(M / TL_HMX_T) * (N / TL_HMX_T) * TL_HMX_TILE_ELMS;
-  if ((a_sz + b_sz + c_sz) * sizeof(__fp16) > region_bytes)
-    return -3;
-  __fp16 *a_t = (__fp16 *)region;
-  __fp16 *b_t = a_t + a_sz;
-  __fp16 *c_t = b_t + b_sz;
-  tl_hmx_pack_A(a_t, A, M, K);
-  tl_hmx_pack_B(b_t, B, K, N);
-  tl_hmx_matmul_tiles(c_t, a_t, b_t, M, N, K, (const __fp16 *)tl_vtcm_base_ptr);
-  tl_hmx_unpack_C(C, c_t, M, N);
-  return 0;
-}
-
-typedef struct {
-  __fp16 *C;
-  const __fp16 *A;
-  const __fp16 *B;
-  int batch, M, N, K;
-  size_t region_bytes; // per-worker VTCM slice
-  int *err;            // first non-zero matmul rc, if any (defense-in-depth)
-} tl_mm_batched_ctx_t;
-
-// Choose the worker count and per-worker VTCM region for a batched matmul.  nw is
-// the MIN of HW threads, batch size, AND how many one-matmul scratches fit VTCM
-// (concurrent workers each need a full disjoint scratch — capping by VTCM is what
-// the first cut missed: 6x a 512^3 scratch is 9MB > 8MB, so a worker's region was
-// too small and its matmul silently refused).  Writes the (tile-aligned) region
-// size; returns nw>=1, or 0 if a single matmul doesn't even fit VTCM.
-TL_HMX_INLINE int tl_mm_plan_workers(int batch, int M, int N, int K,
-                                     size_t *region_bytes) {
-  size_t per_mm = ((size_t)(M / TL_HMX_T) * (K / TL_HMX_T) +
-                   (size_t)(N / TL_HMX_T) * (K / TL_HMX_T) +
-                   (size_t)(M / TL_HMX_T) * (N / TL_HMX_T)) *
-                  TL_HMX_TILE_ELMS * sizeof(__fp16);
-  if (tl_vtcm_total <= TL_HMX_TILE_BYTES)
-    return 0; // too small even for the scale tile (guard the unsigned subtraction)
-  size_t avail = (size_t)tl_vtcm_total - TL_HMX_TILE_BYTES; // minus the scale tile
-  if (per_mm == 0 || per_mm > avail)
-    return 0;
-  int nw = tl_num_workers();
-  int max_vtcm = (int)(avail / per_mm);
-  if (nw > batch)
-    nw = batch;
-  if (nw > max_vtcm)
-    nw = max_vtcm;
-  if (nw < 1)
-    nw = 1;
-  *region_bytes = (avail / (size_t)nw) & ~(size_t)(TL_HMX_TILE_BYTES - 1);
-  return nw;
-}
-
-// Worker: enable HMX for this thread, then process a strided slice of the batch in
-// this worker's private VTCM region.  Worker 0 is the calling thread (already
-// enabled in session_init), so only the spawned 1..nw-1 enable/disable themselves.
-static void tl_mm_batched_worker(void *vctx, int wid, int nw) {
-  tl_mm_batched_ctx_t *c = (tl_mm_batched_ctx_t *)vctx;
-  // HMX lock2(SHARED) is per-thread, exactly one per thread.  The session thread
-  // (already enabled by session_init) runs worker 0 in the common single-thread
-  // FastRPC case, and also runs any worker that fell back to inline after a spawn
-  // failure — those must NOT re-lock.  Only a distinct (spawned) thread enables
-  // itself; if it can't acquire HMX it refuses rather than run MACs unlocked.
-  int en = (qurt_thread_get_id() != tl_hmx_session_tid);
-  if (en && tl_hmx_enable() != 0) {
-    *c->err = -4; // couldn't lock HMX on this thread
-    return;
-  }
-  uint8_t *region =
-      tl_vtcm_base_ptr + TL_HMX_TILE_BYTES + (size_t)wid * c->region_bytes;
-  size_t mk = (size_t)c->M * c->K, kn = (size_t)c->K * c->N,
-         mn = (size_t)c->M * c->N;
-  for (int b = wid; b < c->batch; b += nw) {
-    int rc = tl_hmx_matmul_in_region(c->C + (size_t)b * mn, c->A + (size_t)b * mk,
-                                     c->B + (size_t)b * kn, c->M, c->N, c->K,
-                                     region, c->region_bytes);
-    if (rc != 0)
-      *c->err = rc; // benign race: any failure marks the batch failed
-  }
-  if (en)
-    tl_hmx_disable();
-}
-
-// Batched matmul on the worker pool: `batch` independent C[b]=A[b]*B[b]
-// distributed across HW threads.  The 1 HMX engine serializes the MACs (spinlock)
-// while the 6 HVX units run the pack/unpack of different batch items in parallel.
-// Operands in global DDR; M,N,K multiples of 32.  Returns 0 on ok.
-static int tl_hexagon_hmx_matmul_batched_mt(__fp16 *C, const __fp16 *A,
-                                            const __fp16 *B, int batch, int M,
-                                            int N, int K) {
-  if (batch < 1 || M <= 0 || N <= 0 || K <= 0 || (M % TL_HMX_T) ||
-      (N % TL_HMX_T) || (K % TL_HMX_T))
-    return -1;
-  tl_hmx_session_init();
-  if (!tl_vtcm_base_ptr)
-    return -2;
-  tl_vtcm_shared_high_water = 0; // operands are DDR, no bottom alloc_shared (hygiene)
-  size_t region_bytes;
-  int nw = tl_mm_plan_workers(batch, M, N, K, &region_bytes);
-  if (nw == 0)
-    return -3; // one matmul doesn't fit VTCM
-  int err = 0;
-  tl_mm_batched_ctx_t ctx = {C, A, B, batch, M, N, K, region_bytes, &err};
-  tl_parallel(tl_mm_batched_worker, &ctx, nw);
-  return err;
-}
-
-// Bench: time the batched matmul multithreaded (nw workers) vs single-threaded,
-// `iters` each.  timing[0]=us/iter MT, [1]=us/iter ST, [2]=speedup (ST/MT),
-// [3]=worker count.  C holds the final iteration's result (for a correctness check).
-static int tl_hexagon_hmx_matmul_batched_mt_bench(__fp16 *C, const __fp16 *A,
-                                                  const __fp16 *B, int batch,
-                                                  int M, int N, int K, int iters,
-                                                  float *timing) {
-  if (iters < 1)
-    iters = 1;
-  if (batch < 1 || (M % TL_HMX_T) || (N % TL_HMX_T) || (K % TL_HMX_T))
-    return -1;
-  tl_hmx_session_init();
-  if (!tl_vtcm_base_ptr)
-    return -2;
-  size_t rb_mt;
-  int nw = tl_mm_plan_workers(batch, M, N, K, &rb_mt);
-  if (nw == 0)
-    return -3;
-  size_t rb_st = ((size_t)tl_vtcm_total - TL_HMX_TILE_BYTES) &
-                 ~(size_t)(TL_HMX_TILE_BYTES - 1);
-  int err = 0;
-  tl_mm_batched_ctx_t ctx_mt = {C, A, B, batch, M, N, K, rb_mt, &err};
-  tl_mm_batched_ctx_t ctx_st = {C, A, B, batch, M, N, K, rb_st, &err};
-
-  unsigned long long t0 = HAP_perf_get_qtimer_count();
-  for (int it = 0; it < iters; ++it)
-    tl_parallel(tl_mm_batched_worker, &ctx_mt, nw);
-  unsigned long long t1 = HAP_perf_get_qtimer_count();
-  for (int it = 0; it < iters; ++it)
-    tl_parallel(tl_mm_batched_worker, &ctx_st, 1);
-  unsigned long long t2 = HAP_perf_get_qtimer_count();
-
-  double us_mt = (double)HAP_perf_qtimer_count_to_us(t1 - t0) / iters;
-  double us_st = (double)HAP_perf_qtimer_count_to_us(t2 - t1) / iters;
-  if (timing) {
-    timing[0] = (float)us_mt;
-    timing[1] = (float)us_st;
-    timing[2] = (us_mt > 0.0) ? (float)(us_st / us_mt) : 0.0f;
-    timing[3] = (float)nw;
-  }
-  FARF(ALWAYS,
-       "HMX batched-MT batch=%d %dx%dx%d: MT %.1f us ST %.1f us %.2fx (%d wk)",
-       batch, M, N, K, us_mt, us_st, us_st / us_mt, nw);
   return 0;
 }
