@@ -44,14 +44,17 @@ static inline int tl_num_workers(void) {
 // `go` semaphore until the dispatcher releases it for a job, runs the shared
 // (fn,ctx,nw), then `up`s `done`.  The dispatcher is the ONLY writer of fn/ctx/nw and
 // writes them only between a worker's previous completion and its next release, so no
-// extra lock is needed; the semaphores carry the memory ordering.
+// extra lock is needed: qurt_sem_up/down are out-of-line futex calls (opaque compiler
+// barriers + kernel-side ordering), so the writes happen-before the worker's reads.
+// (Do NOT replace them with an inlined lockless path without an explicit barrier.)
 static struct {
   qurt_sem_t go[TL_MAX_WORKERS]; // dispatcher ups go[w]; worker w blocks on down
   qurt_sem_t done;               // worker ups; dispatcher downs once per released worker
   tl_worker_fn fn;
   void *ctx;
   int nw;
-  int spawned;                   // highest worker id spawned (0 = pool not yet created)
+  int spawned;                   // highest worker id spawned (0 = none)
+  int tried;                     // spawn attempted (so a failed spawn isn't retried/leaked)
   qurt_thread_t th[TL_MAX_WORKERS];
   void *blob;                    // one stack blob for the spawned workers
 } tl_pool;
@@ -68,14 +71,17 @@ static void tl_pool_worker(void *arg) {
 // Spawn the pool once.  Single-threaded (FastRPC _run is serial).  On a spawn
 // failure we stop; tl_parallel runs the un-spawned workers' slices inline.
 static void tl_pool_spawn(void) {
+  tl_pool.tried = 1; // attempt once; a failed spawn must not be retried (would leak)
   int n = TL_MAX_WORKERS - 1; // worker 0 is always the caller
   tl_pool.blob = malloc((size_t)TL_WORKER_STACK_SZ * n);
   if (!tl_pool.blob)
     return; // spawned stays 0 -> tl_parallel falls back to serial inline
   qurt_sem_init_val(&tl_pool.done, 0);
+  for (int w = 1; w <= n; ++w)
+    qurt_sem_init_val(&tl_pool.go[w], 0); // init ALL go[] before any create, so a
+                                          // partial-spawn failure leaves none undefined
   int prio = qurt_thread_get_priority(qurt_thread_get_id());
   for (int w = 1; w <= n; ++w) {
-    qurt_sem_init_val(&tl_pool.go[w], 0);
     qurt_thread_attr_t attr;
     qurt_thread_attr_init(&attr);
     qurt_thread_attr_set_stack_addr(
@@ -86,6 +92,10 @@ static void tl_pool_spawn(void) {
                            (void *)(intptr_t)w) != QURT_EOK)
       break; // spawned stays at the last success
     tl_pool.spawned = w;
+  }
+  if (tl_pool.spawned == 0) { // not one worker started -> free the blob, run serial
+    free(tl_pool.blob);
+    tl_pool.blob = 0;
   }
 }
 
@@ -101,8 +111,8 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
     fn(ctx, 0, 1);
     return 0;
   }
-  if (tl_pool.spawned == 0)
-    tl_pool_spawn(); // lazy, once per session
+  if (!tl_pool.tried)
+    tl_pool_spawn(); // lazy, once per session (tried set even on failure, no retry)
   int pooled = nw - 1;
   if (pooled > tl_pool.spawned)
     pooled = tl_pool.spawned;
