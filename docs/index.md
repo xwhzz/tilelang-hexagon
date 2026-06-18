@@ -19,6 +19,13 @@ get_started/targets
 
 :::{toctree}
 :maxdepth: 1
+:caption: HARDWARE BACKENDS
+
+hexagon_backend
+:::
+
+:::{toctree}
+:maxdepth: 1
 :caption: TUTORIALS
 
 tutorials/debug_tools_for_tilelang
