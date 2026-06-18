@@ -130,7 +130,8 @@ hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP 
 
 You can run it three ways: `tilelang.lower(fn, target="hexagon")` (inspect the C),
 `tilelang.compile(...)` / `@tilelang.jit(target="hexagon")` (build+deploy+run),
-or the direct `HexagonKernelAdapter`.
+or the direct `HexagonKernelAdapter`. Runnable end-to-end examples (matmul, flash
+attention, worker pool) live in [`examples/hexagon/`](../examples/hexagon/).
 
 ---
 
