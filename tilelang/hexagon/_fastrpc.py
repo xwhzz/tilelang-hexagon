@@ -130,6 +130,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     uses_worker = ("tl_hexagon_worker" in kernel_source
                    or "tl_parallel" in kernel_source) and not hmx
     worker_include = "#include <tl_templates/hexagon/worker.h>\n" if uses_worker else ""
+    # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in when a
+    # kernel references the `tl_hvx` prefix (self-contained, needs only -mhvx).
+    uses_hvx = "tl_hvx" in kernel_source
+    hvx_include = "#include <tl_templates/hexagon/hvx_math.h>\n" if uses_hvx else ""
     # Acquire/release the HMX session at _open/_close (the matmul also inits
     # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).
     # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
@@ -149,6 +153,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{vtcm_include}"
         f"{worker_include}"
         f"{hmx_include}"
+        f"{hvx_include}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
         "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"

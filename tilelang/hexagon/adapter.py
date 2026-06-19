@@ -55,7 +55,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         kernel_name: str | None = None,
         connection: HexagonConnection | None = None,
         sdk: HexagonSDK | None = None,
-        dsp_arch: str = "v73",
+        dsp_arch: str = "v79",  # SM8750/Hexagon v79 hardware (see env.py)
         verbose: bool = False,
         workdir: str | None = None,
         use_agent: bool = True,

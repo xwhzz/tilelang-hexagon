@@ -36,7 +36,7 @@ def selftest(
     *,
     project_dir: str = _DEFAULT_PROJECT,
     name: str = "hmx_matmul",
-    dsp_arch: str = "v73",
+    dsp_arch: str = "v79",
     connection: HexagonConnection | None = None,
     verbose: bool = False,
 ) -> float:

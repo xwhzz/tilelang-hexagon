@@ -49,7 +49,11 @@ class HexagonSDK:
     sdk_root: str = field(default_factory=lambda: os.environ.get("HEXAGON_SDK_ROOT", _DEFAULT_SDK_ROOT))
     ndk_root: str = field(default_factory=lambda: os.environ.get("ANDROID_NDK_ROOT", _DEFAULT_NDK_ROOT))
     cmake_root: str = field(default_factory=lambda: os.environ.get("CMAKE_ROOT_PATH", _DEFAULT_CMAKE_ROOT))
-    dsp_arch: str = field(default_factory=lambda: os.environ.get("HEXAGON_DSP_ARCH", "v73"))
+    # Default to v79: the supported hardware is Snapdragon 8 Elite (SM8750,
+    # Hexagon v79).  v79 is a backward-compatible superset of v73, and the HVX
+    # fp16<->fp32 conversion ops (vcvt.hf.sf) used by hvx_math.h require it.
+    # Override with HEXAGON_DSP_ARCH for older targets.
+    dsp_arch: str = field(default_factory=lambda: os.environ.get("HEXAGON_DSP_ARCH", "v79"))
 
     # ---- core paths -------------------------------------------------------
     @property
