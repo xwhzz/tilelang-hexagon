@@ -641,7 +641,10 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
   // index doubles as the chunk base address with j stepping by 64.
   if (UsesLoopVar(ana.Simplify(sidx - j), j))
     return false;
-  if (!HvxExprSupported(store->value, j, &ana))
+  // Supportability probe: a dry run of the emitter (emit=false) — side-effect
+  // free (no stream / name / var allocation), so it's safe before AllocVarID(j)
+  // and it shares the single op-set with the real emit below.
+  if (!EmitHvxExpr(store->value, j, &ana, /*emit=*/false))
     return false;
 
   // ---- emit ----
@@ -650,7 +653,9 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
   stream << "for (int " << jid << " = 0; " << jid << " < " << N << "; " << jid
          << " += " << kHvxF16Lanes << ") {\n";
   int scope = this->BeginScope();
-  HvxLanes r = EmitHvxExpr(store->value, j, &ana);
+  std::optional<HvxLanes> rr = EmitHvxExpr(store->value, j, &ana, /*emit=*/true);
+  ICHECK(rr) << "HVX emit failed after the probe passed (op-set drift?)";
+  HvxLanes r = *rr;
   std::string sref = GetBufferRef(vt, store->buffer.get(), sidx);
   PrintIndent();
   if (AccessAligned128(store->buffer.get(), sidx, j, &ana))
@@ -665,46 +670,11 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
   return true;
 }
 
-bool CodeGenTileLangHexagon::HvxExprSupported(const PrimExpr &e,
-                                              const tirx::Var &j,
-                                              arith::Analyzer *ana) {
-  if (!UsesLoopVar(e, j))
-    return true; // j-independent -> broadcast splat
-  if (const auto *load = e.as<BufferLoadNode>()) {
-    if (load->indices.size() != 1 || load->indices[0].dtype().lanes() != 1)
-      return false;
-    if (load->dtype.lanes() != 1 || !load->dtype.is_float() ||
-        load->dtype.bits() != 16)
-      return false; // j-contiguous loads must be scalar fp16 (widened to fp32)
-    return !UsesLoopVar(ana->Simplify(load->indices[0] - j), j); // unit stride
-  }
-  if (const auto *c = e.as<CastNode>())
-    return HvxExprSupported(c->value, j, ana);
-  if (const auto *a = e.as<AddNode>())
-    return HvxExprSupported(a->a, j, ana) && HvxExprSupported(a->b, j, ana);
-  if (const auto *s = e.as<SubNode>())
-    return HvxExprSupported(s->a, j, ana) && HvxExprSupported(s->b, j, ana);
-  if (const auto *m = e.as<MulNode>())
-    return HvxExprSupported(m->a, j, ana) && HvxExprSupported(m->b, j, ana);
-  if (const auto *d = e.as<DivNode>()) {
-    PrimExpr sa;
-    if (MatchRsqrt(d, &sa)) // 1/sqrt(x) -> rsqrt(x)
-      return HvxExprSupported(sa, j, ana);
-    return HvxExprSupported(d->a, j, ana) && HvxExprSupported(d->b, j, ana);
-  }
-  if (const auto *call = e.as<CallNode>()) {
-    PrimExpr arg;
-    bool base_e;
-    if (MatchExpCall(call, &arg, &base_e))
-      return HvxExprSupported(arg, j, ana);
-    return false;
-  }
-  return false;
-}
-
 CodeGenTileLangHexagon::HvxLanes
 CodeGenTileLangHexagon::EmitHvxOp(const HvxLanes &a, const HvxLanes &b,
-                                  const char *fn) {
+                                  const char *fn, bool emit) {
+  if (!emit)
+    return {"", "", a.bcast && b.bcast};
   std::string lo = name_supply_->FreshName("tl_v");
   PrintIndent();
   stream << "HVX_Vector " << lo << " = " << fn << "(" << a.lo << ", " << b.lo
@@ -719,7 +689,10 @@ CodeGenTileLangHexagon::EmitHvxOp(const HvxLanes &a, const HvxLanes &b,
 }
 
 CodeGenTileLangHexagon::HvxLanes
-CodeGenTileLangHexagon::EmitHvxUnary(const HvxLanes &a, const char *fn) {
+CodeGenTileLangHexagon::EmitHvxUnary(const HvxLanes &a, const char *fn,
+                                    bool emit) {
+  if (!emit)
+    return {"", "", a.bcast};
   std::string lo = name_supply_->FreshName("tl_v");
   PrintIndent();
   stream << "HVX_Vector " << lo << " = " << fn << "(" << a.lo << ");\n";
@@ -731,11 +704,13 @@ CodeGenTileLangHexagon::EmitHvxUnary(const HvxLanes &a, const char *fn) {
   return {lo, hi, false};
 }
 
-CodeGenTileLangHexagon::HvxLanes
+std::optional<CodeGenTileLangHexagon::HvxLanes>
 CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
-                                    arith::Analyzer *ana) {
+                                    arith::Analyzer *ana, bool emit) {
   // j-independent subexpression: evaluate once (scalar C) and splat to fp32.
   if (!UsesLoopVar(e, j)) {
+    if (!emit)
+      return HvxLanes{"", "", true};
     // Render the scalar FIRST: a j-independent subexpr that lowers to statements
     // (a select/if_then_else/Let) emits them to `stream` here — before the splat
     // line — instead of splitting it mid-token.
@@ -743,15 +718,25 @@ CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
     std::string s = name_supply_->FreshName("tl_b");
     PrintIndent();
     stream << "HVX_Vector " << s << " = tl_hvx_splat_f((float)(" << ev << "));\n";
-    return {s, s, true};
+    return HvxLanes{s, s, true};
   }
   // j-contiguous fp16 load: widen to an fp32 (lo, hi) pair.
   if (const auto *load = e.as<BufferLoadNode>()) {
+    if (load->indices.size() != 1 || load->indices[0].dtype().lanes() != 1)
+      return std::nullopt;
+    if (load->dtype.lanes() != 1 || !load->dtype.is_float() ||
+        load->dtype.bits() != 16)
+      return std::nullopt; // contiguous loads must be scalar fp16 (widened)
+    if (UsesLoopVar(ana->Simplify(load->indices[0] - j), j))
+      return std::nullopt; // not unit-stride in j
+    if (!emit)
+      return HvxLanes{"", "", false};
     std::string lo = name_supply_->FreshName("tl_lo");
     std::string hi = name_supply_->FreshName("tl_hi");
     PrintIndent();
     stream << "HVX_Vector " << lo << ", " << hi << ";\n";
-    std::string lref = GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]);
+    std::string lref =
+        GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]);
     PrintIndent();
     if (AccessAligned128(load->buffer.get(), load->indices[0], j, ana))
       stream << "tl_hvx_widen_hf(*(const HVX_Vector*)(&" << lref << "), &" << lo
@@ -759,47 +744,69 @@ CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
     else
       stream << "tl_hvx_widen_hf(tl_hvx_loadu(&" << lref << "), &" << lo << ", &"
              << hi << ");\n";
-    return {lo, hi, false};
+    return HvxLanes{lo, hi, false};
   }
   // fp16<->fp32 casts are transparent (internal compute is fp32).
   if (const auto *c = e.as<CastNode>())
-    return EmitHvxExpr(c->value, j, ana);
-  if (const auto *a = e.as<AddNode>()) {
-    HvxLanes la = EmitHvxExpr(a->a, j, ana), lb = EmitHvxExpr(a->b, j, ana);
-    return EmitHvxOp(la, lb, "tl_hvx_add_sf");
-  }
-  if (const auto *s = e.as<SubNode>()) {
-    HvxLanes la = EmitHvxExpr(s->a, j, ana), lb = EmitHvxExpr(s->b, j, ana);
-    return EmitHvxOp(la, lb, "tl_hvx_sub_sf");
-  }
-  if (const auto *m = e.as<MulNode>()) {
-    HvxLanes la = EmitHvxExpr(m->a, j, ana), lb = EmitHvxExpr(m->b, j, ana);
-    return EmitHvxOp(la, lb, "tl_hvx_mul_sf");
-  }
+    return EmitHvxExpr(c->value, j, ana, emit);
+  // Binary arithmetic (Add/Sub/Mul) — one body for all three.
+  auto binop = [&](const PrimExpr &x, const PrimExpr &y,
+                   const char *fn) -> std::optional<HvxLanes> {
+    auto a = EmitHvxExpr(x, j, ana, emit);
+    if (!a)
+      return std::nullopt;
+    auto b = EmitHvxExpr(y, j, ana, emit);
+    if (!b)
+      return std::nullopt;
+    return EmitHvxOp(*a, *b, fn, emit);
+  };
+  if (const auto *a = e.as<AddNode>())
+    return binop(a->a, a->b, "tl_hvx_add_sf");
+  if (const auto *s = e.as<SubNode>())
+    return binop(s->a, s->b, "tl_hvx_sub_sf");
+  if (const auto *m = e.as<MulNode>())
+    return binop(m->a, m->b, "tl_hvx_mul_sf");
   if (const auto *d = e.as<DivNode>()) {
     PrimExpr sa;
-    if (MatchRsqrt(d, &sa)) // 1/sqrt(x) -> rsqrt(x) directly (one op, accurate)
-      return EmitHvxUnary(EmitHvxExpr(sa, j, ana), "tl_hvx_rsqrt_vsf");
-    HvxLanes la = EmitHvxExpr(d->a, j, ana), lb = EmitHvxExpr(d->b, j, ana);
-    return EmitHvxOp(la, EmitHvxUnary(lb, "tl_hvx_recip_vsf"), "tl_hvx_mul_sf");
+    if (MatchRsqrt(d, &sa)) { // 1/sqrt(x) -> rsqrt(x) (one op, accurate)
+      auto a = EmitHvxExpr(sa, j, ana, emit);
+      if (!a)
+        return std::nullopt;
+      return EmitHvxUnary(*a, "tl_hvx_rsqrt_vsf", emit);
+    }
+    auto a = EmitHvxExpr(d->a, j, ana, emit);
+    if (!a)
+      return std::nullopt;
+    auto b = EmitHvxExpr(d->b, j, ana, emit);
+    if (!b)
+      return std::nullopt;
+    return EmitHvxOp(*a, EmitHvxUnary(*b, "tl_hvx_recip_vsf", emit),
+                     "tl_hvx_mul_sf", emit);
   }
   if (const auto *call = e.as<CallNode>()) {
     PrimExpr arg_expr;
     bool base_e;
-    ICHECK(MatchExpCall(call, &arg_expr, &base_e)); // detection guaranteed a match
-    HvxLanes arg = EmitHvxExpr(arg_expr, j, ana);
+    if (!MatchExpCall(call, &arg_expr, &base_e))
+      return std::nullopt;
+    auto a = EmitHvxExpr(arg_expr, j, ana, emit);
+    if (!a)
+      return std::nullopt;
+    HvxLanes arg = *a;
     if (base_e) {
-      // base-e: exp(x) = exp2(x * log2e); base-2 (exp2f/tl.__exp) needs no rescale.
-      std::string s = name_supply_->FreshName("tl_b");
-      PrintIndent();
-      stream << "HVX_Vector " << s
-             << " = tl_hvx_splat_f(1.4426950408889634f);\n";
-      arg = EmitHvxOp(arg, {s, s, true}, "tl_hvx_mul_sf");
+      // base-e: exp(x) = exp2(x * log2e); base-2 needs no rescale.
+      HvxLanes log2e{"", "", true};
+      if (emit) {
+        std::string s = name_supply_->FreshName("tl_b");
+        PrintIndent();
+        stream << "HVX_Vector " << s
+               << " = tl_hvx_splat_f(1.4426950408889634f);\n";
+        log2e = {s, s, true};
+      }
+      arg = EmitHvxOp(arg, log2e, "tl_hvx_mul_sf", emit);
     }
-    return EmitHvxUnary(arg, "tl_hvx_exp2_vsf");
+    return EmitHvxUnary(arg, "tl_hvx_exp2_vsf", emit);
   }
-  LOG(FATAL) << "EmitHvxExpr: unsupported expr (detection should have caught it)";
-  return {"", "", false};
+  return std::nullopt; // unsupported elementwise node
 }
 
 } // namespace codegen

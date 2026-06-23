@@ -13,6 +13,7 @@
 
 #include "target/source/codegen_c.h"
 #include "tvm/target/codegen.h"
+#include <optional>
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
@@ -85,15 +86,15 @@ private:
   // Try to emit `op` (an innermost loop) as a full-width HVX elementwise loop;
   // returns false (emitting nothing) if the loop isn't a vectorizable map.
   bool TryEmitHvxElementwise(const ForNode *op);
-  // Whether `e` is a supported elementwise expression over loop var `j`
-  // (j-contiguous fp16 loads / j-independent broadcasts / + - * / exp).
-  bool HvxExprSupported(const PrimExpr &e, const tirx::Var &j,
-                        arith::Analyzer *ana);
-  // Recursively emit the HVX statements computing `e`; returns the result lanes.
-  HvxLanes EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
-                       arith::Analyzer *ana);
-  HvxLanes EmitHvxOp(const HvxLanes &a, const HvxLanes &b, const char *fn);
-  HvxLanes EmitHvxUnary(const HvxLanes &a, const char *fn);
+  // One recursive walk for both phases: emit=false is the side-effect-free
+  // supportability probe (returns nullopt if `e` isn't a supported elementwise
+  // expr); emit=true writes the HVX statements and returns the result lanes.
+  // Single op-set — no separate detection function to drift out of sync.
+  std::optional<HvxLanes> EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
+                                      arith::Analyzer *ana, bool emit);
+  HvxLanes EmitHvxOp(const HvxLanes &a, const HvxLanes &b, const char *fn,
+                     bool emit);
+  HvxLanes EmitHvxUnary(const HvxLanes &a, const char *fn, bool emit);
   // Whether a vectorized access buf[idx] (idx = base + j, j stepping 64 fp16) is
   // 128-byte (HVX vector) aligned: shared VTCM tiles are merge-aligned to 128,
   // so it reduces to base % 64 == 0 (provable via the analyzer).  Drives the
