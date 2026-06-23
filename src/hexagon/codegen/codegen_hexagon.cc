@@ -519,20 +519,23 @@ CodeGenTileLangHexagon::PrintTernaryCondExpr(const T *op, const char *compare,
 namespace {
 constexpr int kHvxF16Lanes = 64; // 1024-bit HVX register / 16-bit lane
 
-// Match an exp call in either form: the op-level intrinsic (tl.__exp base-2 /
-// tirx.exp base-e) or — after the pipeline's intrinsic lowering — the
-// call_extern to the libm symbol (exp2f / expf).  Sets *arg to the operand and
-// *base_e true for base-e (which the emitter rescales by log2e before exp2).
+// Does expression `e` depend on the (inner) loop var `j`?
+bool UsesLoopVar(const PrimExpr &e, const tirx::Var &j) {
+  return tirx::UsesVar(e, [&](const VarNode *v) { return v == j.get(); });
+}
+
+// Match an exp call in either form: the op-level intrinsic (tl.__exp and
+// tirx.exp are BOTH base-e e^x — the CUDA backend lowers tl.__exp to `exp`,
+// __exp10 to `exp10`; the DSL docstring claiming 2**x is wrong) or — after the
+// pipeline's intrinsic lowering — the call_extern to a libm symbol (exp2f base-2
+// / expf base-e).  Sets *arg to the operand and *base_e true for base-e (which
+// the emitter rescales by log2e before exp2).
 bool MatchExpCall(const CallNode *call, PrimExpr *arg, bool *base_e) {
   if (call->args.size() == 1) {
-    if (call->op.same_as(Op::Get("tl.__exp"))) {
+    if (call->op.same_as(Op::Get("tl.__exp")) ||
+        call->op.same_as(Op::Get("tirx.exp"))) {
       *arg = call->args[0];
-      *base_e = false;
-      return true;
-    }
-    if (call->op.same_as(Op::Get("tirx.exp"))) {
-      *arg = call->args[0];
-      *base_e = true;
+      *base_e = true; // e^x
       return true;
     }
   }
@@ -591,12 +594,9 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
   tirx::Var j = op->loop_var;
   arith::Analyzer ana;
   ana.Bind(j, Range::FromMinExtent(IntImm(j.dtype(), 0), op->extent));
-  auto j_free = [&](const PrimExpr &x) {
-    return !tirx::UsesVar(x, [&](const VarNode *v) { return v == j.get(); });
-  };
   // Store must be unit-stride in j (idx - j independent of j), so the original
   // index doubles as the chunk base address with j stepping by 64.
-  if (!j_free(ana.Simplify(sidx - j)))
+  if (UsesLoopVar(ana.Simplify(sidx - j), j))
     return false;
   if (!HvxExprSupported(store->value, j, &ana))
     return false;
@@ -620,10 +620,7 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
 bool CodeGenTileLangHexagon::HvxExprSupported(const PrimExpr &e,
                                               const tirx::Var &j,
                                               arith::Analyzer *ana) {
-  auto uses_j = [&](const PrimExpr &x) {
-    return tirx::UsesVar(x, [&](const VarNode *v) { return v == j.get(); });
-  };
-  if (!uses_j(e))
+  if (!UsesLoopVar(e, j))
     return true; // j-independent -> broadcast splat
   if (const auto *load = e.as<BufferLoadNode>()) {
     if (load->indices.size() != 1 || load->indices[0].dtype().lanes() != 1)
@@ -631,7 +628,7 @@ bool CodeGenTileLangHexagon::HvxExprSupported(const PrimExpr &e,
     if (load->dtype.lanes() != 1 || !load->dtype.is_float() ||
         load->dtype.bits() != 16)
       return false; // j-contiguous loads must be scalar fp16 (widened to fp32)
-    return !uses_j(ana->Simplify(load->indices[0] - j)); // unit stride
+    return !UsesLoopVar(ana->Simplify(load->indices[0] - j), j); // unit stride
   }
   if (const auto *c = e.as<CastNode>())
     return HvxExprSupported(c->value, j, ana);
@@ -685,15 +682,15 @@ CodeGenTileLangHexagon::EmitHvxUnary(const HvxLanes &a, const char *fn) {
 CodeGenTileLangHexagon::HvxLanes
 CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
                                     arith::Analyzer *ana) {
-  auto uses_j = [&](const PrimExpr &x) {
-    return tirx::UsesVar(x, [&](const VarNode *v) { return v == j.get(); });
-  };
   // j-independent subexpression: evaluate once (scalar C) and splat to fp32.
-  if (!uses_j(e)) {
+  if (!UsesLoopVar(e, j)) {
+    // Render the scalar FIRST: a j-independent subexpr that lowers to statements
+    // (a select/if_then_else/Let) emits them to `stream` here — before the splat
+    // line — instead of splitting it mid-token.
+    std::string ev = PrintExpr(e);
     std::string s = name_supply_->FreshName("tl_b");
     PrintIndent();
-    stream << "HVX_Vector " << s << " = tl_hvx_splat_f((float)(" << PrintExpr(e)
-           << "));\n";
+    stream << "HVX_Vector " << s << " = tl_hvx_splat_f((float)(" << ev << "));\n";
     return {s, s, true};
   }
   // j-contiguous fp16 load: widen to an fp32 (lo, hi) pair.

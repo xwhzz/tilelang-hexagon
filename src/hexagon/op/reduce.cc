@@ -33,7 +33,6 @@ struct Reduce {
   static Stmt Lower(const ReduceOpNode &op, const LowerArgs &T,
                     arith::Analyzer *analyzer) {
     (void)T;
-    (void)analyzer;
     Array<PrimExpr> src_extents;
     for (const auto &range : op.srcRegion_->region)
       src_extents.push_back(range->extent);
@@ -51,6 +50,20 @@ struct Reduce {
         << "Hexagon reduce writes an fp32 result; declare the destination "
            "float32 (got "
         << op.dst->dtype << ").";
+    ICHECK(!op.nan_propagate)
+        << "Hexagon reduce does not implement nan_propagate (HVX vmax has fixed "
+           "NaN handling); use the default.";
+    // The HVX primitive walks contiguous full-width rows (in + i*cols), and
+    // MakeAccessPtrFromRegion drops a 2D sub-region offset — so the source region
+    // must span the whole buffer.  A sub-tile / column-slice / row-offset reduce
+    // would silently read the wrong rows; reject it loudly instead.
+    for (int d = 0; d < ndim; ++d) {
+      PrimExpr zero = IntImm(op.srcRegion_->region[d]->min.dtype(), 0);
+      ICHECK(analyzer->CanProveEqual(op.srcRegion_->region[d]->min, zero) &&
+             analyzer->CanProveEqual(src_extents[d], op.src->shape[d]))
+          << "Hexagon reduce requires a full-buffer (contiguous-row) source "
+             "region; a sub-region reduce is unsupported.";
+    }
     if (const auto *cols = src_extents[1].as<IntImmNode>()) {
       ICHECK_GT(cols->value, 0) << "Hexagon reduce requires a positive row width.";
     }

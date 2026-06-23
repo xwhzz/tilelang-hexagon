@@ -74,8 +74,13 @@ TL_DEVICE void tl_hvx_storeu(void *p, HVX_Vector v) {
 TL_DEVICE HVX_Vector tl_hvx_exp2_vsf(HVX_Vector x) {
   x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, tl_hvx_splat_f(-126.0f)),
                          tl_hvx_splat_f(126.0f));
-  // k = round-to-nearest(x); f = x - k
-  HVX_Vector ki = Q6_Vw_equals_Vsf(x);     // sf -> int32 (round-to-nearest-even)
+  // k = round-to-nearest(x), f = x - k ∈ [-0.5, 0.5].  Q6_Vw_equals_Vsf truncates
+  // TOWARD ZERO, so bias by copysign(0.5, x) before the convert — otherwise f
+  // lands in (-1, 1) and the degree-5 minimax poly (fit on [-0.5, 0.5]) is
+  // evaluated outside its domain (~100x worse: 3e-6 -> ~3e-4).
+  HVX_Vector half_signed = Q6_V_vor_VV(
+      Q6_V_vand_VV(x, Q6_V_vsplat_R((int)0x80000000)), tl_hvx_splat_f(0.5f));
+  HVX_Vector ki = Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, half_signed)); // trunc(x ± 0.5)
   HVX_Vector kf = Q6_Vsf_equals_Vw(ki);    // back to float for the residual
   HVX_Vector f = tl_hvx_sub_sf(x, kf);     // f ∈ [-0.5, 0.5]
   // 2^f via Horner in qf32:  ((((C5 f + C4) f + C3) f + C2) f + C1) f + C0
