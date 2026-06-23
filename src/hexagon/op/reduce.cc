@@ -9,9 +9,9 @@
  *
  * Only the shapes softmax/layernorm need are handled (2D src, reduce dim=1,
  * clear=True, fp16 src, fp32 dst); anything else errors clearly rather than
- * silently falling back to a GPU-shaped lowering Hexagon can't run.  The src
- * must be a shared/local (not fragment) buffer so ReduceOpNode::InferLayout is a
- * no-op (Hexagon has no fragment-layout inference).
+ * silently falling back to a GPU-shaped lowering Hexagon can't run.  The runtime
+ * helper uses HVX for aligned row spans and scalar tails/fallbacks otherwise, so
+ * non-64-multiple row widths stay correct.
  */
 
 #include "op/reduce.h"
@@ -51,6 +51,9 @@ struct Reduce {
         << "Hexagon reduce writes an fp32 result; declare the destination "
            "float32 (got "
         << op.dst->dtype << ").";
+    if (const auto *cols = src_extents[1].as<IntImmNode>()) {
+      ICHECK_GT(cols->value, 0) << "Hexagon reduce requires a positive row width.";
+    }
 
     const char *fn = nullptr;
     if (op.type->isMax())

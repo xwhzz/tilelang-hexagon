@@ -14,6 +14,7 @@
 #include "target/source/codegen_c.h"
 #include "tvm/target/codegen.h"
 #include <string>
+#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
 #include <unordered_set>
 #include <vector>
@@ -45,6 +46,9 @@ public:
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
   // Reject HMX gemm/matmul calls inside a worker-pool kernel (scratch is global).
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
+  // HVX-vectorize an innermost elementwise loop (the `map` half of the backend's
+  // primitive basis); fall back to CodeGenC's scalar loop otherwise.
+  void VisitStmt_(const ForNode *op) final; // NOLINT(*)
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
 
@@ -70,6 +74,26 @@ private:
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,
                                    std::ostream &os); // NOLINT(*)
+
+  // ---- HVX elementwise ("map") vectorizer (see codegen_hexagon.cc) ----
+  // A subexpression's value as a pair of 32-lane fp32 HVX vectors backing 64
+  // fp16 lanes; `bcast` means lo == hi (a splatted j-independent scalar).
+  struct HvxLanes {
+    std::string lo, hi;
+    bool bcast;
+  };
+  // Try to emit `op` (an innermost loop) as a full-width HVX elementwise loop;
+  // returns false (emitting nothing) if the loop isn't a vectorizable map.
+  bool TryEmitHvxElementwise(const ForNode *op);
+  // Whether `e` is a supported elementwise expression over loop var `j`
+  // (j-contiguous fp16 loads / j-independent broadcasts / + - * / exp).
+  bool HvxExprSupported(const PrimExpr &e, const tirx::Var &j,
+                        arith::Analyzer *ana);
+  // Recursively emit the HVX statements computing `e`; returns the result lanes.
+  HvxLanes EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
+                       arith::Analyzer *ana);
+  HvxLanes EmitHvxOp(const HvxLanes &a, const HvxLanes &b, const char *fn);
+  HvxLanes EmitHvxUnary(const HvxLanes &a, const char *fn);
 };
 
 } // namespace codegen

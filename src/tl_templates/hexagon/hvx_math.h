@@ -19,6 +19,7 @@
 // Pulled in on demand by _fastrpc.py when a kernel references `tl_hvx`.
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <cmath>           // scalar fallbacks for the ragged tail
+#include <stdint.h>
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))
@@ -27,6 +28,10 @@
 // HVX vector geometry: 1024-bit register = 32 fp32 lanes = 64 fp16 lanes.
 #define TL_HVX_F32_LANES 32
 #define TL_HVX_F16_LANES 64
+
+TL_DEVICE int tl_hvx_aligned_128(const void *p) {
+  return (((uintptr_t)p) & 127u) == 0;
+}
 
 // ---------------------------------------------------------------------------
 // fp32 (IEEE "sf") arithmetic.  HVX accumulates in the internal "qf32" format;
@@ -45,6 +50,18 @@ TL_DEVICE HVX_Vector tl_hvx_sub_sf(HVX_Vector a, HVX_Vector b) {
 }
 TL_DEVICE HVX_Vector tl_hvx_mul_sf(HVX_Vector a, HVX_Vector b) {
   return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, b));
+}
+
+// Unaligned 1024-bit load/store.  The shared-memory merge pass packs VTCM tiles
+// at element-aligned (not 128-byte) offsets, so the codegen's elementwise
+// vectorizer must not assume HVX alignment.  `aligned(1)` makes hexagon-clang
+// emit the unaligned vmemu form.
+typedef HVX_Vector tl_hvx_uvector __attribute__((aligned(1)));
+TL_DEVICE HVX_Vector tl_hvx_loadu(const void *p) {
+  return *(const tl_hvx_uvector *)p;
+}
+TL_DEVICE void tl_hvx_storeu(void *p, HVX_Vector v) {
+  *(tl_hvx_uvector *)p = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +117,10 @@ TL_DEVICE HVX_Vector tl_hvx_narrow_hf(HVX_Vector lo, HVX_Vector hi) {
 // 64 fp16 satisfy this); the ragged tail < 64 falls back to scalar.
 // ---------------------------------------------------------------------------
 TL_DEVICE void tl_hvx_exp2_bias_row(__fp16 *out, const __fp16 *in, float bias, int n) {
+  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
+    for (int j = 0; j < n; ++j) out[j] = (__fp16)exp2f((float)in[j] - bias);
+    return;
+  }
   HVX_Vector vb = tl_hvx_splat_f(bias);
   int nv = n / TL_HVX_F16_LANES;
   const HVX_Vector *vin = (const HVX_Vector *)in;
@@ -139,6 +160,10 @@ TL_DEVICE HVX_Vector tl_hvx_rsqrt_vsf(HVX_Vector x) {
 // Row maps: out[j] = f(in[j]); fp16 row, fp32 internal.  `tl_hvx_rsqrt_eps_row`
 // adds eps before the rsqrt (LayerNorm/RMSNorm variance term).
 TL_DEVICE void tl_hvx_recip_row(__fp16 *out, const __fp16 *in, int n) {
+  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
+    for (int j = 0; j < n; ++j) out[j] = (__fp16)(1.0f / (float)in[j]);
+    return;
+  }
   int nv = n / TL_HVX_F16_LANES;
   const HVX_Vector *vin = (const HVX_Vector *)in;
   HVX_Vector *vout = (HVX_Vector *)out;
@@ -150,6 +175,11 @@ TL_DEVICE void tl_hvx_recip_row(__fp16 *out, const __fp16 *in, int n) {
   for (int j = nv * TL_HVX_F16_LANES; j < n; ++j) out[j] = (__fp16)(1.0f / (float)in[j]);
 }
 TL_DEVICE void tl_hvx_rsqrt_eps_row(__fp16 *out, const __fp16 *in, float eps, int n) {
+  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
+    for (int j = 0; j < n; ++j)
+      out[j] = (__fp16)(1.0f / sqrtf((float)in[j] + eps));
+    return;
+  }
   HVX_Vector ve = tl_hvx_splat_f(eps);
   int nv = n / TL_HVX_F16_LANES;
   const HVX_Vector *vin = (const HVX_Vector *)in;
@@ -166,10 +196,10 @@ TL_DEVICE void tl_hvx_rsqrt_eps_row(__fp16 *out, const __fp16 *in, float eps, in
 }
 
 // ---------------------------------------------------------------------------
-// Row reductions over a contiguous fp16 row of length n → fp32 scalar.
+// Row reductions over a contiguous fp16 row of length n -> fp32 scalar.
 // Accumulate across vectors, then a butterfly rotate-reduce within one vector
-// (Q6_V_vror_VR rotates by bytes).  `max` stays in fp16 (exact); `sum`
-// accumulates in fp32 (fp16 would lose precision over a long row).
+// (Q6_V_vror_VR rotates by bytes).  Aligned rows use HVX; short or unaligned
+// rows fall back to scalar so arbitrary row widths are correct.
 // ---------------------------------------------------------------------------
 TL_DEVICE float tl_hvx_lane0_sf(HVX_Vector v) {
   __attribute__((aligned(128))) float buf[TL_HVX_F32_LANES];
@@ -182,6 +212,16 @@ TL_DEVICE float tl_hvx_lane0_hf(HVX_Vector v) {
   return (float)buf[0];
 }
 TL_DEVICE float tl_hvx_row_max(const __fp16 *in, int n) {
+  if (n <= 0)
+    return -3.4028234663852886e38f;
+  if (!tl_hvx_aligned_128(in) || n < TL_HVX_F16_LANES) {
+    float r = (float)in[0];
+    for (int j = 1; j < n; ++j) {
+      float x = (float)in[j];
+      if (x > r) r = x;
+    }
+    return r;
+  }
   const HVX_Vector *v = (const HVX_Vector *)in;
   int nv = n / TL_HVX_F16_LANES;
   HVX_Vector m = v[0];
@@ -195,6 +235,13 @@ TL_DEVICE float tl_hvx_row_max(const __fp16 *in, int n) {
   return r;
 }
 TL_DEVICE float tl_hvx_row_sum(const __fp16 *in, int n) {
+  if (n <= 0)
+    return 0.0f;
+  if (!tl_hvx_aligned_128(in) || n < TL_HVX_F16_LANES) {
+    float r = 0.0f;
+    for (int j = 0; j < n; ++j) r += (float)in[j];
+    return r;
+  }
   const HVX_Vector *v = (const HVX_Vector *)in;
   int nv = n / TL_HVX_F16_LANES;
   HVX_Vector acc = Q6_V_vzero();
@@ -210,7 +257,8 @@ TL_DEVICE float tl_hvx_row_sum(const __fp16 *in, int n) {
 }
 // Whole-tile reductions: out[i] = reduce(in[i, :]) for i in [0, rows).  Output
 // is fp32 (the reduce result feeds the fp32 running-max/sum scalar logic in
-// softmax/layernorm).  Rows must be HVX-aligned (width n a multiple of 64 fp16).
+// softmax/layernorm).  Rows with 128-byte alignment use HVX; other rows are
+// handled by the scalar path in tl_hvx_row_{max,sum}.
 TL_DEVICE void tl_hvx_rowmax_mat(float *out, const __fp16 *in, int rows, int n) {
   for (int i = 0; i < rows; ++i) out[i] = tl_hvx_row_max(in + (size_t)i * n, n);
 }
