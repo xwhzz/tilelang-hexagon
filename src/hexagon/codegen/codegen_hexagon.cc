@@ -591,6 +591,21 @@ void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+bool CodeGenTileLangHexagon::AccessAligned128(const BufferNode *buf,
+                                              const PrimExpr &idx,
+                                              const tirx::Var &j,
+                                              arith::Analyzer *ana) {
+  // Only shared (VTCM) tiles are guaranteed 128-byte aligned (the merge pass
+  // aligns them to 128 for Hexagon); local/global buffers are not.
+  std::string scope = GetPtrStorageScope(buf->data);
+  if (scope != "shared" && scope != "shared.dyn" && scope != "shared.tmem")
+    return false;
+  // idx = base + j with j stepping 64 (j % 64 == 0 at each chunk start), so the
+  // byte address (2 bytes/elem) is 128-aligned iff base % 64 == 0.
+  arith::ModularSet ms = ana->modular_set(ana->Simplify(idx - j));
+  return ms->coeff % 64 == 0 && ms->base % 64 == 0;
+}
+
 bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
   // Innermost loop over a static [0, N) extent that is a multiple of the HVX
   // fp16 width.
@@ -636,9 +651,14 @@ bool CodeGenTileLangHexagon::TryEmitHvxElementwise(const ForNode *op) {
          << " += " << kHvxF16Lanes << ") {\n";
   int scope = this->BeginScope();
   HvxLanes r = EmitHvxExpr(store->value, j, &ana);
+  std::string sref = GetBufferRef(vt, store->buffer.get(), sidx);
   PrintIndent();
-  stream << "tl_hvx_storeu(&" << GetBufferRef(vt, store->buffer.get(), sidx)
-         << ", tl_hvx_narrow_hf(" << r.lo << ", " << r.hi << "));\n";
+  if (AccessAligned128(store->buffer.get(), sidx, j, &ana))
+    stream << "*(HVX_Vector*)(&" << sref << ") = tl_hvx_narrow_hf(" << r.lo
+           << ", " << r.hi << ");\n";
+  else
+    stream << "tl_hvx_storeu(&" << sref << ", tl_hvx_narrow_hf(" << r.lo << ", "
+           << r.hi << "));\n";
   this->EndScope(scope);
   PrintIndent();
   stream << "}\n";
@@ -731,10 +751,14 @@ CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
     std::string hi = name_supply_->FreshName("tl_hi");
     PrintIndent();
     stream << "HVX_Vector " << lo << ", " << hi << ";\n";
+    std::string lref = GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]);
     PrintIndent();
-    stream << "tl_hvx_widen_hf(tl_hvx_loadu(&"
-           << GetBufferRef(load->dtype, load->buffer.get(), load->indices[0])
-           << "), &" << lo << ", &" << hi << ");\n";
+    if (AccessAligned128(load->buffer.get(), load->indices[0], j, ana))
+      stream << "tl_hvx_widen_hf(*(const HVX_Vector*)(&" << lref << "), &" << lo
+             << ", &" << hi << ");\n";
+    else
+      stream << "tl_hvx_widen_hf(tl_hvx_loadu(&" << lref << "), &" << lo << ", &"
+             << hi << ");\n";
     return {lo, hi, false};
   }
   // fp16<->fp32 casts are transparent (internal compute is fp32).

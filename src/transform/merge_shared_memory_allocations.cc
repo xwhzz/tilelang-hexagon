@@ -1636,13 +1636,20 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
     bool preserve_aliases = true;
+    int eff_align = align_bytes;
     if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
       preserve_aliases = target.value()->kind->name != "webgpu";
+      // Hexagon: align merged VTCM tiles to the 128-byte HVX vector so the
+      // elementwise codegen vectorizer can emit aligned vmem (not vmemu), and so
+      // a small (e.g. fp32) tile between two fp16 tiles can't push the next off
+      // 128-byte alignment.
+      if (target.value()->kind->name == "hexagon" && eff_align < 128)
+        eff_align = 128;
     }
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocations(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
-        align_bytes, debug_merge_shared_memory_allocations, preserve_aliases,
+        eff_align, debug_merge_shared_memory_allocations, preserve_aliases,
         disable_reuse);
     return f;
   };

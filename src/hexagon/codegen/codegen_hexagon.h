@@ -94,6 +94,12 @@ private:
                        arith::Analyzer *ana);
   HvxLanes EmitHvxOp(const HvxLanes &a, const HvxLanes &b, const char *fn);
   HvxLanes EmitHvxUnary(const HvxLanes &a, const char *fn);
+  // Whether a vectorized access buf[idx] (idx = base + j, j stepping 64 fp16) is
+  // 128-byte (HVX vector) aligned: shared VTCM tiles are merge-aligned to 128,
+  // so it reduces to base % 64 == 0 (provable via the analyzer).  Drives the
+  // aligned-vmem vs unaligned-vmemu choice.
+  bool AccessAligned128(const BufferNode *buf, const PrimExpr &idx,
+                        const tirx::Var &j, arith::Analyzer *ana);
 };
 
 } // namespace codegen
