@@ -11,6 +11,7 @@ for how the adaptation works.
 | `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
 | `example_flash_attention.py` | two HMX gemms + an HVX online softmax, composed on-chip |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
+| `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) — the basis beyond softmax |
 
 ## Prerequisites
 
@@ -34,6 +35,7 @@ cd examples/hexagon
 python example_matmul.py --m 256 --n 256 --k 256 --block 64
 python example_flash_attention.py --seq 256
 python example_worker_pool.py
+python example_rmsnorm.py --m 64 --n 256
 ```
 
 ## Expected output
@@ -45,6 +47,8 @@ flash attention (M=64, SEQ=256, BN=64, D=64) on HMX+HVX: max abs err = 7.492e-05
 
 [1] batched matmul (6x 128x128x128) across 6 workers: max abs err = 0.0009701  (PASS)
 [2] compute-heavy HVX grid: num_workers=1 1056 ms  num_workers=6 272 ms  ->  3.89x
+
+RMSNorm (M=64, N=256) on HVX: max abs err = 0.001996  (PASS)
 ```
 
 (Errors are fp16 rounding; the matmul runs the HMX engine at ~17 TFLOPS, and the

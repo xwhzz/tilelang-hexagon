@@ -555,6 +555,34 @@ bool MatchExpCall(const CallNode *call, PrimExpr *arg, bool *base_e) {
   }
   return false;
 }
+
+// Match a sqrt call: the op-level tl.ieee_fsqrt or — after intrinsic lowering —
+// the call_extern to sqrtf/sqrt.  Sets *arg to the operand.
+bool MatchSqrtCall(const CallNode *call, PrimExpr *arg) {
+  if (call->args.size() == 1 && call->op.same_as(Op::Get("tl.ieee_fsqrt"))) {
+    *arg = call->args[0];
+    return true;
+  }
+  if (call->args.size() == 2) {
+    if (const auto *s = call->args[0].as<StringImmNode>())
+      if (s->value == "sqrtf" || s->value == "sqrt") {
+        *arg = call->args[1];
+        return true;
+      }
+  }
+  return false;
+}
+
+// Match the rsqrt idiom 1.0 / sqrt(arg) (what T.rsqrt lowers to: 1.0f /
+// sqrtf(x)).  Emitting tl_hvx_rsqrt_vsf(arg) directly is one HVX op and more
+// accurate than recip(sqrt(arg)).
+bool MatchRsqrt(const DivNode *d, PrimExpr *arg) {
+  const auto *num = d->a.as<FloatImmNode>();
+  if (!num || num->value != 1.0)
+    return false;
+  const auto *call = d->b.as<CallNode>();
+  return call && MatchSqrtCall(call, arg);
+}
 } // namespace
 
 void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
@@ -638,8 +666,12 @@ bool CodeGenTileLangHexagon::HvxExprSupported(const PrimExpr &e,
     return HvxExprSupported(s->a, j, ana) && HvxExprSupported(s->b, j, ana);
   if (const auto *m = e.as<MulNode>())
     return HvxExprSupported(m->a, j, ana) && HvxExprSupported(m->b, j, ana);
-  if (const auto *d = e.as<DivNode>())
+  if (const auto *d = e.as<DivNode>()) {
+    PrimExpr sa;
+    if (MatchRsqrt(d, &sa)) // 1/sqrt(x) -> rsqrt(x)
+      return HvxExprSupported(sa, j, ana);
     return HvxExprSupported(d->a, j, ana) && HvxExprSupported(d->b, j, ana);
+  }
   if (const auto *call = e.as<CallNode>()) {
     PrimExpr arg;
     bool base_e;
@@ -721,6 +753,9 @@ CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
     return EmitHvxOp(la, lb, "tl_hvx_mul_sf");
   }
   if (const auto *d = e.as<DivNode>()) {
+    PrimExpr sa;
+    if (MatchRsqrt(d, &sa)) // 1/sqrt(x) -> rsqrt(x) directly (one op, accurate)
+      return EmitHvxUnary(EmitHvxExpr(sa, j, ana), "tl_hvx_rsqrt_vsf");
     HvxLanes la = EmitHvxExpr(d->a, j, ana), lb = EmitHvxExpr(d->b, j, ana);
     return EmitHvxOp(la, EmitHvxUnary(lb, "tl_hvx_recip_vsf"), "tl_hvx_mul_sf");
   }
