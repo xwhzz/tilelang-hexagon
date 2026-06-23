@@ -41,7 +41,7 @@ python example_worker_pool.py
 ```
 matmul 256x256x256 (block 64) on HMX: max abs err = 0.001947  (PASS)
 
-flash attention (M=64, SEQ=256, BN=64, D=64) on HMX: max abs err = 8.042e-05  (PASS)
+flash attention (M=64, SEQ=256, BN=64, D=64) on HMX+HVX: max abs err = 7.492e-05  (PASS)
 
 [1] batched matmul (6x 128x128x128) across 6 workers: max abs err = 0.0009701  (PASS)
 [2] compute-heavy HVX grid: num_workers=1 1056 ms  num_workers=6 272 ms  ->  3.89x
@@ -56,7 +56,10 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   helps HVX-heavy and batched/multi-block work; a single HMX-bound matmul is limited
   by the one matrix engine (the spinlock serializes the MACs). The compute-heavy demo
   is HVX-bound, so its speedup is visible end-to-end.
-- The flash-attention softmax is written as explicit `T.serial` loops (not `T.reduce`)
-  because the backend has no single-thread fragment-layout inference yet — see the
-  kernel comments and the adaptation doc.
+- The flash-attention softmax runs on **HVX**: the elementwise `T.serial` maps
+  (`exp`, rescale, `/l`) are vectorized to 64-lane HVX by the Hexagon codegen, and the
+  row reductions go through the reduce tile op (`hexreduce`). It's spelled with explicit
+  `T.serial` loops + a direct reduce call rather than `T.reduce_max`/`T.Parallel`
+  because the backend has no single-thread fragment-layout inference — see the kernel
+  comments and the adaptation doc.
 - If a run reports an agent/VTCM error, clear stale agents: `adb shell pkill -f _agent`.
