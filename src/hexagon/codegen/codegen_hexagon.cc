@@ -518,6 +518,40 @@ CodeGenTileLangHexagon::PrintTernaryCondExpr(const T *op, const char *compare,
 // ---------------------------------------------------------------------------
 namespace {
 constexpr int kHvxF16Lanes = 64; // 1024-bit HVX register / 16-bit lane
+
+// Match an exp call in either form: the op-level intrinsic (tl.__exp base-2 /
+// tirx.exp base-e) or — after the pipeline's intrinsic lowering — the
+// call_extern to the libm symbol (exp2f / expf).  Sets *arg to the operand and
+// *base_e true for base-e (which the emitter rescales by log2e before exp2).
+bool MatchExpCall(const CallNode *call, PrimExpr *arg, bool *base_e) {
+  if (call->args.size() == 1) {
+    if (call->op.same_as(Op::Get("tl.__exp"))) {
+      *arg = call->args[0];
+      *base_e = false;
+      return true;
+    }
+    if (call->op.same_as(Op::Get("tirx.exp"))) {
+      *arg = call->args[0];
+      *base_e = true;
+      return true;
+    }
+  }
+  if (call->args.size() == 2) {
+    if (const auto *s = call->args[0].as<StringImmNode>()) {
+      if (s->value == "exp2f") {
+        *arg = call->args[1];
+        *base_e = false;
+        return true;
+      }
+      if (s->value == "expf") {
+        *arg = call->args[1];
+        *base_e = true;
+        return true;
+      }
+    }
+  }
+  return false;
+}
 } // namespace
 
 void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
@@ -610,9 +644,10 @@ bool CodeGenTileLangHexagon::HvxExprSupported(const PrimExpr &e,
   if (const auto *d = e.as<DivNode>())
     return HvxExprSupported(d->a, j, ana) && HvxExprSupported(d->b, j, ana);
   if (const auto *call = e.as<CallNode>()) {
-    if (call->args.size() == 1 && (call->op.same_as(Op::Get("tl.__exp")) ||
-                                   call->op.same_as(Op::Get("tirx.exp"))))
-      return HvxExprSupported(call->args[0], j, ana);
+    PrimExpr arg;
+    bool base_e;
+    if (MatchExpCall(call, &arg, &base_e))
+      return HvxExprSupported(arg, j, ana);
     return false;
   }
   return false;
@@ -693,9 +728,12 @@ CodeGenTileLangHexagon::EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
     return EmitHvxOp(la, EmitHvxUnary(lb, "tl_hvx_recip_vsf"), "tl_hvx_mul_sf");
   }
   if (const auto *call = e.as<CallNode>()) {
-    HvxLanes arg = EmitHvxExpr(call->args[0], j, ana);
-    if (call->op.same_as(Op::Get("tirx.exp"))) {
-      // base-e: exp(x) = exp2(x * log2e); base-2 (tl.__exp) needs no rescale.
+    PrimExpr arg_expr;
+    bool base_e;
+    ICHECK(MatchExpCall(call, &arg_expr, &base_e)); // detection guaranteed a match
+    HvxLanes arg = EmitHvxExpr(arg_expr, j, ana);
+    if (base_e) {
+      // base-e: exp(x) = exp2(x * log2e); base-2 (exp2f/tl.__exp) needs no rescale.
       std::string s = name_supply_->FreshName("tl_b");
       PrintIndent();
       stream << "HVX_Vector " << s
