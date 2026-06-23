@@ -243,7 +243,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
     // (2) worker callback: unpack params into same-named locals (so the body emits
     //     unchanged), then run the grid with the OUTERMOST block loop strided across
     //     workers (wp_outermost_pending_ tells the AttrStmt handler).
-    stream << "static void " << name
+    stream << "static int " << name
            << "_worker(void* tl_p, int tl_wid, int tl_nw) {\n";
     stream << "  " << name << "_args_t* tl_a = (" << name << "_args_t*)tl_p;\n";
     for (size_t i = 0; i < f->params.size(); ++i) {
@@ -256,9 +256,10 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
       // the session thread (worker 0 / inline fallback) which session_init already
       // enabled — keyed on tid so it's exactly once per thread.
       stream << "  int tl_en = (qurt_thread_get_id() != tl_hmx_session_tid);\n";
-      // Refuse (skip this worker's blocks) rather than run MACs with HMX unlocked if
-      // the per-thread enable fails — mirrors the template-path worker.
-      stream << "  if (tl_en && tl_hmx_enable() != 0) return;\n";
+      // Refuse rather than run MACs with HMX unlocked if the per-thread enable
+      // fails; the nonzero code is OR-reduced by tl_parallel into the entry's
+      // return, so the host sees a clean failure instead of partial output.
+      stream << "  if (tl_en && tl_hmx_enable() != 0) return TL_ERR_HMX;\n";
     }
     this->PreFunctionBody(f);
     wp_emit_ = true;
@@ -276,10 +277,19 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
     wp_outermost_pending_ = false;
     if (wp_uses_hmx_)
       stream << "  if (tl_en) tl_hmx_disable();\n";
+    stream << "  return TL_OK;\n";
     stream << "}\n";
     // (3) entry: build the args struct and dispatch (workers capped by HW threads).
     this->PrintFuncPrefix(stream);
-    CodeGenC::PrintType(f->ret_type, stream);
+    // The kernel entry returns an int32 status (0 = ok).  f->ret_type is void
+    // here: for the Hexagon device target SplitHostDevice does NOT take its int32
+    // error-propagation path (verified — PrintType(f->ret_type) emits `void`), so
+    // it appends no ret(0) and leaves the type void.  The codegen therefore
+    // declares the status type itself and emits the `return`s explicitly below, at
+    // controlled points — notably AFTER tl_hmx_disable in the worker callback (a
+    // framework-appended ret(0) would land before it and skip the disable).  The
+    // skel maps a nonzero return to AEE_EFAILED.
+    stream << "int32_t";
     this->PrintExtraAttrs(f, stream);
     stream << " " << name << "(";
     emit_signature();
@@ -295,17 +305,18 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
       // Cap workers so nw private VTCM regions (wp_stride_ bytes each) fit alongside
       // the reserved scale tile.  The compile-time guard above is against an 8MB
       // constant; here we check the ACTUAL runtime grant.  If not even one region
-      // fits (smaller SKU / partial VTCM grant), skip the dispatch rather than let a
-      // worker write past the arena.
+      // fits (smaller SKU / partial VTCM grant), fail with TL_ERR_VTCM rather than
+      // run a partial grid or let a worker write past the arena.
       stream << "  tl_vtcm_acquire();\n";
       stream << "  if ((size_t)tl_vtcm_total >= 2048u + " << wp_stride_ << "u) {\n";
       stream << "    unsigned tl_cap = (unsigned)((tl_vtcm_total - 2048u) / "
              << wp_stride_ << "u);\n";
       stream << "    if ((unsigned)tl_nw > tl_cap) tl_nw = (int)tl_cap;\n";
-      stream << "    tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
+      stream << "    return tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
       stream << "  }\n";
+      stream << "  return TL_ERR_VTCM;\n";
     } else {
-      stream << "  tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
+      stream << "  return tl_parallel(" << name << "_worker, &tl_args, tl_nw);\n";
     }
     stream << "}\n\n";
     return;
@@ -313,7 +324,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
 
   // Serial path (single HW thread): the grid lowers to nested for-loops.
   this->PrintFuncPrefix(stream);
-  CodeGenC::PrintType(f->ret_type, stream);
+  stream << "int32_t"; // int32 status (see worker-pool entry); body emits return TL_OK
   this->PrintExtraAttrs(f, stream);
   stream << " " << name << "(";
   emit_signature();
@@ -321,6 +332,10 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
   this->PrintStmt(f->body);
+  // VTCM is acquired+checked once at session _open and held, so a serial kernel
+  // can't fail mid-run here; emit success.  (Worker-pool entries return earlier.)
+  this->PrintIndent();
+  this->stream << "return TL_OK;\n";
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";

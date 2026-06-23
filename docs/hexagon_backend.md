@@ -210,6 +210,14 @@ loops, and the gemm as a single `tl_hexagon_hmx_gemm(&C, &A, &B, 64,64,256, 0,0)
 - **Make it idiomatic** (a tile-op instead of `call_extern`): register a
   `GemmBase`-style impl + `register_gemm_impl` (see `gemm_hmx.py`), so `T.gemm` lowers
   to it directly.
+- **Surface a device-side failure** (VTCM/HMX unavailable, an unmet precondition):
+  the generated kernel entry returns an `int32` status — `TL_OK` / `TL_ERR_VTCM` /
+  `TL_ERR_HMX` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel the worker
+  callback returns the code and `tl_parallel` OR-reduces them into the entry. The
+  FastRPC skel maps any nonzero to `AEE_EFAILED`, so the host's `run()` *raises* rather
+  than returning unwritten/partial output (the silent-wrong-output trap). The codegen
+  emits the `return`s; a new recipe that can fail should return a nonzero code rather
+  than fault or skip silently.
 - **Validate** with the `HexagonKernelAdapter` + a small torch reference (the
   `test_*.py` pattern). The persistent agent (`agent.py`) makes the build→deploy→run
   loop ~5 ms instead of ~170 ms per call.
@@ -222,7 +230,9 @@ loops, and the gemm as a single `tl_hexagon_hmx_gemm(&C, &A, &B, 64,64,256, 0,0)
 and flash attention, HVX-vectorized data movement, `@tilelang.jit(target="hexagon")`,
 and a full **1-HMX/6-HVX worker pool** that parallelizes any multi-block kernel via
 `T.Kernel(num_workers=N)` — including `alloc_shared` blocks (per-worker VTCM) and
-`T.gemm` (per-worker scratch), with a persistent pool (2–4.5× speedups).
+`T.gemm` (per-worker scratch), with a persistent pool (2–4.5× speedups). Unrecoverable
+device conditions (VTCM grant too small, per-worker HMX enable fails) propagate to the
+host as a raised error via the int32 kernel-status ABI rather than silent wrong output.
 
 **Optional, not yet done:** a qtimer path to measure *codegen-kernel* speedups
 on-device (today only the standalone HMX bench is qtimer-instrumented); autotune

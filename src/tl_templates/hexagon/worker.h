@@ -23,8 +23,10 @@
 #define TL_MAX_WORKERS 6
 #define TL_WORKER_STACK_SZ (2 * 16384) // 32 KiB/worker (htp-ops-lib default)
 
-// Worker callback: (ctx, worker id in [0,nw), total worker count nw).
-typedef void (*tl_worker_fn)(void *ctx, int wid, int nw);
+// Worker callback: (ctx, worker id in [0,nw), total worker count nw).  Returns a
+// status code (0 = ok); tl_parallel OR-reduces the workers' codes so a per-worker
+// device failure (e.g. HMX enable) propagates to the kernel entry and the host.
+typedef int (*tl_worker_fn)(void *ctx, int wid, int nw);
 
 // Number of HW threads available, clamped to [1, TL_MAX_WORKERS].  This is the
 // worker count: == HVX context count on the target, so HVX is never oversubscribed.
@@ -57,13 +59,16 @@ static struct {
   int tried;                     // spawn attempted (so a failed spawn isn't retried/leaked)
   qurt_thread_t th[TL_MAX_WORKERS];
   void *blob;                    // one stack blob for the spawned workers
+  int status[TL_MAX_WORKERS];    // worker w's return; dispatcher reads it after the join
 } tl_pool;
 
 static void tl_pool_worker(void *arg) {
   int wid = (int)(intptr_t)arg; // 1..spawned, fixed for this thread's life
   for (;;) {
     qurt_sem_down(&tl_pool.go[wid]); // BLOCK until released for a job
-    tl_pool.fn(tl_pool.ctx, wid, tl_pool.nw);
+    // Publish status[wid] BEFORE the done-up: the dispatcher reads it only after
+    // the matching done-down, so the up/down pair orders this write to its read.
+    tl_pool.status[wid] = tl_pool.fn(tl_pool.ctx, wid, tl_pool.nw);
     qurt_sem_up(&tl_pool.done);
   }
 }
@@ -107,10 +112,8 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
     nw = 1;
   if (nw > TL_MAX_WORKERS)
     nw = TL_MAX_WORKERS;
-  if (nw == 1) {
-    fn(ctx, 0, 1);
-    return 0;
-  }
+  if (nw == 1)
+    return fn(ctx, 0, 1);
   if (!tl_pool.tried)
     tl_pool_spawn(); // lazy, once per session (tried set even on failure, no retry)
   int pooled = nw - 1;
@@ -121,12 +124,14 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
   tl_pool.nw = nw;
   for (int w = 1; w <= pooled; ++w)
     qurt_sem_up(&tl_pool.go[w]); // release the pooled workers
-  fn(ctx, 0, nw);                // worker 0 on the calling thread
+  int rc = fn(ctx, 0, nw);       // worker 0 on the calling thread
   for (int w = pooled + 1; w < nw; ++w)
-    fn(ctx, w, nw); // overflow (fewer spawned than requested) runs inline
+    rc |= fn(ctx, w, nw); // overflow (fewer spawned than requested) runs inline
   for (int w = 1; w <= pooled; ++w)
     qurt_sem_down(&tl_pool.done); // wait for the pooled workers
-  return 0;
+  for (int w = 1; w <= pooled; ++w)
+    rc |= tl_pool.status[w]; // join established happens-before; OR-reduce their codes
+  return rc;
 }
 
 // --- threading selftest: proves dispatch + worker count run on-device, in
@@ -136,10 +141,11 @@ typedef struct {
   float *out;
   int n;
 } tl_worker_selftest_ctx_t;
-static void tl_worker_selftest_body(void *ctx, int wid, int nw) {
+static int tl_worker_selftest_body(void *ctx, int wid, int nw) {
   tl_worker_selftest_ctx_t *c = (tl_worker_selftest_ctx_t *)ctx;
   if (wid < c->n)
     c->out[wid] = (float)((wid + 1) * 100 + nw); // distinct slot per worker
+  return 0;
 }
 // out[0..nw-1] = (wid+1)*100+nw (each by a distinct worker); out[n-1] = nw; the
 // remaining slots stay -1, so the host can verify exactly nw workers ran.

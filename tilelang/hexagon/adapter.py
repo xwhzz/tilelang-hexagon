@@ -26,9 +26,10 @@ from .build import build_cmake_fastrpc
 from .device import AdbConnection, HexagonConnection
 from .env import HexagonSDK
 
-# The kernel entry is the non-static `void name(...)`; skip `static void` helpers
-# (e.g. the worker-pool callback `<name>_worker` emitted before the entry).
-_KERNEL_RE = re.compile(r"(?<!static )\bvoid\s+(\w+)\s*\(")
+# The kernel entry is the non-static generated function.  Hexagon kernels return
+# int32_t so the FastRPC skel can propagate failures; older/source kernels may
+# still be void.  Skip static helpers such as `<name>_worker`.
+_KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def _kernel_name(source: str) -> str:

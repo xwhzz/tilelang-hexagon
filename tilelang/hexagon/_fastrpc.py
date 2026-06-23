@@ -149,6 +149,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     return (
         "// Auto-generated FastRPC skel impl for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n"
+        "#include <type_traits>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
         f"{vtcm_include}"
         f"{worker_include}"
@@ -156,12 +157,22 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{hvx_include}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
+        "template <typename Fn>\n"
+        "static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {\n"
+        "  if constexpr (std::is_void_v<decltype(fn())>) {\n"
+        "    fn();\n"
+        "    return AEE_SUCCESS;\n"
+        "  } else {\n"
+        "    int tl_rc = (int)fn();\n"
+        "    return tl_rc == 0 ? AEE_SUCCESS : AEE_EFAILED;\n"
+        "  }\n"
+        "}\n\n"
         "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
         f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}{hmx_check}{vtcm_check}return AEE_SUCCESS; }}\n"
         f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}{vtcm_close}return AEE_SUCCESS; }}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
-        f"  {kernel_name}({', '.join(call_args)});\n"
-        "  return AEE_SUCCESS;\n}\n\n"
+        f"  return tl_hexagon_forward_kernel_status([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
+        "}\n\n"
         "#ifdef __cplusplus\n}\n#endif\n"
     )
 
