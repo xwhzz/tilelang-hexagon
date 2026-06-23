@@ -43,7 +43,7 @@ def _normalize_for_json(value):
 
 def _resolve_cache_dispatch(
     target: str | Target | None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "hexagon"] | None,
     verbose: bool | None,
 ):
     if target is None:
@@ -105,7 +105,7 @@ def cached(
     *args,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "hexagon"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
@@ -133,7 +133,7 @@ def load_frontend_cached(
     out_idx: list[int] | int | None = None,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "hexagon"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
@@ -167,7 +167,7 @@ def store_frontend_cache(
     out_idx: list[int] | int | None = None,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "hexagon"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
