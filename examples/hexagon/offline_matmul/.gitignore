@@ -1,0 +1,3 @@
+# Generated build tree + artifacts (reproduce with `python generate.py`).
+project/
+generated_matmul_kernel.c

@@ -12,6 +12,7 @@ for how the adaptation works.
 | `example_flash_attention.py` | two HMX gemms + an HVX online softmax, composed on-chip |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
 | `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) — the basis beyond softmax |
+| `offline_matmul/` | the generated kernel built with the **bare Hexagon SDK** + run on device vs a golden reference (no `tilelang.compile` in the loop) |
 
 ## Prerequisites
 
