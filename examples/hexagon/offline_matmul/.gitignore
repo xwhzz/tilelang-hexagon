@@ -1,3 +1,8 @@
-# Generated build tree + artifacts (reproduce with `python generate.py`).
-project/
-generated_matmul_kernel.c
+# The generated C project (project/*.idl, *_dsp.cc, *_host.c, *_agent.c,
+# CMakeLists.txt) and generated_matmul_kernel.c ARE committed (the pre-done
+# codegen).  Ignore only what reproduce.sh produces at build/run time:
+project/hexagon_*/
+project/android_*/
+project/*.bin
+project/ref.npy
+project/C.bin

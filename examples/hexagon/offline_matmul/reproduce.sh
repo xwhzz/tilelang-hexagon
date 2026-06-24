@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Offline reproduce: generated Hexagon matmul kernel -> SDK build -> run on NPU -> compare golden.
 #
-# Prerequisites (see README.md):
+# NO tilelang needed: the codegen (generate.py) is pre-done and the project C is
+# committed.  Prerequisites (see README.md):
 #   - Hexagon SDK build env on PATH (build_cmake, qaic, hexagon-clang++, NDK) — source your SDK env.
-#   - tilelang importable (for step 1 codegen only) + numpy.
+#   - python + numpy (for the golden inputs + the comparison).
 #   - An authorized adb device (`adb devices`).
 #
 #   bash reproduce.sh            # arch defaults to v79; override: HEXAGON_DSP_ARCH=v73 bash reproduce.sh
@@ -15,9 +16,10 @@ IFACE=tl_matmul_kernel
 
 command -v build_cmake >/dev/null || { echo "build_cmake not on PATH — source your Hexagon SDK env first"; exit 1; }
 command -v adb >/dev/null || { echo "adb not found"; exit 1; }
+[ -f "project/${IFACE}_dsp.cc" ] || { echo "committed project missing — run 'python generate.py' once (needs tilelang)"; exit 1; }
 
-echo "== 1/4  generate project + golden (tilelang lower -> FastRPC project) =="
-python generate.py
+echo "== 1/4  golden inputs (numpy only; the tilelang codegen is pre-done in ./project) =="
+python golden.py
 
 echo "== 2/4  build DSP skel + aarch64 host with the Hexagon SDK =="
 # A host toolchain env (e.g. a conda env with compilers) must NOT leak into the

@@ -1,28 +1,31 @@
-"""Generate a self-contained FastRPC project for a Hexagon HMX matmul — no device.
+"""Pre-generate the FastRPC project — the ONE step that needs tilelang.
 
-Lowers the SAME tilelang matmul you'd write for a GPU to cDSP C, then emits the
-full FastRPC project (IDL + skel + host driver + agent + CMakeLists) under
-``./project/``.  Also writes golden inputs (A.bin, B.bin) and the fp32 reference
-(ref.npy) for the on-device comparison, and a readable snapshot of the generated
-device kernel (generated_matmul_kernel.c).
+Run this in advance (where tilelang is installed); its output is committed, so the
+offline build/run needs only the Hexagon SDK + adb + numpy, never tilelang.  Re-run
+it only when you change the kernel.
 
-This is the offline counterpart to ``example_matmul.py``: that one calls
-``tilelang.compile`` (build + deploy + run in one shot); here we stop at codegen
-so ``reproduce.sh`` can build it with the bare Hexagon SDK and run it by hand.
+Emits, under ./project/ :  <iface>.idl, <iface>_dsp.cc (skel + kernel),
+<iface>_host.c, <iface>_agent.c, CMakeLists.txt  — plus a readable
+generated_matmul_kernel.c.  The absolute tl_templates include that write_project
+bakes in (this checkout's path) is rewritten to a repo-relative one so the
+committed CMakeLists builds on any checkout.
 
-    python generate.py          # -> ./project/ + A.bin/B.bin/ref.npy
+    python generate.py
 """
 import os
 
-import numpy as np
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
+from tilelang.env import TILELANG_TEMPLATE_PATH
 from tilelang.hexagon import _fastrpc
 
 M = N = K = 256
 BM = BN = 64
 HERE = os.path.dirname(os.path.abspath(__file__))
+# project/CMakeLists.txt sits at examples/hexagon/offline_matmul/project — four
+# levels under the repo root, whose `src/` is the parent of `tl_templates/`.
+REL_SRC = "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src"
 
 
 def make_matmul():
@@ -48,21 +51,22 @@ def main():
         os.path.join(HERE, "project"), "matmul_kernel",
         res.kernel_source, res.params, result_idx=[2])
 
-    # Golden: fixed-seed fp16 inputs + the fp32 reference (host side).
-    rng = np.random.default_rng(0)
-    A = (rng.standard_normal((M, K), dtype=np.float32) * 0.25).astype(np.float16)
-    B = (rng.standard_normal((K, N), dtype=np.float32) * 0.25).astype(np.float16)
-    A.tofile(os.path.join(proj, "A.bin"))
-    B.tofile(os.path.join(proj, "B.bin"))
-    np.save(os.path.join(proj, "ref.npy"), A.astype(np.float32) @ B.astype(np.float32))
+    # Rewrite the baked-in absolute template include to a repo-relative path so the
+    # committed CMakeLists is portable across checkouts/machines.
+    cml = os.path.join(proj, "CMakeLists.txt")
+    with open(cml) as f:
+        txt = f.read()
+    txt = txt.replace(TILELANG_TEMPLATE_PATH, REL_SRC)
+    with open(cml, "w") as f:
+        f.write(txt)
 
     with open(os.path.join(HERE, "generated_matmul_kernel.c"), "w") as f:
         f.write(res.kernel_source)
 
-    print(f"project : {proj}  (iface = {iface})")
-    print(f"files   : {sorted(os.listdir(proj))}")
-    print(f"golden  : A.bin B.bin ({M}x{K}, {K}x{N} fp16)  ref.npy ({M}x{N} fp32)")
-    print(f"kernel  : generated_matmul_kernel.c")
+    print(f"generated project : {proj}  (iface = {iface})")
+    print(f"committed C       : CMakeLists.txt, {iface}.idl, {iface}_dsp.cc, "
+          f"{iface}_host.c, {iface}_agent.c, generated_matmul_kernel.c")
+    print(f"portable include  : {REL_SRC}")
 
 
 if __name__ == "__main__":

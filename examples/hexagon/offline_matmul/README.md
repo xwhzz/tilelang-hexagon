@@ -1,25 +1,28 @@
 # Offline matmul — generated kernel → SDK build → run on NPU → compare golden
 
 The offline counterpart to [`../example_matmul.py`](../example_matmul.py). That one
-calls `tilelang.compile` and does build + deploy + run in one shot; here we **stop at
-codegen** and drive the bare Hexagon SDK by hand, so you can see the generated C as a
-buildable FastRPC project and run it on the device without tilelang in the loop.
+calls `tilelang.compile` and does build + deploy + run in one shot. Here the **tilelang
+codegen is done in advance and committed** (`project/`), so the build + run + compare
+path needs **only the Hexagon SDK + adb + numpy — not tilelang**.
 
 ```
 offline_matmul/
-  generate.py     # tilelang lower -> ./project/ (IDL+skel+host+agent+CMake) + golden A.bin/B.bin/ref.npy
-  reproduce.sh    # generate -> build_cmake (DSP+host) -> adb push/run -> verify
+  project/        # the generated FastRPC project (IDL + skel + host + agent + CMake) — COMMITTED
+  generate.py     # run-in-advance (needs tilelang): regenerate project/ when you change the kernel
+  golden.py       # (numpy) write project/A.bin, project/B.bin, project/ref.npy
+  reproduce.sh    # golden -> build_cmake (DSP + host) -> adb push/run -> verify   (no tilelang)
   verify.py       # compare project/C.bin against project/ref.npy
-  project/         # generated FastRPC project + build output  (git-ignored; reproduce with generate.py)
 ```
 
-## Prerequisites
+## Prerequisites (to build + run)
 
 - The **Hexagon SDK build env** on `PATH` (`build_cmake`, `qaic`, `hexagon-clang++`, the
   Android NDK) — source your SDK's `setup_sdk_env.source` (on this host: `source /tmp/hexenv.sh`).
-- **tilelang** importable + **numpy** — only for step 1 (the codegen). On this host that's
-  the `tl` conda env.
+- **python + numpy** — for the golden inputs and the comparison (no tilelang).
 - An **authorized adb device** (`adb devices`), e.g. a Snapdragon 8 Elite / Hexagon v79.
+
+> Only `generate.py` needs **tilelang** — and it's already been run; its output is the
+> committed `project/`. Re-run it (`python generate.py`) only if you change the kernel.
 
 ## Run
 
@@ -42,9 +45,10 @@ offline matmul 256x256x256 on HMX vs golden: max abs err = 0.0009761  (PASS)
 
 ## What each step does
 
-1. **generate** — `tilelang.lower(..., target="hexagon")` (Layers 1–3) produces the cDSP C;
-   `_fastrpc.write_project` (Layer 5) wraps it into a FastRPC project. The generated device
-   kernel is also written to `generated_matmul_kernel.c` for inspection — the whole `T.gemm`
+0. **generate (pre-done, committed)** — `python generate.py` ran `tilelang.lower(..., target="hexagon")`
+   (Layers 1–3 → cDSP C) and `_fastrpc.write_project` (Layer 5 → FastRPC project), then patched the
+   `CMakeLists` include to a repo-relative path. Its output is the committed `project/` +
+   `generated_matmul_kernel.c`. You only re-run it if you change the kernel. The whole `T.gemm`
    is one call:
 
    ```c
@@ -62,6 +66,8 @@ offline matmul 256x256x256 on HMX vs golden: max abs err = 0.0009761  (PASS)
    }
    ```
 
+1. **golden** — `golden.py` (numpy) writes fixed-seed fp16 `A.bin`/`B.bin` and the fp32
+   reference `ref.npy` into `project/`.
 2. **build** — `build_cmake hexagon DSP_ARCH=v79` runs `qaic` on the IDL and compiles the
    skel with `hexagon-clang++ -mhmx -mhvx` → `libtl_matmul_kernel_skel.so` (cDSP ELF);
    `build_cmake android` builds the aarch64 host driver `tl_matmul_kernel_test`.

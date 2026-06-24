@@ -1,0 +1,10 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface tl_matmul_kernel : remote_handle64 {
+   AEEResult run(
+      in sequence<uint8> p0,
+      in sequence<uint8> p1,
+      rout sequence<uint8> p2
+   );
+};
