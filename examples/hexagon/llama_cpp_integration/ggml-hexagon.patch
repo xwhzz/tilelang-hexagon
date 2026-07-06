@@ -1,0 +1,56 @@
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 9f9471f..1db98d9 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -12,6 +12,11 @@ include_directories(
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_BINARY_DIR})
+ 
++# tilelang runtime templates (hmx.h / vtcm.h / common.h) for the MM_SELECT=4 path
++include_directories(
++    /home/xwh/tilelang-hexagon/src
++    /home/xwh/tilelang-hexagon/src/tl_templates/hexagon)
++
+ set(HTP_LIB ggml-htp-${DSP_VERSION})
+ 
+ add_library(${HTP_LIB} SHARED
+@@ -41,8 +46,12 @@ add_library(${HTP_LIB} SHARED
+     pad-ops.c
+     matmul-ops.c
+     flash-attn-ops.c
++    tl_ggml_matmul.cc
+ )
+ 
++# hmx.h carries unused static helpers; this TU only uses a few of them.
++set_source_files_properties(tl_ggml_matmul.cc PROPERTIES COMPILE_OPTIONS "-Wno-unused-function")
++
+ target_compile_definitions(${HTP_LIB} PRIVATE
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>)
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 79c292d..3fc1fef 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -21,6 +21,7 @@
+ #include "htp-ops.h"
+ #include "matmul-ops.h"
+ #include "vtcm-utils.h"
++#include <tl_templates/hexagon/tl_embed.h>   // tilelang embedding: op ctx + registry
+ 
+ static void hvx_tensor_add_f32_grid(
+     const struct htp_tensor * restrict dst,
+@@ -2160,6 +2161,14 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                                   int tile_size,
+                                   int aligned_tile_size,
+                                   int vtcm_size) {
++    // tilelang embedding: offer this op to the registry; 0 = a tilelang op ran,
++    // -1 = none matched -> fall through to the stock HMX kernel below.
++    {
++        struct tl_op_ctx octx = { ctx->vtcm_base, ctx->vtcm_size, ctx->vtcm_rctx,
++                                  TL_OP_MATMUL, weight_type, (src2 != NULL),
++                                  dst, activation, weight, m, k, n, act_stride, dst_stride };
++        if (tl_dispatch(&octx) == 0) return 0;
++    }
+     if (k % 32 != 0 || n % 32 != 0) { return -1; }
+     if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
+ 
