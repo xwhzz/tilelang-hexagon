@@ -61,13 +61,26 @@ VTCM (`alloc_shared`) and never hits DDR. `T.gemm` needs `clear_accum=True` on H
 HMX accumulator must be `mxclracc`'d, else NaN).
 
 For **K-streaming** (dequant one K-tile at a time, interleaved with the MAC so it hides under
-the MAC — like ggml-hexagon), the HMX K-loop primitives are exposed in
-`src/tl_templates/hexagon/hmx.h`: `tl_hexagon_hmx_{open,clear,mac,store,close,pack_a,pack_b,
-unpack_c}`. A DSL kernel can drive `clear → (dequant B-tile; pack; MAC) ×K → store` itself.
-**Status: the structure is device-validated correct** (a DSL-driven K-loop matmul and an
-interleaved-dequant q4_0 matmul both pass, rel 2e-4). The perf/hiding optimization
-(whole-register 64-feature dequant slices vs the 32-feature HMX tile; double-buffering;
-worker-pool overlap) is **not yet done** — see §4.
+the MAC — like ggml-hexagon), HMX is modelled as **tile-level ops around the invisible
+accumulator**, not a monolithic `T.gemm`. HMX has no `mma` instruction: loading the
+activation+weight tiles (`mxmem`) is what triggers the MAC, and the accumulator is a single,
+non-addressable per-core register. So the matmul is `begin → clear → (mac per K-tile) →
+store`, and a dequant slots in right before each `mac`. The ops live in
+`tilelang/hexagon/hmx_tile.py` — `hmx.{pack_a, begin, clear, mac, store, end}` — lowering to
+the `tl_hexagon_hmx_*` primitives in `src/tl_templates/hexagon/hmx.h`. See
+`examples/hexagon/example_qmatmul_kstream.py`.
+
+They must be `@T.macro` (they inline into the kernel body): the Crouton-scratch buffer uses
+(`T.address_of`) have to be visible to the eager builder's VTCM liveness/arena analysis, or
+the scratch aliases other `alloc_shared` buffers and you get silent garbage. The caller allocs
+the scratch in the body (like GPU `T.alloc_fragment` for the accumulator) — `hmx.a_tiles(M,K)`
+gives the size. N>32 loops `clear → mac-K → store` per N-tile (one physical accumulator).
+
+**Status: device-validated correct** (DSL-native tile-level K-streaming, single- and
+multi-N-tile, rel 2–4e-4). The perf/hiding optimization (whole-register 64-feature dequant
+slices vs the 32-feature HMX tile — the per-tile dequant is scalar today; double-buffering;
+worker-pool overlap) is **not yet done** — see §4. A first-class `hmx.acc` IR scope (so
+`T.Pipelined` overlaps the dequant automatically) is the deeper follow-up.
 
 ## 4. Honest performance reality (read this before integrating)
 
