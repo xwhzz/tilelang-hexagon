@@ -270,3 +270,65 @@ TL_DEVICE void tl_hvx_rowmax_mat(float *out, const __fp16 *in, int rows, int n) 
 TL_DEVICE void tl_hvx_rowsum_mat(float *out, const __fp16 *in, int rows, int n) {
   for (int i = 0; i < rows; ++i) out[i] = tl_hvx_row_sum(in + (size_t)i * n, n);
 }
+
+// ---------------------------------------------------------------------------
+// q4_0 dequantize -> row-major fp16, vectorized on HVX.  This is the perf-
+// critical "codec" primitive.  The codegen's elementwise vectorizer
+// (EmitHvxExpr) handles fp16 add/sub/mul but NOT the nibble unpack, so the
+// packed->fp16 decode is expressed here as explicit vector ops and reached from
+// the DSL via T.call_extern (a `dequantize` tile op).  Intrinsic sequence
+// mirrors ggml-hexagon's dequantize_tiled_weight_to_fp16_task_q4_0:
+//   vand/vlsr (nibbles) -> vsub 8 -> vshuff (interleave to K order) ->
+//   vunpack b->h (sign-extend) -> hf<-h -> vmpy by per-block scale.
+//
+//   qs : uint8 [N][K/2]  packed nibbles; byte(n,j): low->W[n][2j], high->W[n][2j+1]
+//   sc : fp16  [N][K/32] per-row, per-32-K-block scale
+//   W  : fp16  [N][K]    W[n][k] = ((nibble & 0xF) - 8) * sc[n][k/32]
+// Requires K % 64 == 0 (LFM2 weights: K in {512,2048,8192} all qualify).  One
+// 128-lane op decodes 64 K-values (two scale blocks); the low-32/high-32 lanes
+// take the two blocks' scales via a byte predicate mux.  qs is staged through an
+// aligned buffer so no over-read past the input; W stored unaligned (no base
+// alignment assumption).
+TL_DEVICE void tl_hvx_dequant_q4_0(__fp16 *W, const uint8_t *qs,
+                                   const __fp16 *sc, int N, int K) {
+  const HVX_Vector mask = Q6_Vb_vsplat_R(0x0F);
+  const HVX_Vector i8 = Q6_Vb_vsplat_R(8);
+  const HVX_VectorPred lo32 = Q6_Q_vsetq_R(64); // first 64 bytes = 32 fp16 lanes
+  const int kb = K / 32, ng = K / 64;
+  for (int n = 0; n < N; ++n) {
+    const uint8_t *qrow = qs + (size_t)n * (K / 2);
+    const __fp16 *srow = sc + (size_t)n * kb;
+    __fp16 *wrow = W + (size_t)n * K;
+    for (int g = 0; g < ng; ++g) {
+      __attribute__((aligned(128))) uint8_t tmp[128];
+      __builtin_memcpy(tmp, qrow + g * 32, 32); // 32 bytes = 64 K-values
+      HVX_Vector vq = *(const HVX_Vector *)tmp;
+      HVX_Vector lo = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vq, mask), i8);
+      HVX_Vector hi = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vq, 4), i8);
+      // interleave lo/hi to K order (byte j -> K 2j, 2j+1), then b->h->hf
+      HVX_Vector k64 = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -1));
+      HVX_Vector f16 = Q6_Vhf_equals_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(k64)));
+      uint16_t sa, sb;
+      __builtin_memcpy(&sa, &srow[2 * g], 2);
+      __builtin_memcpy(&sb, &srow[2 * g + 1], 2);
+      HVX_Vector vsc = Q6_V_vmux_QVV(lo32, Q6_Vh_vsplat_R(sa), Q6_Vh_vsplat_R(sb));
+      HVX_Vector res = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(f16, vsc));
+      tl_hvx_storeu(wrow + g * 64, res);
+    }
+  }
+}
+
+// Scalar reference for the same contract (A/B perf baseline == the pre-HVX path).
+TL_DEVICE void tl_hvx_dequant_q4_0_scalar(__fp16 *W, const uint8_t *qs,
+                                          const __fp16 *sc, int N, int K) {
+  for (int n = 0; n < N; ++n) {
+    const uint8_t *qrow = qs + (size_t)n * (K / 2);
+    const __fp16 *srow = sc + (size_t)n * (K / 32);
+    __fp16 *wrow = W + (size_t)n * K;
+    for (int j = 0; j < K / 2; ++j) {
+      uint8_t b = qrow[j];
+      wrow[2 * j] = (__fp16)(((float)(b & 0x0F) - 8.0f) * (float)srow[(2 * j) / 32]);
+      wrow[2 * j + 1] = (__fp16)(((float)(b >> 4) - 8.0f) * (float)srow[(2 * j + 1) / 32]);
+    }
+  }
+}

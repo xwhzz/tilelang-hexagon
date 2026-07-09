@@ -385,6 +385,36 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
   return 0;
 }
 
+// ---- streaming HMX: DSL drives the K-loop (so a dequant can interleave) -------
+// These thin wrappers expose the existing HMX accumulator primitives so a DSL
+// kernel can run the clear->MAC-K->store sequence itself, packing/dequantizing B
+// one K-tile at a time between MACs (dequant of tile kt+1 issues while the HMX
+// MAC of tile kt is in flight -> dequant hides under the MAC, like ggml-hexagon).
+// The DSL owns the Crouton scratch (alloc_shared): a_t [MT*KT tiles], b_t [one or
+// more K-tiles], c_t [one output tile].  TILE = 32; one tile = 1024 fp16 = 2KB.
+// `tl_hexagon_hmx` prefix so _fastrpc.py pulls in this header.
+TL_HMX_INLINE void tl_hexagon_hmx_open(void) {
+  tl_hmx_session_init();                              // idempotent: power/VTCM/HMX + unit scales @ base+0
+  tl_hmx_unit_acquire();
+  tl_hmx_set_scales((const void *)tl_vtcm_base_ptr);  // unit scales @ base+0
+}
+TL_HMX_INLINE void tl_hexagon_hmx_clear(void) { tl_hmx_clear_acc(); }
+TL_HMX_INLINE void tl_hexagon_hmx_mac(const __fp16 *a_tile, const __fp16 *b_tile) {
+  tl_hmx_mac_tiles(a_tile, b_tile, 1);
+}
+TL_HMX_INLINE void tl_hexagon_hmx_store(__fp16 *c_tile) { tl_hmx_store_tile(c_tile); }
+TL_HMX_INLINE void tl_hexagon_hmx_close(void) { tl_hmx_unit_release(); }
+// Pack helpers (row-major fp16 -> Crouton), exposed for the DSL streaming path.
+TL_HMX_INLINE void tl_hexagon_hmx_pack_a(__fp16 *t, const __fp16 *A, int M, int K) {
+  tl_hmx_pack_A(t, A, M, K);
+}
+TL_HMX_INLINE void tl_hexagon_hmx_pack_b(__fp16 *t, const __fp16 *B, int K, int N) {
+  tl_hmx_pack_B(t, B, K, N);
+}
+TL_HMX_INLINE void tl_hexagon_hmx_unpack_c(__fp16 *C, const __fp16 *t, int M, int N) {
+  tl_hmx_unpack_C(C, t, M, N);
+}
+
 // Worker-pool T.gemm: like tl_hexagon_hmx_gemm, but the Crouton scratch is carved
 // TOP-DOWN from `region_end` (the top of THIS worker's VTCM slice) and must stay
 // above `op_floor` (this worker's operand high-water), so concurrent workers' gemms
