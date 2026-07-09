@@ -1,0 +1,15 @@
+{
+  "op": "matmul",
+  "weight_dtype": "q4_0",
+  "M": 32,
+  "N": 128,
+  "K": 2048,
+  "entry": "int32_t qmatmul_compact_kernel(half* A, uint8_t* qcm, half* sc, half* C)",
+  "vtcm_bytes": 667648,
+  "weight_format": {
+    "qcm": "[K/2][N] uint8, column-major packed nibbles (lo->K=2j, hi->K=2j+1)",
+    "sc": "[K/32][N] fp16, per-32K-block scales (compact, resident-friendly)"
+  },
+  "call": "under tl_bridge_enter(vtcm_base, vtcm_size); qmatmul_kernel(act, qcm, sc, out)",
+  "note": "fixed shape; one emit per matmul shape family"
+}

@@ -251,7 +251,43 @@ Still deferred (bigger, higher-risk):
 - **shape-family handling** (#4) and **installed/packaged includes** (#5, partial:
   the shim moved to the repo, but `CMakeLists.txt` still uses absolute `-I` paths).
 
-## Perf reality
+### Update 2 — the embeddable kernel (gap #1), foundation in-repo
+
+Gap #1 (the op body is hand-C, not a `tilelang.compile` artifact) turns out to be
+**mostly a packaging problem, not a missing codegen mode**:
+
+- **`k.get_kernel_source()` IS the embeddable body.** For the DSL q4_0 matmul it's a
+  43-line `extern "C" int32_t qmatmul_kernel(half* A, uint8_t* qcm, half* sc, half* C)`
+  that uses `tl_vtcm_base()` (which the bridge sets) and calls the reused
+  `tl_hexagon_hmx_gemm` — **no FastRPC skel / `_open` / session-acquire wrapper** (that
+  is added separately by the packaging step for Mode A). So embedding needs only the
+  source + the bridge + the runtime headers (`-I` the tilelang templates), exactly the
+  M2b build. `examples/hexagon/llama_cpp_integration/emit_embeddable.py` emits it +
+  a manifest (entry sig, op/dtype/shape, VTCM footprint, weight format); the committed
+  `kernel_qmatmul_compact_*.c` is the artifact.
+- **Residency needs compact scales.** The pedagogical `example_qmatmul.py` takes the
+  *expanded* `scb[K][N]` (fp16, **4× the weight** — can't be resident). The embeddable
+  kernel takes **compact per-block scales `sc[K/32][N]`** (32× smaller, resident-
+  friendly) and expands the block scale in-kernel with the whole-register HVX dequant.
+  Device-verified correct (rel 2.5e-4). This is the real dequant win over the hand-C
+  scalar loop (`tl_dequant_q4_0_chunk`, ~99% of the current 0.8 t/s).
+
+**Remaining device-side steps** (need the llama.cpp build env — Android NDK + Hexagon
+SDK + the ggml-hexagon source tree; **not present in the tilelang dev box**, only the
+pre-built runtime is on-device):
+1. **one-time repack** at load: ggml's repacked-tile q4_0 format (`Tile = weight +
+   (ct*nkt+kt)*576`, nibbles + fp16 scale @ tile+512) → the kernel's `qcm[K/2][N]` +
+   `sc[K/32][N]`, cached resident (hand-C, correct-by-construction; a generated repack
+   is a later nicety);
+2. **embed** `kernel_qmatmul_compact_*.c` into the skel build (add the `.c`, `-I` the
+   templates) and have `tl_mm_run` call `qmatmul_compact_kernel(act, qcm, sc, out)`
+   under `tl_bridge_enter`, replacing the hand-C dequant+gemm loop;
+3. **shape family** (gap #4): the emit is fixed-shape; a model spans matmul shapes, so
+   emit one kernel per shape and dispatch by the manifest (the current hand-C adapter
+   sidesteps this by looping any shape — the generated kernel does not);
+4. rebuild the `htp-v79` skel, `adb push`, A/B on LFM2.
+
+
 
 The proof kernel is slow by construction (scalar per-call dequant, M-pad). Profiling
 showed the tilelang **HMX gemm itself is ~competitive (≈50 t/s, gemm-limited)** and
