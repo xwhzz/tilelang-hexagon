@@ -61,26 +61,36 @@ VTCM (`alloc_shared`) and never hits DDR. `T.gemm` needs `clear_accum=True` on H
 HMX accumulator must be `mxclracc`'d, else NaN).
 
 For **K-streaming** (dequant one K-tile at a time, interleaved with the MAC so it hides under
-the MAC — like ggml-hexagon), HMX is modelled as **tile-level ops around the invisible
-accumulator**, not a monolithic `T.gemm`. HMX has no `mma` instruction: loading the
-activation+weight tiles (`mxmem`) is what triggers the MAC, and the accumulator is a single,
-non-addressable per-core register. So the matmul is `begin → clear → (mac per K-tile) →
-store`, and a dequant slots in right before each `mac`. The ops live in
-`tilelang/hexagon/hmx_tile.py` — `hmx.{pack_a, begin, clear, mac, store, end}` — lowering to
-the `tl_hexagon_hmx_*` primitives in `src/tl_templates/hexagon/hmx.h`. See
-`examples/hexagon/example_qmatmul_kstream.py`.
+the MAC — like ggml-hexagon), HMX is driven at **instruction-atom granularity** via
+`tilelang/hexagon/hmx_intrin.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
+`TensorCoreIntrinEmitter` (`tilelang/cuda/intrinsics/macro/mma_macro_generator.py`). Like the
+tensor-core emitter, it turns the matmul's tiling config into `@T.macro` atoms so the kernel
+composes the K-loop itself (interleaving the dequant), instead of a black-box `T.gemm`:
 
-They must be `@T.macro` (they inline into the kernel body): the Crouton-scratch buffer uses
-(`T.address_of`) have to be visible to the eager builder's VTCM liveness/arena analysis, or
-the scratch aliases other `alloc_shared` buffers and you get silent garbage. The caller allocs
-the scratch in the body (like GPU `T.alloc_fragment` for the accumulator) — `hmx.a_tiles(M,K)`
-gives the size. N>32 loops `clear → mac-K → store` per N-tile (one physical accumulator).
+| tensor core | `HMXIntrinEmitter` | instruction |
+|---|---|---|
+| `ldmatrix_a`/`ldmatrix_b` (shared → reg fragment) | `pack_a`/`pack_b` (row-major VTCM → Crouton VTCM) | HVX `vshuff` |
+| `mma`/`mma_atom` | `mma` (the `mxmem` activation+weight load pair, which IS the MAC) | `{activation=mxmem; weight=mxmem}` |
+| `stmatrix` | `store` (`cvt` → Crouton → unpack) | `cvt.hf=acc; mxmem=cvt` |
+| `T.clear(C_local)` | `clear` | `mxclracc` |
 
-**Status: device-validated correct** (DSL-native tile-level K-streaming, single- and
-multi-N-tile, rel 2–4e-4). The perf/hiding optimization (whole-register 64-feature dequant
-slices vs the 32-feature HMX tile — the per-tile dequant is scalar today; double-buffering;
-worker-pool overlap) is **not yet done** — see §4. A first-class `hmx.acc` IR scope (so
-`T.Pipelined` overlaps the dequant automatically) is the deeper follow-up.
+**Honest divergence from tensor cores:** HMX has no `mma` instruction and NO addressable
+accumulator fragment — loading the a/b Crouton tiles is what triggers the MAC, into a single
+invisible per-core accumulator. So `clear`/`mma`/`store` operate on that implicit accumulator
+(no `C_local` is threaded through); the A/B "fragments" are the Crouton VTCM tiles that
+`pack_a`/`pack_b` produce (`E.a_frag_shape` etc. give the sizes). Granularity matches the CUDA
+emitter: `mma`/`clear` are true single instructions, `pack_*`/`store` are multi-instruction
+layout moves. The methods build a nested `@T.macro` and return its call (the tensor-core
+pattern) — **required**, so the Crouton-scratch buffer uses (`T.address_of`) are visible to the
+eager builder's VTCM liveness/arena pass, else the scratch aliases other `alloc_shared` buffers
+and you get silent garbage. Lowers to the `tl_hexagon_hmx_*` primitives in `hmx.h`. See
+`examples/hexagon/example_qmatmul_kstream.py`. Single M-tile; N>32 loops `clear → mac-K →
+store` per N-tile (one physical accumulator).
+
+**Status: device-validated correct** (atom-granular K-streaming, single- and multi-N-tile, rel
+2–4e-4). The perf/hiding optimization (whole-register 64-feature dequant slices vs the
+32-feature HMX tile — the per-tile dequant is scalar today; double-buffering; worker-pool
+overlap) is **not yet done** — see §4.
 
 ## 4. Honest performance reality (read this before integrating)
 
