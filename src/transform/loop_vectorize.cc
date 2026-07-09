@@ -176,7 +176,15 @@ public:
     bool disable_vectorize_256 = tl_config::Vectorize256Disabled();
     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
 
-    if (TargetSupportVectorize256(Target::Current(false)) &&
+    if (TargetIsHexagon(Target::Current(false))) {
+      // HVX is a 1024-bit vector unit (64 fp16 / 128 int8 lanes) — far wider
+      // than the 128/256-bit vectorized-load width this planner assumes for
+      // GPUs.  Without this, elementwise DSL kernels (e.g. a q4_0 dequant) cap
+      // at 128/dtype_bits lanes (4 for an int32 intermediate) and leave the HVX
+      // unit ~16x underutilized.
+      vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
+          1024;
+    } else if (TargetSupportVectorize256(Target::Current(false)) &&
         !disable_vectorize_256 &&
         VectorizeFindMemoryAccess::MaySupportVectorize256(node)) {
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
@@ -353,6 +361,54 @@ public:
 
     // GCD with loop extent to ensure vector_size divides the loop extent
     vector_size_ = arith::ZeroAwareGCD(loop_extent_vector_size_, vector_size_);
+
+    // Hexagon: HVX has no sub-register vector ops — every instruction works on a
+    // full 128-byte register.  The GCD above minimizes across dtypes, so a loop
+    // mixing a wide and a NARROW dtype (e.g. fp16 output + uint8 input) picks the
+    // wide dtype's 1-register width (fp16 -> 64 lanes), at which the narrow dtype
+    // is sub-register (uint8 at 64 lanes = 64B = half a register).  The codegen
+    // then emits e.g. `uint8_t64 & ...`, which clang lowers to a full-register op
+    // that over-reads and faults on device.  Enforce that the NARROWEST dtype
+    // fills whole registers: vector_size must be a multiple of (1024/min_bits).
+    // Bump to that width (wider dtypes just use a VectorPair) if the loop extent
+    // and every buffer access still vectorize there; otherwise scalarize (safe).
+    if (vector_size_ > 1 && inner_for_ &&
+        TargetIsHexagon(Target::Current(false))) {
+      int min_bits = 0;
+      for (const auto &info : buffer_vector_infos_) {
+        if (!info.buffer.defined())
+          continue;
+        int b = info.buffer->dtype.bits() * info.buffer->dtype.lanes();
+        if (b > 0 && (min_bits == 0 || b < min_bits))
+          min_bits = b;
+      }
+      int reg_lanes = min_bits > 0 ? 1024 / min_bits : 0;
+      if (reg_lanes > 1 && vector_size_ % reg_lanes != 0) {
+        const int64_t *ext = as_const_int(inner_for_->extent);
+        bool ok = ext && (*ext % reg_lanes == 0);
+        for (const auto &info : buffer_vector_infos_) {
+          if (!ok || !info.buffer.defined())
+            continue;
+          if (info.indices.empty()) { // can't re-validate this access -> be safe
+            ok = false;
+            break;
+          }
+          Array<PrimExpr> strides = GetBufferStrides(info.buffer);
+          PrimExpr elem_offset = 0;
+          for (size_t i = 0; i < info.indices.size(); ++i)
+            elem_offset += info.indices[i] * strides[i];
+          if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                   inner_for_->extent, reg_lanes, analyzer_))
+            ok = false;
+        }
+        vector_size_ = ok ? reg_lanes : 1;
+        if (verbose) {
+          std::cerr << "  [Hexagon whole-register] min_bits=" << min_bits
+                    << ", reg_lanes=" << reg_lanes
+                    << " -> vector_size=" << vector_size_ << "\n";
+        }
+      }
+    }
 
     if (verbose) {
       std::cerr << "=== Final vector_size: " << vector_size_ << " ===" << "\n";

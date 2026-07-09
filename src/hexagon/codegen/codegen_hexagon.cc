@@ -69,7 +69,7 @@ void CodeGenTileLangHexagon::PrintType(DataType t,
     }
     if (!fail && lanes == 1)
       return;
-    if (!fail && (lanes >= 2 && lanes <= 16)) {
+    if (!fail && (lanes >= 2 && lanes <= 128)) {
       os << lanes;
       return;
     }
@@ -99,7 +99,7 @@ void CodeGenTileLangHexagon::PrintType(DataType t,
     }
     if (!fail && lanes == 1)
       return;
-    if (!fail && (lanes >= 2 && lanes <= 16)) {
+    if (!fail && (lanes >= 2 && lanes <= 128)) {
       os << lanes;
       return;
     }

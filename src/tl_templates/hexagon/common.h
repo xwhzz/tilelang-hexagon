@@ -29,29 +29,48 @@ using half = __fp16;
 #endif
 
 // Fixed-width vector vocabulary backing the `floatN`/`halfN`/`intN` spellings
-// the C codegen emits (e.g. `*(float4*)(ptr + off)`).  These are plain
-// aggregates; hexagon-clang++ lowers element-wise loops over them and
-// auto-vectorizes onto HVX where profitable.
+// the C codegen emits (e.g. `*(float4*)(ptr + off)`, `(half4)(x)`, `a * b`).
+//
+// Backed by a NATIVE clang ext_vector so element-wise ARITHMETIC lowers to real
+// HVX ops (vand/vlsr/vmpy/…) instead of scalar loops — a DSL dequant like
+// `(int16)(q & 0xF) - 8) * s` becomes native vector `&`/`-`/`*` that
+// hexagon-clang++ maps onto HVX.  `aligned(1)` keeps the codegen's reinterpret
+// loads/stores (`*(halfN*)(ptr + off)`) unaligned-safe — the VTCM shared-memory
+// merge pass packs tiles at element, not 128-byte, offsets; the value ops
+// themselves are alignment-independent, so this costs only the load/store form
+// (vmemu vs vmem), never vectorization.
 template <typename T, int N> struct vec_type {
-  T data[N];
+  typedef T nat_t __attribute__((ext_vector_type(N)));
+  nat_t v __attribute__((aligned(1)));
   vec_type() = default;
-  // Broadcast ctor.  Value taken by const-ref because __fp16 is not a valid
-  // by-value function parameter type on Hexagon.
-  explicit vec_type(const T &v) {
-    for (int i = 0; i < N; ++i) data[i] = v;
-  }
+  vec_type(nat_t n) : v(n) {} // wrap a native result (operator returns / loads)
+  // Broadcast ctor.  const-ref because __fp16 is not a valid by-value parameter
+  // type on Hexagon.  `(nat_t)scalar` is clang's ext_vector splat.
+  explicit vec_type(const T &s) { v = (nat_t)s; }
   // Converting ctor for vector casts, e.g. (half4)float4_value when storing an
-  // fp32 accumulator back as fp16.
+  // fp32 accumulator back as fp16 — a lane-wise numeric convert.
   template <typename U> explicit vec_type(const vec_type<U, N> &o) {
-    for (int i = 0; i < N; ++i) data[i] = (T)o.data[i];
+    v = __builtin_convertvector(o.v, nat_t);
   }
+  // Element-wise operators -> native (HVX) vector ops.  Members are instantiated
+  // lazily, so bit-ops on float aggregates (never emitted) never get type-checked.
+#define TL_VEC_BINOP(op)                                                        \
+  vec_type operator op(const vec_type &o) const { return vec_type(v op o.v); }
+  TL_VEC_BINOP(+) TL_VEC_BINOP(-) TL_VEC_BINOP(*) TL_VEC_BINOP(/)
+  TL_VEC_BINOP(&) TL_VEC_BINOP(|) TL_VEC_BINOP(^) TL_VEC_BINOP(<<) TL_VEC_BINOP(>>)
+#undef TL_VEC_BINOP
 };
 
+// Widths up to 128 lanes: HVX is a 1024-bit vector, so one register holds 128
+// int8 / 64 fp16 / 32 fp32.  The codegen's Hexagon vectorizer plans up to that.
 #define TL_DEFINE_VEC(T)                                                        \
   using T##2 = vec_type<T, 2>;                                                  \
   using T##4 = vec_type<T, 4>;                                                  \
   using T##8 = vec_type<T, 8>;                                                  \
-  using T##16 = vec_type<T, 16>;
+  using T##16 = vec_type<T, 16>;                                                \
+  using T##32 = vec_type<T, 32>;                                                \
+  using T##64 = vec_type<T, 64>;                                                \
+  using T##128 = vec_type<T, 128>;
 
 TL_DEFINE_VEC(float)
 TL_DEFINE_VEC(half)
