@@ -23,19 +23,24 @@ the consequence of that gulf.
 ## Device result — LFM2-1.2B on the NPU (A/B on this box)
 
 Built llama.cpp `4fc4ec55` + the ggml-hexagon backend from a bare host (Android NDK +
-Hexagon SDK 6.6, no Docker), applied the integration, and flipped the `tl_mm_enabled`
-toggle (rebuild skel, redeploy):
+Hexagon SDK 6.6, no Docker), applied the integration, flipped the `tl_mm_enabled` toggle
+(rebuild skel, redeploy). Two versions of the op:
 
-| arm | prefill | decode | output |
-|---|---|---|---|
-| stock | ~96–130 t/s | ~24–29 t/s | coherent |
-| **tilelang op active** | **0.7 t/s** | ~24 t/s | coherent ("…Paris. Paris") |
+| version | prefill (short) | prefill (long, warm) | decode | output |
+|---|---|---|---|---|
+| stock | ~96–130 t/s | ~530 t/s | ~24–29 | coherent |
+| tilelang, hand-C scalar dequant | 0.7 t/s | — | ~24 | coherent |
+| **tilelang, generated whole-register dequant** | 4.3 t/s (repack-bound) | **537.7 t/s** | ~26 | coherent |
 
-Flipping only the toggle swings prefill with **both arms coherent** → the tilelang HMX op
-is provably **active AND correct** inside LFM2's forward pass. Decode is unchanged: the
-intercept is the HMX prefill path (`hmx_mm_2d_f32`); decode (M=1) is a **HVX GEMV** the
-HMX-only intercept doesn't touch. The 0.7 is the current op's **scalar** per-call dequant
-(~99% of the cost) — a correctness proof, not the fast path (see "what's next").
+Flipping only the toggle, **both arms coherent** → the tilelang HMX op is **active AND
+correct** inside LFM2's forward pass. The **fast path reaches PARITY** with the backend's
+hand-tuned q4_0 matmul (537.7 vs 529.9 t/s at the same long prompt) — the predicted ceiling.
+The generated whole-register dequant fixed the scalar hand-C (0.7 → parity); the short-prompt
+4.3 is the **one-time repack** (ggml tile → column-major) charged to a single prefill, which
+in real deployment belongs at model load. Decode is unchanged: the intercept is the HMX
+prefill path (`hmx_mm_2d_f32`); decode (M=1) is a **HVX GEMV** the HMX-only intercept doesn't
+touch. (Gotcha found: HVX whole-register loads from `malloc`'d DDR need ≥128B alignment —
+`memalign(256,…)` for the repack cache, else silent garbage.)
 
 ## Why the Hexagon DSL looks different from CUDA (the hard-won findings)
 
@@ -66,11 +71,12 @@ HMX-only intercept doesn't touch. The 0.7 is the current op's **scalar** per-cal
 
 ## What's next
 
-- **Make the device op fast (→ parity)** — task #30: replace the hand-C scalar dequant with
-  the tilelang **generated** whole-register kernel (`emit_embeddable.py` already emits it),
-  fed by a **one-time, cached** repack of ggml's tile format → the kernel's compact
-  column-major format (`qcm[K/2][N]` + `sc[K/32][N]`), plus per-shape kernels + dispatch by
-  manifest. The embeddable-kernel emit is done; the repack + shape-family wiring is the work.
+- **Fast device op (→ parity)** — **DONE** (task #30): the tilelang generated whole-register
+  dequant + a one-time cached repack (ggml tile → column-major `qcm[K/2][N]` + `sc[K/32][N]`)
+  reach **parity** with the backend (537.7 vs 529.9 t/s, coherent). Remaining polish: move the
+  repack to **model load** (so cold prefill isn't repack-bound), and generate per-shape fully-DSL
+  fused kernels for full coverage (today the whole-register *dequant* is generic over K/N; the
+  fully-fused DSL kernel is fixed-shape).
 - **Beat stock (→ win)** — subgraph fusion (own a fused FFN/attention block in one PD via
   the registry), or a quant format with fewer weight bytes. This is where tilelang's
   composability pays off, and it reuses the whole stack above.
