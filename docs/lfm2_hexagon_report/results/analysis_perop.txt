@@ -1,0 +1,73 @@
+# LFM2 per-op profile  (7994 op instances, total 500307 usec = 500.3 ms HTP compute)
+
+op                total_us     %  count  avg_us   avg_cyc
+---------------------------------------------------------
+MUL_MAT+MUL_MAT     208983 41.8%    544   384.2    812491
+MUL_MAT+ADD         123770 24.7%    769   160.9    341115
+MUL_MAT              79530 15.9%    748   106.3    225754
+FLASH_ATTN_EXT       26822  5.4%    210   127.7    271782
+MUL_MAT+MUL_MAT+MUL_MAT     14920  3.0%    204    73.1    155609
+CONCAT               10828  2.2%    350    30.9     66502
+SWIGLU                7893  1.6%    559    14.1     30792
+RMS_NORM+MUL          6707  1.3%   1573     4.3     10075
+SSM_CONV              5727  1.1%    350    16.4     35704
+CPY                   3692  0.7%    350    10.5     23408
+ROPE                  3288  0.7%    420     7.8     17872
+SET_ROWS              2943  0.6%    420     7.0     16574
+MUL                   2718  0.5%    700     3.9      9257
+GET_ROWS              1329  0.3%    418     3.2      7871
+ADD                    931  0.2%    349     2.7      6431
+SCALE                  226  0.0%     30     7.5     16836
+
+# MUL_MAT by weight tensor role
+role                    total_us   %MM  count  avg_us  dims(w x act)
+------------------------------------------------------------------------------
+shortconv.in_proj          50758 63.8%    350   145.0  2048:6144 x 2048:1
+shortconv.out_proj         17359 21.8%    350    49.6  2048:2048 x 2048:1
+ffn_up                      5101  6.4%     15   340.1  2048:8192 x 2048:35
+ffn_gate                    5070  6.4%     15   338.0  2048:8192 x 2048:35
+attn_q                       660  0.8%      6   110.0  2048:2048 x 2048:35
+attn_v                       331  0.4%      6    55.2  2048:512 x 2048:35
+attn_k                       251  0.3%      6    41.8  2048:512 x 2048:35
+
+# kernel implementation used (kparams field)
+  hvx-tiled               405561 us   81.1%   x2176
+  (none)                   46282 us    9.3%   x5519
+  hvx                      22594 us    4.5%   x204
+  hmx-tiled                21642 us    4.3%   x89
+  hmx-pipe                  4228 us    0.8%   x6
+
+# timeline (op instances in capture order, 20 buckets)
+  [    0-  399]  24406us  MUL_MAT+MUL_MAT ######################
+  [  399-  798]  43690us  MUL_MAT        ########################################
+  [  798- 1197]  31344us  MUL_MAT+MUL_MAT ############################
+  [ 1197- 1596]  23855us  MUL_MAT+MUL_MAT #####################
+  [ 1596- 1995]  23373us  MUL_MAT+MUL_MAT #####################
+  [ 1995- 2394]  23430us  MUL_MAT+MUL_MAT #####################
+  [ 2394- 2793]  23458us  MUL_MAT+MUL_MAT #####################
+  [ 2793- 3192]  23463us  MUL_MAT+MUL_MAT #####################
+  [ 3192- 3591]  23365us  MUL_MAT+MUL_MAT #####################
+  [ 3591- 3990]  23437us  MUL_MAT+MUL_MAT #####################
+  [ 3990- 4389]  23766us  MUL_MAT+MUL_MAT #####################
+  [ 4389- 4788]  23705us  MUL_MAT+MUL_MAT #####################
+  [ 4788- 5187]  23478us  MUL_MAT+MUL_MAT #####################
+  [ 5187- 5586]  23553us  MUL_MAT+MUL_MAT #####################
+  [ 5586- 5985]  23300us  MUL_MAT+MUL_MAT #####################
+  [ 5985- 6384]  23539us  MUL_MAT+MUL_MAT #####################
+  [ 6384- 6783]  23504us  MUL_MAT+MUL_MAT #####################
+  [ 6783- 7182]  23375us  MUL_MAT+MUL_MAT #####################
+  [ 7182- 7581]  23849us  MUL_MAT+MUL_MAT #####################
+  [ 7581- 7980]  23729us  MUL_MAT+MUL_MAT #####################
+  [ 7980- 7994]    688us  MUL_MAT+MUL_MAT 
+
+# top 10 slowest single op instances
+    728us  FLASH_ATTN_EXT node_277 (view) (permuted) x cache_k_l8  64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    707us  FLASH_ATTN_EXT node_75 (view) (permuted) x cache_k_l2 ( 64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    701us  FLASH_ATTN_EXT node_413 (view) (permuted) x cache_k_l12 64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    700us  FLASH_ATTN_EXT node_176 (view) (permuted) x cache_k_l5  64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    696us  FLASH_ATTN_EXT node_345 (view) (permuted) x cache_k_l10 64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    696us  FLASH_ATTN_EXT node_481 (view) (permuted) x cache_k_l14 64:35:32:1 x 64:256:8:1 x 64:256:8:1 x 256:35
+    674us  MUL_MAT+MUL_MAT blk.0.ffn_gate.weight x model.layers.{}. 2048:8192 x 2048:4 x 2048:8192
+    674us  MUL_MAT+MUL_MAT blk.2.ffn_gate.weight x model.layers.{}. 2048:8192 x 2048:4 x 2048:8192
+    674us  MUL_MAT+MUL_MAT blk.4.ffn_gate.weight x model.layers.{}. 2048:8192 x 2048:4 x 2048:8192
+    674us  MUL_MAT+MUL_MAT blk.8.ffn_gate.weight x model.layers.{}. 2048:8192 x 2048:4 x 2048:8192
