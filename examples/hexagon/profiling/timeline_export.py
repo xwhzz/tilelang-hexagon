@@ -16,7 +16,7 @@ LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/prof_pmu.log"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/timeline.json"
 
 pat = re.compile(
-    r"profile-op (\w+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
+    r"profile-op ([\w+]+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
     r"usec (\d+) cycles (\d+) start (\d+) mhz ([\d.]+)(?: pmu \[([\d,]+)\])?"
 )
 
@@ -49,7 +49,7 @@ def layer_of(names):
 
 def role_of(op, names):
     w = names.split(" x ")[0].strip()
-    if op == "MUL_MAT":
+    if op.startswith("MUL_MAT"):
         r = re.sub(r"blk\.\d+\.", "", w).replace(".weight", "")
         return r
     return op.lower()
@@ -113,7 +113,7 @@ def act_ne1(dims):
 
 pref_end = 0
 for i, r in enumerate(rows):
-    if r["op"] == "MUL_MAT" and act_ne1(r["dims"]) > 8:
+    if r["op"].startswith("MUL_MAT") and act_ne1(r["dims"]) > 8:
         pref_end = i
 prefill_ops = pref_end + 1
 print(f"prefill: ops[0:{prefill_ops}]  decode: ops[{prefill_ops}:{len(rows)}]")
@@ -163,7 +163,7 @@ for si, i0 in enumerate(step_idx):
     i1 = step_idx[si + 1] if si + 1 < len(step_idx) else len(rows)
     toks = 1
     for r in rows[i0:i1]:
-        if r["op"] == "MUL_MAT":
+        if r["op"].startswith("MUL_MAT"):
             toks = max(toks, act_ne1(r["dims"]))
     steps.append([round(rows[i0]["t"], 1), toks])  # [packed_start_us, token_count]
 print(f"steps: {len(steps)}  token-counts: {[s[1] for s in steps][:6]}...{[s[1] for s in steps][-3:]}")

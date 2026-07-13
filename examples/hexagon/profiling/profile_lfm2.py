@@ -18,7 +18,7 @@ LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/prof_pmu.log"
 PMU_NAMES = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"]
 
 pat = re.compile(
-    r"profile-op (\w+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
+    r"profile-op ([\w+]+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
     r"usec (\d+) cycles (\d+) start (\d+) mhz ([\d.]+)(?: pmu \[([\d,]+)\])?"
 )
 

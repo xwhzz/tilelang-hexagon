@@ -18,61 +18,64 @@ to deciding what tilelang should target. Companion to
 | **Runtime** | llama.cpp `4fc4ec55`, ggml-htp-v79 skel (stock, `tl_mm_enabled=0`), built with Hexagon SDK 6.6.0.0 / Tools 19.0.07 / NDK r25c |
 | **Workload** | ~35-token prompt (prefill) + 32 generated tokens (decode), `GGML_HEXAGON_PROFILE=2` (PMU) |
 
+> ⚠️ **Corrected.** An earlier version of the tables below undercounted: the parser's
+> op-name regex (`\w+`) dropped ggml's **fused** ops (`MUL_MAT+MUL_MAT`, `MUL_MAT+ADD`,
+> `RMS_NORM+MUL` — the `+` broke the match), losing ~39 % of ops. The corrected full set is
+> **7994 ops / 500.3 ms**, HMX is **5 %** (not 13 %), and the **FFN dominates** (not
+> short-conv). Fix: match `[\w+]+`. Full corrected report:
+> [`hexagon_lfm2_perf.md`](hexagon_lfm2_perf.md).
+
 ## Headline: per-op-type latency
 
-4904 op instances, **145.9 ms total HTP compute** (prefill + 32 decode tokens):
+7994 op instances, **500.3 ms total HTP compute** (prefill + 32 decode). ggml-hexagon
+**fuses** ops (`OPFUSION=1`), so the top entries are fused matmuls:
 
-| op | total | % | count | avg µs | avg cycles |
-|---|---:|---:|---:|---:|---:|
-| **MUL_MAT** | 79.5 ms | **54.5 %** | 748 | 106.3 | 225 754 |
-| **FLASH_ATTN_EXT** | 26.8 ms | **18.4 %** | 210 | 127.7 | 271 782 |
-| CONCAT | 10.8 ms | 7.4 % | 350 | 30.9 | 66 502 |
-| SWIGLU | 7.9 ms | 5.4 % | 559 | 14.1 | 30 792 |
-| SSM_CONV | 5.7 ms | 3.9 % | 350 | 16.4 | 35 704 |
-| CPY | 3.7 ms | 2.5 % | 350 | 10.5 | 23 408 |
-| ROPE | 3.3 ms | 2.3 % | 420 | 7.8 | 17 872 |
-| SET_ROWS | 2.9 ms | 2.0 % | 420 | 7.0 | 16 574 |
-| MUL | 2.7 ms | 1.9 % | 700 | 3.9 | 9 257 |
-| GET_ROWS / ADD / SCALE | <1 % each | | | | |
-
-**MUL_MAT + FLASH_ATTN = 73 %.** Everything else is small.
-
-## MUL_MAT broken down by weight tensor — the real hot spot
-
-This is the non-obvious result. Within MUL_MAT, the FFN projections are **not** the top —
-the **short-conv projections dominate**:
-
-| weight role | total | % of MUL_MAT | count | avg µs | dims (w × act) |
+| op | total | % | count | avg µs | what |
 |---|---:|---:|---:|---:|---|
-| **shortconv.in_proj** | 50.8 ms | **63.8 %** | 350 | 145.0 | `2048×6144 · 2048×1` |
-| **shortconv.out_proj** | 17.4 ms | **21.8 %** | 350 | 49.6 | `2048×2048 · 2048×1` |
-| ffn_up | 5.1 ms | 6.4 % | 15 | 340.1 | `2048×8192 · 2048×35` |
-| ffn_gate | 5.1 ms | 6.4 % | 15 | 338.0 | `2048×8192 · 2048×35` |
-| attn_q / attn_v / attn_k | <1 % each | | | | |
+| **MUL_MAT+MUL_MAT** | 209.0 ms | **41.8 %** | 544 | 384.2 | fused `ffn_gate + ffn_up` |
+| **MUL_MAT+ADD** | 123.8 ms | **24.7 %** | 769 | 160.9 | fused `ffn_down`+add / `attn_output`+add |
+| **MUL_MAT** | 79.5 ms | **15.9 %** | 748 | 106.3 | standalone `shortconv.in_proj`/`out_proj` |
+| **FLASH_ATTN_EXT** | 26.8 ms | **5.4 %** | 210 | 127.7 | attention |
+| MUL_MAT+MUL_MAT+MUL_MAT | 14.9 ms | 3.0 % | 204 | 73.1 | fused QKV |
+| CONCAT | 10.8 ms | 2.2 % | 350 | 30.9 | cache concat |
+| SWIGLU | 7.9 ms | 1.6 % | 559 | 14.1 | FFN activation |
+| RMS_NORM+MUL | 6.7 ms | 1.3 % | 1573 | 4.3 | fused norm |
+| SSM_CONV | 5.7 ms | 1.1 % | 350 | 16.4 | short-conv |
+| CPY / ROPE / SET_ROWS / MUL / GET_ROWS / ADD / SCALE | <1 % each | | | | |
 
-**85 % of all matmul time is the two short-conv projections** (`in_proj` produces the
-6144-wide B·C·x gate/conv input; `out_proj` maps back to 2048). They're small per-call
-but run **every layer × every token**, so they accumulate. The FFN projections have high
-per-call cost but only 6 FFN-bearing layers × few calls in this trace.
+**All matmul variants together = ~85 % of compute.**
 
-## Which engine ran each op — HMX is idle, ~87 % is HVX
+## Where the time goes — the FFN dominates
+
+| block | share | detail |
+|---|---:|---|
+| **FFN** | **~66 %** | `ffn_gate+ffn_up` 41.8 % + `ffn_down+add` 22.5 % + SWIGLU 1.6 % |
+| **short-conv** | **~15 %** | `in_proj` 10.1 % + `out_proj` 3.5 % + SSM_CONV 1.1 % |
+| **attention** | **~11 %** | flash-attn 5.4 % + QKV 3.0 % + `attn_output` 2.2 % |
+
+The FFN (gate/up/down) is two-thirds of compute and is **already fused** by ggml
+(gate+up, down+add). The short-conv block (`in_proj → SSM_CONV → out_proj`) is **not**
+fused — the conv sits between the projections — which is the open tilelang fusion target.
+(The earlier "short-conv dominates" claim was the artifact of dropping the fused FFN ops.)
+
+## Which engine ran each op — HMX is idle, ~95 % is HVX
 
 The profiler's `kparams` field only tags a kernel variant for the ops that *have* a
 kernel-selection struct (`htp_mm_kernel_params`) — i.e. **matmul and flash-attn**, which
 report `hvx-tiled` / `hmx-tiled` / `hmx-pipe`. Every other op prints `----`. **A blank
 `kparams` does not mean the op ran on the scalar unit** — the ggml-hexagon HTP kernels for
 add/mul/swiglu/conv/concat/cpy/rope are all HVX-vectorized (`hvx_*` / `Q6_V*` intrinsics on
-the 6-thread worker-pool). Grouping by kernel tag gives three lanes:
+the 6-thread worker-pool). Grouping by kernel tag (full 7994-op set):
 
 | lane | total | % of compute | ops | what |
 |---|---:|---:|---:|---|
-| **HVX · matmul/attn** | 86.9 ms | **59.5 %** | 884 | `hvx-tiled` GEMV + `hvx` flash-attn |
-| **HVX · elementwise** | 39.6 ms | **27.1 %** | 3946 | add/mul/swiglu/conv/concat/cpy/rope — untagged, still HVX |
-| **HMX · matrix** | 19.5 ms | **13.4 %** | 74 | `hmx-tiled`/`hmx-pipe`, batched prefill only |
+| **HVX · matmul/attn** | 428.2 ms | **85.6 %** | 2380 | `hvx-tiled` GEMV (incl. fused ffn/qkv) + `hvx` flash-attn |
+| **HVX · elementwise** | 46.3 ms | **9.3 %** | 5519 | rms_norm/add/mul/swiglu/conv/concat/cpy/rope — untagged, still HVX |
+| **HMX · matrix** | 25.9 ms | **5.2 %** | 95 | `hmx-tiled`/`hmx-pipe`, batched prefill only |
 
-**The HMX matrix engine — the thing the NPU is built around — carries only 13 % of the
-work; ~87 % is HVX.** HMX only fires on the batched (`ne1=35`) prefill matmuls; decode's
-short-conv projections are `ne1=1` GEMV that route to `hvx-tiled` and never touch HMX.
+**The HMX matrix engine — the thing the NPU is built around — carries only 5 % of the
+work; ~95 % is HVX.** HMX only fires on the batched (`ne1=35`) prefill matmuls; all of
+decode is `ne1=1` GEMV (fused FFN + short-conv) routed to `hvx-tiled`, never touching HMX.
 
 ### Hardware-PMU verification (on-silicon counters, not source-reading)
 
@@ -139,7 +142,7 @@ sampling would be strictly worse here; itrace's value is a CPU+DSP *system* view
 [`lfm2_perfetto_trace.json`](lfm2_perfetto_trace.json) is the **Chrome-trace / Perfetto JSON**
 itrace's `ITRACE_JSON_FILE` would emit — but built from ggml's correctly-attributed per-op PMU
 capture (`chrome_trace_export.py`). **Open it at [ui.perfetto.dev](https://ui.perfetto.dev)**
-(drag the file) or `chrome://tracing`. It has all 4904 ops as duration bars on three engine
+(drag the file) or `chrome://tracing`. It has all 7994 ops as duration bars on three engine
 tracks (HMX / HVX-matmul / HVX-elementwise) with per-op args (layer, shape, dtype, kernel,
 cycles, `HVX_ACTIVE`, committed packets), plus three **hardware counter line-graphs**
 (`HVX_ACTIVE`, `committed_pkts`, `AXI_write_req`) sampled per op — richer than itrace's 500 µs
@@ -148,7 +151,7 @@ sampling because it's per-op, not time-sampled.
 ## Interactive timeline
 
 [`hexagon_timeline.html`](hexagon_timeline.html) is an nsys-style trace viewer for this
-capture (open the file, or the published artifact): every one of the 4904 op instances is
+capture (open the file, or the published artifact): every one of the 7994 op instances is
 a bar placed in execution order at its measured latency, colored by op type, split into
 **HMX / HVX-matmul / HVX-elementwise** lanes so the idle HMX lane is visible at a glance. Zoom/pan, a
 phase ribbon marking the 36 forward passes (2 warmup + 1 prefill@35tok + 31 decode@1tok),
@@ -184,16 +187,18 @@ long steady tail of ~6.1 ms each, dominated by the per-layer short-conv GEMVs on
 
 ## What this means for tilelang
 
-1. **MUL_MAT is the top target (54 %) — but the volume is short-conv GEMV on HVX, not
-   HMX FFN.** Our tilelang q4_0 matmul targets the HMX path; that's only ~10 % of MUL_MAT
-   time here. The bigger prize is the `hvx-tiled` GEMV that runs every layer every token.
-2. **The HMX matrix engine is idle ~90 % of the time** (only the batched prefill FFN uses
-   it). Decode is HVX-bound. A win needs to speed up the HVX GEMV path or find work for HMX.
-3. **FFN is a fusable subgraph** (`ffn_gate` + `ffn_up` → SWIGLU → `ffn_down`, 6.4+6.4+5.4 %),
-   and the short-conv block (`in_proj` → SSM_CONV → `out_proj`, 63.8+3.9+21.8 % of MM/conv)
-   is an even bigger fusable unit — both keep intermediates in VTCM instead of DDR.
-4. Confirms the strategic read: single-op parity isn't the win; **subgraph fusion is** —
-   and the biggest subgraph is LFM2's short-conv block, not the FFN.
+1. **Matmul is ~85 % of compute, and it's HVX GEMV, not HMX.** All of decode is `ne1=1`
+   GEMV on `hvx-tiled`; the HMX matrix engine only fires on batched prefill. The lever is
+   the HVX GEMV kernel + 4-bit dequant, run every layer every token.
+2. **The HMX matrix engine is idle ~95 % of the time.** Decode is HVX-bound. A win needs to
+   speed up the HVX GEMV path or find a way to put decode work on HMX.
+3. **The FFN (~66 %) is already fused by ggml** (`ffn_gate+ffn_up`, `ffn_down+add`) — so
+   re-fusing it wins little; the matmul kernel is the lever there. The **short-conv block
+   (~15 %) is NOT fused** (`in_proj → SSM_CONV → out_proj`, the conv sits between the
+   projections) — that's the open tilelang fusion target: keep intermediates in VTCM.
+4. Single-op matmul parity is done; the gap to nexa (2× decode) is a **runtime/scheduling**
+   gap, not op coverage. See [`hexagon_lfm2_perf.md`](hexagon_lfm2_perf.md) for the full
+   perf comparison and the corrected numbers.
 
 ## Reproduce
 

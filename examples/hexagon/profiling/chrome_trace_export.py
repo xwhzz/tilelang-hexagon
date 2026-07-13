@@ -25,7 +25,7 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/lfm2_perfetto_trace.json"
 PMU_COMMITTED_PKT, PMU_HVX_ACTIVE, PMU_AXI_WR = 0, 2, 4
 
 pat = re.compile(
-    r"profile-op (\w+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
+    r"profile-op ([\w+]+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|"
     r"usec (\d+) cycles (\d+) start (\d+) mhz ([\d.]+)(?: pmu \[([\d,]+)\])?"
 )
 
@@ -78,7 +78,7 @@ t = 0.0
 for r in rows:
     events.append({
         "ph": "X", "pid": PID, "tid": r["lane"], "ts": round(t, 3), "dur": r["usec"],
-        "name": r["op"] + (f' {r["role"]}' if r["op"] == "MUL_MAT" else ""),
+        "name": r["op"] + (f' {r["role"]}' if r["op"].startswith("MUL_MAT") else ""),
         "args": {
             "layer": (f'blk.{r["L"]}' if r["L"] >= 0 else "-"),
             "role": r["role"], "shape": r["dims"], "dtype": r["dt"], "kernel": r["kern"],
