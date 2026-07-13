@@ -26,25 +26,29 @@ fast it is (vs nexa/GenieX), which operators run where (HMX / HVX / scalar), wha
 
 `llama-bench -p 1024 -n 128` (prefill 1024 tokens, then generate 128), 3 repeats, on `HTP0`:
 
-| runtime | weights | prefill (pp1024) | decode (tg128) |
-|---|---|---:|---:|
-| **nexa / GenieX** (their reported figure, QNN NPU) | **8-bit (w8a16)** | **3618.4 t/s** | **69.5 t/s** |
-| **llama.cpp ggml-hexagon** | **Q4_0 (4-bit)** | **3174.6 t/s** | **35.6 t/s** |
-| llama.cpp ggml-hexagon | F16 (16-bit) | 2174.0 t/s | 22.1 t/s |
+| runtime | weights | bytes | prefill (pp1024) | decode (tg128) |
+|---|---|---:|---:|---:|
+| **nexa / GenieX** (reported, QNN NPU) | **8-bit (w8a16)** | 1.27 GB | **3618.4 t/s** | **69.5 t/s** |
+| llama.cpp ggml-hexagon | **Q8_0 (8-bit)** | 1.19 GB | 3271.6 t/s | 26.6 t/s |
+| **llama.cpp ggml-hexagon** | **Q4_0 (4-bit)** | 0.65 GB | 3174.6 t/s | 35.6 t/s |
+| llama.cpp ggml-hexagon | F16 (16-bit) | 2.18 GB | 2174.0 t/s | 22.1 t/s |
 
-- **Prefill**: nexa **1.14×** llama.cpp-Q4_0 — close.
-- **Decode**: nexa **1.95×** llama.cpp-Q4_0 — nearly 2×.
+Two clean results — the **Q8_0** row matches nexa's weight precision (both 8-bit, ~1.2 GB),
+so it isolates the runtime from the quantization:
 
-**The decode gap is the real story, and it is *not* weight bandwidth.** nexa's weights are
-**8-bit (2× the bytes** of Q4_0's 4-bit), yet it decodes 2× faster. If decode were
-weight-streaming-bound the 4-bit model would win. So llama.cpp's decode is bound by
-something else — the HVX GEMV compute + 4-bit dequant overhead + per-op dispatch — and
-nexa's QNN path (whole-graph compile, static scheduling, better kernel/engine use) beats it.
-F16 is slowest (no HMX win at `ne1=1`, and 3.4× the bytes of Q4_0).
+1. **llama.cpp decode is weight-bandwidth-bound.** Q4_0 (35.6) **>** Q8_0 (26.6) **>** F16
+   (22.1) — decode throughput tracks *fewer bytes streamed*, exactly as a memory-bound
+   `ne1=1` GEMV should. So Q4_0 is llama.cpp's fastest decode config.
+2. **At equal 8-bit precision, nexa decodes 2.6× faster** (69.5 vs Q8_0's 26.6) — a *bigger*
+   gap than the Q4_0 comparison. And nexa's 8-bit even beats llama.cpp's *4-bit* by 2×
+   (69.5 vs 35.6) **despite streaming ~2× the bytes**. So nexa's decode advantage is a
+   **pure runtime/kernel win** (QNN whole-graph compile + scheduling + better engine use —
+   likely HMX, which llama.cpp leaves 95 % idle at decode), not weight bits.
+3. **Prefill is close and quant-insensitive** (Q8_0 3272 ≈ Q4_0 3175, both ~0.9× nexa's
+   3618) — prefill is compute-bound (batched → HMX), where llama.cpp is already competitive.
 
 *Caveat: the nexa number is their published figure (we could not run nexa on-device — its
-license failed to validate). llama.cpp numbers are measured here. The quantizations differ
-(8-bit vs 4-bit), so this compares shipping configs, not identical math.*
+license failed to validate); llama.cpp numbers are measured here.*
 
 ## 3. What are the `npu-mobile` weights? — 8-bit, not bf16
 
@@ -132,8 +136,9 @@ out_proj` runs as three separate ops because the conv sits between the projectio
 ## 5. Implications for tilelang
 
 1. **HMX is 95 % idle.** The matrix engine only fires on batched prefill; all of decode is
-   HVX GEMV (`ne1=1`). The decode ceiling is memory-bound GEMV + dequant on HVX — exactly
-   where nexa's QNN path is 2× faster.
+   HVX GEMV (`ne1=1`), which is memory-bandwidth-bound (confirmed: Q4_0 > Q8_0 > F16 decode).
+   At equal 8-bit precision nexa decodes **2.6×** faster — a pure runtime/kernel gap, exactly
+   the decode path where llama.cpp leaves HMX unused.
 2. **The FFN subgraph is already fused by ggml** (gate+up, down+add). Re-fusing it in
    tilelang wins little; the matmul *kernel* (HVX GEMV / 4-bit dequant) is the lever there.
 3. **The short-conv block is the open fusion target** (~15 %, un-fused): a tilelang kernel
@@ -150,10 +155,15 @@ models `LFM2-1.2B-{Q4_0,F16}.gguf`, `llama-bench`, `llama-cli`).
 ### Performance (§2)
 
 ```bash
+# make the Q8_0 (8-bit, matches nexa) from the F16 GGUF on-device — quantize is CPU-only:
+adb shell "cd /data/local/tmp/llamahtp && LD_LIBRARY_PATH=. \
+  ./llama-quantize LFM2-1.2B-F16.gguf LFM2-1.2B-Q8_0.gguf Q8_0"
+
+# bench each: Q4_0 (fastest decode), Q8_0 (= nexa precision), F16
 adb shell "cd /data/local/tmp/llamahtp && LD_LIBRARY_PATH=. \
   ADSP_LIBRARY_PATH=.:/vendor/lib/rfsa/adsp:/dsp \
   ./llama-bench -m LFM2-1.2B-Q4_0.gguf -dev HTP0 -ngl 99 -p 1024 -n 128 -r 3"
-# repeat with -m LFM2-1.2B-F16.gguf
+# repeat with -m LFM2-1.2B-Q8_0.gguf and -m LFM2-1.2B-F16.gguf
 ```
 
 ### Per-op profile with PMU (§4)
