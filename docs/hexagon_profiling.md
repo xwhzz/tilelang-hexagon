@@ -106,16 +106,44 @@ applies depends on the runtime:
 
 | tool | granularity | output | applies to our LFM2/llama.cpp path? |
 |---|---|---|---|
-| **itrace** (Hexagon SDK `libs/itrace`) | per-DSP-section, PMU events | **Chrome-trace / Perfetto JSON** timeline | **Yes** — taps the same PMU counters over FastRPC; needs itrace sections or system-wide DSP trace |
+| **itrace** (Hexagon SDK `libs/itrace`) | per-DSP-section or sampled, PMU events | **Chrome-trace / Perfetto JSON** timeline | Partially — see below; its *sampling* mode misattributes on Hexagon |
 | **Snapdragon Profiler** | system-level DSP/HMX/HVX util, clocks, thermal | GUI/CSV, real-time over ADB | **Yes**, for utilization/clock/thermal — not per-op graph timing |
 | **QNN `qnn-profile-viewer`** (`--profiling_level detailed`) | per-op on HTP, cycle-accurate | text/CSV | **No** — QNN-graph only (our Qwen3-4B QNN path, not llama.cpp) |
 | **Qualcomm AI Hub** profiling job | per-layer, official, unit breakdown | web report | **No** — needs an AI-Hub-compilable model (LFM2 unsupported) |
 | **ETM** (`HAP_user_etm_enable`, `GGML_HEXAGON_ETM`) | cycle-accurate instruction trace | binary trace, heavy post-processing | possible but heavyweight |
 
-The pragmatic complete picture for the llama.cpp path = the **PMU counters we already have**
-(the on-silicon truth, decoded above) + **itrace** for a Perfetto timeline + **Snapdragon
-Profiler** for system-level HMX/HVX utilization. Notably ggml's default event set has **no
-HMX counter** — to measure HMX occupancy directly we'd add an HMX event to `opt_pmu_evt`.
+Notably ggml's default event set has **no HMX counter** — to measure HMX occupancy directly
+we'd add an HMX event to `opt_pmu_evt`.
+
+### itrace attempted on-device — and why in-context per-op beats it
+
+We deployed itrace's full runtime to the device (all prebuilt for our exact target:
+`android_aarch64` host libs + `hexagon_toolv19_v79` DSP skel + libperfetto/libprotobuf) and
+drove it via the **zero-recompile automated constructor** (`LD_PRELOAD=libitrace_constructor.so`
++ `itrace_config.txt`). It got most of the way: loaded, parsed the config, and **identified
+every event** (`HVX_ACTIVE=0x80cc`, `COMMITTED_PKT_ANY`, `AXI_*`) on the CDSP domain — then
+**null-deref SIGSEGV** (`fault addr 0x0`) at the first setup action *after* config parse,
+because the constructor runs at **library-load time (before `main`)**, before the process's
+FastRPC subsystem is initialized. The clean fix is explicit itrace init after `main` (a
+llama.cpp rebuild linking libitrace).
+
+But the deeper finding made that rebuild not worth it: **Hexagon PMU counters (`upmucnt`) are
+per-hardware-thread.** itrace's periodic-sampling mode runs its reader in its *own* PD/thread,
+so it samples the counters of threads that *aren't* running ggml's ops — wrong attribution.
+ggml's `PROFILE=2` reads the same counters **in-context, around each op, on the executing
+thread** — the *correct* per-op methodology, and the data we already have. So itrace's
+sampling would be strictly worse here; itrace's value is a CPU+DSP *system* view, not per-op.
+
+### Deliverable: a real Perfetto trace from the in-context PMU
+
+[`lfm2_perfetto_trace.json`](lfm2_perfetto_trace.json) is the **Chrome-trace / Perfetto JSON**
+itrace's `ITRACE_JSON_FILE` would emit — but built from ggml's correctly-attributed per-op PMU
+capture (`chrome_trace_export.py`). **Open it at [ui.perfetto.dev](https://ui.perfetto.dev)**
+(drag the file) or `chrome://tracing`. It has all 4904 ops as duration bars on three engine
+tracks (HMX / HVX-matmul / HVX-elementwise) with per-op args (layer, shape, dtype, kernel,
+cycles, `HVX_ACTIVE`, committed packets), plus three **hardware counter line-graphs**
+(`HVX_ACTIVE`, `committed_pkts`, `AXI_write_req`) sampled per op — richer than itrace's 500 µs
+sampling because it's per-op, not time-sampled.
 
 ## Interactive timeline
 
