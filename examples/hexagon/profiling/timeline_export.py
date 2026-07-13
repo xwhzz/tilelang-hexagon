@@ -20,9 +20,15 @@ pat = re.compile(
     r"usec (\d+) cycles (\d+) start (\d+) mhz ([\d.]+)(?: pmu \[([\d,]+)\])?"
 )
 
-ENGINE = [  # kparams prefix -> (engine lane, pretty)
+# The profile's kparams field is a MATMUL-only struct (htp_mm_kernel_params): only
+# matmul & flash-attn write a kernel-variant tag (hvx-tiled / hmx-tiled / hmx-pipe).
+# Every other op prints "----". That does NOT mean it ran on the scalar unit — the
+# ggml-hexagon HTP kernels for add/mul/swiglu/conv/concat/cpy/rope are all HVX-
+# vectorized (hvx_* / Q6_V* intrinsics on the 6-thread worker-pool). So the three
+# lanes are: HMX matmul, HVX matmul/attn (tagged), HVX elementwise (untagged).
+ENGINE = [  # kparams prefix -> lane label
     ("hmx", "HMX"),
-    ("hvx", "HVX"),
+    ("hvx", "HVX · matmul/attn"),
 ]
 
 
@@ -31,7 +37,7 @@ def engine_of(kparams):
     for pre, name in ENGINE:
         if k.startswith(pre):
             return name, k
-    return "scalar/DSP", (k or "scalar")
+    return "HVX · elementwise", (k or "elementwise")
 
 
 def layer_of(names):
@@ -128,7 +134,7 @@ op_names = sorted({r["op"] for r in rows})
 roles = sorted({r["role"] for r in rows})
 dims_tab = sorted({r["dims"] for r in rows})
 dt_tab = sorted({r["dt"] for r in rows})
-engs = ["HMX", "HVX", "scalar/DSP"]
+engs = ["HMX", "HVX · matmul/attn", "HVX · elementwise"]
 oi = {v: i for i, v in enumerate(op_names)}
 ri = {v: i for i, v in enumerate(roles)}
 di = {v: i for i, v in enumerate(dims_tab)}

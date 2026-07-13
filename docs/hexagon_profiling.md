@@ -55,41 +55,74 @@ the **short-conv projections dominate**:
 but run **every layer × every token**, so they accumulate. The FFN projections have high
 per-call cost but only 6 FFN-bearing layers × few calls in this trace.
 
-## Which engine ran each op — HMX is mostly idle
+## Which engine ran each op — HMX is idle, ~87 % is HVX
 
-The `kparams` field records the kernel that ran. The split is striking:
+The profiler's `kparams` field only tags a kernel variant for the ops that *have* a
+kernel-selection struct (`htp_mm_kernel_params`) — i.e. **matmul and flash-attn**, which
+report `hvx-tiled` / `hmx-tiled` / `hmx-pipe`. Every other op prints `----`. **A blank
+`kparams` does not mean the op ran on the scalar unit** — the ggml-hexagon HTP kernels for
+add/mul/swiglu/conv/concat/cpy/rope are all HVX-vectorized (`hvx_*` / `Q6_V*` intrinsics on
+the 6-thread worker-pool). Grouping by kernel tag gives three lanes:
 
-| op | kernels used |
-|---|---|
-| **MUL_MAT** | **`hvx-tiled` 64.3 ms (×680)**, `hmx-tiled` 15.3 ms (×68) |
-| FLASH_ATTN_EXT | `hvx` 22.6 ms (×204), `hmx-pipe` 4.2 ms (×6) |
-| SSM_CONV | scalar 5.7 ms | SWIGLU | scalar 7.9 ms |
-
-**~80 % of matmul time runs on HVX (the vector unit), not HMX (the matrix engine).**
-Reason: the short-conv projections are decode-time **GEMV** (activation `ne1=1`), which
-ggml-hexagon routes to an HVX tiled kernel — the single HMX unit only handles the
-batched (`ne1=35`) prefill FFN matmuls (`hmx-tiled`, 15.3 ms). So **the matrix engine is
-mostly idle during decode**; decode is HVX-bound on the short-conv GEMVs.
-
-Totalled across **all** ops (not just MUL_MAT), the engine split is the single sharpest
-number in this profile:
-
-| engine | total | % of compute | ops |
-|---|---:|---:|---:|
-| **HVX** (vector) | 86.9 ms | **59.5 %** | 884 |
-| **scalar / DSP** | 39.6 ms | **27.1 %** | 3946 |
-| **HMX** (matrix) | 19.5 ms | **13.4 %** | 74 |
+| lane | total | % of compute | ops | what |
+|---|---:|---:|---:|---|
+| **HVX · matmul/attn** | 86.9 ms | **59.5 %** | 884 | `hvx-tiled` GEMV + `hvx` flash-attn |
+| **HVX · elementwise** | 39.6 ms | **27.1 %** | 3946 | add/mul/swiglu/conv/concat/cpy/rope — untagged, still HVX |
+| **HMX · matrix** | 19.5 ms | **13.4 %** | 74 | `hmx-tiled`/`hmx-pipe`, batched prefill only |
 
 **The HMX matrix engine — the thing the NPU is built around — carries only 13 % of the
-work.** ~87 % of inference is vector + scalar. Any tilelang win has to move the needle on
-the HVX GEMV path, or find a way to route the short-conv projections onto HMX.
+work; ~87 % is HVX.** HMX only fires on the batched (`ne1=35`) prefill matmuls; decode's
+short-conv projections are `ne1=1` GEMV that route to `hvx-tiled` and never touch HMX.
+
+### Hardware-PMU verification (on-silicon counters, not source-reading)
+
+`PROFILE=2` also captures 8 Hexagon **PMU hardware counters** per op. Decoding the events
+ggml programs (`{0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C}`), **counter[2] =
+`0x100` = `HVX_ACTIVE`** (HVX-active cycles; confirmed against the SDK's raw-opcode table
+and `itrace` example). Per-op `HVX_ACTIVE / total-cycles`:
+
+| op | HVX_ACTIVE / cycle | reading |
+|---|---:|---|
+| CPY | **2.01×** | HVX-bound, worker-pool spread across threads |
+| MUL_MAT | **1.73×** | HVX-bound, multi-threaded |
+| CONCAT | **1.69×** | HVX-bound |
+| FLASH_ATTN_EXT | **1.07×** | HVX-bound |
+| SWIGLU | 0.74× | mostly HVX |
+| SSM_CONV | 0.21× | HVX + memory/setup |
+| ROPE / ADD / MUL / SCALE / rows | 0.00–0.15× | **overhead-bound**, not scalar-compute |
+
+(ratio > 1 because counters sum across the up-to-6 worker-pool HVX contexts.) The heavy ops
+genuinely saturate HVX. The tiny glue ops read low **not because they run on a scalar ALU**
+— the source proves HVX intrinsics — but because they're **overhead-bound**: FastRPC
+dispatch + memory latency + address setup dwarf the handful of vector packets. That fixed
+per-op cost is precisely what operator **fusion** eliminates, which sharpens the fusion
+argument rather than pointing at a scalar bottleneck.
+
+## Proper NPU profilers (beyond ggml's built-in one)
+
+ggml-hexagon's `GGML_HEXAGON_PROFILE` is homegrown (its ambiguous `kparams` field is what
+mislabeled the "scalar" lane above). The Qualcomm stack ships real profilers; which one
+applies depends on the runtime:
+
+| tool | granularity | output | applies to our LFM2/llama.cpp path? |
+|---|---|---|---|
+| **itrace** (Hexagon SDK `libs/itrace`) | per-DSP-section, PMU events | **Chrome-trace / Perfetto JSON** timeline | **Yes** — taps the same PMU counters over FastRPC; needs itrace sections or system-wide DSP trace |
+| **Snapdragon Profiler** | system-level DSP/HMX/HVX util, clocks, thermal | GUI/CSV, real-time over ADB | **Yes**, for utilization/clock/thermal — not per-op graph timing |
+| **QNN `qnn-profile-viewer`** (`--profiling_level detailed`) | per-op on HTP, cycle-accurate | text/CSV | **No** — QNN-graph only (our Qwen3-4B QNN path, not llama.cpp) |
+| **Qualcomm AI Hub** profiling job | per-layer, official, unit breakdown | web report | **No** — needs an AI-Hub-compilable model (LFM2 unsupported) |
+| **ETM** (`HAP_user_etm_enable`, `GGML_HEXAGON_ETM`) | cycle-accurate instruction trace | binary trace, heavy post-processing | possible but heavyweight |
+
+The pragmatic complete picture for the llama.cpp path = the **PMU counters we already have**
+(the on-silicon truth, decoded above) + **itrace** for a Perfetto timeline + **Snapdragon
+Profiler** for system-level HMX/HVX utilization. Notably ggml's default event set has **no
+HMX counter** — to measure HMX occupancy directly we'd add an HMX event to `opt_pmu_evt`.
 
 ## Interactive timeline
 
 [`hexagon_timeline.html`](hexagon_timeline.html) is an nsys-style trace viewer for this
 capture (open the file, or the published artifact): every one of the 4904 op instances is
 a bar placed in execution order at its measured latency, colored by op type, split into
-**HMX / HVX / scalar** lanes so the idle HMX lane is visible at a glance. Zoom/pan, a
+**HMX / HVX-matmul / HVX-elementwise** lanes so the idle HMX lane is visible at a glance. Zoom/pan, a
 phase ribbon marking the 36 forward passes (2 warmup + 1 prefill@35tok + 31 decode@1tok),
 a minimap, and per-bar tooltips (layer, role, shape, dtype). Built from the same log by
 `timeline_export.py`. The timeline is **packed by compute time** — the per-op `start`
