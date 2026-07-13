@@ -71,6 +71,33 @@ ggml-hexagon routes to an HVX tiled kernel — the single HMX unit only handles 
 batched (`ne1=35`) prefill FFN matmuls (`hmx-tiled`, 15.3 ms). So **the matrix engine is
 mostly idle during decode**; decode is HVX-bound on the short-conv GEMVs.
 
+Totalled across **all** ops (not just MUL_MAT), the engine split is the single sharpest
+number in this profile:
+
+| engine | total | % of compute | ops |
+|---|---:|---:|---:|
+| **HVX** (vector) | 86.9 ms | **59.5 %** | 884 |
+| **scalar / DSP** | 39.6 ms | **27.1 %** | 3946 |
+| **HMX** (matrix) | 19.5 ms | **13.4 %** | 74 |
+
+**The HMX matrix engine — the thing the NPU is built around — carries only 13 % of the
+work.** ~87 % of inference is vector + scalar. Any tilelang win has to move the needle on
+the HVX GEMV path, or find a way to route the short-conv projections onto HMX.
+
+## Interactive timeline
+
+[`hexagon_timeline.html`](hexagon_timeline.html) is an nsys-style trace viewer for this
+capture (open the file, or the published artifact): every one of the 4904 op instances is
+a bar placed in execution order at its measured latency, colored by op type, split into
+**HMX / HVX / scalar** lanes so the idle HMX lane is visible at a glance. Zoom/pan, a
+phase ribbon marking the 36 forward passes (2 warmup + 1 prefill@35tok + 31 decode@1tok),
+a minimap, and per-bar tooltips (layer, role, shape, dtype). Built from the same log by
+`timeline_export.py`. The timeline is **packed by compute time** — the per-op `start`
+cycle-counter is a per-core free-running counter (6 HW threads + op batching), not a
+shared clock, so ~half the timestamps run backwards and can't place ops on a wall-clock;
+laying measured durations end-to-end in ggml execution order gives the true compute
+sequence without host-logging gaps.
+
 ## Timeline
 
 Op instances in execution order, 20 buckets (`#` = relative time in bucket):
