@@ -1,0 +1,471 @@
+<title>tilelang × Hexagon NPU — 技术路线汇报</title>
+<style>
+  :root {
+    --bg:#0b0e14; --stage:#0f141d; --panel:#161d29; --panel2:#1c2634; --line:#273244;
+    --ink:#e8edf4; --dim:#9aa7ba; --faint:#6b7889;
+    --hmx:#f5b942;      /* 矩阵引擎 / 目标 / 强调 */
+    --hvx:#3fbdf5;      /* 向量单元 */
+    --win:#54d98c; --warn:#f2683c; --gap:#f2683c;
+    --hmx-soft:#f5b9421f; --hvx-soft:#3fbdf51f; --win-soft:#54d98c1f;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
+    --r:14px;
+  }
+  @media (prefers-color-scheme:light){
+    :root{ --bg:#eef1f6; --stage:#ffffff; --panel:#f4f6fa; --panel2:#e9edf4; --line:#d7deea;
+           --ink:#141a24; --dim:#4d586a; --faint:#8590a2; --hmx-soft:#f5b94222; --hvx-soft:#3fbdf522; --win-soft:#54d98c22; }
+  }
+  :root[data-theme="dark"]{ --bg:#0b0e14; --stage:#0f141d; --panel:#161d29; --panel2:#1c2634; --line:#273244;
+           --ink:#e8edf4; --dim:#9aa7ba; --faint:#6b7889; --hmx-soft:#f5b9421f; --hvx-soft:#3fbdf51f; --win-soft:#54d98c1f; }
+  :root[data-theme="light"]{ --bg:#eef1f6; --stage:#ffffff; --panel:#f4f6fa; --panel2:#e9edf4; --line:#d7deea;
+           --ink:#141a24; --dim:#4d586a; --faint:#8590a2; --hmx-soft:#f5b94222; --hvx-soft:#3fbdf522; --win-soft:#54d98c22; }
+
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; }
+  body{ background:var(--bg); color:var(--ink); font-family:var(--sans);
+        -webkit-font-smoothing:antialiased; overflow:hidden; }
+
+  /* ---- 16:9 舞台 ---- */
+  .deck{ position:fixed; inset:0; display:grid; place-items:center; }
+  .stage{ position:relative; width:min(97vw, calc(96vh * 16/9)); aspect-ratio:16/9;
+          background:var(--stage); border:1px solid var(--line); border-radius:var(--r);
+          box-shadow:0 20px 70px #0007; overflow:hidden;
+          container-type:inline-size; }
+  .light .stage{ box-shadow:0 16px 50px #0002; }
+
+  .slide{ position:absolute; inset:0; padding:4.2cqw 4.6cqw 3.4cqw;
+          display:flex; flex-direction:column; opacity:0; visibility:hidden;
+          transform:translateX(22px) scale(.995); transition:opacity .38s ease, transform .38s ease; }
+  .slide.active{ opacity:1; visibility:visible; transform:none; }
+  @media (prefers-reduced-motion:reduce){ .slide{ transition:none; } }
+
+  /* typography scaled to container width so it fits any projector */
+  .eyebrow{ font-family:var(--mono); font-size:1.55cqw; letter-spacing:.18em; text-transform:uppercase;
+            color:var(--hmx); display:flex; align-items:center; gap:.8em; margin-bottom:1.6cqw; }
+  .eyebrow .num{ color:var(--faint); }
+  .eyebrow::after{ content:""; flex:1; height:1px; background:var(--line); }
+  h1{ font-size:6.2cqw; font-weight:760; line-height:1.02; letter-spacing:-.02em; text-wrap:balance; }
+  h2{ font-size:3.7cqw; font-weight:720; line-height:1.08; letter-spacing:-.015em; text-wrap:balance; }
+  h2 .hl{ color:var(--hmx); }
+  h2 .hlb{ color:var(--hvx); }
+  .sub{ color:var(--dim); font-size:1.95cqw; line-height:1.5; margin-top:1.4cqw; max-width:52em; }
+  p{ font-size:1.7cqw; line-height:1.5; color:var(--dim); }
+  b,strong{ color:var(--ink); font-weight:640; }
+  .mono{ font-family:var(--mono); }
+  code{ font-family:var(--mono); font-size:.92em; background:var(--panel2); padding:.08em .4em;
+        border-radius:5px; color:var(--ink); }
+  .body{ flex:1; min-height:0; display:flex; flex-direction:column; justify-content:center; }
+
+  /* ---- reusable bits ---- */
+  .grid{ display:grid; gap:1.5cqw; }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:2.1cqw 2.2cqw; }
+  .card h3{ font-size:1.9cqw; font-weight:680; margin-bottom:.7cqw; display:flex; align-items:center; gap:.5em; }
+  .card p{ font-size:1.5cqw; line-height:1.46; }
+  .tag{ font-family:var(--mono); font-size:1.15cqw; padding:.28em .7em; border-radius:100px;
+        border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .tag.hmx{ color:var(--hmx); border-color:#f5b94255; background:var(--hmx-soft); }
+  .tag.hvx{ color:var(--hvx); border-color:#3fbdf555; background:var(--hvx-soft); }
+  .tag.win{ color:var(--win); border-color:#54d98c55; background:var(--win-soft); }
+  .tag.gap{ color:var(--gap); border-color:#f2683c55; background:#f2683c1c; }
+  .dot{ width:.62em; height:.62em; border-radius:50%; display:inline-block; flex:none; }
+
+  table{ width:100%; border-collapse:collapse; font-size:1.5cqw; }
+  th,td{ text-align:left; padding:.86cqw 1cqw; border-bottom:1px solid var(--line); }
+  th{ font-family:var(--mono); font-weight:600; font-size:1.2cqw; text-transform:uppercase;
+      letter-spacing:.06em; color:var(--faint); }
+  td.n,th.n{ text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  tr.hi td{ background:var(--hmx-soft); }
+  tbody tr:last-child td{ border-bottom:0; }
+
+  .kpis{ display:grid; grid-template-columns:repeat(3,1fr); gap:1.6cqw; }
+  .kpi{ background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:2cqw 2.1cqw;
+        border-left:3px solid var(--hmx); }
+  .kpi .v{ font-family:var(--mono); font-size:4.4cqw; font-weight:700; line-height:1; letter-spacing:-.02em;
+           font-variant-numeric:tabular-nums; }
+  .kpi .v small{ font-size:.42em; color:var(--faint); font-weight:500; letter-spacing:0; }
+  .kpi .l{ color:var(--dim); font-size:1.4cqw; margin-top:.7cqw; line-height:1.35; }
+  .kpi.hvx{ border-left-color:var(--hvx); } .kpi.hvx .v{ color:var(--hvx); }
+  .kpi.win{ border-left-color:var(--win); } .kpi.win .v{ color:var(--win); }
+  .kpi.hmx .v{ color:var(--hmx); }
+
+  /* bar chart */
+  .bars{ display:flex; flex-direction:column; gap:1.05cqw; }
+  .bar{ display:grid; grid-template-columns:11em 1fr auto; align-items:center; gap:1.1cqw; font-size:1.45cqw; }
+  .bar .nm{ color:var(--ink); font-weight:560; }
+  .bar .track{ height:1.9cqw; background:var(--panel2); border-radius:5px; overflow:hidden; }
+  .bar .fill{ height:100%; border-radius:5px; background:var(--hmx); }
+  .bar .val{ font-family:var(--mono); color:var(--dim); font-variant-numeric:tabular-nums; font-size:1.35cqw; }
+
+  pre{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:1.7cqw 1.9cqw;
+       font-family:var(--mono); font-size:1.32cqw; line-height:1.62; overflow:auto; color:var(--ink); }
+  pre .c{ color:var(--faint); }          /* comment */
+  pre .k{ color:var(--hvx); }            /* keyword */
+  pre .s{ color:var(--win); }            /* string/val */
+  pre .h{ color:var(--hmx); font-weight:600; }  /* highlight */
+
+  .flow{ display:flex; align-items:stretch; gap:0; }
+  .step{ flex:1; background:var(--panel); border:1px solid var(--line); padding:1.5cqw 1.3cqw; position:relative; }
+  .step:first-child{ border-radius:10px 0 0 10px; }
+  .step:last-child{ border-radius:0 10px 10px 0; }
+  .step + .step{ border-left:0; }
+  .step .si{ font-family:var(--mono); font-size:1.15cqw; color:var(--hmx); }
+  .step .st{ font-size:1.5cqw; font-weight:640; margin:.5cqw 0 .3cqw; }
+  .step .sd{ font-size:1.22cqw; color:var(--dim); line-height:1.4; font-family:var(--mono); }
+  .step.dev{ border-color:#f5b94255; }
+
+  ul.clean{ list-style:none; display:flex; flex-direction:column; gap:1.15cqw; }
+  ul.clean li{ font-size:1.62cqw; line-height:1.42; color:var(--dim); padding-left:1.7em; position:relative; }
+  ul.clean li::before{ content:"▸"; position:absolute; left:0; color:var(--hmx); }
+  ul.clean li b{ color:var(--ink); }
+
+  .lead{ font-size:2.1cqw; line-height:1.5; color:var(--ink); font-weight:560; max-width:42em; }
+  .lead .hl{ color:var(--hmx); } .lead .hlb{ color:var(--hvx); } .lead .win{ color:var(--win); }
+
+  /* ---- chrome: progress, footer, nav ---- */
+  .footer{ position:absolute; left:0; right:0; bottom:0; height:3cqw; display:flex; align-items:center;
+           gap:1.4cqw; padding:0 4.6cqw; font-family:var(--mono); font-size:1.15cqw; color:var(--faint); }
+  .footer .title{ color:var(--dim); }
+  .footer .pg{ margin-left:auto; color:var(--dim); }
+  .progress{ position:absolute; top:0; left:0; height:3px; background:var(--hmx); transition:width .38s ease; z-index:5; }
+  .dots{ display:flex; gap:.5em; }
+  .dots i{ width:.6em; height:.6em; border-radius:50%; background:var(--line); cursor:pointer; transition:background .2s,transform .2s; }
+  .dots i.on{ background:var(--hmx); transform:scale(1.25); }
+
+  .nav{ position:fixed; bottom:1.4vh; right:1.6vw; display:flex; gap:.5em; z-index:20; }
+  .nav button, .theme{ font-family:var(--mono); font-size:13px; background:var(--panel); color:var(--dim);
+    border:1px solid var(--line); border-radius:8px; padding:.5em .8em; cursor:pointer; }
+  .nav button:hover,.theme:hover{ color:var(--ink); border-color:var(--hmx); }
+  .nav button:focus-visible,.theme:focus-visible{ outline:2px solid var(--hmx); outline-offset:2px; }
+  .theme{ position:fixed; top:1.4vh; right:1.6vw; z-index:20; }
+  .hint{ position:fixed; bottom:1.4vh; left:1.6vw; z-index:20; font-family:var(--mono); font-size:12px; color:var(--faint); }
+
+  .cover-bg{ position:absolute; inset:0; z-index:0; opacity:.5; }
+  .cover-wrap{ position:relative; z-index:1; height:100%; display:flex; flex-direction:column; justify-content:center; }
+</style>
+
+<div class="deck">
+  <div class="stage" id="stage">
+    <div class="progress" id="progress"></div>
+
+    <!-- 1 · COVER -->
+    <section class="slide active">
+      <canvas class="cover-bg" id="coverCanvas"></canvas>
+      <div class="cover-wrap">
+        <div class="eyebrow"><span class="num">技术路线汇报</span> · LFM2 端侧部署</div>
+        <h1>tilelang × Hexagon NPU<br><span style="color:var(--hmx)">把 LFM2 的 decode 推向 nexa</span></h1>
+        <p class="sub">在骁龙 8 Elite(Hexagon v79)上,用 tilelang DSL 写高性能算子、替换进 llama.cpp 的 ggml-hexagon 后端——现状盘点、完整性能剖析、以及 tilelang 真正该发力的地方。</p>
+        <div class="kpis" style="margin-top:3cqw">
+          <div class="kpi win"><div class="v">+80<small>% decode</small></div><div class="l">lm_head 搬回 NPU(一行改动,两法验证)</div></div>
+          <div class="kpi hmx"><div class="v">2.09→1.24<small>×</small></div><div class="l">对 nexa 差距(Q4_0 @1024 上下文)</div></div>
+          <div class="kpi"><div class="v">95<small>% idle</small></div><div class="l">HMX 矩阵引擎在 decode 时全程闲置</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2 · Hexagon 不是 GPU -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">01</span> 背景</div>
+      <h2>Hexagon <span class="hl">不是 GPU</span> —— 大部分难点都源于这条鸿沟</h2>
+      <div class="body">
+        <div class="grid" style="grid-template-columns:repeat(3,1fr); margin-bottom:1.6cqw">
+          <div class="card"><h3><span class="dot" style="background:var(--hvx)"></span>HVX 向量</h3><p>1024-bit(128 字节)寄存器 × 6 硬件线程。<b>没有子寄存器操作</b> —— 每条指令都是整个 128B 寄存器。</p></div>
+          <div class="card"><h3><span class="dot" style="background:var(--hmx)"></span>HMX 矩阵</h3><p><b>一个</b> fp16 矩阵引擎,32×32 Crouton tile。没有 <code>mma</code> 指令、没有可寻址累加器 —— 加载 tile <b>就是</b> MAC。</p></div>
+          <div class="card"><h3><span class="dot" style="background:var(--dim)"></span>VTCM + DMA</h3><p>8 MB 软件管理 SRAM。<b>没有自动缓存、没有 SIMT</b>。权重从 DDR 流式,靠 DMA + 显式搬运。</p></div>
+        </div>
+        <div class="card" style="border-left:3px solid var(--warn)">
+          <p style="font-size:1.6cqw"><b>与 CUDA 的鸿沟:</b> 没有 SIMT、没有 <code>mma</code>、没有 <code>C_local</code> 累加器片段、没有自动缓存。把一个 tilelang 算子搬上 Hexagon,比搬上 CUDA 难得多 —— 这决定了下面整个栈的形态。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3 · 已建成的栈 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">02</span> 现状 · 已建成</div>
+      <h2>五层栈已打通,单算子达 <span class="hl">parity</span></h2>
+      <div class="body">
+        <table style="margin-bottom:1.4cqw">
+          <thead><tr><th>层</th><th>内容</th><th>状态</th></tr></thead>
+          <tbody>
+            <tr><td><b>Codegen</b></td><td>全寄存器 HVX 向量化 —— 1024-bit 宽度 +「最窄 dtype 必须填满整个寄存器」规则 + 原生 <code>ext_vector</code></td><td><span class="tag win">✓ 已提交,零回归</span></td></tr>
+            <tr><td><b>DSL 内核</b></td><td>全 DSL 的 q4_0 dequant(匹配手写 HVX)+ fused dequant→VTCM→<code>T.gemm</code>→HMX</td><td><span class="tag win">✓ device-correct 2.5e-4</span></td></tr>
+            <tr><td><b>HMX 抽象</b></td><td><code>HMXIntrinEmitter</code> —— instruction-atom(pack_a/pack_b/mma/store/clear),tilelang <code>TensorCoreIntrinEmitter</code> 的 Hexagon 对应</td><td><span class="tag win">✓ K-streaming 正确</span></td></tr>
+            <tr><td><b>运行时对接</b></td><td>bridge(骑 host VTCM+HMX)、op registry、ggml 拦截、embeddable-kernel emit</td><td><span class="tag win">✓ 机制完成</span></td></tr>
+            <tr class="hi"><td><b>设备</b></td><td>LFM2-1.2B 在 NPU 上跑,tilelang q4_0 matmul 在模型里 A/B</td><td><span class="tag hmx">prefill parity 537.7 / 529.9</span></td></tr>
+          </tbody>
+        </table>
+        <div class="card" style="border-left:3px solid var(--gap)">
+          <p style="font-size:1.6cqw"><b>但这是 prefill 的天花板。</b> 拦截点是 HMX prefill 路径(M≤32),而且 backend 已经把 q4_0 matmul 调优了 —— 单算子重写只能<b>追平</b>,不能超越。<b>decode(M=1 GEMV)完全没碰。</b></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4 · 完整前向剖析 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">03</span> 本轮 · 完整前向剖析</div>
+      <h2>一个 decode token = 227 算子,<span class="hl">FFN 占 69%</span></h2>
+      <div class="body">
+        <div class="grid" style="grid-template-columns:1.35fr 1fr; align-items:center">
+          <div class="bars">
+            <div class="bar"><span class="nm">FFN gate+up</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">46%</span></div>
+            <div class="bar"><span class="nm">FFN down</span><span class="track"><span class="fill" style="width:50%"></span></span><span class="val">23%</span></div>
+            <div class="bar"><span class="nm">短卷积 in_proj</span><span class="track"><span class="fill" style="width:24%;background:var(--hvx)"></span></span><span class="val">11%</span></div>
+            <div class="bar"><span class="nm">注意力 flash</span><span class="track"><span class="fill" style="width:9%;background:var(--hvx)"></span></span><span class="val">4%</span></div>
+            <div class="bar"><span class="nm">短卷积 out_proj</span><span class="track"><span class="fill" style="width:7%;background:var(--hvx)"></span></span><span class="val">3%</span></div>
+            <div class="bar"><span class="nm">Attn QKV</span><span class="track"><span class="fill" style="width:6%;background:var(--hvx)"></span></span><span class="val">3%</span></div>
+            <div class="bar"><span class="nm">短卷积 conv 本体</span><span class="track"><span class="fill" style="width:2%;background:var(--faint)"></span></span><span class="val">1%</span></div>
+            <div class="bar"><span class="nm">norm / cache / glue</span><span class="track"><span class="fill" style="width:13%;background:var(--faint)"></span></span><span class="val">6%</span></div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:1.4cqw">
+            <div class="card"><h3 style="color:var(--hmx)">HMX 只干 5.2%</h3><p>decode 的所有 matmul 都是 M=1 GEMV,全走 HVX 向量单元。<b>矩阵引擎 95% 闲置。</b></p></div>
+            <div class="card"><h3>16 层惊人均匀</h3><p>每层 ~0.83ms —— 短卷积层(0.83)和注意力层(0.84)<b>一样</b>,都被 FFN 主导。混合架构在 decode 时不省时间。</p></div>
+          </div>
+        </div>
+        <p style="text-align:center; font-size:1.4cqw; margin-top:1.6cqw; color:var(--faint)">数据:<code>GGML_HEXAGON_PROFILE=2</code> 逐算子 + 8 个硬件 PMU 计数器 · 7994 算子 / 500ms · HVX_ACTIVE(0x100)验证引擎归属</p>
+      </div>
+    </section>
+
+    <!-- 5 · vs nexa -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">04</span> 本轮 · 与 nexa 对比</div>
+      <h2>同精度下,nexa 的 decode 快 <span class="hl">2×</span> —— 不是量化,是运行时</h2>
+      <div class="body">
+        <div class="grid" style="grid-template-columns:1.25fr 1fr; align-items:center">
+          <table>
+            <thead><tr><th>运行时 @1024</th><th>权重</th><th class="n">prefill</th><th class="n">decode</th></tr></thead>
+            <tbody>
+              <tr class="hi"><td><b>nexa / GenieX</b>(QNN)</td><td>8-bit</td><td class="n">3618</td><td class="n"><b>69.5</b></td></tr>
+              <tr><td>llama.cpp</td><td>Q8_0(8-bit)</td><td class="n">3272</td><td class="n">26.6</td></tr>
+              <tr><td>llama.cpp</td><td>Q4_0(4-bit)</td><td class="n">3175</td><td class="n">35.6</td></tr>
+              <tr><td>llama.cpp</td><td>F16</td><td class="n">2174</td><td class="n">22.1</td></tr>
+            </tbody>
+          </table>
+          <ul class="clean">
+            <li><b>decode 受权重带宽限制</b>:Q4_0 &gt; Q8_0 &gt; F16(字节越少越快)</li>
+            <li><b>同为 8-bit,nexa 快 2.6×</b> —— 它 8-bit 甚至比 llama 的 4-bit 还快,尽管多搬一倍字节</li>
+            <li>拆开每 token:<b>框架开销只有 3.5ms(13%)</b>,不是瓶颈</li>
+            <li><b class="mono" style="color:var(--hmx)">→ nexa 的优势 = 整图编译 + 吃 HMX,不是量化</b></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6 · lm_head 实战 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">05</span> 本轮 · 实战收益</div>
+      <h2>lm_head 搬回 NPU:<span class="win">一行改动,decode +80%</span></h2>
+      <div class="body">
+        <div class="grid" style="grid-template-columns:1fr 1fr; align-items:center; margin-bottom:1.4cqw">
+          <div>
+            <p style="font-size:1.55cqw; margin-bottom:1.2cqw">ggml-hexagon 因为一句 <code>// hardcoded limit ... for now</code> 把 65536 词表的 lm_head 赶去 CPU。它是 134M 参数,<b>每 token 都要读一遍</b>,还是串行关键路径。</p>
+            <pre><span class="c">// ggml-hexagon.cpp:2797</span>
+<span class="c">- if (src0->ne[1] > 32768) return false;</span>
+<span class="h">+ if (src0->ne[1] > 131072) return false;</span>
+<span class="c">// 配合 --token-embedding-type q4_0</span></pre>
+          </div>
+          <table>
+            <thead><tr><th>lm_head 在</th><th class="n">decode</th><th class="n">每 token</th></tr></thead>
+            <tbody>
+              <tr><td>CPU · 1 线程</td><td class="n">16.9</td><td class="n">43.7ms</td></tr>
+              <tr><td>CPU · 8 线程</td><td class="n">35.6</td><td class="n">12.4ms</td></tr>
+              <tr class="hi"><td><b>NPU(HVX)</b></td><td class="n"><b>64.1</b></td><td class="n"><b>1.43ms</b></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+          <div class="card"><h3 style="font-size:1.6cqw">两法交叉验证</h3><p>线程扩展(3.5×)+ NPU profile(1.43ms 实测)收敛到同一个数 —— CPU 上白扔 12.4ms/token。</p></div>
+          <div class="card"><h3 style="font-size:1.6cqw">同一 GEMV,NPU 快 8.7×</h3><p>CPU 5 GB/s(计算受限)vs NPU 50 GB/s(跑满 DDR)。</p></div>
+          <div class="card"><h3 style="font-size:1.6cqw">可提上游的 patch</h3><p>注释自己写着「for now」—— 本就是待办。输出文本完全正确。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 7 · 诊断:差距在哪 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">06</span> 诊断</div>
+      <h2>叠加优化后,对 nexa 差距 <span class="hl">2.09× → 1.24×</span></h2>
+      <div class="body">
+        <div class="bars" style="margin-bottom:2cqw; gap:1.4cqw">
+          <div class="bar" style="grid-template-columns:13em 1fr auto"><span class="nm">原始基线 Q4_0</span><span class="track"><span class="fill" style="width:48%;background:var(--faint)"></span></span><span class="val">33.2 tok/s</span></div>
+          <div class="bar" style="grid-template-columns:13em 1fr auto"><span class="nm">+ lm_head 上 NPU</span><span class="track"><span class="fill" style="width:79%"></span></span><span class="val">54.8 <b style="color:var(--win)">+65%</b></span></div>
+          <div class="bar" style="grid-template-columns:13em 1fr auto"><span class="nm">+ OPPOLL=1(忙轮询)</span><span class="track"><span class="fill" style="width:81%"></span></span><span class="val">56.1 <b style="color:var(--win)">+69%</b></span></div>
+          <div class="bar" style="grid-template-columns:13em 1fr auto"><span class="nm">nexa(8-bit,QNN)</span><span class="track"><span class="fill" style="width:100%;background:var(--hmx)"></span></span><span class="val">69.5 tok/s</span></div>
+        </div>
+        <div class="grid" style="grid-template-columns:1fr 1fr">
+          <div class="card" style="border-left:3px solid var(--win)"><h3 style="font-size:1.7cqw">✓ 已拿下</h3><p>lm_head 覆盖缺口(+65%)、OPPOLL 消唤醒延迟(+18% 轻载)、框架开销证明很小(3.5ms)。</p></div>
+          <div class="card" style="border-left:3px solid var(--hmx)"><h3 style="font-size:1.7cqw">剩下的 2×(同精度)</h3><p><b>不是框架,是计算/内存效率</b>:HMX 全程闲置 + HVX 量化 GEMV 内核 + 权重流式。这是 tilelang 的主场。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 8 · 战略:tilelang 该怎么用 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">07</span> 战略 · 核心结论</div>
+      <h2>别再打 prefill —— 打 backend 的<span class="hl">弱项</span></h2>
+      <div class="body">
+        <p class="lead" style="margin-bottom:2cqw">之前 tilelang 打的是 prefill 的 HMX matmul,已 <span class="win">parity</span> —— 但那是 backend 的<b>强项</b>,重写只能追平。真正的机会在 backend 没优化好的地方:<span class="hl">decode</span>。</p>
+        <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+          <div class="card" style="border-top:3px solid var(--hmx)">
+            <h3><span class="tag hmx">收益最大</span></h3>
+            <h3 style="margin-top:.6cqw">① decode 量化 GEMV</h3>
+            <p>FFN 的 gate/up/down(69% 时间)是 M=1 GEMV,全走 HVX、HMX 闲置。写更好的量化 GEMV,或想办法用 HMX —— <b>直接攻那 2× 差距</b>。</p>
+          </div>
+          <div class="card" style="border-top:3px solid var(--hvx)">
+            <h3><span class="tag hvx">组合性</span></h3>
+            <h3 style="margin-top:.6cqw">② 短卷积块融合</h3>
+            <p><code>in_proj → SSM_CONV → out_proj</code>(15%)是<b>唯一没被 ggml 融合的子图</b>(conv 夹在中间)。融合后中间量留 VTCM,省两次 DDR 往返/token。</p>
+          </div>
+          <div class="card" style="border-top:3px solid var(--win)">
+            <h3><span class="tag win">已验证</span></h3>
+            <h3 style="margin-top:.6cqw">③ 覆盖缺口</h3>
+            <p>lm_head(+80%,已证)+ backend 不支持的 op/量化格式。tilelang 的价值 = <b>覆盖 backend 拒绝的形状</b>,不是重写它已有的。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 9 · tilelang-NPU 流程 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">08</span> 流程 · tilelang → 设备</div>
+      <h2>一个 tilelang 算子怎么跑进 llama.cpp</h2>
+      <div class="body">
+        <div class="flow" style="margin-bottom:2cqw">
+          <div class="step"><div class="si">01 · DSL</div><div class="st">写 <code>@T.prim_func</code></div><div class="sd">alloc_shared + DSL dequant + T.gemm</div></div>
+          <div class="step"><div class="si">02 · 编译</div><div class="st">全寄存器 HVX codegen</div><div class="sd">1024-bit 向量化 + HMX lowering</div></div>
+          <div class="step"><div class="si">03 · 抽取</div><div class="st">get_kernel_source()</div><div class="sd">= 可嵌入的 extern "C" body</div></div>
+          <div class="step dev"><div class="si">04 · 对接</div><div class="st">registry + bridge</div><div class="sd">tl_op_desc + 骑 host VTCM/HMX</div></div>
+          <div class="step dev"><div class="si">05 · 拦截</div><div class="st">patch hmx_mm 顶部</div><div class="sd">tl_dispatch()==0 → return</div></div>
+          <div class="step dev"><div class="si">06 · 部署</div><div class="st">重编 skel + push</div><div class="sd">A/B: tl_mm_enabled 开关</div></div>
+        </div>
+        <div class="grid" style="grid-template-columns:1fr 1fr">
+          <div class="card"><h3 style="font-size:1.65cqw"><span class="dot" style="background:var(--hmx)"></span>关键设计:Mode B(骑 host 资源)</h3><p>tilelang 算子作为<b>源码</b>co-compile 进 <code>libggml-htp-v79.so</code>,复用 host 已获取的 VTCM 区 + HMX 锁,不自己 acquire session —— 这是能嵌进别人 skel 的前提。</p></div>
+          <div class="card"><h3 style="font-size:1.65cqw"><span class="dot" style="background:var(--win)"></span>安全边界:decline → fall through</h3><p><code>run()</code> 返回 <code>-1</code> 就回退 backend 原内核 —— tilelang 路径可以<b>只覆盖部分形状</b>,不影响模型正确性。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 10 · 算子对接例子 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">09</span> 例子 · fused q4_0 matmul</div>
+      <h2>一个 kernel 写完:DSL dequant + HMX gemm</h2>
+      <div class="body">
+        <div class="grid" style="grid-template-columns:1.15fr .85fr; align-items:start; gap:2cqw">
+          <pre><span class="k">@T.prim_func</span>
+<span class="k">def</span> qmatmul(A, qcm, scb, C):        <span class="c"># A:激活 qcm:q4_0权重 scb:scale</span>
+  <span class="k">with</span> T.Kernel(1, threads=1):
+    A_sh = T.alloc_shared((M,K), <span class="s">"float16"</span>)
+    B_sh = T.alloc_shared((K,N), <span class="s">"float16"</span>)  <span class="c"># 反量化后留 VTCM</span>
+    T.copy(A, A_sh)
+    <span class="k">for</span> j <span class="k">in</span> T.serial(KH):              <span class="c"># DSL q4_0 dequant → 整宽 HVX</span>
+      <span class="k">for</span> ni <span class="k">in</span> T.vectorized(<span class="h">128</span>):    <span class="c"># 填满 128B 寄存器</span>
+        q  = T.Cast(<span class="s">"int16"</span>, qcm[j,n])   <span class="c"># 先加宽</span>
+        lo = (q & <span class="s">0xF</span>) - <span class="s">8</span>            <span class="c"># 低 nibble</span>
+        B_sh[2*j,n] = T.Cast(<span class="s">"float16"</span>,lo) * scb[2*j,n]
+    T.gemm(A_sh, B_sh, C_sh, <span class="h">clear_accum=True</span>)  <span class="c"># → HMX</span>
+    T.copy(C_sh, C)</pre>
+          <div style="display:flex; flex-direction:column; gap:1.3cqw">
+            <div class="card"><h3 style="font-size:1.55cqw">两层 DSL surface</h3><p><b>简单:</b> 上面这样,一个 <code>T.gemm</code> 搞定(dequant 是普通 DSL 算术)。<br><b>进阶:</b> <code>HMXIntrinEmitter</code> 手驱 K-loop,让 dequant 藏在 MAC 下。</p></div>
+            <div class="card"><h3 style="font-size:1.55cqw">三条 HVX 铁律</h3><p>① 最窄 dtype 填满寄存器(<code>vectorized(128)</code>)<br>② bitwise 前先加宽到 int16<br>③ 权重预打包 column-major,dequant 存连续。</p></div>
+            <p style="font-size:1.32cqw; color:var(--faint)">可运行:<code>examples/hexagon/example_qmatmul.py</code> · 对接全套:<code>llama_cpp_integration/</code></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 11 · 任务列表 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">10</span> 任务评估</div>
+      <h2>优先级 × 收益 × 难度</h2>
+      <div class="body">
+        <table>
+          <thead><tr><th>任务</th><th>收益</th><th>难度</th><th>状态</th></tr></thead>
+          <tbody>
+            <tr class="hi"><td><b>decode 量化 GEMV 内核</b>(FFN gate/up/down)</td><td><span class="tag hmx">★★★ 攻 2× 差距</span></td><td>高</td><td>未开始 · 主战场</td></tr>
+            <tr><td><b>短卷积块子图融合</b>(in_proj→conv→out_proj)</td><td><span class="tag hvx">★★ 省 DDR 往返</span></td><td>中高</td><td>未开始 · 唯一没融的</td></tr>
+            <tr><td><b>lm_head 搬回 NPU</b>(改上限 + 重量化)</td><td><span class="tag win">★★ +80% 实测</span></td><td>低</td><td><span class="tag win">✓ 已验证,可上游</span></td></tr>
+            <tr><td>OPPOLL=1 默认化(轻载 +18%)</td><td><span class="tag win">★ 免费</span></td><td>低</td><td><span class="tag win">✓ 已验证</span></td></tr>
+            <tr><td>K-streaming perf(dequant 藏 MAC 下 → parity)</td><td><span class="tag">★ prefill 天花板</span></td><td>中</td><td>结构正确,perf 未做完</td></tr>
+            <tr><td>embeddable kernel 直连(去掉手转写)+ 形状族分发</td><td><span class="tag">工程完备性</span></td><td>中</td><td>off-device 验证</td></tr>
+          </tbody>
+        </table>
+        <p style="text-align:center; font-size:1.4cqw; margin-top:1.4cqw; color:var(--faint)">决策:<b style="color:var(--hmx)">先摘 lm_head 这颗低垂果实(已证)</b>,同时正式立项 decode 量化 GEMV(唯一能够到 nexa 的路)。</p>
+      </div>
+    </section>
+
+    <!-- 12 · 总结 -->
+    <section class="slide">
+      <div class="eyebrow"><span class="num">11</span> 总结</div>
+      <h2>一句话:<span class="hl">战场从 prefill 移到 decode</span></h2>
+      <div class="body">
+        <p class="lead" style="margin-bottom:2.4cqw">tilelang 的栈已经能生成 device-correct 的 HMX 算子并对接进 llama.cpp。这轮 profiling 证明:<b>prefill 已 parity(backend 强项),真正的机会在 decode</b> —— 那里 HMX 95% 闲置,backend 弱,tilelang 能赢。</p>
+        <div class="kpis">
+          <div class="kpi win"><div class="v">+80<small>%</small></div><div class="l">lm_head 上 NPU 的实测 decode 收益(已验证,可上游)</div></div>
+          <div class="kpi hmx"><div class="v">69<small>% / decode</small></div><div class="l">FFN 的 GEMV —— decode 量化 GEMV 内核是主战场</div></div>
+          <div class="kpi hvx"><div class="v">2<small>× 待攻</small></div><div class="l">同精度对 nexa 的剩余差距 = HMX + 量化 GEMV 内核</div></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer">
+      <span class="title">tilelang × Hexagon NPU · LFM2 技术路线</span>
+      <span class="dots" id="dots"></span>
+      <span class="pg" id="pageno">1 / 12</span>
+    </div>
+  </div>
+</div>
+
+<button class="theme" id="theme">◐ 主题</button>
+<div class="nav"><button id="prev">← 上一页</button><button id="next">下一页 →</button></div>
+<div class="hint">← → / 空格翻页 · 点击左右半区 · F 全屏</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const N=slides.length; let i=0;
+  const prog=document.getElementById('progress'), pageno=document.getElementById('pageno'),
+        dotsEl=document.getElementById('dots');
+  slides.forEach((_,k)=>{ const d=document.createElement('i'); d.onclick=()=>go(k); dotsEl.appendChild(d); });
+  const dots=[...dotsEl.children];
+  function go(n){ i=Math.max(0,Math.min(N-1,n));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    dots.forEach((d,k)=>d.classList.toggle('on',k===i));
+    prog.style.width=((i+1)/N*100)+'%'; pageno.textContent=(i+1)+' / '+N; }
+  const next=()=>go(i+1), prev=()=>go(i-1);
+  document.getElementById('next').onclick=next;
+  document.getElementById('prev').onclick=prev;
+  addEventListener('keydown',e=>{
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){e.preventDefault();next();}
+    else if(e.key==='ArrowLeft'||e.key==='PageUp'){e.preventDefault();prev();}
+    else if(e.key==='Home')go(0); else if(e.key==='End')go(N-1);
+    else if(e.key==='f'||e.key==='F'){ if(!document.fullscreenElement)document.documentElement.requestFullscreen(); else document.exitFullscreen(); }
+  });
+  document.getElementById('stage').addEventListener('click',e=>{
+    if(e.target.closest('button,a,.dots,pre')) return;
+    const r=e.currentTarget.getBoundingClientRect();
+    (e.clientX-r.left)/r.width>0.5 ? next() : prev();
+  });
+  // theme toggle
+  const root=document.documentElement, tb=document.getElementById('theme');
+  function sync(){ document.body.classList.toggle('light', root.getAttribute('data-theme')==='light'
+      || (!root.getAttribute('data-theme') && matchMedia('(prefers-color-scheme:light)').matches)); }
+  tb.onclick=()=>{ const cur=root.getAttribute('data-theme')
+      || (matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+    root.setAttribute('data-theme', cur==='dark'?'light':'dark'); sync(); drawCover(); };
+  matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{sync();drawCover();});
+  sync();
+
+  // cover: subtle Crouton-tile / matrix-engine field on canvas
+  const cv=document.getElementById('coverCanvas'), cx=cv.getContext('2d');
+  function drawCover(){
+    const st=cv.parentElement.getBoundingClientRect(); const dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=st.width*dpr; cv.height=st.height*dpr; cx.setTransform(dpr,0,0,dpr,0,0);
+    cx.clearRect(0,0,st.width,st.height);
+    const g=32, W=st.width, H=st.height;
+    for(let y=0;y<H;y+=g) for(let x=0;x<W;x+=g){
+      const on=(x*7+y*13)%97; if(on>78){ // sparse lit tiles = HMX 32x32 crouton
+        cx.fillStyle= on>92 ? 'rgba(245,185,66,'+(0.05+ (on-92)/8*0.10)+')' : 'rgba(63,189,245,0.04)';
+        cx.fillRect(x+2,y+2,g-4,g-4);
+      }
+      cx.strokeStyle='rgba(120,140,170,0.05)'; cx.strokeRect(x,y,g,g);
+    }
+  }
+  addEventListener('resize',drawCover); drawCover(); go(0);
+</script>

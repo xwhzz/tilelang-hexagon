@@ -168,6 +168,10 @@ docs/lfm2_hexagon_report/
 └── results/                      运行脚本后生成(prof_pmu.log / *.json)
 ```
 
+**汇报材料**(本目录):
+- [`tilelang_npu_slides.html`](tilelang_npu_slides.html) —— 技术路线汇报 slides(12 页,键盘翻页):现状、完整前向剖析、tilelang 战略、流程、算子对接例子、任务评估。
+- [`tilelang_operator_integration.md`](tilelang_operator_integration.md) —— tilelang 算子对接完整示例(DSL → 编译 → 嵌入 → patch → A/B 六步 + 踩坑)。
+
 **可视化产物**(在上级 `docs/`):
 - [`../hexagon_timeline.html`](../hexagon_timeline.html) —— 交互式 nsys 风格时间线,7994 个算子按引擎分道、可缩放悬停。
 - [`../lfm2_perfetto_trace.json`](../lfm2_perfetto_trace.json) —— 拖进 [ui.perfetto.dev](https://ui.perfetto.dev):3 条引擎轨道 + HVX_ACTIVE/committed-pkt/AXI 硬件计数器折线。
