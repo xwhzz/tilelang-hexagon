@@ -8,3 +8,6 @@
 *.gif binary
 
 *.h linguist-language=C++
+hexagon_backend_demo/artifacts/** binary
+*.so binary
+*.pdf binary

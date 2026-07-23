@@ -127,3 +127,7 @@ maint/host_checks/logs/*
 
 # uv Lockfile
 uv.lock
+
+# 外部参考仓库(各自有 .git,留本地不 vendored)
+/htp-ops-lib/
+/mini-htp/
