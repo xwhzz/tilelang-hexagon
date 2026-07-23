@@ -1,0 +1,1412 @@
+ggml-hex: Loading driver libcdsprpc.so
+ggml-hex: Profiling mode 1 : pmu-evt [  ]
+ggml-hex: Hexagon backend (experimental) : allocating new registry : ndev 1
+ggml-hex: Hexagon Arch version v79
+ggml-hex: HTP0 allocating new session
+ggml-hex: HTP0 hwinfo: threads 6, hvx 6, hmx 1, vtcm 8 MB
+ggml-hex: HTP0 new session : session-id 0 domain-id 3 uri file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 handle 0xb400007270e875e0
+ggml-hex: HTP0 op batching: n-bufs 16 n-tensors 7168 n-ops 1024 vmem 3355443200
+llama_model_loader: loaded meta data with 34 key-value pairs and 148 tensors from LFM2-1.2B-Q4_0.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = lfm2
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                               general.name str              = LFM2 1.2B
+llama_model_loader: - kv   3:                           general.basename str              = LFM2
+llama_model_loader: - kv   4:                         general.size_label str              = 1.2B
+llama_model_loader: - kv   5:                            general.license str              = other
+llama_model_loader: - kv   6:                       general.license.name str              = lfm1.0
+llama_model_loader: - kv   7:                       general.license.link str              = LICENSE
+llama_model_loader: - kv   8:                               general.tags arr[str,4]       = ["liquid", "lfm2", "edge", "text-gene...
+llama_model_loader: - kv   9:                          general.languages arr[str,8]       = ["en", "ar", "zh", "fr", "de", "ja", ...
+llama_model_loader: - kv  10:                           lfm2.block_count u32              = 16
+llama_model_loader: - kv  11:                        lfm2.context_length u32              = 128000
+llama_model_loader: - kv  12:                      lfm2.embedding_length u32              = 2048
+llama_model_loader: - kv  13:                   lfm2.feed_forward_length u32              = 8192
+llama_model_loader: - kv  14:                  lfm2.attention.head_count u32              = 32
+llama_model_loader: - kv  15:               lfm2.attention.head_count_kv arr[i32,16]      = [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, ...
+llama_model_loader: - kv  16:                        lfm2.rope.freq_base f32              = 1000000.000000
+llama_model_loader: - kv  17:                            lfm2.vocab_size u32              = 65536
+llama_model_loader: - kv  18:                     lfm2.shortconv.l_cache u32              = 3
+llama_model_loader: - kv  19:      lfm2.attention.layer_norm_rms_epsilon f32              = 0.000010
+llama_model_loader: - kv  20:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  21:                         tokenizer.ggml.pre str              = lfm2
+llama_model_loader: - kv  22:                      tokenizer.ggml.tokens arr[str,65536]   = ["<|pad|>", "<|startoftext|>", "<|end...
+llama_model_loader: - kv  23:                  tokenizer.ggml.token_type arr[i32,65536]   = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, ...
+llama_model_loader: - kv  24:                      tokenizer.ggml.merges arr[str,63683]   = ["Ċ Ċ", "Ċ ĊĊ", "ĊĊ Ċ", "Ċ �...
+llama_model_loader: - kv  25:                tokenizer.ggml.bos_token_id u32              = 1
+llama_model_loader: - kv  26:                tokenizer.ggml.eos_token_id u32              = 7
+llama_model_loader: - kv  27:            tokenizer.ggml.padding_token_id u32              = 0
+llama_model_loader: - kv  28:               tokenizer.ggml.add_bos_token bool             = true
+llama_model_loader: - kv  29:               tokenizer.ggml.add_sep_token bool             = false
+llama_model_loader: - kv  30:               tokenizer.ggml.add_eos_token bool             = false
+llama_model_loader: - kv  31:                    tokenizer.chat_template str              = {{bos_token}}{% for message in messag...
+llama_model_loader: - kv  32:               general.quantization_version u32              = 2
+llama_model_loader: - kv  33:                          general.file_type u32              = 2
+llama_model_loader: - type  f32:   55 tensors
+llama_model_loader: - type q4_0:   92 tensors
+llama_model_loader: - type q6_K:    1 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q4_0
+print_info: file size   = 661.25 MiB (4.74 BPW) 
+llama_prepare_model_devices: using device HTP0 (Hexagon) (unknown id) - 0 MiB free
+init_tokenizer: initializing tokenizer for type 2
+load: 0 unused tokens
+load: control token:  64398 '<|file_start|>' is not marked as EOG
+load: control token:  64396 '<|review_start|>' is not marked as EOG
+load: control token:  64395 '<|cot_end|>' is not marked as EOG
+load: control token:  64394 '<|cot_start|>' is not marked as EOG
+load: control token:     92 '<|reserved_82|>' is not marked as EOG
+load: control token:    200 '<|reserved_190|>' is not marked as EOG
+load: control token:    159 '<|reserved_149|>' is not marked as EOG
+load: control token:    173 '<|reserved_163|>' is not marked as EOG
+load: control token:    208 '<|reserved_198|>' is not marked as EOG
+load: control token:     26 '<|reserved_16|>' is not marked as EOG
+load: control token:    221 '<|reserved_211|>' is not marked as EOG
+load: control token:    197 '<|reserved_187|>' is not marked as EOG
+load: control token:    393 '<|reserved_383|>' is not marked as EOG
+load: control token:    127 '<|reserved_117|>' is not marked as EOG
+load: control token:    416 '<|reserved_406|>' is not marked as EOG
+load: control token:    213 '<|reserved_203|>' is not marked as EOG
+load: control token:    246 '<|reserved_236|>' is not marked as EOG
+load: control token:     39 '<|reserved_29|>' is not marked as EOG
+load: control token:    436 '<|reserved_426|>' is not marked as EOG
+load: control token:    499 '<|reserved_489|>' is not marked as EOG
+load: control token:    462 '<|reserved_452|>' is not marked as EOG
+load: control token:    394 '<|reserved_384|>' is not marked as EOG
+load: control token:    425 '<|reserved_415|>' is not marked as EOG
+load: control token:    308 '<|reserved_298|>' is not marked as EOG
+load: control token:    362 '<|reserved_352|>' is not marked as EOG
+load: control token:    297 '<|reserved_287|>' is not marked as EOG
+load: control token:    136 '<|reserved_126|>' is not marked as EOG
+load: control token:    488 '<|reserved_478|>' is not marked as EOG
+load: control token:     59 '<|reserved_49|>' is not marked as EOG
+load: control token:      9 '<|tool_list_end|>' is not marked as EOG
+load: control token:    238 '<|reserved_228|>' is not marked as EOG
+load: control token:    106 '<|reserved_96|>' is not marked as EOG
+load: control token:    169 '<|reserved_159|>' is not marked as EOG
+load: control token:      4 '<|fim_mid|>' is not marked as EOG
+load: control token:    445 '<|reserved_435|>' is not marked as EOG
+load: control token:    309 '<|reserved_299|>' is not marked as EOG
+load: control token:     28 '<|reserved_18|>' is not marked as EOG
+load: control token:     36 '<|reserved_26|>' is not marked as EOG
+load: control token:    144 '<|reserved_134|>' is not marked as EOG
+load: control token:     52 '<|reserved_42|>' is not marked as EOG
+load: control token:     29 '<|reserved_19|>' is not marked as EOG
+load: control token:    381 '<|reserved_371|>' is not marked as EOG
+load: control token:    388 '<|reserved_378|>' is not marked as EOG
+load: control token:    387 '<|reserved_377|>' is not marked as EOG
+load: control token:    201 '<|reserved_191|>' is not marked as EOG
+load: control token:     61 '<|reserved_51|>' is not marked as EOG
+load: control token:     63 '<|reserved_53|>' is not marked as EOG
+load: control token:    431 '<|reserved_421|>' is not marked as EOG
+load: control token:    142 '<|reserved_132|>' is not marked as EOG
+load: control token:     79 '<|reserved_69|>' is not marked as EOG
+load: control token:    216 '<|reserved_206|>' is not marked as EOG
+load: control token:    301 '<|reserved_291|>' is not marked as EOG
+load: control token:      1 '<|startoftext|>' is not marked as EOG
+load: control token:    397 '<|reserved_387|>' is not marked as EOG
+load: control token:    114 '<|reserved_104|>' is not marked as EOG
+load: control token:    248 '<|reserved_238|>' is not marked as EOG
+load: control token:    162 '<|reserved_152|>' is not marked as EOG
+load: control token:    322 '<|reserved_312|>' is not marked as EOG
+load: control token:     17 '<|reserved_7|>' is not marked as EOG
+load: control token:     57 '<|reserved_47|>' is not marked as EOG
+load: control token:    100 '<|reserved_90|>' is not marked as EOG
+load: control token:    468 '<|reserved_458|>' is not marked as EOG
+load: control token:     86 '<|reserved_76|>' is not marked as EOG
+load: control token:     64 '<|reserved_54|>' is not marked as EOG
+load: control token:    420 '<|reserved_410|>' is not marked as EOG
+load: control token:     70 '<|reserved_60|>' is not marked as EOG
+load: control token:    279 '<|reserved_269|>' is not marked as EOG
+load: control token:      0 '<|pad|>' is not marked as EOG
+load: control token:    109 '<|reserved_99|>' is not marked as EOG
+load: control token:    149 '<|reserved_139|>' is not marked as EOG
+load: control token:    254 '<|reserved_244|>' is not marked as EOG
+load: control token:    145 '<|reserved_135|>' is not marked as EOG
+load: control token:    343 '<|reserved_333|>' is not marked as EOG
+load: control token:    354 '<|reserved_344|>' is not marked as EOG
+load: control token:    222 '<|reserved_212|>' is not marked as EOG
+load: control token:    161 '<|reserved_151|>' is not marked as EOG
+load: control token:    134 '<|reserved_124|>' is not marked as EOG
+load: control token:    153 '<|reserved_143|>' is not marked as EOG
+load: control token:    193 '<|reserved_183|>' is not marked as EOG
+load: control token:    363 '<|reserved_353|>' is not marked as EOG
+load: control token:    281 '<|reserved_271|>' is not marked as EOG
+load: control token:    225 '<|reserved_215|>' is not marked as EOG
+load: control token:    374 '<|reserved_364|>' is not marked as EOG
+load: control token:    120 '<|reserved_110|>' is not marked as EOG
+load: control token:    152 '<|reserved_142|>' is not marked as EOG
+load: control token:    438 '<|reserved_428|>' is not marked as EOG
+load: control token:    199 '<|reserved_189|>' is not marked as EOG
+load: control token:     11 '<|tool_call_end|>' is not marked as EOG
+load: control token:    405 '<|reserved_395|>' is not marked as EOG
+load: control token:    304 '<|reserved_294|>' is not marked as EOG
+load: control token:    483 '<|reserved_473|>' is not marked as EOG
+load: control token:    219 '<|reserved_209|>' is not marked as EOG
+load: control token:    345 '<|reserved_335|>' is not marked as EOG
+load: control token:    372 '<|reserved_362|>' is not marked as EOG
+load: control token:    334 '<|reserved_324|>' is not marked as EOG
+load: control token:    360 '<|reserved_350|>' is not marked as EOG
+load: control token:    338 '<|reserved_328|>' is not marked as EOG
+load: control token:     45 '<|reserved_35|>' is not marked as EOG
+load: control token:    164 '<|reserved_154|>' is not marked as EOG
+load: control token:    147 '<|reserved_137|>' is not marked as EOG
+load: control token:    336 '<|reserved_326|>' is not marked as EOG
+load: control token:     85 '<|reserved_75|>' is not marked as EOG
+load: control token:    315 '<|reserved_305|>' is not marked as EOG
+load: control token:    247 '<|reserved_237|>' is not marked as EOG
+load: control token:      5 '<|fim_suf|>' is not marked as EOG
+load: control token:    108 '<|reserved_98|>' is not marked as EOG
+load: control token:     56 '<|reserved_46|>' is not marked as EOG
+load: control token:    265 '<|reserved_255|>' is not marked as EOG
+load: control token:    395 '<|reserved_385|>' is not marked as EOG
+load: control token:  64399 '<|file_end|>' is not marked as EOG
+load: control token:    443 '<|reserved_433|>' is not marked as EOG
+load: control token:    385 '<|reserved_375|>' is not marked as EOG
+load: control token:    276 '<|reserved_266|>' is not marked as EOG
+load: control token:    205 '<|reserved_195|>' is not marked as EOG
+load: control token:     10 '<|tool_call_start|>' is not marked as EOG
+load: control token:    228 '<|reserved_218|>' is not marked as EOG
+load: control token:    166 '<|reserved_156|>' is not marked as EOG
+load: control token:     25 '<|reserved_15|>' is not marked as EOG
+load: control token:    373 '<|reserved_363|>' is not marked as EOG
+load: control token:    170 '<|reserved_160|>' is not marked as EOG
+load: control token:    486 '<|reserved_476|>' is not marked as EOG
+load: control token:     33 '<|reserved_23|>' is not marked as EOG
+load: control token:    400 '<|reserved_390|>' is not marked as EOG
+load: control token:    461 '<|reserved_451|>' is not marked as EOG
+load: control token:    116 '<|reserved_106|>' is not marked as EOG
+load: control token:     19 '<|reserved_9|>' is not marked as EOG
+load: control token:     97 '<|reserved_87|>' is not marked as EOG
+load: control token:    260 '<|reserved_250|>' is not marked as EOG
+load: control token:    295 '<|reserved_285|>' is not marked as EOG
+load: control token:    194 '<|reserved_184|>' is not marked as EOG
+load: control token:    117 '<|reserved_107|>' is not marked as EOG
+load: control token:    259 '<|reserved_249|>' is not marked as EOG
+load: control token:    212 '<|reserved_202|>' is not marked as EOG
+load: control token:    369 '<|reserved_359|>' is not marked as EOG
+load: control token:    189 '<|reserved_179|>' is not marked as EOG
+load: control token:    456 '<|reserved_446|>' is not marked as EOG
+load: control token:     81 '<|reserved_71|>' is not marked as EOG
+load: control token:    453 '<|reserved_443|>' is not marked as EOG
+load: control token:    125 '<|reserved_115|>' is not marked as EOG
+load: control token:    299 '<|reserved_289|>' is not marked as EOG
+load: control token:    234 '<|reserved_224|>' is not marked as EOG
+load: control token:    348 '<|reserved_338|>' is not marked as EOG
+load: control token:    202 '<|reserved_192|>' is not marked as EOG
+load: control token:     53 '<|reserved_43|>' is not marked as EOG
+load: control token:    284 '<|reserved_274|>' is not marked as EOG
+load: control token:    349 '<|reserved_339|>' is not marked as EOG
+load: control token:     41 '<|reserved_31|>' is not marked as EOG
+load: control token:     46 '<|reserved_36|>' is not marked as EOG
+load: control token:    139 '<|reserved_129|>' is not marked as EOG
+load: control token:     35 '<|reserved_25|>' is not marked as EOG
+load: control token:    442 '<|reserved_432|>' is not marked as EOG
+load: control token:    434 '<|reserved_424|>' is not marked as EOG
+load: control token:    267 '<|reserved_257|>' is not marked as EOG
+load: control token:    231 '<|reserved_221|>' is not marked as EOG
+load: control token:    342 '<|reserved_332|>' is not marked as EOG
+load: control token:    379 '<|reserved_369|>' is not marked as EOG
+load: control token:     21 '<|reserved_11|>' is not marked as EOG
+load: control token:    316 '<|reserved_306|>' is not marked as EOG
+load: control token:    243 '<|reserved_233|>' is not marked as EOG
+load: control token:    186 '<|reserved_176|>' is not marked as EOG
+load: control token:    172 '<|reserved_162|>' is not marked as EOG
+load: control token:    458 '<|reserved_448|>' is not marked as EOG
+load: control token:    175 '<|reserved_165|>' is not marked as EOG
+load: control token:    500 '<|reserved_490|>' is not marked as EOG
+load: control token:    229 '<|reserved_219|>' is not marked as EOG
+load: control token:    300 '<|reserved_290|>' is not marked as EOG
+load: control token:    306 '<|reserved_296|>' is not marked as EOG
+load: control token:    258 '<|reserved_248|>' is not marked as EOG
+load: control token:    482 '<|reserved_472|>' is not marked as EOG
+load: control token:    411 '<|reserved_401|>' is not marked as EOG
+load: control token:    472 '<|reserved_462|>' is not marked as EOG
+load: control token:    185 '<|reserved_175|>' is not marked as EOG
+load: control token:    101 '<|reserved_91|>' is not marked as EOG
+load: control token:    215 '<|reserved_205|>' is not marked as EOG
+load: control token:    126 '<|reserved_116|>' is not marked as EOG
+load: control token:    346 '<|reserved_336|>' is not marked as EOG
+load: control token:    319 '<|reserved_309|>' is not marked as EOG
+load: control token:     51 '<|reserved_41|>' is not marked as EOG
+load: control token:    366 '<|reserved_356|>' is not marked as EOG
+load: control token:    133 '<|reserved_123|>' is not marked as EOG
+load: control token:     99 '<|reserved_89|>' is not marked as EOG
+load: control token:    441 '<|reserved_431|>' is not marked as EOG
+load: control token:    195 '<|reserved_185|>' is not marked as EOG
+load: control token:    292 '<|reserved_282|>' is not marked as EOG
+load: control token:    230 '<|reserved_220|>' is not marked as EOG
+load: control token:    280 '<|reserved_270|>' is not marked as EOG
+load: control token:    325 '<|reserved_315|>' is not marked as EOG
+load: control token:    487 '<|reserved_477|>' is not marked as EOG
+load: control token:     94 '<|reserved_84|>' is not marked as EOG
+load: control token:    403 '<|reserved_393|>' is not marked as EOG
+load: control token:    271 '<|reserved_261|>' is not marked as EOG
+load: control token:    122 '<|reserved_112|>' is not marked as EOG
+load: control token:    399 '<|reserved_389|>' is not marked as EOG
+load: control token:    333 '<|reserved_323|>' is not marked as EOG
+load: control token:    165 '<|reserved_155|>' is not marked as EOG
+load: control token:    359 '<|reserved_349|>' is not marked as EOG
+load: control token:    146 '<|reserved_136|>' is not marked as EOG
+load: control token:    130 '<|reserved_120|>' is not marked as EOG
+load: control token:     76 '<|reserved_66|>' is not marked as EOG
+load: control token:    471 '<|reserved_461|>' is not marked as EOG
+load: control token:    435 '<|reserved_425|>' is not marked as EOG
+load: control token:    480 '<|reserved_470|>' is not marked as EOG
+load: control token:    302 '<|reserved_292|>' is not marked as EOG
+load: control token:    176 '<|reserved_166|>' is not marked as EOG
+load: control token:    131 '<|reserved_121|>' is not marked as EOG
+load: control token:     30 '<|reserved_20|>' is not marked as EOG
+load: control token:    317 '<|reserved_307|>' is not marked as EOG
+load: control token:    233 '<|reserved_223|>' is not marked as EOG
+load: control token:    250 '<|reserved_240|>' is not marked as EOG
+load: control token:    214 '<|reserved_204|>' is not marked as EOG
+load: control token:     40 '<|reserved_30|>' is not marked as EOG
+load: control token:     72 '<|reserved_62|>' is not marked as EOG
+load: control token:    180 '<|reserved_170|>' is not marked as EOG
+load: control token:    464 '<|reserved_454|>' is not marked as EOG
+load: control token:     66 '<|reserved_56|>' is not marked as EOG
+load: control token:    184 '<|reserved_174|>' is not marked as EOG
+load: control token:     75 '<|reserved_65|>' is not marked as EOG
+load: control token:    432 '<|reserved_422|>' is not marked as EOG
+load: control token:    428 '<|reserved_418|>' is not marked as EOG
+load: control token:    291 '<|reserved_281|>' is not marked as EOG
+load: control token:    224 '<|reserved_214|>' is not marked as EOG
+load: control token:    150 '<|reserved_140|>' is not marked as EOG
+load: control token:    496 '<|reserved_486|>' is not marked as EOG
+load: control token:    391 '<|reserved_381|>' is not marked as EOG
+load: control token:    268 '<|reserved_258|>' is not marked as EOG
+load: control token:    376 '<|reserved_366|>' is not marked as EOG
+load: control token:    132 '<|reserved_122|>' is not marked as EOG
+load: control token:    492 '<|reserved_482|>' is not marked as EOG
+load: control token:    410 '<|reserved_400|>' is not marked as EOG
+load: control token:    245 '<|reserved_235|>' is not marked as EOG
+load: control token:    324 '<|reserved_314|>' is not marked as EOG
+load: control token:    398 '<|reserved_388|>' is not marked as EOG
+load: control token:    104 '<|reserved_94|>' is not marked as EOG
+load: control token:    318 '<|reserved_308|>' is not marked as EOG
+load: control token:     24 '<|reserved_14|>' is not marked as EOG
+load: control token:     82 '<|reserved_72|>' is not marked as EOG
+load: control token:    321 '<|reserved_311|>' is not marked as EOG
+load: control token:    124 '<|reserved_114|>' is not marked as EOG
+load: control token:     68 '<|reserved_58|>' is not marked as EOG
+load: control token:    444 '<|reserved_434|>' is not marked as EOG
+load: control token:    401 '<|reserved_391|>' is not marked as EOG
+load: control token:    409 '<|reserved_399|>' is not marked as EOG
+load: control token:    330 '<|reserved_320|>' is not marked as EOG
+load: control token:      6 '<|im_start|>' is not marked as EOG
+load: control token:     55 '<|reserved_45|>' is not marked as EOG
+load: control token:    427 '<|reserved_417|>' is not marked as EOG
+load: control token:    433 '<|reserved_423|>' is not marked as EOG
+load: control token:    242 '<|reserved_232|>' is not marked as EOG
+load: control token:    357 '<|reserved_347|>' is not marked as EOG
+load: control token:    367 '<|reserved_357|>' is not marked as EOG
+load: control token:     13 '<|tool_response_end|>' is not marked as EOG
+load: control token:    135 '<|reserved_125|>' is not marked as EOG
+load: control token:    138 '<|reserved_128|>' is not marked as EOG
+load: control token:    156 '<|reserved_146|>' is not marked as EOG
+load: control token:    188 '<|reserved_178|>' is not marked as EOG
+load: control token:     80 '<|reserved_70|>' is not marked as EOG
+load: control token:    475 '<|reserved_465|>' is not marked as EOG
+load: control token:    305 '<|reserved_295|>' is not marked as EOG
+load: control token:     83 '<|reserved_73|>' is not marked as EOG
+load: control token:    285 '<|reserved_275|>' is not marked as EOG
+load: control token:    105 '<|reserved_95|>' is not marked as EOG
+load: control token:    497 '<|reserved_487|>' is not marked as EOG
+load: control token:     93 '<|reserved_83|>' is not marked as EOG
+load: control token:    236 '<|reserved_226|>' is not marked as EOG
+load: control token:     38 '<|reserved_28|>' is not marked as EOG
+load: control token:    481 '<|reserved_471|>' is not marked as EOG
+load: control token:    404 '<|reserved_394|>' is not marked as EOG
+load: control token:    298 '<|reserved_288|>' is not marked as EOG
+load: control token:    211 '<|reserved_201|>' is not marked as EOG
+load: control token:    190 '<|reserved_180|>' is not marked as EOG
+load: control token:    356 '<|reserved_346|>' is not marked as EOG
+load: control token:    191 '<|reserved_181|>' is not marked as EOG
+load: control token:    203 '<|reserved_193|>' is not marked as EOG
+load: control token:    448 '<|reserved_438|>' is not marked as EOG
+load: control token:    473 '<|reserved_463|>' is not marked as EOG
+load: control token:    495 '<|reserved_485|>' is not marked as EOG
+load: control token:    339 '<|reserved_329|>' is not marked as EOG
+load: control token:    446 '<|reserved_436|>' is not marked as EOG
+load: control token:     96 '<|reserved_86|>' is not marked as EOG
+load: control token:    255 '<|reserved_245|>' is not marked as EOG
+load: control token:     87 '<|reserved_77|>' is not marked as EOG
+load: control token:    220 '<|reserved_210|>' is not marked as EOG
+load: control token:    350 '<|reserved_340|>' is not marked as EOG
+load: control token:    273 '<|reserved_263|>' is not marked as EOG
+load: control token:    491 '<|reserved_481|>' is not marked as EOG
+load: control token:    383 '<|reserved_373|>' is not marked as EOG
+load: control token:    469 '<|reserved_459|>' is not marked as EOG
+load: control token:    155 '<|reserved_145|>' is not marked as EOG
+load: control token:    413 '<|reserved_403|>' is not marked as EOG
+load: control token:    378 '<|reserved_368|>' is not marked as EOG
+load: control token:    365 '<|reserved_355|>' is not marked as EOG
+load: control token:    478 '<|reserved_468|>' is not marked as EOG
+load: control token:    239 '<|reserved_229|>' is not marked as EOG
+load: control token:    196 '<|reserved_186|>' is not marked as EOG
+load: control token:    470 '<|reserved_460|>' is not marked as EOG
+load: control token:    449 '<|reserved_439|>' is not marked as EOG
+load: control token:     91 '<|reserved_81|>' is not marked as EOG
+load: control token:    323 '<|reserved_313|>' is not marked as EOG
+load: control token:    326 '<|reserved_316|>' is not marked as EOG
+load: control token:     71 '<|reserved_61|>' is not marked as EOG
+load: control token:    107 '<|reserved_97|>' is not marked as EOG
+load: control token:    439 '<|reserved_429|>' is not marked as EOG
+load: control token:     44 '<|reserved_34|>' is not marked as EOG
+load: control token:    171 '<|reserved_161|>' is not marked as EOG
+load: control token:    282 '<|reserved_272|>' is not marked as EOG
+load: control token:    406 '<|reserved_396|>' is not marked as EOG
+load: control token:    253 '<|reserved_243|>' is not marked as EOG
+load: control token:    181 '<|reserved_171|>' is not marked as EOG
+load: control token:    332 '<|reserved_322|>' is not marked as EOG
+load: control token:    347 '<|reserved_337|>' is not marked as EOG
+load: control token:     89 '<|reserved_79|>' is not marked as EOG
+load: control token:    177 '<|reserved_167|>' is not marked as EOG
+load: control token:     31 '<|reserved_21|>' is not marked as EOG
+load: control token:    311 '<|reserved_301|>' is not marked as EOG
+load: control token:    182 '<|reserved_172|>' is not marked as EOG
+load: control token:    476 '<|reserved_466|>' is not marked as EOG
+load: control token:    167 '<|reserved_157|>' is not marked as EOG
+load: control token:    192 '<|reserved_182|>' is not marked as EOG
+load: control token:    287 '<|reserved_277|>' is not marked as EOG
+load: control token:    137 '<|reserved_127|>' is not marked as EOG
+load: control token:    392 '<|reserved_382|>' is not marked as EOG
+load: control token:      8 '<|tool_list_start|>' is not marked as EOG
+load: control token:    337 '<|reserved_327|>' is not marked as EOG
+load: control token:    484 '<|reserved_474|>' is not marked as EOG
+load: control token:    440 '<|reserved_430|>' is not marked as EOG
+load: control token:    380 '<|reserved_370|>' is not marked as EOG
+load: control token:    102 '<|reserved_92|>' is not marked as EOG
+load: control token:     90 '<|reserved_80|>' is not marked as EOG
+load: control token:    227 '<|reserved_217|>' is not marked as EOG
+load: control token:    110 '<|reserved_100|>' is not marked as EOG
+load: control token:    262 '<|reserved_252|>' is not marked as EOG
+load: control token:    157 '<|reserved_147|>' is not marked as EOG
+load: control token:    490 '<|reserved_480|>' is not marked as EOG
+load: control token:    277 '<|reserved_267|>' is not marked as EOG
+load: control token:    329 '<|reserved_319|>' is not marked as EOG
+load: control token:    294 '<|reserved_284|>' is not marked as EOG
+load: control token:    494 '<|reserved_484|>' is not marked as EOG
+load: control token:    344 '<|reserved_334|>' is not marked as EOG
+load: control token:    493 '<|reserved_483|>' is not marked as EOG
+load: control token:    272 '<|reserved_262|>' is not marked as EOG
+load: control token:    474 '<|reserved_464|>' is not marked as EOG
+load: control token:    414 '<|reserved_404|>' is not marked as EOG
+load: control token:    151 '<|reserved_141|>' is not marked as EOG
+load: control token:    451 '<|reserved_441|>' is not marked as EOG
+load: control token:    256 '<|reserved_246|>' is not marked as EOG
+load: control token:    244 '<|reserved_234|>' is not marked as EOG
+load: control token:     54 '<|reserved_44|>' is not marked as EOG
+load: control token:    389 '<|reserved_379|>' is not marked as EOG
+load: control token:    479 '<|reserved_469|>' is not marked as EOG
+load: control token:     73 '<|reserved_63|>' is not marked as EOG
+load: control token:    269 '<|reserved_259|>' is not marked as EOG
+load: control token:     62 '<|reserved_52|>' is not marked as EOG
+load: control token:    179 '<|reserved_169|>' is not marked as EOG
+load: control token:    209 '<|reserved_199|>' is not marked as EOG
+load: control token:    232 '<|reserved_222|>' is not marked as EOG
+load: control token:    353 '<|reserved_343|>' is not marked as EOG
+load: control token:    489 '<|reserved_479|>' is not marked as EOG
+load: control token:    168 '<|reserved_158|>' is not marked as EOG
+load: control token:    275 '<|reserved_265|>' is not marked as EOG
+load: control token:     27 '<|reserved_17|>' is not marked as EOG
+load: control token:     16 '<|reserved_6|>' is not marked as EOG
+load: control token:    327 '<|reserved_317|>' is not marked as EOG
+load: control token:     88 '<|reserved_78|>' is not marked as EOG
+load: control token:    148 '<|reserved_138|>' is not marked as EOG
+load: control token:    129 '<|reserved_119|>' is not marked as EOG
+load: control token:    450 '<|reserved_440|>' is not marked as EOG
+load: control token:    226 '<|reserved_216|>' is not marked as EOG
+load: control token:    355 '<|reserved_345|>' is not marked as EOG
+load: control token:     78 '<|reserved_68|>' is not marked as EOG
+load: control token:    115 '<|reserved_105|>' is not marked as EOG
+load: control token:    430 '<|reserved_420|>' is not marked as EOG
+load: control token:    283 '<|reserved_273|>' is not marked as EOG
+load: control token:     23 '<|reserved_13|>' is not marked as EOG
+load: control token:    240 '<|reserved_230|>' is not marked as EOG
+load: control token:     98 '<|reserved_88|>' is not marked as EOG
+load: control token:    422 '<|reserved_412|>' is not marked as EOG
+load: control token:    415 '<|reserved_405|>' is not marked as EOG
+load: control token:    331 '<|reserved_321|>' is not marked as EOG
+load: control token:    160 '<|reserved_150|>' is not marked as EOG
+load: control token:     77 '<|reserved_67|>' is not marked as EOG
+load: control token:    178 '<|reserved_168|>' is not marked as EOG
+load: control token:    465 '<|reserved_455|>' is not marked as EOG
+load: control token:    424 '<|reserved_414|>' is not marked as EOG
+load: control token:    112 '<|reserved_102|>' is not marked as EOG
+load: control token:    459 '<|reserved_449|>' is not marked as EOG
+load: control token:     84 '<|reserved_74|>' is not marked as EOG
+load: control token:     20 '<|reserved_10|>' is not marked as EOG
+load: control token:    198 '<|reserved_188|>' is not marked as EOG
+load: control token:    341 '<|reserved_331|>' is not marked as EOG
+load: control token:    274 '<|reserved_264|>' is not marked as EOG
+load: control token:    335 '<|reserved_325|>' is not marked as EOG
+load: control token:     47 '<|reserved_37|>' is not marked as EOG
+load: control token:    361 '<|reserved_351|>' is not marked as EOG
+load: control token:    235 '<|reserved_225|>' is not marked as EOG
+load: control token:    154 '<|reserved_144|>' is not marked as EOG
+load: control token:    290 '<|reserved_280|>' is not marked as EOG
+load: control token:    358 '<|reserved_348|>' is not marked as EOG
+load: control token:    183 '<|reserved_173|>' is not marked as EOG
+load: control token:    364 '<|reserved_354|>' is not marked as EOG
+load: control token:    314 '<|reserved_304|>' is not marked as EOG
+load: control token:    111 '<|reserved_101|>' is not marked as EOG
+load: control token:     67 '<|reserved_57|>' is not marked as EOG
+load: control token:     95 '<|reserved_85|>' is not marked as EOG
+load: control token:     34 '<|reserved_24|>' is not marked as EOG
+load: control token:    407 '<|reserved_397|>' is not marked as EOG
+load: control token:    141 '<|reserved_131|>' is not marked as EOG
+load: control token:      3 '<|fim_pre|>' is not marked as EOG
+load: control token:    143 '<|reserved_133|>' is not marked as EOG
+load: control token:    278 '<|reserved_268|>' is not marked as EOG
+load: control token:    264 '<|reserved_254|>' is not marked as EOG
+load: control token:    351 '<|reserved_341|>' is not marked as EOG
+load: control token:    396 '<|reserved_386|>' is not marked as EOG
+load: control token:    257 '<|reserved_247|>' is not marked as EOG
+load: control token:    457 '<|reserved_447|>' is not marked as EOG
+load: control token:    455 '<|reserved_445|>' is not marked as EOG
+load: control token:    460 '<|reserved_450|>' is not marked as EOG
+load: control token:     74 '<|reserved_64|>' is not marked as EOG
+load: control token:  64397 '<|review_end|>' is not marked as EOG
+load: control token:    417 '<|reserved_407|>' is not marked as EOG
+load: control token:    119 '<|reserved_109|>' is not marked as EOG
+load: control token:    289 '<|reserved_279|>' is not marked as EOG
+load: control token:    466 '<|reserved_456|>' is not marked as EOG
+load: control token:    370 '<|reserved_360|>' is not marked as EOG
+load: control token:    296 '<|reserved_286|>' is not marked as EOG
+load: control token:     58 '<|reserved_48|>' is not marked as EOG
+load: control token:    429 '<|reserved_419|>' is not marked as EOG
+load: control token:     49 '<|reserved_39|>' is not marked as EOG
+load: control token:    204 '<|reserved_194|>' is not marked as EOG
+load: control token:    423 '<|reserved_413|>' is not marked as EOG
+load: control token:    312 '<|reserved_302|>' is not marked as EOG
+load: control token:    371 '<|reserved_361|>' is not marked as EOG
+load: control token:    261 '<|reserved_251|>' is not marked as EOG
+load: control token:    382 '<|reserved_372|>' is not marked as EOG
+load: control token:    263 '<|reserved_253|>' is not marked as EOG
+load: control token:    174 '<|reserved_164|>' is not marked as EOG
+load: control token:     65 '<|reserved_55|>' is not marked as EOG
+load: control token:    128 '<|reserved_118|>' is not marked as EOG
+load: control token:    237 '<|reserved_227|>' is not marked as EOG
+load: control token:     37 '<|reserved_27|>' is not marked as EOG
+load: control token:    421 '<|reserved_411|>' is not marked as EOG
+load: control token:    187 '<|reserved_177|>' is not marked as EOG
+load: control token:    386 '<|reserved_376|>' is not marked as EOG
+load: control token:    118 '<|reserved_108|>' is not marked as EOG
+load: control token:    419 '<|reserved_409|>' is not marked as EOG
+load: control token:     22 '<|reserved_12|>' is not marked as EOG
+load: control token:    467 '<|reserved_457|>' is not marked as EOG
+load: control token:    288 '<|reserved_278|>' is not marked as EOG
+load: control token:     43 '<|reserved_33|>' is not marked as EOG
+load: control token:     50 '<|reserved_40|>' is not marked as EOG
+load: control token:    249 '<|reserved_239|>' is not marked as EOG
+load: control token:    408 '<|reserved_398|>' is not marked as EOG
+load: control token:    223 '<|reserved_213|>' is not marked as EOG
+load: control token:     48 '<|reserved_38|>' is not marked as EOG
+load: control token:    113 '<|reserved_103|>' is not marked as EOG
+load: control token:    307 '<|reserved_297|>' is not marked as EOG
+load: control token:     32 '<|reserved_22|>' is not marked as EOG
+load: control token:    123 '<|reserved_113|>' is not marked as EOG
+load: control token:    206 '<|reserved_196|>' is not marked as EOG
+load: control token:    210 '<|reserved_200|>' is not marked as EOG
+load: control token:    426 '<|reserved_416|>' is not marked as EOG
+load: control token:    352 '<|reserved_342|>' is not marked as EOG
+load: control token:    412 '<|reserved_402|>' is not marked as EOG
+load: control token:    375 '<|reserved_365|>' is not marked as EOG
+load: control token:    303 '<|reserved_293|>' is not marked as EOG
+load: control token:    384 '<|reserved_374|>' is not marked as EOG
+load: control token:    217 '<|reserved_207|>' is not marked as EOG
+load: control token:    477 '<|reserved_467|>' is not marked as EOG
+load: control token:    270 '<|reserved_260|>' is not marked as EOG
+load: control token:    340 '<|reserved_330|>' is not marked as EOG
+load: control token:    207 '<|reserved_197|>' is not marked as EOG
+load: control token:    163 '<|reserved_153|>' is not marked as EOG
+load: control token:    437 '<|reserved_427|>' is not marked as EOG
+load: control token:    140 '<|reserved_130|>' is not marked as EOG
+load: control token:    498 '<|reserved_488|>' is not marked as EOG
+load: control token:    252 '<|reserved_242|>' is not marked as EOG
+load: control token:    447 '<|reserved_437|>' is not marked as EOG
+load: control token:    418 '<|reserved_408|>' is not marked as EOG
+load: control token:    402 '<|reserved_392|>' is not marked as EOG
+load: control token:    241 '<|reserved_231|>' is not marked as EOG
+load: control token:    377 '<|reserved_367|>' is not marked as EOG
+load: control token:    368 '<|reserved_358|>' is not marked as EOG
+load: control token:    158 '<|reserved_148|>' is not marked as EOG
+load: control token:    266 '<|reserved_256|>' is not marked as EOG
+load: control token:    328 '<|reserved_318|>' is not marked as EOG
+load: control token:    320 '<|reserved_310|>' is not marked as EOG
+load: control token:     42 '<|reserved_32|>' is not marked as EOG
+load: control token:    251 '<|reserved_241|>' is not marked as EOG
+load: control token:     69 '<|reserved_59|>' is not marked as EOG
+load: control token:    286 '<|reserved_276|>' is not marked as EOG
+load: control token:    218 '<|reserved_208|>' is not marked as EOG
+load: control token:    390 '<|reserved_380|>' is not marked as EOG
+load: control token:    452 '<|reserved_442|>' is not marked as EOG
+load: control token:    313 '<|reserved_303|>' is not marked as EOG
+load: control token:     18 '<|reserved_8|>' is not marked as EOG
+load: control token:    485 '<|reserved_475|>' is not marked as EOG
+load: control token:    454 '<|reserved_444|>' is not marked as EOG
+load: control token:     12 '<|tool_response_start|>' is not marked as EOG
+load: control token:    103 '<|reserved_93|>' is not marked as EOG
+load: control token:    293 '<|reserved_283|>' is not marked as EOG
+load: control token:    121 '<|reserved_111|>' is not marked as EOG
+load: control token:    310 '<|reserved_300|>' is not marked as EOG
+load: control token:     60 '<|reserved_50|>' is not marked as EOG
+load: control token:    463 '<|reserved_453|>' is not marked as EOG
+load: printing all EOG tokens:
+load:   - 2 ('<|endoftext|>')
+load:   - 7 ('<|im_end|>')
+load: special tokens cache size = 507
+load: token to piece cache size = 0.3756 MB
+print_info: arch                  = lfm2
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 128000
+print_info: n_embd_inp            = 2048
+print_info: n_embd                = 2048
+print_info: n_embd_out            = 2048
+print_info: n_layer               = 16
+print_info: n_layer_all           = 16
+print_info: n_head                = 32
+print_info: n_head_kv             = [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0]
+print_info: n_rot                 = 64
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: n_embd_head_k         = 64
+print_info: n_embd_head_v         = 64
+print_info: n_gqa                 = [0, 0, 4, 0, 0, 4, 0, 0, 4, 0, 4, 0, 4, 0, 4, 0]
+print_info: n_embd_k_gqa          = [0, 0, 512, 0, 0, 512, 0, 0, 512, 0, 512, 0, 512, 0, 512, 0]
+print_info: n_embd_v_gqa          = [0, 0, 512, 0, 0, 512, 0, 0, 512, 0, 512, 0, 512, 0, 512, 0]
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-05
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: f_attn_value_scale    = 0.0000
+print_info: n_ff                  = 8192
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = -1
+print_info: rope type             = 2
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 1000000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 128000
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: model type            = 1.2B
+print_info: model params          = 1.17 B
+print_info: general.name          = LFM2 1.2B
+print_info: vocab type            = BPE
+print_info: n_vocab               = 65536
+print_info: n_merges              = 63683
+print_info: BOS token             = 1 '<|startoftext|>'
+print_info: EOS token             = 7 '<|im_end|>'
+print_info: EOT token             = 2 '<|endoftext|>'
+print_info: PAD token             = 0 '<|pad|>'
+print_info: LF token              = 708 'Ċ'
+print_info: EOG token             = 2 '<|endoftext|>'
+print_info: EOG token             = 7 '<|im_end|>'
+print_info: max token length      = 30
+load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
+load_tensors: layer   0 assigned to device HTP0, is_swa = 0
+load_tensors: layer   1 assigned to device HTP0, is_swa = 0
+load_tensors: layer   2 assigned to device HTP0, is_swa = 0
+load_tensors: layer   3 assigned to device HTP0, is_swa = 0
+load_tensors: layer   4 assigned to device HTP0, is_swa = 0
+load_tensors: layer   5 assigned to device HTP0, is_swa = 0
+load_tensors: layer   6 assigned to device HTP0, is_swa = 0
+load_tensors: layer   7 assigned to device HTP0, is_swa = 0
+load_tensors: layer   8 assigned to device HTP0, is_swa = 0
+load_tensors: layer   9 assigned to device HTP0, is_swa = 0
+load_tensors: layer  10 assigned to device HTP0, is_swa = 0
+load_tensors: layer  11 assigned to device HTP0, is_swa = 0
+load_tensors: layer  12 assigned to device HTP0, is_swa = 0
+load_tensors: layer  13 assigned to device HTP0, is_swa = 0
+load_tensors: layer  14 assigned to device HTP0, is_swa = 0
+load_tensors: layer  15 assigned to device HTP0, is_swa = 0
+load_tensors: layer  16 assigned to device HTP0, is_swa = 0
+create_tensor: loading tensor token_embd.weight
+create_tensor: loading tensor token_embd_norm.weight
+create_tensor: loading tensor token_embd.weight
+create_tensor: loading tensor blk.0.ffn_norm.weight
+create_tensor: loading tensor blk.0.ffn_gate.weight
+create_tensor: loading tensor blk.0.ffn_down.weight
+create_tensor: loading tensor blk.0.ffn_up.weight
+create_tensor: loading tensor blk.0.attn_norm.weight
+create_tensor: loading tensor blk.0.shortconv.conv.weight
+create_tensor: loading tensor blk.0.shortconv.in_proj.weight
+create_tensor: loading tensor blk.0.shortconv.out_proj.weight
+create_tensor: loading tensor blk.1.ffn_norm.weight
+create_tensor: loading tensor blk.1.ffn_gate.weight
+create_tensor: loading tensor blk.1.ffn_down.weight
+create_tensor: loading tensor blk.1.ffn_up.weight
+create_tensor: loading tensor blk.1.attn_norm.weight
+create_tensor: loading tensor blk.1.shortconv.conv.weight
+create_tensor: loading tensor blk.1.shortconv.in_proj.weight
+create_tensor: loading tensor blk.1.shortconv.out_proj.weight
+create_tensor: loading tensor blk.2.ffn_norm.weight
+create_tensor: loading tensor blk.2.ffn_gate.weight
+create_tensor: loading tensor blk.2.ffn_down.weight
+create_tensor: loading tensor blk.2.ffn_up.weight
+create_tensor: loading tensor blk.2.attn_norm.weight
+create_tensor: loading tensor blk.2.attn_q_norm.weight
+create_tensor: loading tensor blk.2.attn_k_norm.weight
+create_tensor: loading tensor blk.2.attn_q.weight
+create_tensor: loading tensor blk.2.attn_k.weight
+create_tensor: loading tensor blk.2.attn_v.weight
+create_tensor: loading tensor blk.2.attn_output.weight
+create_tensor: loading tensor blk.3.ffn_norm.weight
+create_tensor: loading tensor blk.3.ffn_gate.weight
+create_tensor: loading tensor blk.3.ffn_down.weight
+create_tensor: loading tensor blk.3.ffn_up.weight
+create_tensor: loading tensor blk.3.attn_norm.weight
+create_tensor: loading tensor blk.3.shortconv.conv.weight
+create_tensor: loading tensor blk.3.shortconv.in_proj.weight
+create_tensor: loading tensor blk.3.shortconv.out_proj.weight
+create_tensor: loading tensor blk.4.ffn_norm.weight
+create_tensor: loading tensor blk.4.ffn_gate.weight
+create_tensor: loading tensor blk.4.ffn_down.weight
+create_tensor: loading tensor blk.4.ffn_up.weight
+create_tensor: loading tensor blk.4.attn_norm.weight
+create_tensor: loading tensor blk.4.shortconv.conv.weight
+create_tensor: loading tensor blk.4.shortconv.in_proj.weight
+create_tensor: loading tensor blk.4.shortconv.out_proj.weight
+create_tensor: loading tensor blk.5.ffn_norm.weight
+create_tensor: loading tensor blk.5.ffn_gate.weight
+create_tensor: loading tensor blk.5.ffn_down.weight
+create_tensor: loading tensor blk.5.ffn_up.weight
+create_tensor: loading tensor blk.5.attn_norm.weight
+create_tensor: loading tensor blk.5.attn_q_norm.weight
+create_tensor: loading tensor blk.5.attn_k_norm.weight
+create_tensor: loading tensor blk.5.attn_q.weight
+create_tensor: loading tensor blk.5.attn_k.weight
+create_tensor: loading tensor blk.5.attn_v.weight
+create_tensor: loading tensor blk.5.attn_output.weight
+create_tensor: loading tensor blk.6.ffn_norm.weight
+create_tensor: loading tensor blk.6.ffn_gate.weight
+create_tensor: loading tensor blk.6.ffn_down.weight
+create_tensor: loading tensor blk.6.ffn_up.weight
+create_tensor: loading tensor blk.6.attn_norm.weight
+create_tensor: loading tensor blk.6.shortconv.conv.weight
+create_tensor: loading tensor blk.6.shortconv.in_proj.weight
+create_tensor: loading tensor blk.6.shortconv.out_proj.weight
+create_tensor: loading tensor blk.7.ffn_norm.weight
+create_tensor: loading tensor blk.7.ffn_gate.weight
+create_tensor: loading tensor blk.7.ffn_down.weight
+create_tensor: loading tensor blk.7.ffn_up.weight
+create_tensor: loading tensor blk.7.attn_norm.weight
+create_tensor: loading tensor blk.7.shortconv.conv.weight
+create_tensor: loading tensor blk.7.shortconv.in_proj.weight
+create_tensor: loading tensor blk.7.shortconv.out_proj.weight
+create_tensor: loading tensor blk.8.ffn_norm.weight
+create_tensor: loading tensor blk.8.ffn_gate.weight
+create_tensor: loading tensor blk.8.ffn_down.weight
+create_tensor: loading tensor blk.8.ffn_up.weight
+create_tensor: loading tensor blk.8.attn_norm.weight
+create_tensor: loading tensor blk.8.attn_q_norm.weight
+create_tensor: loading tensor blk.8.attn_k_norm.weight
+create_tensor: loading tensor blk.8.attn_q.weight
+create_tensor: loading tensor blk.8.attn_k.weight
+create_tensor: loading tensor blk.8.attn_v.weight
+create_tensor: loading tensor blk.8.attn_output.weight
+create_tensor: loading tensor blk.9.ffn_norm.weight
+create_tensor: loading tensor blk.9.ffn_gate.weight
+create_tensor: loading tensor blk.9.ffn_down.weight
+create_tensor: loading tensor blk.9.ffn_up.weight
+create_tensor: loading tensor blk.9.attn_norm.weight
+create_tensor: loading tensor blk.9.shortconv.conv.weight
+create_tensor: loading tensor blk.9.shortconv.in_proj.weight
+create_tensor: loading tensor blk.9.shortconv.out_proj.weight
+create_tensor: loading tensor blk.10.ffn_norm.weight
+create_tensor: loading tensor blk.10.ffn_gate.weight
+create_tensor: loading tensor blk.10.ffn_down.weight
+create_tensor: loading tensor blk.10.ffn_up.weight
+create_tensor: loading tensor blk.10.attn_norm.weight
+create_tensor: loading tensor blk.10.attn_q_norm.weight
+create_tensor: loading tensor blk.10.attn_k_norm.weight
+create_tensor: loading tensor blk.10.attn_q.weight
+create_tensor: loading tensor blk.10.attn_k.weight
+create_tensor: loading tensor blk.10.attn_v.weight
+create_tensor: loading tensor blk.10.attn_output.weight
+create_tensor: loading tensor blk.11.ffn_norm.weight
+create_tensor: loading tensor blk.11.ffn_gate.weight
+create_tensor: loading tensor blk.11.ffn_down.weight
+create_tensor: loading tensor blk.11.ffn_up.weight
+create_tensor: loading tensor blk.11.attn_norm.weight
+create_tensor: loading tensor blk.11.shortconv.conv.weight
+create_tensor: loading tensor blk.11.shortconv.in_proj.weight
+create_tensor: loading tensor blk.11.shortconv.out_proj.weight
+create_tensor: loading tensor blk.12.ffn_norm.weight
+create_tensor: loading tensor blk.12.ffn_gate.weight
+create_tensor: loading tensor blk.12.ffn_down.weight
+create_tensor: loading tensor blk.12.ffn_up.weight
+create_tensor: loading tensor blk.12.attn_norm.weight
+create_tensor: loading tensor blk.12.attn_q_norm.weight
+create_tensor: loading tensor blk.12.attn_k_norm.weight
+create_tensor: loading tensor blk.12.attn_q.weight
+create_tensor: loading tensor blk.12.attn_k.weight
+create_tensor: loading tensor blk.12.attn_v.weight
+create_tensor: loading tensor blk.12.attn_output.weight
+create_tensor: loading tensor blk.13.ffn_norm.weight
+create_tensor: loading tensor blk.13.ffn_gate.weight
+create_tensor: loading tensor blk.13.ffn_down.weight
+create_tensor: loading tensor blk.13.ffn_up.weight
+create_tensor: loading tensor blk.13.attn_norm.weight
+create_tensor: loading tensor blk.13.shortconv.conv.weight
+create_tensor: loading tensor blk.13.shortconv.in_proj.weight
+create_tensor: loading tensor blk.13.shortconv.out_proj.weight
+create_tensor: loading tensor blk.14.ffn_norm.weight
+create_tensor: loading tensor blk.14.ffn_gate.weight
+create_tensor: loading tensor blk.14.ffn_down.weight
+create_tensor: loading tensor blk.14.ffn_up.weight
+create_tensor: loading tensor blk.14.attn_norm.weight
+create_tensor: loading tensor blk.14.attn_q_norm.weight
+create_tensor: loading tensor blk.14.attn_k_norm.weight
+create_tensor: loading tensor blk.14.attn_q.weight
+create_tensor: loading tensor blk.14.attn_k.weight
+create_tensor: loading tensor blk.14.attn_v.weight
+create_tensor: loading tensor blk.14.attn_output.weight
+create_tensor: loading tensor blk.15.ffn_norm.weight
+create_tensor: loading tensor blk.15.ffn_gate.weight
+create_tensor: loading tensor blk.15.ffn_down.weight
+create_tensor: loading tensor blk.15.ffn_up.weight
+create_tensor: loading tensor blk.15.attn_norm.weight
+create_tensor: loading tensor blk.15.shortconv.conv.weight
+create_tensor: loading tensor blk.15.shortconv.in_proj.weight
+create_tensor: loading tensor blk.15.shortconv.out_proj.weight
+done_getting_tensors: tensor 'token_embd.weight' (q6_K) (and 93 others) cannot be used with preferred buffer type CPU_REPACK, using CPU instead
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 15 repeating layers to GPU
+load_tensors: offloaded 17/17 layers to GPU
+load_tensors:   CPU_Mapped model buffer size =   105.00 MiB
+load_tensors:   CPU_REPACK model buffer size =   105.00 MiB
+load_tensors:         HTP0 model buffer size =     0.50 MiB
+load_tensors:  HTP0-REPACK model buffer size =   555.75 MiB
+.repack: repack tensor token_embd.weight with q6_K_8x8
+.....................................................................
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 256
+llama_context: n_ctx_seq     = 256
+llama_context: n_batch       = 32
+llama_context: n_ubatch      = 32
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = auto
+llama_context: kv_unified    = false
+llama_context: freq_base     = 1000000.0
+llama_context: freq_scale    = 1
+llama_context: n_rs_seq      = 0
+llama_context: n_outputs_max = 32
+llama_context: n_ctx_seq (256) < n_ctx_train (128000) -- the full capacity of the model will not be utilized
+set_abort_callback: call
+llama_context:        CPU  output buffer size =     0.25 MiB
+llama_kv_cache: layer   0: filtered
+llama_kv_cache: layer   1: filtered
+llama_kv_cache: layer   2: dev = HTP0
+llama_kv_cache: layer   3: filtered
+llama_kv_cache: layer   4: filtered
+llama_kv_cache: layer   5: dev = HTP0
+llama_kv_cache: layer   6: filtered
+llama_kv_cache: layer   7: filtered
+llama_kv_cache: layer   8: dev = HTP0
+llama_kv_cache: layer   9: filtered
+llama_kv_cache: layer  10: dev = HTP0
+llama_kv_cache: layer  11: filtered
+llama_kv_cache: layer  12: dev = HTP0
+llama_kv_cache: layer  13: filtered
+llama_kv_cache: layer  14: dev = HTP0
+llama_kv_cache: layer  15: filtered
+llama_kv_cache:       HTP0 KV buffer size =     3.00 MiB
+llama_kv_cache: size =    3.00 MiB (   256 cells,   6 layers,  1/1 seqs), K (f16):    1.50 MiB, V (f16):    1.50 MiB
+llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 64
+llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 64
+llama_memory_recurrent, layer   0: dev = HTP0
+llama_memory_recurrent, layer   1: dev = HTP0
+llama_memory_recurrent: layer   2: skipped
+llama_memory_recurrent, layer   3: dev = HTP0
+llama_memory_recurrent, layer   4: dev = HTP0
+llama_memory_recurrent: layer   5: skipped
+llama_memory_recurrent, layer   6: dev = HTP0
+llama_memory_recurrent, layer   7: dev = HTP0
+llama_memory_recurrent: layer   8: skipped
+llama_memory_recurrent, layer   9: dev = HTP0
+llama_memory_recurrent: layer  10: skipped
+llama_memory_recurrent, layer  11: dev = HTP0
+llama_memory_recurrent: layer  12: skipped
+llama_memory_recurrent, layer  13: dev = HTP0
+llama_memory_recurrent: layer  14: skipped
+llama_memory_recurrent, layer  15: dev = HTP0
+llama_memory_recurrent:       HTP0 RS buffer size =     0.16 MiB
+llama_memory_recurrent: size =    0.16 MiB (     1 cells,  16 layers,  1 seqs  0 rs_seq), R (f32):    0.16 MiB, S (f32):    0.00 MiB
+llama_context: enumerating backends
+llama_context: backend_ptrs.size() = 2
+sched_reserve: reserving ...
+sched_reserve: max_nodes = 1192
+sched_reserve: reserving full memory module
+sched_reserve: worst-case: n_tokens = 32, n_seqs = 1, n_outputs = 1
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+sched_reserve: Flash Attention was auto, set to enabled
+sched_reserve: resolving fused Gated Delta Net support:
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =   16, n_seqs =  1, n_outputs =   16
+sched_reserve: fused Gated Delta Net (chunked) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =   32, n_seqs =  1, n_outputs =   32
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+graph_reserve: reserving a graph for ubatch with n_tokens =   32, n_seqs =  1, n_outputs =   32
+sched_reserve:       HTP0 compute buffer size =     3.54 MiB
+sched_reserve:        CPU compute buffer size =     8.25 MiB
+sched_reserve: graph nodes  = 548
+sched_reserve: graph splits = 3
+sched_reserve: reserve took 2.35 ms, sched copies = 1
+attach_threadpool: call
+set_n_threads: n_threads = 8, n_threads_batch = 8
+ggml-hex: HTP0 profile-op SCALE|cache_r_l0 (reshaped) (view) -> cache_r_l0 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 13 cycles 28487 start 3410684010 mhz 2191.3
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l0 (reshaped) x HTP0# (view)#0 -> node_5|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 7352 start 3410712539 mhz 2450.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|HTP0#model.embed_tokens#0 x blk.0.attn_norm.weight -> model.layers.{}.operator_norm-0|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 39 cycles 85572 start 3410719931 mhz 2194.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.shortconv.in_proj.weight x model.layers.{}.operator_norm-0 (reshaped) -> model.layers.{}.conv.in_proj-0|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 308 cycles 653217 start 3410806248 mhz 2120.8
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-0 (view) x model.layers.{}.conv.in_proj-0 (view) -> node_17|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 65713 start 3411460199 mhz 2190.4
+ggml-hex: HTP0 profile-op CONCAT|node_5 (reshaped) x  (transposed) -> node_19|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 50 cycles 106901 start 3411526387 mhz 2138.0
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l0 (view) -> cache_r_l0 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 33 cycles 72191 start 3411633781 mhz 2187.6
+ggml-hex: HTP0 profile-op SCALE|cache_r_l1 (reshaped) (view) -> cache_r_l1 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 15032 start 3411706458 mhz 2147.4
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l1 (reshaped) x HTP0# (view)#0 -> node_26|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 5418 start 3411721530 mhz 2709.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_19 x blk.0.shortconv.conv.weight -> model.layers.{}.conv.conv-0|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 64 cycles 137750 start 3411726988 mhz 2152.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-0 (view) x model.layers.{}.conv.conv-0 -> node_33|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56704 start 3411865489 mhz 2180.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.shortconv.out_proj.weight x node_33 -> model.layers.{}.conv.out_proj-0|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 138 cycles 292888 start 3411922675 mhz 2122.4
+ggml-hex: HTP0 profile-op ADD|HTP0#model.embed_tokens#0 x model.layers.{}.conv.out_proj-0 (reshaped) -> node_36|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 57759 start 3412216543 mhz 2221.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_36 x blk.0.ffn_norm.weight -> model.layers.{}.ffn_out-0|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50831 start 3412274787 mhz 2210.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.ffn_gate.weight x model.layers.{}.ffn_out-0 -> ffn_gate-0|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 405 cycles 857287 start 3412326089 mhz 2116.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.ffn_up.weight x model.layers.{}.ffn_out-0 -> ffn_up-0|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 408 cycles 864620 start 3413184361 mhz 2119.2
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-0 x ffn_up-0 -> ffn_swiglu-0|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 100 cycles 213009 start 3414049702 mhz 2130.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.0.ffn_down.weight x ffn_swiglu-0 x node_36 -> l_out-0|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 424 cycles 896945 start 3414263201 mhz 2115.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-0 x blk.1.attn_norm.weight -> model.layers.{}.operator_norm-1|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 55330 start 3415161142 mhz 2213.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.shortconv.in_proj.weight x model.layers.{}.operator_norm-1 (reshaped) -> model.layers.{}.conv.in_proj-1|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 320 cycles 677465 start 3415216958 mhz 2117.1
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-1 (view) x model.layers.{}.conv.in_proj-1 (view) -> node_50|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 28 cycles 61793 start 3415895178 mhz 2206.9
+ggml-hex: HTP0 profile-op CONCAT|node_26 (reshaped) x  (transposed) -> node_52|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 48 cycles 103040 start 3415957444 mhz 2146.7
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l1 (view) -> cache_r_l1 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 30 cycles 65048 start 3416060961 mhz 2168.3
+ggml-hex: HTP0 profile-op SSM_CONV|node_52 x blk.1.shortconv.conv.weight -> model.layers.{}.conv.conv-1|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 139771 start 3416126489 mhz 2150.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-1 (view) x model.layers.{}.conv.conv-1 -> node_58|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56883 start 3416266731 mhz 2187.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.shortconv.out_proj.weight x node_58 -> model.layers.{}.conv.out_proj-1|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 137 cycles 292480 start 3416324092 mhz 2134.9
+ggml-hex: HTP0 profile-op ADD|l_out-0 x model.layers.{}.conv.out_proj-1 (reshaped) -> node_61|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51521 start 3416617546 mhz 2146.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_61 x blk.1.ffn_norm.weight -> model.layers.{}.ffn_out-1|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 49641 start 3416669547 mhz 2158.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.ffn_gate.weight x model.layers.{}.ffn_out-1 -> ffn_gate-1|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 403 cycles 853549 start 3416719683 mhz 2118.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.ffn_up.weight x model.layers.{}.ffn_out-1 -> ffn_up-1|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 385 cycles 815369 start 3417574231 mhz 2117.8
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-1 x ffn_up-1 -> ffn_swiglu-1|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 197594 start 3418390587 mhz 2124.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.1.ffn_down.weight x ffn_swiglu-1 x node_61 -> l_out-1|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 423 cycles 895149 start 3418588692 mhz 2116.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-1 x blk.2.attn_norm.weight -> model.layers.{}.operator_norm-2|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 55603 start 3419484848 mhz 2224.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_q.weight x model.layers.{}.operator_norm-2 -> Qcur-2|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 143 cycles 303964 start 3419540935 mhz 2125.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_v.weight x model.layers.{}.operator_norm-2 -> Vcur-2|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 52 cycles 110855 start 3419845890 mhz 2131.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_k.weight x model.layers.{}.operator_norm-2 -> Kcur-2|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 36 cycles 77835 start 3419956798 mhz 2162.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-2 x blk.2.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-2|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 41 cycles 89740 start 3420034698 mhz 2188.8
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-2 x HTP0#leaf_25#0 -> node_75|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 44 cycles 95638 start 3420124927 mhz 2173.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-2 x blk.2.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-2|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 20 cycles 42286 start 3420221306 mhz 2114.3
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-2 x HTP0#leaf_25#0 -> node_82|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 33744 start 3420263640 mhz 2249.6
+ggml-hex: HTP0 profile-op SET_ROWS|node_82 (view) x HTP0#leaf_29#0 x cache_k_l2 -> cache_k_l2 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 13 cycles 28897 start 3420297459 mhz 2222.8
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-2 (view) x HTP0#leaf_31#0 x cache_v_l2 -> cache_v_l2 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 33560 start 3420326775 mhz 2237.3
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_75 (view) (permuted) x cache_k_l2 (view) (permuted) x cache_v_l2 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-2|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 468 cycles 991501 start 3420360761 mhz 2118.6
+ggml-hex: HTP0 profile-op SCALE|cache_r_l3 (reshaped) (view) -> cache_r_l3 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 9 cycles 19742 start 3421353005 mhz 2193.6
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l3 (reshaped) x HTP0# (view)#0 -> node_98|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 7597 start 3421372787 mhz 2532.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.2.attn_output.weight x kqv_out-2 x l_out-1 -> node_104|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 132 cycles 280209 start 3421380425 mhz 2122.8
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_104 x blk.2.ffn_norm.weight -> model.layers.{}.ffn_out-2|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50295 start 3421661636 mhz 2186.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.ffn_gate.weight x model.layers.{}.ffn_out-2 -> ffn_gate-2|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 404 cycles 854806 start 3421712411 mhz 2115.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.ffn_up.weight x model.layers.{}.ffn_out-2 -> ffn_up-2|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 389 cycles 823657 start 3422567968 mhz 2117.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-2 x ffn_up-2 -> ffn_swiglu-2|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 97 cycles 207703 start 3423392353 mhz 2141.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.2.ffn_down.weight x ffn_swiglu-2 x node_104 -> l_out-2|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 429 cycles 907604 start 3423600542 mhz 2115.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-2 x blk.3.attn_norm.weight -> model.layers.{}.operator_norm-3|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 57094 start 3424508886 mhz 2195.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.shortconv.in_proj.weight x model.layers.{}.operator_norm-3 (reshaped) -> model.layers.{}.conv.in_proj-3|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 322 cycles 681374 start 3424566461 mhz 2116.1
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-3 (view) x model.layers.{}.conv.in_proj-3 (view) -> node_118|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 65058 start 3425248837 mhz 2168.6
+ggml-hex: HTP0 profile-op CONCAT|node_98 (reshaped) x  (transposed) -> node_120|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 51 cycles 109011 start 3425314379 mhz 2137.5
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l3 (view) -> cache_r_l3 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 30 cycles 66290 start 3425423872 mhz 2209.7
+ggml-hex: HTP0 profile-op SCALE|cache_r_l4 (reshaped) (view) -> cache_r_l4 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 16814 start 3425490643 mhz 2402.0
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l4 (reshaped) x HTP0# (view)#0 -> node_127|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6743 start 3425507497 mhz 2247.7
+ggml-hex: HTP0 profile-op SSM_CONV|node_120 x blk.3.shortconv.conv.weight -> model.layers.{}.conv.conv-3|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 141555 start 3425514280 mhz 2144.8
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-3 (view) x model.layers.{}.conv.conv-3 -> node_134|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56198 start 3425656583 mhz 2161.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.shortconv.out_proj.weight x node_134 -> model.layers.{}.conv.out_proj-3|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 139 cycles 294722 start 3425713258 mhz 2120.3
+ggml-hex: HTP0 profile-op ADD|l_out-2 x model.layers.{}.conv.out_proj-3 (reshaped) -> node_137|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54782 start 3426008982 mhz 2191.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_137 x blk.3.ffn_norm.weight -> model.layers.{}.ffn_out-3|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51134 start 3426064238 mhz 2223.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.ffn_gate.weight x model.layers.{}.ffn_out-3 -> ffn_gate-3|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 407 cycles 861321 start 3426115787 mhz 2116.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.ffn_up.weight x model.layers.{}.ffn_out-3 -> ffn_up-3|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 406 cycles 860169 start 3426978101 mhz 2118.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-3 x ffn_up-3 -> ffn_swiglu-3|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 98 cycles 208278 start 3427838957 mhz 2125.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.3.ffn_down.weight x ffn_swiglu-3 x node_137 -> l_out-3|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 415 cycles 878349 start 3428047715 mhz 2116.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-3 x blk.4.attn_norm.weight -> model.layers.{}.operator_norm-4|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 56568 start 3428927278 mhz 2175.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.shortconv.in_proj.weight x model.layers.{}.operator_norm-4 (reshaped) -> model.layers.{}.conv.in_proj-4|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 324 cycles 686381 start 3428984541 mhz 2118.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-4 (view) x model.layers.{}.conv.in_proj-4 (view) -> node_151|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 65964 start 3429672114 mhz 2198.8
+ggml-hex: HTP0 profile-op CONCAT|node_127 (reshaped) x  (transposed) -> node_153|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 50 cycles 107424 start 3429738811 mhz 2148.5
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l4 (view) -> cache_r_l4 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 33 cycles 70708 start 3429846957 mhz 2142.7
+ggml-hex: HTP0 profile-op SSM_CONV|node_153 x blk.4.shortconv.conv.weight -> model.layers.{}.conv.conv-4|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 141941 start 3429918388 mhz 2150.6
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-4 (view) x model.layers.{}.conv.conv-4 -> node_159|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56923 start 3430061021 mhz 2189.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.shortconv.out_proj.weight x node_159 -> model.layers.{}.conv.out_proj-4|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 140 cycles 297717 start 3430118669 mhz 2126.6
+ggml-hex: HTP0 profile-op ADD|l_out-3 x model.layers.{}.conv.out_proj-4 (reshaped) -> node_162|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 53613 start 3430417630 mhz 2144.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_162 x blk.4.ffn_norm.weight -> model.layers.{}.ffn_out-4|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54524 start 3430471926 mhz 2181.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.ffn_gate.weight x model.layers.{}.ffn_out-4 -> ffn_gate-4|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 409 cycles 865238 start 3430527049 mhz 2115.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.ffn_up.weight x model.layers.{}.ffn_out-4 -> ffn_up-4|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 411 cycles 869143 start 3431393514 mhz 2114.7
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-4 x ffn_up-4 -> ffn_swiglu-4|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 118 cycles 252343 start 3432263292 mhz 2138.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.4.ffn_down.weight x ffn_swiglu-4 x node_162 -> l_out-4|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 506 cycles 1071041 start 3432516545 mhz 2116.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-4 x blk.5.attn_norm.weight -> model.layers.{}.operator_norm-5|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 28 cycles 60436 start 3433589355 mhz 2158.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_q.weight x model.layers.{}.operator_norm-5 -> Qcur-5|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 310371 start 3433650091 mhz 2125.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_v.weight x model.layers.{}.operator_norm-5 -> Vcur-5|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 54 cycles 115958 start 3433961277 mhz 2147.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_k.weight x model.layers.{}.operator_norm-5 -> Kcur-5|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 36 cycles 77287 start 3434077282 mhz 2146.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-5 x blk.5.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-5|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 33 cycles 71486 start 3434154632 mhz 2166.2
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-5 x HTP0#leaf_25#0 -> node_176|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 42 cycles 90467 start 3434226424 mhz 2154.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-5 x blk.5.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-5|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 41676 start 3434317698 mhz 2193.5
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-5 x HTP0#leaf_25#0 -> node_183|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 16 cycles 34990 start 3434359430 mhz 2186.9
+ggml-hex: HTP0 profile-op SET_ROWS|node_183 (view) x HTP0#leaf_29#0 x cache_k_l5 -> cache_k_l5 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 11 cycles 24010 start 3434394493 mhz 2182.7
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-5 (view) x HTP0#leaf_31#0 x cache_v_l5 -> cache_v_l5 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 14 cycles 31427 start 3434418807 mhz 2244.8
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_176 (view) (permuted) x cache_k_l5 (view) (permuted) x cache_v_l5 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-5|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 465 cycles 984050 start 3434450531 mhz 2116.2
+ggml-hex: HTP0 profile-op SCALE|cache_r_l6 (reshaped) (view) -> cache_r_l6 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 12 cycles 26485 start 3435435145 mhz 2207.1
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l6 (reshaped) x HTP0# (view)#0 -> node_199|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 7672 start 3435461670 mhz 2557.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.5.attn_output.weight x kqv_out-5 x l_out-4 -> node_205|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 125 cycles 266789 start 3435469383 mhz 2134.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_205 x blk.5.ffn_norm.weight -> model.layers.{}.ffn_out-5|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52939 start 3435736995 mhz 2205.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.ffn_gate.weight x model.layers.{}.ffn_out-5 -> ffn_gate-5|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 388 cycles 820859 start 3435790237 mhz 2115.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.ffn_up.weight x model.layers.{}.ffn_out-5 -> ffn_up-5|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 386 cycles 816857 start 3436611907 mhz 2116.2
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-5 x ffn_up-5 -> ffn_swiglu-5|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 95 cycles 203882 start 3437429315 mhz 2146.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.5.ffn_down.weight x ffn_swiglu-5 x node_205 -> l_out-5|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 424 cycles 897451 start 3437633500 mhz 2116.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-5 x blk.6.attn_norm.weight -> model.layers.{}.operator_norm-6|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54047 start 3438531758 mhz 2161.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.shortconv.in_proj.weight x model.layers.{}.operator_norm-6 (reshaped) -> model.layers.{}.conv.in_proj-6|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 329 cycles 697494 start 3438586106 mhz 2120.0
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-6 (view) x model.layers.{}.conv.in_proj-6 (view) -> node_219|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 31 cycles 67412 start 3439284171 mhz 2174.6
+ggml-hex: HTP0 profile-op CONCAT|node_199 (reshaped) x  (transposed) -> node_221|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 46 cycles 98666 start 3439351880 mhz 2144.9
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l6 (view) -> cache_r_l6 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 27 cycles 58150 start 3439450852 mhz 2153.7
+ggml-hex: HTP0 profile-op SCALE|cache_r_l7 (reshaped) (view) -> cache_r_l7 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 16901 start 3439509306 mhz 2414.4
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l7 (reshaped) x HTP0# (view)#0 -> node_228|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 5674 start 3439526247 mhz 2837.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_221 x blk.6.shortconv.conv.weight -> model.layers.{}.conv.conv-6|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 140345 start 3439531961 mhz 2159.2
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-6 (view) x model.layers.{}.conv.conv-6 -> node_235|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 25 cycles 55744 start 3439672868 mhz 2229.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.shortconv.out_proj.weight x node_235 -> model.layers.{}.conv.out_proj-6|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 311652 start 3439728917 mhz 2134.6
+ggml-hex: HTP0 profile-op ADD|l_out-5 x model.layers.{}.conv.out_proj-6 (reshaped) -> node_238|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52324 start 3440041377 mhz 2180.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_238 x blk.6.ffn_norm.weight -> model.layers.{}.ffn_out-6|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53605 start 3440094005 mhz 2233.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.ffn_gate.weight x model.layers.{}.ffn_out-6 -> ffn_gate-6|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 410 cycles 867708 start 3440147912 mhz 2116.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.ffn_up.weight x model.layers.{}.ffn_out-6 -> ffn_up-6|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 416 cycles 880003 start 3441016183 mhz 2115.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-6 x ffn_up-6 -> ffn_swiglu-6|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 199125 start 3441896740 mhz 2141.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.6.ffn_down.weight x ffn_swiglu-6 x node_238 -> l_out-6|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 430 cycles 910034 start 3442096169 mhz 2116.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-6 x blk.7.attn_norm.weight -> model.layers.{}.operator_norm-7|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 57819 start 3443006765 mhz 2223.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.shortconv.in_proj.weight x model.layers.{}.operator_norm-7 (reshaped) -> model.layers.{}.conv.in_proj-7|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 338 cycles 716119 start 3443064880 mhz 2118.7
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-7 (view) x model.layers.{}.conv.in_proj-7 (view) -> node_252|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 63079 start 3443781813 mhz 2175.1
+ggml-hex: HTP0 profile-op CONCAT|node_228 (reshaped) x  (transposed) -> node_254|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 45 cycles 96224 start 3443845194 mhz 2138.3
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l7 (view) -> cache_r_l7 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 26 cycles 56806 start 3443941723 mhz 2184.8
+ggml-hex: HTP0 profile-op SSM_CONV|node_254 x blk.7.shortconv.conv.weight -> model.layers.{}.conv.conv-7|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 139445 start 3443998823 mhz 2145.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-7 (view) x model.layers.{}.conv.conv-7 -> node_260|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56527 start 3444138572 mhz 2174.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.shortconv.out_proj.weight x node_260 -> model.layers.{}.conv.out_proj-7|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 310336 start 3444195401 mhz 2125.6
+ggml-hex: HTP0 profile-op ADD|l_out-6 x model.layers.{}.conv.out_proj-7 (reshaped) -> node_263|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51412 start 3444506548 mhz 2142.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_263 x blk.7.ffn_norm.weight -> model.layers.{}.ffn_out-7|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 53970 start 3444558265 mhz 2158.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.ffn_gate.weight x model.layers.{}.ffn_out-7 -> ffn_gate-7|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 436 cycles 922395 start 3444612535 mhz 2115.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.ffn_up.weight x model.layers.{}.ffn_out-7 -> ffn_up-7|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 415 cycles 877918 start 3445535494 mhz 2115.5
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-7 x ffn_up-7 -> ffn_swiglu-7|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 197792 start 3446413964 mhz 2126.8
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.7.ffn_down.weight x ffn_swiglu-7 x node_263 -> l_out-7|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 454 cycles 960655 start 3446612061 mhz 2116.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-7 x blk.8.attn_norm.weight -> model.layers.{}.operator_norm-8|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54466 start 3447573529 mhz 2178.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_q.weight x model.layers.{}.operator_norm-8 -> Qcur-8|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 148 cycles 315567 start 3447628300 mhz 2132.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_v.weight x model.layers.{}.operator_norm-8 -> Vcur-8|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 55 cycles 116274 start 3447993904 mhz 2114.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_k.weight x model.layers.{}.operator_norm-8 -> Kcur-8|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 38 cycles 81505 start 3448110247 mhz 2144.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-8 x blk.8.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-8|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 36 cycles 78261 start 3448191813 mhz 2173.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-8 x HTP0#leaf_25#0 -> node_277|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 34 cycles 74149 start 3448270396 mhz 2180.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-8 x blk.8.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-8|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 18 cycles 39498 start 3448345109 mhz 2194.3
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-8 x HTP0#leaf_25#0 -> node_284|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 33409 start 3448384669 mhz 2227.3
+ggml-hex: HTP0 profile-op SET_ROWS|node_284 (view) x HTP0#leaf_29#0 x cache_k_l8 -> cache_k_l8 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 11 cycles 24414 start 3448418142 mhz 2219.5
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-8 (view) x HTP0#leaf_31#0 x cache_v_l8 -> cache_v_l8 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 14 cycles 32089 start 3448442856 mhz 2292.1
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_277 (view) (permuted) x cache_k_l8 (view) (permuted) x cache_v_l8 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-8|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 458 cycles 969906 start 3448475250 mhz 2117.7
+ggml-hex: HTP0 profile-op SCALE|cache_r_l9 (reshaped) (view) -> cache_r_l9 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 8 cycles 19030 start 3449445729 mhz 2378.8
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l9 (reshaped) x HTP0# (view)#0 -> node_300|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 6087 start 3449464799 mhz 3043.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.8.attn_output.weight x kqv_out-8 x l_out-7 -> node_306|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 134 cycles 285704 start 3449470926 mhz 2132.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_306 x blk.8.ffn_norm.weight -> model.layers.{}.ffn_out-8|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52029 start 3449757437 mhz 2167.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.ffn_gate.weight x model.layers.{}.ffn_out-8 -> ffn_gate-8|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 414 cycles 876874 start 3449809770 mhz 2118.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.ffn_up.weight x model.layers.{}.ffn_out-8 -> ffn_up-8|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 415 cycles 877508 start 3450687450 mhz 2114.5
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-8 x ffn_up-8 -> ffn_swiglu-8|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 97 cycles 206235 start 3451565776 mhz 2126.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.8.ffn_down.weight x ffn_swiglu-8 x node_306 -> l_out-8|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 452 cycles 956455 start 3451772308 mhz 2116.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-8 x blk.9.attn_norm.weight -> model.layers.{}.operator_norm-9|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 55356 start 3452729567 mhz 2214.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.shortconv.in_proj.weight x model.layers.{}.operator_norm-9 (reshaped) -> model.layers.{}.conv.in_proj-9|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 341 cycles 722168 start 3452785226 mhz 2117.8
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-9 (view) x model.layers.{}.conv.in_proj-9 (view) -> node_320|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 66245 start 3453508200 mhz 2208.2
+ggml-hex: HTP0 profile-op CONCAT|node_300 (reshaped) x  (transposed) -> node_322|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 47 cycles 100265 start 3453574750 mhz 2133.3
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l9 (view) -> cache_r_l9 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 28 cycles 60367 start 3453675316 mhz 2156.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_322 x blk.9.shortconv.conv.weight -> model.layers.{}.conv.conv-9|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 141711 start 3453735984 mhz 2147.1
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-9 (view) x model.layers.{}.conv.conv-9 -> node_328|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 25 cycles 55336 start 3453877991 mhz 2213.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.shortconv.out_proj.weight x node_328 -> model.layers.{}.conv.out_proj-9|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 309731 start 3453933631 mhz 2121.4
+ggml-hex: HTP0 profile-op ADD|l_out-8 x model.layers.{}.conv.out_proj-9 (reshaped) -> node_331|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53382 start 3454243928 mhz 2224.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_331 x blk.9.ffn_norm.weight -> model.layers.{}.ffn_out-9|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52502 start 3454297609 mhz 2187.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.ffn_gate.weight x model.layers.{}.ffn_out-9 -> ffn_gate-9|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 429 cycles 909078 start 3454350667 mhz 2119.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.ffn_up.weight x model.layers.{}.ffn_out-9 -> ffn_up-9|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 431 cycles 911729 start 3455260553 mhz 2115.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-9 x ffn_up-9 -> ffn_swiglu-9|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 198609 start 3456172847 mhz 2135.6
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.9.ffn_down.weight x ffn_swiglu-9 x node_331 -> l_out-9|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 449 cycles 950418 start 3456371752 mhz 2116.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-9 x blk.10.attn_norm.weight -> model.layers.{}.operator_norm-10|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53763 start 3457322981 mhz 2240.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_q.weight x model.layers.{}.operator_norm-10 -> Qcur-10|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 149 cycles 315849 start 3457377046 mhz 2119.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_v.weight x model.layers.{}.operator_norm-10 -> Vcur-10|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 54 cycles 114175 start 3457693703 mhz 2114.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_k.weight x model.layers.{}.operator_norm-10 -> Kcur-10|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 79786 start 3457807941 mhz 2156.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-10 x blk.10.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-10|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 35 cycles 77038 start 3457887791 mhz 2201.1
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-10 x HTP0#leaf_25#0 -> node_345|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 32 cycles 70432 start 3457965134 mhz 2201.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-10 x blk.10.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-10|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 41609 start 3458036133 mhz 2189.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-10 x HTP0#leaf_25#0 -> node_352|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 32263 start 3458077796 mhz 2150.9
+ggml-hex: HTP0 profile-op SET_ROWS|node_352 (view) x HTP0#leaf_29#0 x cache_k_l10 -> cache_k_l10 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 10 cycles 23036 start 3458110133 mhz 2303.6
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-10 (view) x HTP0#leaf_31#0 x cache_v_l10 -> cache_v_l10 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 33731 start 3458133474 mhz 2248.7
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_345 (view) (permuted) x cache_k_l10 (view) (permuted) x cache_v_l10 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-10|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 453 cycles 959696 start 3458167510 mhz 2118.5
+ggml-hex: HTP0 profile-op SCALE|cache_r_l11 (reshaped) (view) -> cache_r_l11 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 8 cycles 18779 start 3459127776 mhz 2347.4
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l11 (reshaped) x HTP0# (view)#0 -> node_368|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 6034 start 3459146595 mhz 3017.0
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.10.attn_output.weight x kqv_out-10 x l_out-9 -> node_374|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 138 cycles 293281 start 3459152669 mhz 2125.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_374 x blk.10.ffn_norm.weight -> model.layers.{}.ffn_out-10|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50400 start 3459446761 mhz 2191.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.ffn_gate.weight x model.layers.{}.ffn_out-10 -> ffn_gate-10|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 416 cycles 881892 start 3459497461 mhz 2119.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.ffn_up.weight x model.layers.{}.ffn_out-10 -> ffn_up-10|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 434 cycles 919224 start 3460379921 mhz 2118.0
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-10 x ffn_up-10 -> ffn_swiglu-10|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 94 cycles 200861 start 3461299957 mhz 2136.8
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.10.ffn_down.weight x ffn_swiglu-10 x node_374 -> l_out-10|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 451 cycles 955778 start 3461501119 mhz 2119.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-10 x blk.11.attn_norm.weight -> model.layers.{}.operator_norm-11|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 56487 start 3462457464 mhz 2172.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.shortconv.in_proj.weight x model.layers.{}.operator_norm-11 (reshaped) -> model.layers.{}.conv.in_proj-11|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 345 cycles 730151 start 3462514248 mhz 2116.4
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-11 (view) x model.layers.{}.conv.in_proj-11 (view) -> node_388|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 63002 start 3463245210 mhz 2172.5
+ggml-hex: HTP0 profile-op CONCAT|node_368 (reshaped) x  (transposed) -> node_390|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 47 cycles 100790 start 3463308512 mhz 2144.5
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l11 (view) -> cache_r_l11 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 28 cycles 61740 start 3463409606 mhz 2205.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_390 x blk.11.shortconv.conv.weight -> model.layers.{}.conv.conv-11|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 140603 start 3463471642 mhz 2130.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-11 (view) x model.layers.{}.conv.conv-11 -> node_396|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56408 start 3463612549 mhz 2169.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.shortconv.out_proj.weight x node_396 -> model.layers.{}.conv.out_proj-11|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 145 cycles 308165 start 3463669262 mhz 2125.3
+ggml-hex: HTP0 profile-op ADD|l_out-10 x model.layers.{}.conv.out_proj-11 (reshaped) -> node_399|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51252 start 3463977992 mhz 2228.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_399 x blk.11.ffn_norm.weight -> model.layers.{}.ffn_out-11|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 27 cycles 59586 start 3464029548 mhz 2206.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.ffn_gate.weight x model.layers.{}.ffn_out-11 -> ffn_gate-11|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 413 cycles 874548 start 3464089698 mhz 2117.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.ffn_up.weight x model.layers.{}.ffn_out-11 -> ffn_up-11|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 430 cycles 910676 start 3464965059 mhz 2117.9
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-11 x ffn_up-11 -> ffn_swiglu-11|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 199243 start 3465876287 mhz 2142.4
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.11.ffn_down.weight x ffn_swiglu-11 x node_399 -> l_out-11|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 437 cycles 926295 start 3466075833 mhz 2119.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-11 x blk.12.attn_norm.weight -> model.layers.{}.operator_norm-12|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 53896 start 3467002937 mhz 2155.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_q.weight x model.layers.{}.operator_norm-12 -> Qcur-12|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 149 cycles 318014 start 3467057133 mhz 2134.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_v.weight x model.layers.{}.operator_norm-12 -> Vcur-12|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 53 cycles 112301 start 3467375956 mhz 2118.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_k.weight x model.layers.{}.operator_norm-12 -> Kcur-12|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 79258 start 3467488307 mhz 2142.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-12 x blk.12.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-12|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 34 cycles 73645 start 3467567627 mhz 2166.0
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-12 x HTP0#leaf_25#0 -> node_413|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 32 cycles 70027 start 3467641569 mhz 2188.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-12 x blk.12.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-12|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 41011 start 3467712163 mhz 2158.5
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-12 x HTP0#leaf_25#0 -> node_420|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 33443 start 3467753216 mhz 2229.5
+ggml-hex: HTP0 profile-op SET_ROWS|node_420 (view) x HTP0#leaf_29#0 x cache_k_l12 -> cache_k_l12 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 12 cycles 27978 start 3467786736 mhz 2331.5
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-12 (view) x HTP0#leaf_31#0 x cache_v_l12 -> cache_v_l12 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 33961 start 3467815019 mhz 2264.1
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_413 (view) (permuted) x cache_k_l12 (view) (permuted) x cache_v_l12 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-12|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 459 cycles 972258 start 3467849276 mhz 2118.2
+ggml-hex: HTP0 profile-op SCALE|cache_r_l13 (reshaped) (view) -> cache_r_l13 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 11 cycles 24213 start 3468822101 mhz 2201.2
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l13 (reshaped) x HTP0# (view)#0 -> node_436|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 6364 start 3468846354 mhz 3182.0
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.12.attn_output.weight x kqv_out-12 x l_out-11 -> node_442|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 135 cycles 287266 start 3468852759 mhz 2127.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_442 x blk.12.ffn_norm.weight -> model.layers.{}.ffn_out-12|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52558 start 3469140831 mhz 2189.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.ffn_gate.weight x model.layers.{}.ffn_out-12 -> ffn_gate-12|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 415 cycles 879447 start 3469193693 mhz 2119.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.ffn_up.weight x model.layers.{}.ffn_out-12 -> ffn_up-12|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 434 cycles 919093 start 3470073954 mhz 2117.7
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-12 x ffn_up-12 -> ffn_swiglu-12|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 94 cycles 200496 start 3470993817 mhz 2132.9
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.12.ffn_down.weight x ffn_swiglu-12 x node_442 -> l_out-12|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 451 cycles 954937 start 3471194617 mhz 2117.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-12 x blk.13.attn_norm.weight -> model.layers.{}.operator_norm-13|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 56039 start 3472150359 mhz 2155.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.shortconv.in_proj.weight x model.layers.{}.operator_norm-13 (reshaped) -> model.layers.{}.conv.in_proj-13|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 341 cycles 722941 start 3472206702 mhz 2120.1
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-13 (view) x model.layers.{}.conv.in_proj-13 (view) -> node_456|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 63773 start 3472930206 mhz 2199.1
+ggml-hex: HTP0 profile-op CONCAT|node_436 (reshaped) x  (transposed) -> node_458|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 47 cycles 100609 start 3472994282 mhz 2140.6
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l13 (view) -> cache_r_l13 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 62882 start 3473095190 mhz 2168.3
+ggml-hex: HTP0 profile-op SSM_CONV|node_458 x blk.13.shortconv.conv.weight -> model.layers.{}.conv.conv-13|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 140943 start 3473158372 mhz 2135.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-13 (view) x model.layers.{}.conv.conv-13 -> node_464|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 57875 start 3473299618 mhz 2226.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.shortconv.out_proj.weight x node_464 -> model.layers.{}.conv.out_proj-13|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 145 cycles 307999 start 3473357791 mhz 2124.1
+ggml-hex: HTP0 profile-op ADD|l_out-12 x model.layers.{}.conv.out_proj-13 (reshaped) -> node_467|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53098 start 3473666600 mhz 2212.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_467 x blk.13.ffn_norm.weight -> model.layers.{}.ffn_out-13|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53613 start 3473719998 mhz 2233.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.ffn_gate.weight x model.layers.{}.ffn_out-13 -> ffn_gate-13|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 429 cycles 909368 start 3473773915 mhz 2119.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.ffn_up.weight x model.layers.{}.ffn_out-13 -> ffn_up-13|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 432 cycles 914306 start 3474683853 mhz 2116.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-13 x ffn_up-13 -> ffn_swiglu-13|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 95 cycles 201612 start 3475598969 mhz 2122.2
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.13.ffn_down.weight x ffn_swiglu-13 x node_467 -> l_out-13|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 436 cycles 922993 start 3475800878 mhz 2117.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-13 x blk.14.attn_norm.weight -> model.layers.{}.operator_norm-14|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54076 start 3476724676 mhz 2163.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_q.weight x model.layers.{}.operator_norm-14 -> Qcur-14|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 130 cycles 277604 start 3476779319 mhz 2135.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_v.weight x model.layers.{}.operator_norm-14 -> Vcur-14|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 53 cycles 113665 start 3477057733 mhz 2144.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_k.weight x model.layers.{}.operator_norm-14 -> Kcur-14|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 80322 start 3477171455 mhz 2170.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-14 x blk.14.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-14|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 34 cycles 73987 start 3477251840 mhz 2176.1
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-14 x HTP0#leaf_25#0 -> node_481|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 34 cycles 73612 start 3477326132 mhz 2165.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-14 x blk.14.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-14|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 40751 start 3477400304 mhz 2144.8
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-14 x HTP0#leaf_25#0 -> node_488|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 17 cycles 36177 start 3477441106 mhz 2128.1
+ggml-hex: HTP0 profile-op SET_ROWS|node_488 (view) x HTP0#leaf_29#0 x cache_k_l14 -> cache_k_l14 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 11 cycles 24597 start 3477477344 mhz 2236.1
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-14 (view) x HTP0#leaf_31#0 x cache_v_l14 -> cache_v_l14 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 16 cycles 36016 start 3477502240 mhz 2251.0
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_481 (view) (permuted) x cache_k_l14 (view) (permuted) x cache_v_l14 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-14|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 456 cycles 964589 start 3477538559 mhz 2115.3
+ggml-hex: HTP0 profile-op SCALE|cache_r_l15 (reshaped) (view) -> cache_r_l15 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 11 cycles 23981 start 3478503708 mhz 2180.1
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l15 (reshaped) x HTP0# (view)#0 -> node_504|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 7771 start 3478527729 mhz 2590.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.14.attn_output.weight x kqv_out-14 x l_out-13 -> node_510|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 137 cycles 291237 start 3478535540 mhz 2125.8
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_510 x blk.14.ffn_norm.weight -> model.layers.{}.ffn_out-14|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 27 cycles 59325 start 3478827592 mhz 2197.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.ffn_gate.weight x model.layers.{}.ffn_out-14 -> ffn_gate-14|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 411 cycles 870174 start 3478887733 mhz 2117.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.ffn_up.weight x model.layers.{}.ffn_out-14 -> ffn_up-14|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 434 cycles 919110 start 3479758722 mhz 2117.8
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-14 x ffn_up-14 -> ffn_swiglu-14|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 91 cycles 194296 start 3480678392 mhz 2135.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.14.ffn_down.weight x ffn_swiglu-14 x node_510 -> l_out-14|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 436 cycles 923919 start 3480872991 mhz 2119.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-14 x blk.15.attn_norm.weight -> model.layers.{}.operator_norm-15|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54002 start 3481797723 mhz 2160.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.15.shortconv.in_proj.weight x model.layers.{}.operator_norm-15 (reshaped) -> model.layers.{}.conv.in_proj-15|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 333 cycles 704929 start 3481852030 mhz 2116.9
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-15 (view) x model.layers.{}.conv.in_proj-15 (view) -> node_524|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 31 cycles 66165 start 3482557772 mhz 2134.4
+ggml-hex: HTP0 profile-op CONCAT|node_504 (reshaped) x  (transposed) -> node_526|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 48 cycles 103556 start 3482624233 mhz 2157.4
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l15 (view) -> cache_r_l15 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 63349 start 3482728093 mhz 2184.4
+ggml-hex: HTP0 profile-op GET_ROWS|l_out-14 x HTP0#leaf_171#0 -> node_530|2048:32 x 1:1 -> 2048:1|f32 x i32 -> f32|4:8192 x 4:4 -> 4:8192|----|usec 3 cycles 7817 start 3482791744 mhz 2605.7
+ggml-hex: HTP0 profile-op SSM_CONV|node_526 x blk.15.shortconv.conv.weight -> model.layers.{}.conv.conv-15|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 140501 start 3482799601 mhz 2161.6
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-15 (view) x model.layers.{}.conv.conv-15 -> node_533|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 25 cycles 55876 start 3482940671 mhz 2235.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.15.shortconv.out_proj.weight x node_533 -> model.layers.{}.conv.out_proj-15|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 127 cycles 269988 start 3482996847 mhz 2125.9
+ggml-hex: HTP0 profile-op GET_ROWS|model.layers.{}.conv.out_proj-15 (reshaped) x HTP0#leaf_171#0 -> node_536|2048:32 x 1:1 -> 2048:1|f32 x i32 -> f32|4:8192 x 4:4 -> 4:8192|----|usec 6 cycles 13102 start 3483267645 mhz 2183.7
+ggml-hex: HTP0 profile-op ADD|node_530 x node_536 -> node_537|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 7 cycles 16359 start 3483280787 mhz 2337.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_537 x blk.15.ffn_norm.weight -> model.layers.{}.ffn_out-15|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 10 cycles 22710 start 3483297186 mhz 2271.0
+ggml-hex: HTP0 profile-op MUL_MAT+MUL_MAT|blk.15.ffn_gate.weight x model.layers.{}.ffn_out-15 x blk.15.ffn_up.weight -> ffn_up-15|2048:8192 x 2048:1 x 2048:8192 -> 8192:1|q4_0 x f32 x q4_0 -> f32|18:1152 x 4:8192 x 18:1152 -> 4:32768|hvx-tiled vtcm 7987200|usec 420 cycles 888990 start 3483319936 mhz 2116.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-15 x ffn_up-15 -> ffn_swiglu-15|8192:1 x 8192:1 -> 8192:1|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 14 cycles 31266 start 3484208991 mhz 2233.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.15.ffn_down.weight x ffn_swiglu-15 x node_537 -> l_out-15|8192:2048 x 8192:1 x 2048:1 -> 2048:1|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hvx-tiled vtcm 8355840|usec 211 cycles 445936 start 3484240297 mhz 2113.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-15 x token_embd_norm.weight -> result_norm|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 4 cycles 10056 start 3484686307 mhz 2514.0
+ggml-hex: HTP0 profile-batch n-ops 264 batch-dur-usec 37483 htp-ops-usec 34724
+set_n_threads: n_threads = 8, n_threads_batch = 8
+ggml-hex: HTP0 profile-op SCALE|cache_r_l0 (reshaped) (view) -> cache_r_l0 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 5 cycles 10804 start 3486235857 mhz 2160.8
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l0 (reshaped) x HTP0# (view)#0 -> node_5|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 4368 start 3486246722 mhz 2184.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|HTP0#model.embed_tokens#0 x blk.0.attn_norm.weight -> model.layers.{}.operator_norm-0|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 31 cycles 67897 start 3486251130 mhz 2190.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.shortconv.in_proj.weight x model.layers.{}.operator_norm-0 (reshaped) -> model.layers.{}.conv.in_proj-0|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 319 cycles 676445 start 3486319761 mhz 2120.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-0 (view) x model.layers.{}.conv.in_proj-0 (view) -> node_17|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 62867 start 3486997190 mhz 2167.8
+ggml-hex: HTP0 profile-op CONCAT|node_5 (reshaped) x  (transposed) -> node_19|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 44 cycles 95589 start 3487060537 mhz 2172.5
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l0 (view) -> cache_r_l0 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 28 cycles 62107 start 3487156609 mhz 2218.1
+ggml-hex: HTP0 profile-op SCALE|cache_r_l1 (reshaped) (view) -> cache_r_l1 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 14999 start 3487219187 mhz 2142.7
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l1 (reshaped) x HTP0# (view)#0 -> node_26|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 5530 start 3487234226 mhz 2765.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_19 x blk.0.shortconv.conv.weight -> model.layers.{}.conv.conv-0|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 63 cycles 134327 start 3487239796 mhz 2132.2
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-0 (view) x model.layers.{}.conv.conv-0 -> node_33|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56226 start 3487374875 mhz 2162.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.shortconv.out_proj.weight x node_33 -> model.layers.{}.conv.out_proj-0|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 119 cycles 252966 start 3487431588 mhz 2125.8
+ggml-hex: HTP0 profile-op ADD|HTP0#model.embed_tokens#0 x model.layers.{}.conv.out_proj-0 (reshaped) -> node_36|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 57669 start 3487685541 mhz 2218.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_36 x blk.0.ffn_norm.weight -> model.layers.{}.ffn_out-0|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50295 start 3487743685 mhz 2186.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.ffn_gate.weight x model.layers.{}.ffn_out-0 -> ffn_gate-0|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 404 cycles 856276 start 3487794454 mhz 2119.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.0.ffn_up.weight x model.layers.{}.ffn_out-0 -> ffn_up-0|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 405 cycles 856231 start 3488651731 mhz 2114.2
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-0 x ffn_up-0 -> ffn_swiglu-0|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 96 cycles 205903 start 3489508709 mhz 2144.8
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.0.ffn_down.weight x ffn_swiglu-0 x node_36 -> l_out-0|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 409 cycles 865993 start 3489715369 mhz 2117.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-0 x blk.1.attn_norm.weight -> model.layers.{}.operator_norm-1|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52568 start 3490582359 mhz 2190.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.shortconv.in_proj.weight x model.layers.{}.operator_norm-1 (reshaped) -> model.layers.{}.conv.in_proj-1|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 317 cycles 671955 start 3490635405 mhz 2119.7
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-1 (view) x model.layers.{}.conv.in_proj-1 (view) -> node_50|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 62338 start 3491308352 mhz 2149.6
+ggml-hex: HTP0 profile-op CONCAT|node_26 (reshaped) x  (transposed) -> node_52|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 46 cycles 99894 start 3491371168 mhz 2171.6
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l1 (view) -> cache_r_l1 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 64050 start 3491471540 mhz 2208.6
+ggml-hex: HTP0 profile-op SSM_CONV|node_52 x blk.1.shortconv.conv.weight -> model.layers.{}.conv.conv-1|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 63 cycles 136032 start 3491536081 mhz 2159.2
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-1 (view) x model.layers.{}.conv.conv-1 -> node_58|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56571 start 3491672602 mhz 2175.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.shortconv.out_proj.weight x node_58 -> model.layers.{}.conv.out_proj-1|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 118 cycles 251355 start 3491729665 mhz 2130.1
+ggml-hex: HTP0 profile-op ADD|l_out-0 x model.layers.{}.conv.out_proj-1 (reshaped) -> node_61|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50591 start 3491982014 mhz 2199.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_61 x blk.1.ffn_norm.weight -> model.layers.{}.ffn_out-1|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50800 start 3492033084 mhz 2208.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.ffn_gate.weight x model.layers.{}.ffn_out-1 -> ffn_gate-1|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 402 cycles 851480 start 3492084626 mhz 2118.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.1.ffn_up.weight x model.layers.{}.ffn_out-1 -> ffn_up-1|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 385 cycles 814593 start 3492937107 mhz 2115.8
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-1 x ffn_up-1 -> ffn_swiglu-1|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 95 cycles 202968 start 3493752434 mhz 2136.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.1.ffn_down.weight x ffn_swiglu-1 x node_61 -> l_out-1|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 411 cycles 870480 start 3493956046 mhz 2118.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-1 x blk.2.attn_norm.weight -> model.layers.{}.operator_norm-2|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 49647 start 3494827534 mhz 2158.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_q.weight x model.layers.{}.operator_norm-2 -> Qcur-2|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 142 cycles 302500 start 3494877663 mhz 2130.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_v.weight x model.layers.{}.operator_norm-2 -> Vcur-2|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 50 cycles 107658 start 3495181145 mhz 2153.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.attn_k.weight x model.layers.{}.operator_norm-2 -> Kcur-2|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 35 cycles 75271 start 3495288856 mhz 2150.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-2 x blk.2.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-2|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 40 cycles 87434 start 3495364188 mhz 2185.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-2 x HTP0#leaf_25#0 -> node_75|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 37 cycles 80054 start 3495452099 mhz 2163.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-2 x blk.2.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-2|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 40441 start 3495533143 mhz 2128.5
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-2 x HTP0#leaf_25#0 -> node_82|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 33106 start 3495573626 mhz 2207.1
+ggml-hex: HTP0 profile-op SET_ROWS|node_82 (view) x HTP0#leaf_29#0 x cache_k_l2 -> cache_k_l2 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 12 cycles 26715 start 3495606806 mhz 2226.2
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-2 (view) x HTP0#leaf_31#0 x cache_v_l2 -> cache_v_l2 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 14 cycles 31410 start 3495634051 mhz 2243.6
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_75 (view) (permuted) x cache_k_l2 (view) (permuted) x cache_v_l2 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-2|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 464 cycles 981712 start 3495665886 mhz 2115.8
+ggml-hex: HTP0 profile-op SCALE|cache_r_l3 (reshaped) (view) -> cache_r_l3 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 8 cycles 18472 start 3496648355 mhz 2309.0
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l3 (reshaped) x HTP0# (view)#0 -> node_98|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6461 start 3496666868 mhz 2153.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.2.attn_output.weight x kqv_out-2 x l_out-1 -> node_104|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 129 cycles 274312 start 3496673369 mhz 2126.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_104 x blk.2.ffn_norm.weight -> model.layers.{}.ffn_out-2|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 22 cycles 48450 start 3496948660 mhz 2202.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.ffn_gate.weight x model.layers.{}.ffn_out-2 -> ffn_gate-2|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 383 cycles 811680 start 3496997603 mhz 2119.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.2.ffn_up.weight x model.layers.{}.ffn_out-2 -> ffn_up-2|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 405 cycles 857971 start 3497810273 mhz 2118.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-2 x ffn_up-2 -> ffn_swiglu-2|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 92 cycles 196297 start 3498668988 mhz 2133.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.2.ffn_down.weight x ffn_swiglu-2 x node_104 -> l_out-2|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 421 cycles 890825 start 3498865702 mhz 2116.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-2 x blk.3.attn_norm.weight -> model.layers.{}.operator_norm-3|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51187 start 3499757533 mhz 2225.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.shortconv.in_proj.weight x model.layers.{}.operator_norm-3 (reshaped) -> model.layers.{}.conv.in_proj-3|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 318 cycles 674036 start 3499809194 mhz 2119.6
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-3 (view) x model.layers.{}.conv.in_proj-3 (view) -> node_118|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 62470 start 3500484216 mhz 2154.1
+ggml-hex: HTP0 profile-op CONCAT|node_98 (reshaped) x  (transposed) -> node_120|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 47 cycles 100477 start 3500547160 mhz 2137.8
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l3 (view) -> cache_r_l3 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 64040 start 3500648112 mhz 2208.3
+ggml-hex: HTP0 profile-op SCALE|cache_r_l4 (reshaped) (view) -> cache_r_l4 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 15211 start 3500712628 mhz 2173.0
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l4 (reshaped) x HTP0# (view)#0 -> node_127|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 5668 start 3500727879 mhz 2834.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_120 x blk.3.shortconv.conv.weight -> model.layers.{}.conv.conv-3|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 62 cycles 133689 start 3500733587 mhz 2156.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-3 (view) x model.layers.{}.conv.conv-3 -> node_134|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56781 start 3500868018 mhz 2183.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.shortconv.out_proj.weight x node_134 -> model.layers.{}.conv.out_proj-3|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 138 cycles 292765 start 3500925272 mhz 2121.5
+ggml-hex: HTP0 profile-op ADD|l_out-2 x model.layers.{}.conv.out_proj-3 (reshaped) -> node_137|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50497 start 3501219038 mhz 2195.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_137 x blk.3.ffn_norm.weight -> model.layers.{}.ffn_out-3|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51363 start 3501270020 mhz 2233.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.ffn_gate.weight x model.layers.{}.ffn_out-3 -> ffn_gate-3|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 403 cycles 853703 start 3501321866 mhz 2118.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.3.ffn_up.weight x model.layers.{}.ffn_out-3 -> ffn_up-3|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 383 cycles 811595 start 3502176557 mhz 2119.0
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-3 x ffn_up-3 -> ffn_swiglu-3|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 96 cycles 204354 start 3502989152 mhz 2128.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.3.ffn_down.weight x ffn_swiglu-3 x node_137 -> l_out-3|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 421 cycles 890857 start 3503193985 mhz 2116.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-3 x blk.4.attn_norm.weight -> model.layers.{}.operator_norm-4|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53005 start 3504085824 mhz 2208.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.shortconv.in_proj.weight x model.layers.{}.operator_norm-4 (reshaped) -> model.layers.{}.conv.in_proj-4|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 322 cycles 682167 start 3504139306 mhz 2118.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-4 (view) x model.layers.{}.conv.in_proj-4 (view) -> node_151|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 63291 start 3504822613 mhz 2182.4
+ggml-hex: HTP0 profile-op CONCAT|node_127 (reshaped) x  (transposed) -> node_153|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 46 cycles 98566 start 3504886566 mhz 2142.7
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l4 (view) -> cache_r_l4 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 63506 start 3504985758 mhz 2189.9
+ggml-hex: HTP0 profile-op SSM_CONV|node_153 x blk.4.shortconv.conv.weight -> model.layers.{}.conv.conv-4|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 63 cycles 135935 start 3505049924 mhz 2157.7
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-4 (view) x model.layers.{}.conv.conv-4 -> node_159|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 25 cycles 55375 start 3505186493 mhz 2215.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.shortconv.out_proj.weight x node_159 -> model.layers.{}.conv.out_proj-4|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 138 cycles 293144 start 3505242511 mhz 2124.2
+ggml-hex: HTP0 profile-op ADD|l_out-3 x model.layers.{}.conv.out_proj-4 (reshaped) -> node_162|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50458 start 3505536804 mhz 2193.8
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_162 x blk.4.ffn_norm.weight -> model.layers.{}.ffn_out-4|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51685 start 3505587888 mhz 2247.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.ffn_gate.weight x model.layers.{}.ffn_out-4 -> ffn_gate-4|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 404 cycles 854993 start 3505640124 mhz 2116.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.4.ffn_up.weight x model.layers.{}.ffn_out-4 -> ffn_up-4|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 401 cycles 849578 start 3506496277 mhz 2118.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-4 x ffn_up-4 -> ffn_swiglu-4|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 198392 start 3507346510 mhz 2133.2
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.4.ffn_down.weight x ffn_swiglu-4 x node_162 -> l_out-4|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 408 cycles 864279 start 3507545271 mhz 2118.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-4 x blk.5.attn_norm.weight -> model.layers.{}.operator_norm-5|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51359 start 3508410356 mhz 2233.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_q.weight x model.layers.{}.operator_norm-5 -> Qcur-5|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 142 cycles 301231 start 3508462019 mhz 2121.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_v.weight x model.layers.{}.operator_norm-5 -> Vcur-5|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 53 cycles 112498 start 3508764058 mhz 2122.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.attn_k.weight x model.layers.{}.operator_norm-5 -> Kcur-5|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 35 cycles 74658 start 3508876620 mhz 2133.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-5 x blk.5.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-5|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 35 cycles 75229 start 3508951341 mhz 2149.4
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-5 x HTP0#leaf_25#0 -> node_176|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 38 cycles 82304 start 3509026876 mhz 2165.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-5 x blk.5.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-5|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 18 cycles 39591 start 3509109742 mhz 2199.5
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-5 x HTP0#leaf_25#0 -> node_183|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 32501 start 3509149385 mhz 2166.7
+ggml-hex: HTP0 profile-op SET_ROWS|node_183 (view) x HTP0#leaf_29#0 x cache_k_l5 -> cache_k_l5 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 10 cycles 22464 start 3509181955 mhz 2246.4
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-5 (view) x HTP0#leaf_31#0 x cache_v_l5 -> cache_v_l5 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 14 cycles 31119 start 3509204721 mhz 2222.8
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_176 (view) (permuted) x cache_k_l5 (view) (permuted) x cache_v_l5 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-5|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 455 cycles 962840 start 3509236145 mhz 2116.1
+ggml-hex: HTP0 profile-op SCALE|cache_r_l6 (reshaped) (view) -> cache_r_l6 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 10 cycles 23079 start 3510199541 mhz 2307.9
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l6 (reshaped) x HTP0# (view)#0 -> node_199|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6692 start 3510222662 mhz 2230.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.5.attn_output.weight x kqv_out-5 x l_out-4 -> node_205|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 125 cycles 265828 start 3510229394 mhz 2126.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_205 x blk.5.ffn_norm.weight -> model.layers.{}.ffn_out-5|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50563 start 3510496041 mhz 2198.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.ffn_gate.weight x model.layers.{}.ffn_out-5 -> ffn_gate-5|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 383 cycles 811411 start 3510546900 mhz 2118.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.5.ffn_up.weight x model.layers.{}.ffn_out-5 -> ffn_up-5|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 402 cycles 852073 start 3511358875 mhz 2119.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-5 x ffn_up-5 -> ffn_swiglu-5|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 198648 start 3512211633 mhz 2136.0
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.5.ffn_down.weight x ffn_swiglu-5 x node_205 -> l_out-5|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 404 cycles 855950 start 3512410582 mhz 2118.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-5 x blk.6.attn_norm.weight -> model.layers.{}.operator_norm-6|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51781 start 3513267343 mhz 2157.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.shortconv.in_proj.weight x model.layers.{}.operator_norm-6 (reshaped) -> model.layers.{}.conv.in_proj-6|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 334 cycles 708339 start 3513319568 mhz 2120.8
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-6 (view) x model.layers.{}.conv.in_proj-6 (view) -> node_219|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 62640 start 3514028724 mhz 2160.0
+ggml-hex: HTP0 profile-op CONCAT|node_199 (reshaped) x  (transposed) -> node_221|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 44 cycles 94567 start 3514091663 mhz 2149.2
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l6 (view) -> cache_r_l6 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 26 cycles 56253 start 3514186534 mhz 2163.6
+ggml-hex: HTP0 profile-op SCALE|cache_r_l7 (reshaped) (view) -> cache_r_l7 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 7 cycles 16323 start 3514243086 mhz 2331.9
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l7 (reshaped) x HTP0# (view)#0 -> node_228|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 5514 start 3514259449 mhz 2757.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_221 x blk.6.shortconv.conv.weight -> model.layers.{}.conv.conv-6|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 62 cycles 133981 start 3514265003 mhz 2161.0
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-6 (view) x model.layers.{}.conv.conv-6 -> node_235|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56170 start 3514399543 mhz 2160.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.shortconv.out_proj.weight x node_235 -> model.layers.{}.conv.out_proj-6|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 143 cycles 303539 start 3514456018 mhz 2122.7
+ggml-hex: HTP0 profile-op ADD|l_out-5 x model.layers.{}.conv.out_proj-6 (reshaped) -> node_238|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 49815 start 3514760369 mhz 2165.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_238 x blk.6.ffn_norm.weight -> model.layers.{}.ffn_out-6|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52925 start 3514810489 mhz 2205.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.ffn_gate.weight x model.layers.{}.ffn_out-6 -> ffn_gate-6|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 383 cycles 811307 start 3514863710 mhz 2118.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.6.ffn_up.weight x model.layers.{}.ffn_out-6 -> ffn_up-6|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 421 cycles 890466 start 3515675826 mhz 2115.1
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-6 x ffn_up-6 -> ffn_swiglu-6|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 94 cycles 200988 start 3516566852 mhz 2138.2
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.6.ffn_down.weight x ffn_swiglu-6 x node_238 -> l_out-6|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 424 cycles 898419 start 3516768138 mhz 2118.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-6 x blk.7.attn_norm.weight -> model.layers.{}.operator_norm-7|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 26 cycles 57483 start 3517667366 mhz 2210.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.shortconv.in_proj.weight x model.layers.{}.operator_norm-7 (reshaped) -> model.layers.{}.conv.in_proj-7|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 333 cycles 704792 start 3517725150 mhz 2116.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-7 (view) x model.layers.{}.conv.in_proj-7 (view) -> node_252|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 64205 start 3518430759 mhz 2140.2
+ggml-hex: HTP0 profile-op CONCAT|node_228 (reshaped) x  (transposed) -> node_254|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 44 cycles 95440 start 3518495260 mhz 2169.1
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l7 (view) -> cache_r_l7 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 26 cycles 57730 start 3518591004 mhz 2220.4
+ggml-hex: HTP0 profile-op SSM_CONV|node_254 x blk.7.shortconv.conv.weight -> model.layers.{}.conv.conv-7|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 63 cycles 134978 start 3518649034 mhz 2142.5
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-7 (view) x model.layers.{}.conv.conv-7 -> node_260|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56940 start 3518784315 mhz 2190.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.shortconv.out_proj.weight x node_260 -> model.layers.{}.conv.out_proj-7|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 144 cycles 306892 start 3518841559 mhz 2131.2
+ggml-hex: HTP0 profile-op ADD|l_out-6 x model.layers.{}.conv.out_proj-7 (reshaped) -> node_263|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 50872 start 3519149009 mhz 2211.8
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_263 x blk.7.ffn_norm.weight -> model.layers.{}.ffn_out-7|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51001 start 3519200185 mhz 2217.4
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.ffn_gate.weight x model.layers.{}.ffn_out-7 -> ffn_gate-7|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 412 cycles 871869 start 3519251483 mhz 2116.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.7.ffn_up.weight x model.layers.{}.ffn_out-7 -> ffn_up-7|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 401 cycles 850123 start 3520124170 mhz 2120.0
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-7 x ffn_up-7 -> ffn_swiglu-7|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 91 cycles 193780 start 3520974847 mhz 2129.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.7.ffn_down.weight x ffn_swiglu-7 x node_263 -> l_out-7|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 421 cycles 891813 start 3521169190 mhz 2118.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-7 x blk.8.attn_norm.weight -> model.layers.{}.operator_norm-8|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53426 start 3522061818 mhz 2226.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_q.weight x model.layers.{}.operator_norm-8 -> Qcur-8|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 310563 start 3522115540 mhz 2127.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_v.weight x model.layers.{}.operator_norm-8 -> Vcur-8|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 50 cycles 107414 start 3522466662 mhz 2148.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.attn_k.weight x model.layers.{}.operator_norm-8 -> Kcur-8|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 79664 start 3522574135 mhz 2153.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-8 x blk.8.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-8|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 35 cycles 76840 start 3522653874 mhz 2195.4
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-8 x HTP0#leaf_25#0 -> node_277|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 33 cycles 71952 start 3522731023 mhz 2180.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-8 x blk.8.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-8|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 18 cycles 39742 start 3522803544 mhz 2207.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-8 x HTP0#leaf_25#0 -> node_284|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 32929 start 3522843341 mhz 2195.3
+ggml-hex: HTP0 profile-op SET_ROWS|node_284 (view) x HTP0#leaf_29#0 x cache_k_l8 -> cache_k_l8 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 11 cycles 25351 start 3522876339 mhz 2304.6
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-8 (view) x HTP0#leaf_31#0 x cache_v_l8 -> cache_v_l8 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 14 cycles 30375 start 3522902001 mhz 2169.6
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_277 (view) (permuted) x cache_k_l8 (view) (permuted) x cache_v_l8 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-8|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 458 cycles 968759 start 3522932673 mhz 2115.2
+ggml-hex: HTP0 profile-op SCALE|cache_r_l9 (reshaped) (view) -> cache_r_l9 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 9 cycles 20971 start 3523902001 mhz 2330.1
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l9 (reshaped) x HTP0# (view)#0 -> node_300|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 2 cycles 6032 start 3523923012 mhz 3016.0
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.8.attn_output.weight x kqv_out-8 x l_out-7 -> node_306|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 133 cycles 283175 start 3523929084 mhz 2129.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_306 x blk.8.ffn_norm.weight -> model.layers.{}.ffn_out-8|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 23 cycles 51198 start 3524213069 mhz 2226.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.ffn_gate.weight x model.layers.{}.ffn_out-8 -> ffn_gate-8|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 404 cycles 856577 start 3524264566 mhz 2120.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.8.ffn_up.weight x model.layers.{}.ffn_out-8 -> ffn_up-8|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 422 cycles 892770 start 3525121959 mhz 2115.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-8 x ffn_up-8 -> ffn_swiglu-8|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 93 cycles 199122 start 3526015534 mhz 2141.1
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.8.ffn_down.weight x ffn_swiglu-8 x node_306 -> l_out-8|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 440 cycles 930771 start 3526214958 mhz 2115.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-8 x blk.9.attn_norm.weight -> model.layers.{}.operator_norm-9|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52927 start 3527146543 mhz 2205.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.shortconv.in_proj.weight x model.layers.{}.operator_norm-9 (reshaped) -> model.layers.{}.conv.in_proj-9|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 336 cycles 713077 start 3527199773 mhz 2122.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-9 (view) x model.layers.{}.conv.in_proj-9 (view) -> node_320|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 63335 start 3527913418 mhz 2184.0
+ggml-hex: HTP0 profile-op CONCAT|node_300 (reshaped) x  (transposed) -> node_322|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 44 cycles 95443 start 3527977058 mhz 2169.2
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l9 (view) -> cache_r_l9 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 27 cycles 58819 start 3528072805 mhz 2178.5
+ggml-hex: HTP0 profile-op SSM_CONV|node_322 x blk.9.shortconv.conv.weight -> model.layers.{}.conv.conv-9|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 62 cycles 133274 start 3528131919 mhz 2149.6
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-9 (view) x model.layers.{}.conv.conv-9 -> node_328|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56484 start 3528265499 mhz 2172.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.shortconv.out_proj.weight x node_328 -> model.layers.{}.conv.out_proj-9|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 144 cycles 306722 start 3528322283 mhz 2130.0
+ggml-hex: HTP0 profile-op ADD|l_out-8 x model.layers.{}.conv.out_proj-9 (reshaped) -> node_331|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51486 start 3528629810 mhz 2145.2
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_331 x blk.9.ffn_norm.weight -> model.layers.{}.ffn_out-9|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52676 start 3528681593 mhz 2194.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.ffn_gate.weight x model.layers.{}.ffn_out-9 -> ffn_gate-9|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 423 cycles 896332 start 3528734573 mhz 2119.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.9.ffn_up.weight x model.layers.{}.ffn_out-9 -> ffn_up-9|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 410 cycles 868652 start 3529631713 mhz 2118.7
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-9 x ffn_up-9 -> ffn_swiglu-9|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 95 cycles 203087 start 3530500916 mhz 2137.8
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.9.ffn_down.weight x ffn_swiglu-9 x node_331 -> l_out-9|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 448 cycles 949469 start 3530704308 mhz 2119.4
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-9 x blk.10.attn_norm.weight -> model.layers.{}.operator_norm-10|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 55407 start 3531654584 mhz 2216.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_q.weight x model.layers.{}.operator_norm-10 -> Qcur-10|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 133 cycles 282358 start 3531710295 mhz 2123.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_v.weight x model.layers.{}.operator_norm-10 -> Vcur-10|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 56 cycles 120155 start 3531993464 mhz 2145.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.attn_k.weight x model.layers.{}.operator_norm-10 -> Kcur-10|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 79920 start 3532113686 mhz 2160.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-10 x blk.10.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-10|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 38 cycles 82453 start 3532193670 mhz 2169.8
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-10 x HTP0#leaf_25#0 -> node_345|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 36 cycles 77546 start 3532276427 mhz 2154.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-10 x blk.10.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-10|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 18 cycles 39500 start 3532354540 mhz 2194.4
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-10 x HTP0#leaf_25#0 -> node_352|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 32654 start 3532394082 mhz 2176.9
+ggml-hex: HTP0 profile-op SET_ROWS|node_352 (view) x HTP0#leaf_29#0 x cache_k_l10 -> cache_k_l10 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 12 cycles 25979 start 3532426811 mhz 2164.9
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-10 (view) x HTP0#leaf_31#0 x cache_v_l10 -> cache_v_l10 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 32956 start 3532453088 mhz 2197.1
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_345 (view) (permuted) x cache_k_l10 (view) (permuted) x cache_v_l10 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-10|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 460 cycles 973748 start 3532486349 mhz 2116.8
+ggml-hex: HTP0 profile-op SCALE|cache_r_l11 (reshaped) (view) -> cache_r_l11 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 9 cycles 19080 start 3533460659 mhz 2120.0
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l11 (reshaped) x HTP0# (view)#0 -> node_368|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6629 start 3533479779 mhz 2209.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.10.attn_output.weight x kqv_out-10 x l_out-9 -> node_374|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 136 cycles 290021 start 3533486448 mhz 2132.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_374 x blk.10.ffn_norm.weight -> model.layers.{}.ffn_out-10|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51910 start 3533777277 mhz 2162.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.ffn_gate.weight x model.layers.{}.ffn_out-10 -> ffn_gate-10|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 413 cycles 874748 start 3533829490 mhz 2118.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.10.ffn_up.weight x model.layers.{}.ffn_out-10 -> ffn_up-10|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 413 cycles 875280 start 3534705044 mhz 2119.3
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-10 x ffn_up-10 -> ffn_swiglu-10|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 96 cycles 205103 start 3535580880 mhz 2136.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.10.ffn_down.weight x ffn_swiglu-10 x node_374 -> l_out-10|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 453 cycles 958598 start 3535786282 mhz 2116.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-10 x blk.11.attn_norm.weight -> model.layers.{}.operator_norm-11|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54791 start 3536745449 mhz 2191.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.shortconv.in_proj.weight x model.layers.{}.operator_norm-11 (reshaped) -> model.layers.{}.conv.in_proj-11|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 341 cycles 722035 start 3536800537 mhz 2117.4
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-11 (view) x model.layers.{}.conv.in_proj-11 (view) -> node_388|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 65665 start 3537523380 mhz 2188.8
+ggml-hex: HTP0 profile-op CONCAT|node_368 (reshaped) x  (transposed) -> node_390|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 48 cycles 102513 start 3537589349 mhz 2135.7
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l11 (view) -> cache_r_l11 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 63026 start 3537692162 mhz 2173.3
+ggml-hex: HTP0 profile-op SSM_CONV|node_390 x blk.11.shortconv.conv.weight -> model.layers.{}.conv.conv-11|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 66 cycles 141497 start 3537755506 mhz 2143.9
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-11 (view) x model.layers.{}.conv.conv-11 -> node_396|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 56540 start 3537897311 mhz 2174.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.shortconv.out_proj.weight x node_396 -> model.layers.{}.conv.out_proj-11|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 148 cycles 314081 start 3537954154 mhz 2122.2
+ggml-hex: HTP0 profile-op ADD|l_out-10 x model.layers.{}.conv.out_proj-11 (reshaped) -> node_399|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52414 start 3538268789 mhz 2183.9
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_399 x blk.11.ffn_norm.weight -> model.layers.{}.ffn_out-11|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 53958 start 3538321505 mhz 2158.3
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.ffn_gate.weight x model.layers.{}.ffn_out-11 -> ffn_gate-11|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 418 cycles 885592 start 3538375765 mhz 2118.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.11.ffn_up.weight x model.layers.{}.ffn_out-11 -> ffn_up-11|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 411 cycles 870329 start 3539262174 mhz 2117.6
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-11 x ffn_up-11 -> ffn_swiglu-11|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 96 cycles 204409 start 3540133060 mhz 2129.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.11.ffn_down.weight x ffn_swiglu-11 x node_399 -> l_out-11|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 451 cycles 954560 start 3540338273 mhz 2116.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-11 x blk.12.attn_norm.weight -> model.layers.{}.operator_norm-12|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54528 start 3541293650 mhz 2181.1
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_q.weight x model.layers.{}.operator_norm-12 -> Qcur-12|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 149 cycles 316402 start 3541348474 mhz 2123.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_v.weight x model.layers.{}.operator_norm-12 -> Vcur-12|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 57 cycles 122064 start 3541665688 mhz 2141.5
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.attn_k.weight x model.layers.{}.operator_norm-12 -> Kcur-12|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 37 cycles 78924 start 3541787808 mhz 2133.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-12 x blk.12.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-12|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 34 cycles 75087 start 3541866796 mhz 2208.4
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-12 x HTP0#leaf_25#0 -> node_413|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 37 cycles 79296 start 3541942187 mhz 2143.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-12 x blk.12.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-12|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 40658 start 3542022040 mhz 2139.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-12 x HTP0#leaf_25#0 -> node_420|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 16 cycles 34511 start 3542062739 mhz 2156.9
+ggml-hex: HTP0 profile-op SET_ROWS|node_420 (view) x HTP0#leaf_29#0 x cache_k_l12 -> cache_k_l12 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 13 cycles 29703 start 3542097319 mhz 2284.8
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-12 (view) x HTP0#leaf_31#0 x cache_v_l12 -> cache_v_l12 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 33156 start 3542127327 mhz 2210.4
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_413 (view) (permuted) x cache_k_l12 (view) (permuted) x cache_v_l12 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-12|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 463 cycles 979528 start 3542160780 mhz 2115.6
+ggml-hex: HTP0 profile-op SCALE|cache_r_l13 (reshaped) (view) -> cache_r_l13 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 11 cycles 24198 start 3543141103 mhz 2199.8
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l13 (reshaped) x HTP0# (view)#0 -> node_436|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6554 start 3543165341 mhz 2184.7
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.12.attn_output.weight x kqv_out-12 x l_out-11 -> node_442|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 135 cycles 288295 start 3543171935 mhz 2135.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_442 x blk.12.ffn_norm.weight -> model.layers.{}.ffn_out-12|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 51790 start 3543461046 mhz 2157.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.ffn_gate.weight x model.layers.{}.ffn_out-12 -> ffn_gate-12|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 412 cycles 873385 start 3543513133 mhz 2119.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.12.ffn_up.weight x model.layers.{}.ffn_out-12 -> ffn_up-12|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 417 cycles 883147 start 3544387330 mhz 2117.9
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-12 x ffn_up-12 -> ffn_swiglu-12|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 98 cycles 208287 start 3545271574 mhz 2125.4
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.12.ffn_down.weight x ffn_swiglu-12 x node_442 -> l_out-12|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 451 cycles 955499 start 3545480165 mhz 2118.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-12 x blk.13.attn_norm.weight -> model.layers.{}.operator_norm-13|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 54516 start 3546436473 mhz 2180.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.shortconv.in_proj.weight x model.layers.{}.operator_norm-13 (reshaped) -> model.layers.{}.conv.in_proj-13|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 320 cycles 678484 start 3546491292 mhz 2120.3
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-13 (view) x model.layers.{}.conv.in_proj-13 (view) -> node_456|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 29 cycles 62601 start 3547170588 mhz 2158.7
+ggml-hex: HTP0 profile-op CONCAT|node_436 (reshaped) x  (transposed) -> node_458|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 47 cycles 100875 start 3547233487 mhz 2146.3
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l13 (view) -> cache_r_l13 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 29 cycles 63156 start 3547334666 mhz 2177.8
+ggml-hex: HTP0 profile-op SSM_CONV|node_458 x blk.13.shortconv.conv.weight -> model.layers.{}.conv.conv-13|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 138466 start 3547398129 mhz 2130.2
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-13 (view) x model.layers.{}.conv.conv-13 -> node_464|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 26 cycles 58056 start 3547536900 mhz 2232.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.shortconv.out_proj.weight x node_464 -> model.layers.{}.conv.out_proj-13|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 146 cycles 309950 start 3547595254 mhz 2122.9
+ggml-hex: HTP0 profile-op ADD|l_out-12 x model.layers.{}.conv.out_proj-13 (reshaped) -> node_467|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52745 start 3547906019 mhz 2197.7
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_467 x blk.13.ffn_norm.weight -> model.layers.{}.ffn_out-13|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53188 start 3547959062 mhz 2216.2
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.ffn_gate.weight x model.layers.{}.ffn_out-13 -> ffn_gate-13|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 421 cycles 892392 start 3548012547 mhz 2119.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.13.ffn_up.weight x model.layers.{}.ffn_out-13 -> ffn_up-13|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 427 cycles 903530 start 3548905508 mhz 2116.0
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-13 x ffn_up-13 -> ffn_swiglu-13|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 96 cycles 205299 start 3549809597 mhz 2138.5
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.13.ffn_down.weight x ffn_swiglu-13 x node_467 -> l_out-13|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 453 cycles 958126 start 3550015199 mhz 2115.1
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-13 x blk.14.attn_norm.weight -> model.layers.{}.operator_norm-14|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 53591 start 3550973890 mhz 2233.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_q.weight x model.layers.{}.operator_norm-14 -> Qcur-14|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 149 cycles 316731 start 3551027785 mhz 2125.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_v.weight x model.layers.{}.operator_norm-14 -> Vcur-14|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 53 cycles 113776 start 3551345324 mhz 2146.7
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.attn_k.weight x model.layers.{}.operator_norm-14 -> Kcur-14|2048:512 x 2048:32 -> 512:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:2048|hmx-tiled vtcm 3113216|usec 38 cycles 80540 start 3551459150 mhz 2119.5
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Qcur-14 x blk.14.attn_q_norm.weight -> model.layers.{}.self_attn.q_layernorm-14|64:32:32:1 x 64:1 -> 64:32:32:1|f32 x f32 -> f32|4:256:8192:262144 x 4:256 -> 4:256:8192:262144|----|usec 34 cycles 73879 start 3551539752 mhz 2172.9
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.q_layernorm-14 x HTP0#leaf_25#0 -> node_481|64:32:32:1 x 32:1 -> 64:32:32:1|f32 x i32 -> f32|4:256:8192:262144 x 4:128 -> 4:256:8192:262144|----|usec 35 cycles 76567 start 3551613931 mhz 2187.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|Kcur-14 x blk.14.attn_k_norm.weight -> model.layers.{}.self_attn.k_layernorm-14|64:8:32:1 x 64:1 -> 64:8:32:1|f32 x f32 -> f32|4:256:2048:65536 x 4:256 -> 4:256:2048:65536|----|usec 19 cycles 40923 start 3551691068 mhz 2153.8
+ggml-hex: HTP0 profile-op ROPE|model.layers.{}.self_attn.k_layernorm-14 x HTP0#leaf_25#0 -> node_488|64:8:32:1 x 32:1 -> 64:8:32:1|f32 x i32 -> f32|4:256:2048:65536 x 4:128 -> 4:256:2048:65536|----|usec 15 cycles 31963 start 3551732031 mhz 2130.9
+ggml-hex: HTP0 profile-op SET_ROWS|node_488 (view) x HTP0#leaf_29#0 x cache_k_l14 -> cache_k_l14 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 11 cycles 24871 start 3551764056 mhz 2261.0
+ggml-hex: HTP0 profile-op SET_ROWS|Vcur-14 (view) x HTP0#leaf_31#0 x cache_v_l14 -> cache_v_l14 (view)|512:32 x 32:1 x 512:256 -> 512:256|f32 x i64 x f16 -> f16|4:2048 x 8:256 x 2:1024 -> 2:1024|----|usec 15 cycles 33780 start 3551789228 mhz 2252.0
+ggml-hex: HTP0 profile-op FLASH_ATTN_EXT|node_481 (view) (permuted) x cache_k_l14 (view) (permuted) x cache_v_l14 (view) (permuted) x HTP0#attn_inp_kq_mask#0 -> __fattn__-14|64:32:32:1 x 64:256:8:1 x 64:256:8:1 x 256:32 -> 64:32:32:1|f32 x f16 x f16 x f16 -> f32|4:8192:256:262144! x 2:1024:128:262144! x 2:1024:128:262144! x 2:512 -> 4:256:8192:262144|hmx-pipe vtcm 194304|usec 460 cycles 973896 start 3551823313 mhz 2117.2
+ggml-hex: HTP0 profile-op SCALE|cache_r_l15 (reshaped) (view) -> cache_r_l15 (reshaped) (view) (view)|4096:1 -> 4096:1|f32 -> f32|4:16384 -> 4:16384|----|usec 11 cycles 25204 start 3552797771 mhz 2291.3
+ggml-hex: HTP0 profile-op GET_ROWS|cache_r_l15 (reshaped) x HTP0# (view)#0 -> node_504|4096:1 x 1:1 -> 4096:1|f32 x i32 -> f32|4:16384 x 4:4 -> 4:16384|----|usec 3 cycles 6828 start 3552823017 mhz 2276.0
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.14.attn_output.weight x kqv_out-14 x l_out-13 -> node_510|2048:2048 x 2048:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:1152 x 4:8192 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 140 cycles 298661 start 3552829885 mhz 2133.3
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_510 x blk.14.ffn_norm.weight -> model.layers.{}.ffn_out-14|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 24 cycles 52294 start 3553129111 mhz 2178.9
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.ffn_gate.weight x model.layers.{}.ffn_out-14 -> ffn_gate-14|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 423 cycles 895064 start 3553181710 mhz 2116.0
+ggml-hex: HTP0 profile-op MUL_MAT|blk.14.ffn_up.weight x model.layers.{}.ffn_out-14 -> ffn_up-14|2048:8192 x 2048:32 -> 8192:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:32768|hmx-tiled vtcm 8335616|usec 432 cycles 915166 start 3554077583 mhz 2118.4
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-14 x ffn_up-14 -> ffn_swiglu-14|8192:32 x 8192:32 -> 8192:32|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 97 cycles 208870 start 3554993530 mhz 2153.3
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.14.ffn_down.weight x ffn_swiglu-14 x node_510 -> l_out-14|8192:2048 x 8192:32 x 2048:32 -> 2048:32|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hmx-tiled vtcm 8212736|usec 450 cycles 952934 start 3555203210 mhz 2117.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-14 x blk.15.attn_norm.weight -> model.layers.{}.operator_norm-15|2048:32 x 2048:1 -> 2048:32|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 25 cycles 55545 start 3556156959 mhz 2221.8
+ggml-hex: HTP0 profile-op MUL_MAT|blk.15.shortconv.in_proj.weight x model.layers.{}.operator_norm-15 (reshaped) -> model.layers.{}.conv.in_proj-15|2048:6144 x 2048:32 -> 6144:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:24576|hmx-tiled vtcm 8335616|usec 331 cycles 702340 start 3556212809 mhz 2121.9
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-15 (view) x model.layers.{}.conv.in_proj-15 (view) -> node_524|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:24576! -> 4:8192|----|usec 30 cycles 64374 start 3556915954 mhz 2145.8
+ggml-hex: HTP0 profile-op CONCAT|node_504 (reshaped) x  (transposed) -> node_526|2:2048 x 32:2048 -> 34:2048|f32 x f32 -> f32|4:8 x 8192:4! -> 4:136|----|usec 48 cycles 103761 start 3556980631 mhz 2161.7
+ggml-hex: HTP0 profile-op CPY| (view) x cache_r_l15 (view) -> cache_r_l15 (view) (copy of  (view))|2:2048 x 4096:1 -> 4096:1|f32 x f32 -> f32|4:136! x 4:16384 -> 4:16384|----|usec 28 cycles 60895 start 3557084689 mhz 2174.8
+ggml-hex: HTP0 profile-op GET_ROWS|l_out-14 x HTP0#leaf_171#0 -> node_530|2048:32 x 1:1 -> 2048:1|f32 x i32 -> f32|4:8192 x 4:4 -> 4:8192|----|usec 3 cycles 8049 start 3557145884 mhz 2683.0
+ggml-hex: HTP0 profile-op SSM_CONV|node_526 x blk.15.shortconv.conv.weight -> model.layers.{}.conv.conv-15|34:2048 x 3:2048 -> 2048:32|f32 x f32 -> f32|4:136 x 4:12 -> 4:8192|----|usec 65 cycles 138366 start 3557153973 mhz 2128.7
+ggml-hex: HTP0 profile-op MUL|model.layers.{}.conv.in_proj-15 (view) x model.layers.{}.conv.conv-15 -> node_533|2048:32 x 2048:32 -> 2048:32|f32 x f32 -> f32|4:24576! x 4:8192 -> 4:8192|----|usec 25 cycles 55914 start 3557292911 mhz 2236.6
+ggml-hex: HTP0 profile-op MUL_MAT|blk.15.shortconv.out_proj.weight x node_533 -> model.layers.{}.conv.out_proj-15|2048:2048 x 2048:32 -> 2048:32|q4_0 x f32 -> f32|18:1152 x 4:8192 -> 4:8192|hmx-tiled vtcm 8335616|usec 128 cycles 271953 start 3557349122 mhz 2124.6
+ggml-hex: HTP0 profile-op GET_ROWS|model.layers.{}.conv.out_proj-15 (reshaped) x HTP0#leaf_171#0 -> node_536|2048:32 x 1:1 -> 2048:1|f32 x i32 -> f32|4:8192 x 4:4 -> 4:8192|----|usec 6 cycles 13599 start 3557621885 mhz 2266.5
+ggml-hex: HTP0 profile-op ADD|node_530 x node_536 -> node_537|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 6 cycles 13464 start 3557635524 mhz 2244.0
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|node_537 x blk.15.ffn_norm.weight -> model.layers.{}.ffn_out-15|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 8 cycles 17014 start 3557649028 mhz 2126.8
+ggml-hex: HTP0 profile-op MUL_MAT+MUL_MAT|blk.15.ffn_gate.weight x model.layers.{}.ffn_out-15 x blk.15.ffn_up.weight -> ffn_up-15|2048:8192 x 2048:1 x 2048:8192 -> 8192:1|q4_0 x f32 x q4_0 -> f32|18:1152 x 4:8192 x 18:1152 -> 4:32768|hvx-tiled vtcm 7987200|usec 424 cycles 897573 start 3557666082 mhz 2116.9
+ggml-hex: HTP0 profile-op SWIGLU|ffn_gate-15 x ffn_up-15 -> ffn_swiglu-15|8192:1 x 8192:1 -> 8192:1|f32 x f32 -> f32|4:32768 x 4:32768 -> 4:32768|----|usec 16 cycles 35123 start 3558563720 mhz 2195.2
+ggml-hex: HTP0 profile-op MUL_MAT+ADD|blk.15.ffn_down.weight x ffn_swiglu-15 x node_537 -> l_out-15|8192:2048 x 8192:1 x 2048:1 -> 2048:1|q4_0 x f32 x f32 -> f32|18:4608 x 4:32768 x 4:8192 -> 4:8192|hvx-tiled vtcm 8355840|usec 209 cycles 442993 start 3558598883 mhz 2119.6
+ggml-hex: HTP0 profile-op RMS_NORM+MUL|l_out-15 x token_embd_norm.weight -> result_norm|2048:1 x 2048:1 -> 2048:1|f32 x f32 -> f32|4:8192 x 4:8192 -> 4:8192|----|usec 5 cycles 10665 start 3559041945 mhz 2133.0
+ggml-hex: HTP0 profile-batch n-ops 264 batch-dur-usec 36724 htp-ops-usec 34162
+| model                          |       size |     params | backend    | ngl | dev          |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------------ | --------------: | -------------------: |
+| lfm2 1.2B Q4_0                 | 661.25 MiB |     1.17 B | HTP        |  99 | HTP0         |            pp32 |        590.60 ± 0.00 |
+llama_perf_context_print:        load time =     699.07 ms
+llama_perf_context_print: prompt eval time =       0.00 ms /    64 tokens (    0.00 ms per token,      inf tokens per second)
+llama_perf_context_print:        eval time =       0.00 ms /     1 runs   (    0.00 ms per token,      inf tokens per second)
+llama_perf_context_print:       total time =     753.43 ms /    65 tokens
+llama_perf_context_print:    graphs reused =          1
+~llama_context:       HTP0 compute buffer size is   3.5360 MiB, matches expectation of   3.5360 MiB
+~llama_context:        CPU compute buffer size is   8.2501 MiB, matches expectation of   8.2501 MiB
+
+build: 4fc4ec55 (9859)

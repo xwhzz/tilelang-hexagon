@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "op": "matmul",
+  "example": "llama_cpp_q4_walkthrough",
+  "shape": {
+    "M": 32,
+    "N": 256,
+    "K": 2048
+  },
+  "entries": {
+    "pack": "tl_walkthrough_q4_m32_n256_k2048_pack_kernel",
+    "dequant": "tl_walkthrough_q4_m32_n256_k2048_dequant_kernel",
+    "compute": "tl_walkthrough_q4_m32_n256_k2048_compute_kernel"
+  },
+  "weight_layout": {
+    "llama_source": "[8][64][576] uint8",
+    "dma_staged": "[8][64][640] uint8"
+  },
+  "resource_owner": {
+    "vtcm": "llama.cpp",
+    "dma": "llama.cpp",
+    "workers": "llama.cpp",
+    "hmx_protocol": "generated compute stage"
+  }
+}

@@ -1,0 +1,42 @@
+# Core target and lowering dispatch
+tilelang/utils/target.py
+tilelang/engine/lower.py
+tilelang/jit/execution_backend.py
+tilelang/jit/kernel.py
+tilelang/cache/__init__.py
+tilelang/language/__init__.py
+tilelang/language/allocate.py
+tilelang/language/builtin.py
+
+# Hexagon compiler, tile-op lowering, runtime, and hardware templates
+src/hexagon/
+src/op/builtin.cc
+src/op/builtin.h
+src/transform/loop_vectorize.cc
+src/transform/merge_shared_memory_allocations.cc
+src/tl_templates/hexagon/
+tilelang/hexagon/
+
+# General backend examples and end-to-end operator cases
+examples/hexagon/README.md
+examples/hexagon/example_matmul.py
+examples/hexagon/example_worker_pool.py
+examples/hexagon/example_flash_attention.py
+examples/hexagon/example_rmsnorm.py
+examples/hexagon/example_qmatmul.py
+examples/hexagon/example_qmatmul_kstream.py
+examples/hexagon/example_qgemv_q8_0.py
+examples/hexagon/llama_cpp_integration/
+testing/python/hexagon/
+
+# Design, integration, profiling, and reproduction documentation
+docs/hexagon_backend.md
+docs/hexagon_backend_zh.md
+docs/hexagon_dsl_kernels.md
+docs/hexagon_profiling.md
+docs/llama_cpp_integration.md
+docs/llama_cpp_inference_flow.md
+docs/llama_cpp_reproduce.md
+docs/tilelang_hexagon_q8_design.md
+docs/tilelang_hexagon_8bit_handoff.md
+docs/lfm2_hexagon_report/tilelang_operator_integration.md

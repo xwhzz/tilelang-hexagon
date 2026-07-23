@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "op": "matmul",
+  "implementation": "staged_explicit_hmx_atoms",
+  "M": 32,
+  "N": 256,
+  "K": 2048,
+  "entries": {
+    "pack": "tl_q4_hmx_staged_m32_n256_k2048_pack_kernel",
+    "dequant": "tl_q4_hmx_staged_m32_n256_k2048_dequant_kernel",
+    "compute": "tl_q4_hmx_staged_m32_n256_k2048_compute_kernel"
+  },
+  "dequantization": "parallel_range_of_hvx_q4_tile_atoms",
+  "padded_weight_format": {
+    "shape": "[8][64][640] uint8",
+    "dma": "2D 576B -> 640B rows"
+  },
+  "vtcm": {
+    "activation_bytes": 131072,
+    "dequant_bytes": 1048576,
+    "output_crouton_bytes": 2048,
+    "bias_bytes": 256,
+    "raw_weight_stage_bytes": 327680,
+    "raw_weight_stages": 2
+  },
+  "runtime_contract": {
+    "workers": "caller-owned synchronous parallel_for",
+    "dma": "caller-owned ordered async 2D queue",
+    "hmx": "caller locks compute resource; compute stage owns accumulator protocol"
+  },
+  "lowering_contract": {
+    "q4_atom": "tl_hexagon_q4_0_dequant_tile_32x32",
+    "activation_atom": "tl_hexagon_hmx_pack_a_f32_pair_k32",
+    "hmx_atom": "tl_hexagon_hmx_mma_atom",
+    "layout": "TileLang T.Layout for activation/weight/output Croutons"
+  }
+}

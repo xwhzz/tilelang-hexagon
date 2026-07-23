@@ -1,0 +1,107 @@
+diff --git a/ggml/src/ggml-hexagon/CMakeLists.txt b/ggml/src/ggml-hexagon/CMakeLists.txt
+index 845b922b..501c3d11 100644
+--- a/ggml/src/ggml-hexagon/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/CMakeLists.txt
+@@ -26,0 +27,10 @@ set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: en
++set(GGML_HEXAGON_TILELANG_SOURCE_DIR "$ENV{TILELANG_SOURCE_DIR}" CACHE PATH
++    "TileLang source tree used by generated Hexagon kernels")
++option(GGML_HEXAGON_TILELANG_WALKTHROUGH
++    "Build the one-shape TileLang Q4 walkthrough" OFF)
++
++if (GGML_HEXAGON_TILELANG_WALKTHROUGH AND
++    NOT IS_DIRECTORY "${GGML_HEXAGON_TILELANG_SOURCE_DIR}/src/tl_templates/hexagon")
++    message(FATAL_ERROR
++        "Set GGML_HEXAGON_TILELANG_SOURCE_DIR to the TileLang source tree")
++endif()
+@@ -72,0 +83,2 @@ function(build_htp_skel V)
++            -DTILELANG_SOURCE_DIR:PATH=${GGML_HEXAGON_TILELANG_SOURCE_DIR}
++            -DTILELANG_WALKTHROUGH:BOOL=${GGML_HEXAGON_TILELANG_WALKTHROUGH}
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 9f9471f6..06bb0f71 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -14,0 +15,13 @@ include_directories(
++set(TILELANG_WALKTHROUGH_SOURCES)
++if (TILELANG_WALKTHROUGH)
++    include_directories(
++        ${TILELANG_SOURCE_DIR}/src
++        ${TILELANG_SOURCE_DIR}/src/tl_templates/hexagon)
++    list(APPEND TILELANG_WALKTHROUGH_SOURCES
++        tl_walkthrough_adapter.cc
++        kernel_walkthrough_q4_m32_n256_k2048.cc)
++    set_source_files_properties(
++        kernel_walkthrough_q4_m32_n256_k2048.cc
++        PROPERTIES COMPILE_OPTIONS "-Wno-unused-function;-fno-lto")
++endif()
++
+@@ -43,0 +57 @@ add_library(${HTP_LIB} SHARED
++    ${TILELANG_WALKTHROUGH_SOURCES}
+@@ -49,0 +64,4 @@ target_compile_definitions(${HTP_LIB} PRIVATE
++if (TILELANG_WALKTHROUGH)
++    target_compile_definitions(${HTP_LIB} PRIVATE TL_Q4_HMX_ENABLED=1)
++endif()
++
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 79c292dc..ab43d920 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -23,0 +24,30 @@
++#ifdef TL_Q4_HMX_ENABLED
++#include <tl_templates/hexagon/tl_embed.h>
++
++static int tl_dma_push_1d(
++        void * queue, void * dst, const void * src, uint32_t bytes) {
++    return dma_queue_push(
++        (dma_queue *) queue, dma_make_ptr(dst, src), bytes, bytes, bytes, 1) ? 0 : -1;
++}
++
++static int tl_dma_push_2d(
++        void * queue, void * dst, const void * src,
++        uint32_t dst_stride, uint32_t src_stride,
++        uint32_t width, uint32_t height) {
++    return dma_queue_push(
++        (dma_queue *) queue, dma_make_ptr(dst, src),
++        dst_stride, src_stride, width, height) ? 0 : -1;
++}
++
++static void * tl_dma_pop(void * queue) {
++    return dma_queue_pop((dma_queue *) queue).dst;
++}
++
++static int tl_parallel_run(
++        void * pool, tl_parallel_task task, void * data,
++        unsigned int workers) {
++    return worker_pool_run_func(
++        (worker_pool_context_t) pool, (worker_callback_t) task,
++        data, workers) == 0 ? 0 : -1;
++}
++#endif
+@@ -2162,0 +2193,28 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
++#ifdef TL_Q4_HMX_ENABLED
++    // Offer the op to TileLang. A decline falls through to stock unchanged.
++    {
++        struct tl_op_ctx octx = {0};
++        octx.vtcm_base   = ctx->vtcm_base;
++        octx.vtcm_size   = ctx->vtcm_size;
++        octx.vtcm_rctx   = ctx->vtcm_rctx;
++        octx.dma.queue   = ctx->dma[0];
++        octx.dma.push_1d = tl_dma_push_1d;
++        octx.dma.push_2d = tl_dma_push_2d;
++        octx.dma.pop     = tl_dma_pop;
++        octx.parallel.pool        = ctx->worker_pool;
++        octx.parallel.run         = tl_parallel_run;
++        octx.parallel.max_workers = n_threads;
++        octx.kind        = TL_OP_MATMUL;
++        octx.weight_type = weight_type;
++        octx.has_bias    = (src2 != NULL);
++        octx.dst         = dst;
++        octx.act         = activation;
++        octx.weight      = weight;
++        octx.m           = m;
++        octx.k           = k;
++        octx.n           = n;
++        octx.act_stride  = act_stride;
++        octx.dst_stride  = dst_stride;
++        if (tl_dispatch(&octx) == 0) return 0;
++    }
++#endif

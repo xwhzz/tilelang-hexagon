@@ -1,0 +1,16 @@
+{
+  "op": "q8_0_dot_32x1",
+  "K": 2048,
+  "N": 32,
+  "bias": false,
+  "entry": "int32_t qgemv_q8_0_k2048_nobias_kernel(uint8_t* weight, uint8_t* activation, float* dst)",
+  "source_weight_tile_bytes": 1088,
+  "staged_tile_bytes": 1152,
+  "staged_weight_bytes": 73728,
+  "staged_activation_bytes": 73728,
+  "layout": "ggml-hexagon q8_0_tiled after 2D-DMA padding",
+  "ownership": {
+    "tilelang": "HVX signed-int8 dot + scale accumulation",
+    "embedding_runtime": "DMA, VTCM buffers, activation quantization, worker pool"
+  }
+}

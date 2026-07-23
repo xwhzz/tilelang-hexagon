@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TileLang Qualcomm Hexagon NPU Backend</title>
+  <link rel="stylesheet" href="assets/app.css">
+  <script defer src="assets/app.js"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="演示页导航">
+      <div class="brand">
+        <img src="assets/tilelang-logo.png" alt="TileLang">
+        <div>
+          <strong>Hexagon Backend</strong>
+          <span>TECHNICAL DECK</span>
+        </div>
+      </div>
+      <nav class="slide-nav" id="slideNav"></nav>
+      <div class="sidebar-footer">
+        Qualcomm Hexagon v79<br>
+        HVX / HMX / VTCM / FastRPC
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="toolbar">
+        <button class="tool-button menu-button" id="menuButton" type="button" title="目录" aria-label="目录">☰</button>
+        <div class="toolbar-title" id="toolbarTitle"></div>
+        <button class="tool-button" id="notesButton" type="button" title="讲稿">讲稿</button>
+        <button class="tool-button" id="printButton" type="button" title="打印或导出 PDF">打印</button>
+        <button class="tool-button" id="fullscreenButton" type="button" title="全屏" aria-label="全屏">⛶</button>
+        <button class="tool-button" id="prevButton" type="button" title="上一页" aria-label="上一页">←</button>
+        <button class="tool-button" id="nextButton" type="button" title="下一页" aria-label="下一页">→</button>
+      </header>
+
+      <div class="stage-shell">
+        <div class="deck-frame">
+          <div class="progress" id="progress"></div>
+
+          <section class="slide cover" data-title="TileLang × Qualcomm Hexagon NPU Backend"
+            data-notes="开场先给出主线：先建立有类型的 HMX/HVX primitives，再用手写 kernel 确认硬件上限，用显式 TileLang 复现，最后接入 pipeline、autotune 和框架 package。案例只提供证据，不定义 backend。">
+            <div class="cover-top">
+              <div class="cover-brand">
+                <img src="assets/tilelang-logo.png" alt="TileLang">
+                <span>TILELANG BACKEND ENGINEERING</span>
+              </div>
+              <div class="cover-date">DEVICE VALIDATED · 2026.07</div>
+            </div>
+            <div class="cover-main">
+              <h1>TileLang × Qualcomm<br><span class="accent">Hexagon NPU Backend</span></h1>
+              <p class="subtitle">从 typed HMX/HVX primitives 和手写性能基线，到 explicit TileLang schedules、流水调度与框架 package。</p>
+            </div>
+            <div class="cover-flow" aria-label="backend 主流程">
+              <div><b>Primitive Catalog</b><span>dtype / repr / side effect</span></div>
+              <div><b>Handwritten Ceiling</b><span>intrinsic C baseline</span></div>
+              <div><b>Explicit TileLang</b><span>atoms / loops / Layout</span></div>
+              <div><b>Generic Schedule</b><span>pipeline / worker / tune</span></div>
+              <div><b>Framework Package</b><span>registry / resource lease</span></div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="项目目标与验收边界"
+            data-notes="强调三个验收层次：第一，普通 TileLang 程序能跑；第二，遇到 Hexagon 特有能力时有正确的低层抽象；第三，生成体能进入真实框架。模型 tok/s 只是最后验证，不是唯一验收指标。">
+            <div class="slide-head">
+              <div><div class="section">01 · Project Definition</div><h1>目标是 backend，不是模型专用 kernel 集合</h1></div>
+              <div class="aside">把硬件差异收敛到 target、layout、instruction atom 和 runtime ownership。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-3">
+                <div class="panel red">
+                  <div class="kicker">PLATFORM</div>
+                  <h2>通用 target</h2>
+                  <p>支持 TileLang PrimFunc lowering、C codegen、构建、部署、执行和错误传播。</p>
+                </div>
+                <div class="panel teal">
+                  <div class="kicker">HARDWARE</div>
+                  <h2>分层硬件抽象</h2>
+                  <p>HVX vector、HMX matrix、VTCM、DMA 和 worker 各自有清晰边界。</p>
+                </div>
+                <div class="panel green">
+                  <div class="kicker">INTEGRATION</div>
+                  <h2>两种执行模式</h2>
+                  <p>Standalone FastRPC 用于开发验证；embedded resource lease 用于现有 runtime。</p>
+                </div>
+              </div>
+              <div class="grid-2">
+                <div class="panel white">
+                  <h3>验收标准</h3>
+                  <ul class="clean-list">
+                    <li><strong>可读：</strong>generated C 中能看到 VTCM 和硬件调用</li>
+                    <li><strong>可跑：</strong>真实设备结果与 torch golden 一致</li>
+                    <li><strong>可扩展：</strong>新 op 不需要复制完整 runtime</li>
+                    <li><strong>可嵌入：</strong>不匹配时安全回落宿主 stock kernel</li>
+                  </ul>
+                </div>
+                <div class="panel white">
+                  <h3>实施顺序</h3>
+                  <ul class="clean-list">
+                    <li><strong>Primitive：</strong>先冻结 dtype、result repr 和副作用</li>
+                    <li><strong>Handwritten：</strong>建立硬件可达到的性能上限</li>
+                    <li><strong>Explicit TileLang：</strong>复现 loop、layout 和依赖</li>
+                    <li><strong>Generalize：</strong>最后接入流水、worker 和 autotune</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="band">Workload profiling 与 primitive 盘点并行进行：前者决定先优化什么，后者决定 TileLang 能可靠表达什么。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Hexagon 硬件模型"
+            data-notes="从第一性原理解释抽象。HVX 是六路全宽向量上下文，HMX 是单个隐式累加器矩阵引擎，VTCM 没有自动 cache，DMA 显式搬运，FastRPC 又把设备放在另一个进程和处理器上。这决定 Hexagon 不能照搬 CUDA backend。">
+            <div class="slide-head">
+              <div><div class="section">02 · Hardware Model</div><h1>Hexagon 不是 SIMT GPU</h1></div>
+              <div class="aside">VLIW DSP + HVX + HMX + VTCM + DMA + FastRPC</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-4">
+                <div class="metric teal"><div class="value">128B</div><div class="label">HVX 全寄存器宽度<br>6 个 vector contexts</div></div>
+                <div class="metric gold"><div class="value">32×32</div><div class="label">单个 FP16 HMX<br>Crouton tile</div></div>
+                <div class="metric green"><div class="value">8 MiB</div><div class="label">软件管理 VTCM<br>无自动 cache</div></div>
+                <div class="metric"><div class="value">2D DMA</div><div class="label">显式 stride / padding<br>ordered async queue</div></div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node red"><strong>DDR tensors</strong><span>global memory</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>DMA / HVX copy</strong><span>explicit movement</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>VTCM</strong><span>aligned software arena</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>HVX or HMX</strong><span>vector / matrix</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node red"><strong>Output</strong><span>DDR or next stage</span></div>
+              </div>
+              <div class="grid-2">
+                <div class="panel teal"><h3>对 codegen 的影响</h3><p>没有 warp/threadIdx 协作。Grid 要变成显式控制流；mixed dtype vectorization 必须满足最窄 dtype 填满 128B。</p></div>
+                <div class="panel gold"><h3>对 runtime 的影响</h3><p>VTCM/HMX 是资源，不是普通地址空间；FastRPC session、worker 和 DMA queue 都必须有唯一 owner。</p></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="抽象边界与所有权"
+            data-notes="这里是整个项目最重要的一页。语义和调度属于 TileLang，硬件不可分指令属于 target template，session 和资源申请属于实际 runtime owner。Embedded 时 llama.cpp 只借资源，不接管 TileLang 的算子语义。">
+            <div class="slide-head">
+              <div><div class="section">03 · Abstraction Boundary</div><h1>语义、调度、指令与资源所有权分开</h1></div>
+              <div class="aside">避免把 dequant、DMA、线程和 compute 封进一个 monolithic tile-op。</div>
+            </div>
+            <div class="slide-body">
+              <div class="layer-stack">
+                <div class="layer"><span class="id">L0</span><strong>Operator semantics</strong><p>shape、logical dtype、accum、tail 和 epilogue</p><span class="owner">TileLang / workload</span></div>
+                <div class="layer"><span class="id">L1</span><strong>Schedule + Layout</strong><p>tile traversal、worker partition、`T.Layout`、buffer lifetime</p><span class="owner">TileLang</span></div>
+                <div class="layer"><span class="id">L2</span><strong>Typed primitives</strong><p>HVX value/repr、HMX clear/mma/convert/store 和 dependency</p><span class="owner">Hexagon target</span></div>
+                <div class="layer"><span class="id">L3</span><strong>Data movement</strong><p>sync copy、async DMA、commit/wait 和 VTCM plan</p><span class="owner">lowering + runtime</span></div>
+                <div class="layer"><span class="id">L4</span><strong>Resource lifecycle</strong><p>FastRPC session、VTCM/HMX acquire、DMA queue、worker pool</p><span class="owner">actual owner</span></div>
+              </div>
+              <div class="band teal"><strong>关键判据：</strong>Standalone 时 TileLang runtime 是 owner；嵌入 llama.cpp 时宿主是 owner，TileLang 只接收窄资源租约。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="五层 Backend 架构"
+            data-notes="五层架构让 compiler 保持小。Codegen 只是 C emitter，硬件细节集中在 template header。这样调一条 HMX/HVX recipe 不必重新设计 DSL，也通常不必改 compiler pass。">
+            <div class="slide-head">
+              <div><div class="section">04 · Backend Stack</div><h1>从通用 DSL 到真实 cDSP 的五层结构</h1></div>
+              <div class="aside">Hexagon 是 CPU-like C backend 的 sibling，而不是 CUDA codegen 的变体。</div>
+            </div>
+            <div class="slide-body">
+              <div class="layer-stack">
+                <div class="layer"><span class="id">L1</span><strong>Frontend / TIR</strong><p>`T.Kernel`、`T.copy`、`T.gemm`、`T.Layout` 和 explicit atoms</p><span class="owner">tilelang/language</span></div>
+                <div class="layer"><span class="id">L2</span><strong>Hexagon pipeline</strong><p>CPU passes + Hexagon copy/fill/gemm/reduce + memory/layout transforms</p><span class="owner">src/hexagon/op</span></div>
+                <div class="layer"><span class="id">L3</span><strong>C codegen</strong><p>serialized grid、VTCM offsets、worker callback、device ABI</p><span class="owner">codegen_hexagon</span></div>
+                <div class="layer"><span class="id">L4</span><strong>Hardware recipes</strong><p>typed HVX/HMX、layout、VTCM、worker 和 DMA recipes</p><span class="owner">tl_templates</span></div>
+                <div class="layer"><span class="id">L5</span><strong>Runtime / embedding</strong><p>FastRPC project + adb agent，或 host-owned `tl_op_ctx`</p><span class="owner">tilelang/hexagon</span></div>
+              </div>
+              <div class="grid-3">
+                <div class="panel red"><h3>薄 codegen</h3><p>发射普通 C 和少量 runtime calls，不内置 Crouton 配方。</p></div>
+                <div class="panel teal"><h3>可替换 recipe</h3><p>硬件指令在 header 中迭代，保持 TIR 接口稳定。</p></div>
+                <div class="panel green"><h3>同一 generated body</h3><p>既能被 standalone skel 包装，也能 co-compile 到宿主。</p></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="TileLang 到 Hexagon 的生成流程"
+            data-notes="这页回答 TileLang 到底怎么生成 Hexagon 算子。lower 可以停在 C 源码检查；compile 会继续生成 IDL、skel、host 和 CMake，通过 SDK 编译并 adb 部署；embeddable emitter 则只输出裸 device function。">
+            <div class="slide-head">
+              <div><div class="section">05 · Compilation Flow</div><h1>TileLang 生成 Hexagon 算子的完整流程</h1></div>
+              <div class="aside">一个 PrimFunc，三个入口：lower、standalone compile、embeddable emit。</div>
+            </div>
+            <div class="slide-body">
+              <div class="flow-row">
+                <div class="flow-node red"><strong>@T.prim_func</strong><span>operator + schedule</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>Hexagon TIR</strong><span>LowerTileOp / layout / liveness</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>Generated C</strong><span>CodeGenTileLangHexagon</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>Recipe headers</strong><span>HVX / HMX / VTCM</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node red"><strong>hexagon-clang++</strong><span>-mhvx -mhmx</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>cDSP execution</strong><span>FastRPC or host skel</span></div>
+              </div>
+              <div class="grid-3">
+                <div class="panel white"><div class="kicker">INSPECT</div><h3>`tilelang.lower`</h3><p>不连接设备，检查 kernel C、VTCM offset、layout 和 extern atom。</p></div>
+                <div class="panel white"><div class="kicker">STANDALONE</div><h3>`tilelang.compile`</h3><p>生成 FastRPC project，SDK 编译、adb 部署并返回 torch-callable。</p></div>
+                <div class="panel white"><div class="kicker">EMBED</div><h3>compile-only emitter</h3><p>输出裸 device body + manifest，作为宿主 skel 的一个 source file。</p></div>
+              </div>
+              <div class="band green">参数 ABI 必须保持 host declaration order；对称 shape 很容易掩盖错误的 alphabetical reorder。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="高层 T.gemm 的目标形态"
+            data-notes="这页描述产品最终入口，不代表实现顺序。Backend 开发先用 explicit primitives 对齐硬件和性能；当多个 kernel 共享稳定结构后，才把 shared、copy 和 gemm 收敛成高层 recipe。">
+            <div class="slide-head">
+              <div><div class="section">06 · Recipe Path</div><h1>`T.gemm` 是稳定 primitives 之上的最终 recipe</h1></div>
+              <div class="aside">先证明 explicit path，再上提高层接口。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-2">
+                <div class="code-block" id="gemmCode"><button class="copy-button" data-copy-target="gemmCode" type="button">复制</button><span class="keyword">with</span> T.Kernel(grid_n, grid_m, threads=1):
+    A_sh = T.alloc_shared((BM, K), <span class="value">"float16"</span>)
+    B_sh = T.alloc_shared((K, BN), <span class="value">"float16"</span>)
+    C_sh = T.alloc_shared((BM, BN), <span class="value">"float16"</span>)
+    T.copy(A_tile, A_sh)
+    T.copy(B_tile, B_sh)
+    <span class="call">T.gemm</span>(A_sh, B_sh, C_sh, clear_accum=True)
+    T.copy(C_sh, C_tile)</div>
+                <div>
+                  <div class="panel red"><h3>`T.alloc_shared`</h3><p>编译成 VTCM arena 的对齐静态 offset，并发布 shared high-water。</p></div>
+                  <div class="panel teal" style="margin-top:12px"><h3>`T.copy`</h3><p>普通循环由 Hexagon vector codegen 变成全寄存器 HVX load/store。</p></div>
+                  <div class="panel gold" style="margin-top:12px"><h3>`T.gemm`</h3><p>Lower 到 `tl_hexagon_hmx_gemm`，template 完成 Crouton pack、MAC 和 unpack。</p></div>
+                </div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node teal"><strong>row-major VTCM</strong><span>easy copy / compose</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>Crouton scratch</strong><span>HVX pack</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>HMX MAC</strong><span>implicit accumulator</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>row-major output</strong><span>HVX unpack</span></div>
+              </div>
+              <div class="band teal"><strong>上提条件：</strong>typed convert/store、Crouton layout、dependency 和手写性能基线都已经稳定，且 explicit TileLang 路径仍可使用。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="低层 HMX 与 Layout 抽象"
+            data-notes="Backend 开发首先使用这一层。HMXIntrinEmitter 对齐 GPU backend 暴露 MMA intrinsic 的方式，但诚实表达 HMX 的差异：累加器不可寻址，是 dependency token；A/B/C operand 是 VTCM Crouton layout。">
+            <div class="slide-head">
+              <div><div class="section">07 · Instruction-Level Path</div><h1>HMX intrinsic 与 `T.Layout` 暴露正确的低层边界</h1></div>
+              <div class="aside">不是再次封装完整 GEMM，而是让 TileLang 调度组合硬件 atoms。</div>
+            </div>
+            <div class="slide-body">
+              <div class="flow-row">
+                <div class="flow-node red"><strong>acquire</strong><span>dependency token</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>load_bias</strong><span>scale / mode state</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>clear</strong><span>implicit accumulator</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>K-loop mma</strong><span>mxmem pair = MAC</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>convert + store</strong><span>Crouton C</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node red"><strong>release</strong><span>serialize one HMX</span></div>
+              </div>
+              <div class="grid-3">
+                <div class="panel red"><h3>Activation layout</h3><p>row-pair interleave，2 KiB 对齐，`T.Layout` 决定逻辑 `(m,k)` 到 Crouton offset。</p></div>
+                <div class="panel gold"><h3>Weight layout</h3><p>32x32 tile，K-pair 与 channel 交织；typed pack atom 可直接写最终地址。</p></div>
+                <div class="panel teal"><h3>Output layout</h3><p>convert-state 写 Crouton，再以 32-lane FP32 HVX 边界输出。</p></div>
+              </div>
+              <div class="grid-2">
+                <div class="panel white"><h3>与 GPU intrinsic 的共同点</h3><p>layout、load/mma/store atoms、显式 K loop、依赖关系都由 TileLang 看见，因此可以融合和调度。</p></div>
+                <div class="panel white"><h3>必须保留的硬件差异</h3><p>HMX accumulator 全核唯一且不可寻址；token 只表达顺序和存活期，不伪装成 register fragment。</p></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Standalone 与 Embedded 两种运行模式"
+            data-notes="两种模式共用 generated device body。Standalone 包装完整 session，适合开发；Embedded 只借资源，适合 llama.cpp 等宿主。很多早期崩溃和内存满载都来自把两套 owner 混在一起。">
+            <div class="slide-head">
+              <div><div class="section">08 · Runtime Modes</div><h1>同一个 generated body，两种资源所有权</h1></div>
+              <div class="aside">Mode A 开发验证；Mode B 进入已有 NPU runtime。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-2">
+                <div class="panel green">
+                  <div class="kicker">MODE A</div>
+                  <h2>Standalone FastRPC</h2>
+                  <ul class="clean-list">
+                    <li>TileLang 生成 IDL、ARM host、DSP skel、CMake</li>
+                    <li>TileLang 申请 VTCM/HMX/power，启动 persistent agent</li>
+                    <li>tensor marshal + adb + FastRPC，直接对 torch golden</li>
+                    <li>适合 backend 开发、数值测试和 microbenchmark</li>
+                  </ul>
+                </div>
+                <div class="panel blue">
+                  <div class="kicker">MODE B</div>
+                  <h2>Embedded Host Skel</h2>
+                  <ul class="clean-list">
+                    <li>generated body 作为源码 co-compile 到宿主 skel</li>
+                    <li>宿主拥有 session、VTCM、DMA、worker 和 HMX handle</li>
+                    <li>TileLang 只通过 `tl_op_ctx` 接受同步资源租约</li>
+                    <li>`run() == -1` 立即回落 stock kernel</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node red"><strong>TileLang PrimFunc</strong><span>one source of truth</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>Generated device C</strong><span>no session wrapper</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>FastRPC wrapper</strong><span>standalone</span></div>
+                <div class="flow-node blue"><strong>Host skel source</strong><span>embedded</span></div>
+              </div>
+              <div class="band">资源由谁申请，就由谁释放。Embedded kernel 不能再次创建 session、VTCM arena 或 persistent worker pool。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="并行、VTCM 与异步 DMA"
+            data-notes="当前已有两套数据移动能力：standalone 的同步 copy/vectorization，以及 embedded 模式借宿主 1D/2D DMA callback。下一阶段要把 async copy 的 commit/wait 抽成 target hook，不能把 PTX 或 DMA descriptor 暴露到 DSL。">
+            <div class="slide-head">
+              <div><div class="section">09 · Scheduling Resources</div><h1>1-HMX / 6-HVX / VTCM / DMA 的调度关系</h1></div>
+              <div class="aside">worker 是执行映射，DMA 是依赖图，HMX 仍然只有一个。</div>
+            </div>
+            <div class="slide-body">
+              <div class="schedule" aria-label="staged schedule">
+                <div class="label">DMA</div><div class="slot dma">prefetch B0</div><div class="slot dma">prefetch B1</div><div class="slot dma">prefetch B2</div><div class="slot dma">prefetch B3</div><div class="slot dma">...</div><div class="slot dma">drain</div>
+                <div class="label">HVX ×6</div><div class="slot">pack A</div><div class="slot hvx">range B0</div><div class="slot hvx">range B1</div><div class="slot hvx">range B2</div><div class="slot hvx">range B3</div><div class="slot">epilogue</div>
+                <div class="label">HMX ×1</div><div class="slot">idle</div><div class="slot hmx">compute 0</div><div class="slot hmx">compute 1</div><div class="slot hmx">compute 2</div><div class="slot hmx">compute 3</div><div class="slot">release</div>
+              </div>
+              <div class="grid-3">
+                <div class="panel teal"><h3>`num_workers=6`</h3><p>外层 blocks 按 stride 分配；每个 worker 有独立 VTCM slice，HVX 工作可并行。</p></div>
+                <div class="panel gold"><h3>单 HMX spinlock</h3><p>pack/unpack 可并行，隐式 accumulator 协议必须串行，不能伪造六个 HMX。</p></div>
+                <div class="panel blue"><h3>Ordered 2D DMA</h3><p>可同时完成 stride 和 padding；queue、descriptor 和 cache policy 留在 runtime。</p></div>
+              </div>
+              <div class="band teal"><strong>当前缺口：</strong>`T.Pipelined` 表达 stage 和依赖，Hexagon lowering 选择 ordered DMA 或 HVX fallback；queue/descriptor 不进入用户 DSL。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Q4/HMX 端到端案例"
+            data-notes="这里才进入 Q4。它的意义是验证通用抽象，而不是把 backend 做成 Q4 backend。576B 正好是一个有意义的原生 tile atom，四条 HVX 链可并行；TileLang 仍看见 tile range、layout 和 HMX K loop。">
+            <div class="slide-head">
+              <div><div class="section">10 · Case Study A</div><h1>Q4/HMX：用一个案例贯通 layout、atom 与 schedule</h1></div>
+              <div class="aside">案例目标：不使用 `T.gemm` 隐藏 K loop，也不把完整 operator 塞进 C helper。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-2">
+                <div>
+                  <div class="flow-row">
+                    <div class="flow-node red"><strong>512B quant</strong><span>4 × 128B HVX</span></div>
+                    <div class="flow-node green"><strong>64B scales</strong><span>32 × fp16</span></div>
+                  </div>
+                  <div class="band" style="margin-top:12px">一个 576B native Q4_0 tile → 一个 32×32 FP16 weight Crouton</div>
+                  <div class="panel white" style="margin-top:12px"><h3>Native atom 内部</h3><p>load scale → low/high nibble → subtract 8 → unpack → FP16 multiply → Crouton stores。四个 quant vectors 同时保持 live，提供指令级并行。</p></div>
+                </div>
+                <div class="code-block"><span class="comment"># TileLang schedule stays visible</span>
+<span class="keyword">for</span> tile <span class="keyword">in</span> T.serial(tile_begin, tile_end):
+    nt = tile // KT
+    kt = tile % KT
+    Q.<span class="call">dequant_tile</span>(
+        B_hmx, W,
+        (nt, kt * 32, 0),
+        (nt, kt, 0),
+    )
+
+<span class="keyword">for</span> kt <span class="keyword">in</span> T.serial(KT):
+    E.<span class="call">mma_atom</span>(acc, A_hmx, B_hmx, ...)</div>
+              </div>
+              <div class="timeline">
+                <div class="timeline-step"><span class="step-id">STAGE 1</span><strong>Pack A once</strong><p>FP32 → activation Crouton</p></div>
+                <div class="timeline-step"><span class="step-id">STAGE 2</span><strong>2D DMA pad</strong><p>576B rows → aligned 640B</p></div>
+                <div class="timeline-step"><span class="step-id">STAGE 3</span><strong>Parallel dequant</strong><p>6 workers, disjoint tile ranges</p></div>
+                <div class="timeline-step"><span class="step-id">STAGE 4</span><strong>Explicit HMX</strong><p>clear / K-mma / convert / store</p></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="最小 llama.cpp 集成方案"
+            data-notes="先讲最小闭环，不引入第二套 runtime 或通用 registry。TileLang compile-only 生成普通 Hexagon C ABI 函数；把 translation unit 加入现有 HTP skel；在一个 stock op 前按 dtype 和 shape 判断，命中后直接调用，未命中继续原实现。">
+            <div class="slide-head">
+              <div><div class="section">11 · Minimal Integration</div><h1>最小方案：生成函数直接编进现有 llama.cpp DSP skel</h1></div>
+              <div class="aside">一个 symbol、一个调用点、一个 fallback。</div>
+            </div>
+            <div class="slide-body">
+              <div class="flow-row">
+                <div class="flow-node red"><strong>TileLang PrimFunc</strong><span>explicit HVX / HMX kernel</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>compile-only</strong><span>kernel.cc + kernel.h</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node blue"><strong>HTP CMake</strong><span>add one source file</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>stock op offer</strong><span>dtype + fixed shape</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>tl_kernel()</strong><span>or stock fallback</span></div>
+              </div>
+              <div class="grid-2">
+                <div class="code-block"><span class="comment">// generated header: plain C ABI</span>
+<span class="keyword">extern</span> <span class="value">"C"</span> <span class="keyword">int</span> tl_kernel(
+    <span class="keyword">void</span> *vtcm, <span class="keyword">const void</span> *src0,
+    <span class="keyword">const void</span> *src1, <span class="keyword">void</span> *dst,
+    <span class="keyword">int</span> m, <span class="keyword">int</span> n, <span class="keyword">int</span> k);
+
+<span class="comment">// one offer before the existing DSP implementation</span>
+<span class="keyword">if</span> (dtype == expected &amp;&amp; m == M &amp;&amp; n == N &amp;&amp; k == K) {
+    <span class="keyword">if</span> (<span class="call">tl_kernel</span>(vtcm, a, w, c, m, n, k) == 0)
+        <span class="keyword">return</span> 0;
+}
+<span class="keyword">return</span> <span class="call">stock_kernel</span>(...);</div>
+                <div>
+                  <div class="panel teal"><div class="kicker">GENERATE</div><h3>输出可直接链接的 C/C++</h3><p>保留显式 layout 和 intrinsic；kernel 不依赖 ggml 类型，也不创建 FastRPC session。</p></div>
+                  <div class="panel blue" style="margin-top:12px"><div class="kicker">CO-COMPILE</div><h3>只改 source list</h3><p>generated translation unit 使用 Hexagon clang，与现有代码共同链接进原 DSP skel。</p></div>
+                  <div class="panel green" style="margin-top:12px"><div class="kicker">CALL + FALLBACK</div><h3>先固定一个调用条件</h3><p>借用 llama.cpp 已有 VTCM/HMX 资源；未命中或返回失败时继续 stock 路径。</p></div>
+                </div>
+              </div>
+              <div class="band green"><strong>最小验收：</strong>模型 forward 命中 generated symbol、输出与 stock 一致；其他 shape 和算子行为完全不变。</div>
+            </div>
+          </section>
+          <section class="slide" data-title="Primitive-first 技术路线"
+            data-notes="这页给出项目主线。Primitive catalog 和 workload profiling 并行启动；手写 kernel 建立硬件上限；显式 TileLang 必须先接近手写版本；之后才引入通用调度和高层 recipe。框架 package 从一开始使用统一 ABI。">
+            <div class="slide-head">
+              <div><div class="section">12 · Primitive-first Roadmap</div><h1>先对齐硬件和类型，再自动化算子调度</h1></div>
+              <div class="aside">Primitive-first · baseline-driven · integration in parallel</div>
+            </div>
+            <div class="slide-body">
+              <div class="flow-row">
+                <div class="flow-node red"><strong>1 · Catalog</strong><span>dtype / repr / side effect</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>2 · Handwritten</strong><span>intrinsic C ceiling</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>3 · Explicit TL</strong><span>atoms / loops / Layout</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node blue"><strong>4 · Generalize</strong><span>pipeline / worker / tune</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>5 · Package</strong><span>registry / framework ABI</span></div>
+              </div>
+              <div class="grid-3">
+                <div class="panel red"><div class="kicker">TYPE FIRST</div><h3>四种类型分开</h3><p>logical dtype、compute dtype、hardware representation、storage dtype 不能混用。</p></div>
+                <div class="panel gold"><div class="kicker">PROFILE IN PARALLEL</div><h3>热点决定顺序</h3><p>调用占比、shape 覆盖、可消除流量和复用价值决定首批算子。</p></div>
+                <div class="panel teal"><div class="kicker">PARITY GATE</div><h3>先显式再优化</h3><p>TileLang explicit kernel 未接近手写基线前，不上提高层 op 或 autotune。</p></div>
+              </div>
+              <div class="band"><strong>边界：</strong>primitive 固定最小硬件语义；recipe 组合 primitives；schedule 决定 loop、layout、pipeline 和 worker。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="当前 Primitive 缺口与 FP32 输出"
+            data-notes="当前 HMX atom 主链路已经存在，近期阻塞主要在类型化 HVX codegen。FP32 add 的硬件结果先是 qf32，必须显式转换到 IEEE sf 才能存储；现有 elementwise fast path 又固定按 64 个 FP16 输入、两个 FP32 寄存器、最终 narrow 到 FP16。">
+            <div class="slide-head">
+              <div><div class="section">13 · Current Gaps</div><h1>FP32 add 暴露了当前类型模型的根本缺口</h1></div>
+              <div class="aside">表达式 dtype 不等于硬件结果表示。</div>
+            </div>
+            <div class="slide-body">
+              <div class="flow-row">
+                <div class="flow-node teal"><strong>IEEE FP32 inputs</strong><span>32 lanes / 128B</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node gold"><strong>Q6 qf32 add</strong><span>internal result repr</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node red"><strong>qf32 → sf</strong><span>required conversion</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>FP32 store</strong><span>one 32-lane vector</span></div>
+              </div>
+              <div class="grid-3">
+                <div class="panel teal">
+                  <h3>HVX 近期阻塞</h3>
+                  <ul class="clean-list">
+                    <li>typed `HvxValue` 与 register count</li>
+                    <li>FP32 load/add/store generated path</li>
+                    <li>convert、predicate、tail、reduction</li>
+                  </ul>
+                </div>
+                <div class="panel gold">
+                  <h3>HMX 仍需补齐</h3>
+                  <ul class="clean-list">
+                    <li>typed convert mode，删除 magic number</li>
+                    <li>硬件 store 与最终 tensor dtype 分层</li>
+                    <li>completion、operand lifetime、tail</li>
+                  </ul>
+                </div>
+                <div class="panel blue">
+                  <h3>Schedule primitives</h3>
+                  <ul class="clean-list">
+                    <li>DMA 1D/2D + completion token</li>
+                    <li>worker id、barrier、join</li>
+                    <li>VTCM lifetime 与 double buffer</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="band green"><strong>当前判断：</strong>HMX core 已有；typed HVX、HMX output contract 和统一 conformance harness 是下一阶段底座。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="重点任务与执行顺序"
+            data-notes="只讲四组重点任务。第一，补 typed HVX 和 HMX output contract；第二，用手写热点 kernel 建立性能上限；第三，用 explicit TileLang 达到 parity 后接入通用调度；第四，手写和 generated kernel 从一开始共用 llama.cpp registry ABI。">
+            <div class="slide-head">
+              <div><div class="section">14 · Priority Tasks</div><h1>重点任务：先补底座，再做性能和产品化</h1></div>
+              <div class="aside">完整任务 ID 留在技术路线文档。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-4">
+                <div class="panel red">
+                  <div class="kicker">NOW · BLOCKER</div><h3>Typed primitives</h3>
+                  <p>HVX FP32 load/add/store、转换输出矩阵；HMX typed convert/store。</p>
+                </div>
+                <div class="panel gold">
+                  <div class="kicker">NEXT · BASELINE</div><h3>手写性能上限</h3>
+                  <p>从热点中选代表算子，统一 ABI/layout，分离 compute、DMA 和同步成本。</p>
+                </div>
+                <div class="panel teal">
+                  <div class="kicker">THEN · TILELANG</div><h3>Explicit parity</h3>
+                  <p>先复现 atoms、loops、Layout，再启用 pipeline、worker 和 autotune。</p>
+                </div>
+                <div class="panel green">
+                  <div class="kicker">PARALLEL · INTEGRATE</div><h3>统一框架接口</h3>
+                  <p>手写与 generated kernel 共用 registry、resource lease 和 stock fallback。</p>
+                </div>
+              </div>
+              <div class="timeline">
+                <div class="timeline-step"><span class="step-id">WAVE 1</span><strong>Primitive gate</strong><p>类型正确、指令命中、device golden</p></div>
+                <div class="timeline-step"><span class="step-id">WAVE 2</span><strong>Kernel gate</strong><p>手写 ceiling 与瓶颈归因</p></div>
+                <div class="timeline-step"><span class="step-id">WAVE 3</span><strong>TileLang gate</strong><p>explicit kernel 接近手写基线</p></div>
+                <div class="timeline-step"><span class="step-id">WAVE 4</span><strong>Product gate</strong><p>通用调度、package、CI、版本矩阵</p></div>
+              </div>
+              <div class="band"><strong>近期关键路径：</strong>typed HVX/HMX output → conformance tests → handwritten baseline → explicit TileLang parity。</div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="现场演示流程"
+            data-notes="现场可以根据时间选择。最稳的演示是 lower + test-codegen，不依赖设备；设备在线时加普通 matmul 和 worker；最后再用 llama.cpp chat 证明真实框架。演示结束务必恢复 stock。">
+            <div class="slide-head">
+              <div><div class="section">15 · Live Demo</div><h1>从通用 backend 到真实框架的现场路径</h1></div>
+              <div class="aside">完整 12 分钟；设备不可用时仍有离线 fallback。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-2">
+                <div class="code-block" id="demoCommands"><button class="copy-button" data-copy-target="demoCommands" type="button">复制</button><span class="comment"># 1. environment + offline compiler</span>
+./scripts/demo.sh check
+./scripts/demo.sh lower
+./scripts/demo.sh test-codegen
+
+<span class="comment"># 2. generic backend on device</span>
+./scripts/demo.sh matmul
+./scripts/demo.sh workers
+
+<span class="comment"># 3. low-level cases</span>
+./scripts/demo.sh q4-standalone
+./scripts/demo.sh q8-standalone
+
+<span class="comment"># 4. framework integration example</span>
+./scripts/demo.sh llama-walkthrough
+./scripts/demo.sh inspect-llama
+./scripts/demo.sh deploy-q4
+./scripts/demo.sh bench-q4
+./scripts/demo.sh chat-q4
+./scripts/demo.sh restore-stock</div>
+                <div>
+                  <div class="panel green"><h3>5 分钟精简版</h3><p>`lower` → `matmul` → `deploy-q4` → `chat-q4` → `restore-stock`。只讲硬件映射、编译流程、Mode B 和任务评估。</p></div>
+                  <div class="panel blue" style="margin-top:12px"><h3>无设备备用</h3><p>`lower` → `test-codegen` → `generate-q4`，然后展示 generated C、manifest 和已归档 raw logs。</p></div>
+                  <div class="panel red" style="margin-top:12px"><h3>收尾检查</h3><p>`status` 必须确认 active skel 与 `.stock` SHA256 相同。FastRPC 命令必须从设备工作目录启动。</p></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="结论与交付物"
+            data-notes="结束时回到四条原则：通用 DSL 优先；低层 atom 对齐硬件；资源 ownership 明确；性能结论必须来自真实设备和同口径 A/B。交付目录包含站点、文档、源码快照、脚本、skel 和日志。">
+            <div class="slide-head">
+              <div><div class="section">16 · Conclusion</div><h1>从案例验证转向 primitive-first 工程化</h1></div>
+              <div class="aside">TileLang 可以成为 Qualcomm Hexagon 的真正 backend，而不只是 kernel generator。</div>
+            </div>
+            <div class="slide-body">
+              <div class="grid-2">
+                <div class="panel white">
+                  <h2>四条技术结论</h2>
+                  <ul class="clean-list">
+                    <li><strong>类型先行：</strong>logical、compute、hardware repr、storage 分层</li>
+                    <li><strong>低层 atom 诚实：</strong>用 layout 和 dependency 表达 HMX/HVX 差异</li>
+                    <li><strong>基线驱动：</strong>手写 ceiling → explicit TileLang → 通用优化</li>
+                    <li><strong>集成统一：</strong>standalone 与 embedded 共用 package contract</li>
+                  </ul>
+                </div>
+                <div class="panel white">
+                  <h2>集中交付目录</h2>
+                  <ul class="clean-list">
+                    <li><strong>`index.html`：</strong>离线演示站与打印版</li>
+                    <li><strong>`docs/`：</strong>架构、任务评估、讲稿和 runbook</li>
+                    <li><strong>`scripts/`：</strong>一条命令完成各演示阶段</li>
+                    <li><strong>`sources/`：</strong>TileLang 与 llama.cpp 关键源码快照</li>
+                    <li><strong>`artifacts/` / `results/`：</strong>已验证 skel、哈希和原始日志</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node red"><strong>Primitive contract</strong><span>typed and tested</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node teal"><strong>Explicit parity</strong><span>handwritten ceiling</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-node green"><strong>General backend</strong><span>pipeline / tune / package</span></div>
+              </div>
+              <div class="band green">真正的交付是可复用的 typed primitives、compiler schedule、runtime contract 和 framework package，而不是固定算子集合。</div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <aside class="notes-drawer" id="notesDrawer" aria-live="polite">
+    <h2>本页讲稿</h2>
+    <p id="notesText"></p>
+  </aside>
+</body>
+</html>

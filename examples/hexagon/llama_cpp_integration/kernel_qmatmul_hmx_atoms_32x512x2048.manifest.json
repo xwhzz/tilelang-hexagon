@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "op": "matmul",
+  "implementation": "explicit_hmx_atoms",
+  "dequantization": "tilelang_scheduled_hvx_q4_tile_atoms",
+  "weight_dtype": "q4_0",
+  "activation_dtype": "float32",
+  "output_dtype": "float32",
+  "M": 32,
+  "N": 512,
+  "K": 2048,
+  "entry": "int32_t tl_q4_hmx_m32_n512_k2048_embedded(void* vtcm_base, unsigned int vtcm_size, float* activation, uint8_t* weight, float* output)",
+  "kernel_entry": "int32_t tl_q4_hmx_m32_n512_k2048_kernel(float* A, uint8_t* W, float* C)",
+  "vtcm_bytes": 268288,
+  "weight_bytes": 589824,
+  "weight_format": {
+    "shape": "[N/32][K/32][576] uint8",
+    "quant": "tile[0:512] is [16 K-pairs][32 output channels]",
+    "scale": "tile[512:576] is 32 little-endian FP16 scales",
+    "source": "ggml-hexagon native repacked Q4_0 tile; pass weight directly"
+  },
+  "runtime_contract": {
+    "hmx_session": "caller-owned",
+    "vtcm": "caller-owned and bound with tl_bridge_enter",
+    "dma": "caller-owned; registry double-buffers raw weight slices in VTCM",
+    "weight_padding": "128B-aligned VTCM stage keeps 64B readable past final scale tail",
+    "activation": "contiguous [32][2048] float32",
+    "output": "contiguous [32][512] float32",
+    "call": "tl_q4_hmx_m32_n512_k2048_embedded(vtcm_base, vtcm_size, activation, weight, output)"
+  },
+  "lowering_contract": {
+    "q4_atom": "tl_hexagon_q4_0_dequant_tile_32x32",
+    "activation_atom": "tl_hexagon_hmx_pack_a_f32_pair_k32",
+    "forbidden": [
+      "T.gemm",
+      "tl_hexagon_hmx_gemm",
+      "tl_hexagon_hmx_pack_a",
+      "tl_hexagon_hmx_pack_b",
+      "tl.hexagon_q4_0_dequant",
+      "tl_hexagon_hmx_dequant_q4_0",
+      "qcm/scale repack cache"
+    ],
+    "hmx_protocol": [
+      "acquire",
+      "load_bias",
+      "clear",
+      "mma",
+      "convert",
+      "store",
+      "release"
+    ]
+  },
+  "note": "fixed HMX shape; emit one symbol per llama.cpp dispatch family"
+}

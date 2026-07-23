@@ -1,0 +1,70 @@
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 9f9471f..a4f56ff 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -12,6 +12,10 @@ include_directories(
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_BINARY_DIR})
+ 
++set(TILELANG_SOURCE_DIR "/home/xwh/tilelang-hexagon" CACHE PATH "tilelang source tree")
++include_directories(
++    ${TILELANG_SOURCE_DIR}/src)
++
+ set(HTP_LIB ggml-htp-${DSP_VERSION})
+ 
+ add_library(${HTP_LIB} SHARED
+@@ -41,8 +45,12 @@ add_library(${HTP_LIB} SHARED
+     pad-ops.c
+     matmul-ops.c
+     flash-attn-ops.c
++    tl_ggml_qgemv.cc
+ )
+ 
++set_source_files_properties(tl_ggml_qgemv.cc PROPERTIES
++    COMPILE_OPTIONS "-Wno-unused-function")
++
+ target_compile_definitions(${HTP_LIB} PRIVATE
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>)
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 79c292d..1cfe4d3 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -21,6 +21,7 @@
+ #include "htp-ops.h"
+ #include "matmul-ops.h"
+ #include "vtcm-utils.h"
++#include <tl_templates/hexagon/tl_embed.h>
+ 
+ static void hvx_tensor_add_f32_grid(
+     const struct htp_tensor * restrict dst,
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index 5fe12bc..46d1027 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -666,6 +666,25 @@ static inline HVX_VectorPair accum_q8_0_32x2(
+ }
+ 
+ static void tiled_vec_dot_q8_0_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
++    // TileLang embedding seam: ggml still owns activation quantization, the
++    // per-worker DMA queue, and VTCM.  Offer only the ready 32xK dot atom; a
++    // declined dispatch falls through to the byte-identical stock kernel.
++    {
++        struct tl_op_ctx octx = {0};
++        octx.kind        = TL_OP_QGEMV_DOT;
++        octx.weight_type = HTP_TYPE_Q8_0;
++        octx.dst         = s;
++        octx.weight      = (const uint8_t *) vx;
++        octx.k           = (int) n;
++        octx.n           = 32;
++        octx.tiled_act   = (const uint8_t *) vy;
++        octx.bias        = sz;
++        octx.valid_rows  = (int) valid_rows;
++        if (tl_dispatch(&octx) == 0) {
++            return;
++        }
++    }
++
+     const uint8_t * restrict tile_ptr = vx;
+     const uint8_t * restrict y_q = vy;
+ 
