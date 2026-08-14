@@ -117,7 +117,7 @@ maint/host_checks/logs/*
 *.ncu-rep
 
 # csv
-*.csv
+# *.csv
 
 # perf regression test
 .perf_regression/
