@@ -38,13 +38,10 @@ These are the decisions that keep the adaptation small and the code navigable.
    decides hardware. (The one Hexagon-specific knob is `T.Kernel(num_workers=N)`,
    propagated like `cluster_dims`.)
 
-2. **The codegen is a thin C emitter; all hardware intimacy lives in C templates.**
-   `CodeGenTileLangHexagon` emits plain C with no knowledge of HMX/HVX/Crouton. A
-   `T.gemm` becomes a *single* `tl_hexagon_hmx_gemm(...)` call; the entire HMX recipe
-   (power, VTCM, Crouton pack/unpack, the `mxmem` MAC) lives in
-   `src/tl_templates/hexagon/hmx.h`. This is the single most important rule — it keeps
-   the codegen ~500 lines and lets you tune the hardware recipe without recompiling
-   the compiler (headers are read at skel-build time).
+2. **The codegen is a thin C emitter; instruction details live in C templates.**
+   `CodeGenTileLangHexagon` emits plain C and maps HMX TIR intrinsics to wrappers in
+   `src/tl_templates/hexagon/hmx.h`. `GemmHMX` owns layout inference and composes the
+   explicit clear/MAC/convert/store sequence; codegen does not construct that protocol.
 
 3. **Hexagon is a sibling of the CPU C backend, not a GPU codegen.** It emits C +
    HVX/HMX intrinsics, so `CodeGenTileLangHexagon` extends TVM's `CodeGenC` and reuses
@@ -142,12 +139,14 @@ attention, worker pool) live in [`examples/hexagon/`](../examples/hexagon/).
 | `T.Kernel(grid)` | nested `for` loops (grid serialized on one HW thread) | — |
 | `T.Kernel(..., num_workers=N)` | outermost `blockIdx.x` loop **strided across HW threads** via `tl_parallel` | `worker.h` |
 | `T.alloc_shared` | a byte offset into the VTCM arena `tl_vtcm_base()+off` | `vtcm.h` |
-| `T.copy(global, shared)` | HVX-vectorized `half8` load/store loop | (codegen) |
-| `T.gemm(A,B,C)` | one `tl_hexagon_hmx_gemm(...)` (or `_gemm_mt` in a worker pool) | `hmx.h` |
+| `T.copy(global, hmx_shared)` | strided DDR -> native Crouton pack (`vshuff` on the common path) | Hexagon copy/layout lowering |
+| `T.copy(hmx_shared, global)` | native Crouton -> strided DDR unpack (`vdeal` on the common path) | Hexagon copy/layout lowering |
+| `T.copy(row_shared, hmx_shared)` | native Crouton pack/unpack | Hexagon copy/layout lowering |
+| `T.gemm(A,B,C)` | explicit HMX atom loops; each result stores directly into its 2 KB-aligned native C tile | `gemm_hmx.py`, `hmx.h` |
 
-The whole matmul is *one call*. Reading the generated C for a tiled matmul, you see
-the grid as `for (bx) for (by)`, the operands as VTCM offsets, the copies as `half8`
-loops, and the gemm as a single `tl_hexagon_hmx_gemm(&C, &A, &B, 64,64,256, 0,0)`.
+Reading generated C for a tiled matmul now shows the grid loops, strided
+`tl_hexagon_hmx_pack_crouton`/`unpack_crouton` calls at the DDR/native boundary,
+native Crouton VTCM offsets, and explicit HMX atoms.
 
 ---
 
@@ -156,16 +155,23 @@ loops, and the gemm as a single `tl_hexagon_hmx_gemm(&C, &A, &B, 64,64,256, 0,0)
 - **Crouton layout.** HMX reads operands from VTCM in a mandatory 32×32-tile layout:
   `cpos(i,j) = (i&~1)*32 + j*2 + (i&1)` — a **row-pair interleave**. That interleave
   is exactly one HVX `Q6_W_vshuff_VVR` of two source rows per 64-column span (and
-  `vdeal` to unpack), which is why the pack/unpack are HVX-vectorized, not scalar
-  (~64× faster). Operands stay **row-major in VTCM** (so the `T.copy` auto-vectorizes
-  and softmax stays vectorizable); `tl_hexagon_hmx_gemm` HVX-packs to a Crouton
-  scratch internally. *Lesson: keep the user-visible layout simple; hide Crouton in
-  the runtime.*
+  `vdeal` to unpack). `GemmHMX.infer_layout` assigns this native layout directly. A full
+  FP16 VTCM-to-VTCM `T.copy` with exactly one HMX-layout endpoint is recognized by the
+  Hexagon copy lowering and uses those helpers. Widths not divisible by 64 and transposed
+  source storage retain scalar fallbacks. The row-major stride is explicit in the helper
+  ABI, so a future DMA lowering can stage the same region without changing the Crouton
+  transform contract.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
   pipeline axis** — you reduce the whole inner-K for an output tile in one `mxclracc`
   sequence; outer-loop / `clear_accum=False` accumulation lives in HVX/VTCM (decompose
   into an overwrite-gemm-to-temp + HVX add — this is how flash attention works).
+
+- **HMX operands have role-specific alignment.** Activation and output need 2048-byte
+  VTCM alignment, weight needs 128 bytes, and the scale/bias config block needs 256
+  bytes. The shared-memory planner propagates each requirement from the corresponding
+  HMX intrinsic operand. Every 32x32 FP16 output tile is itself 2048 bytes, so `T.gemm`
+  can advance between native C tiles and store directly without an HVX staging copy.
 
 - **Param-order ABI bug (subtle, was silent).** `SplitHostDevice::SortDeviceParams`
   orders device-kernel params *alphabetically*; correct for GPU (the host wrapper
@@ -226,11 +232,17 @@ loops, and the gemm as a single `tl_hexagon_hmx_gemm(&C, &A, &B, 64,64,256, 0,0)
 
 ## 9. Status and what's left
 
-**Working and device-validated:** idiomatic `T.gemm`→HMX (~17 TFLOPS), single-block
-and flash attention, HVX-vectorized data movement, `@tilelang.jit(target="hexagon")`,
+**Device-validated:** the native-layout emitter-based `T.gemm` path passes the standalone
+32×128×128 q4 regression (`rel err = 0.000351`) and the fused-copy 256×256×256 FP16
+offline matmul (`max abs err = 0.0009766`) on v79. The earlier monolithic row-major path
+also validated idiomatic `T.gemm`→HMX
+(~17 TFLOPS), single-block and flash attention, HVX-vectorized data movement,
+`@tilelang.jit(target="hexagon")`,
 and a full **1-HMX/6-HVX worker pool** that parallelizes any multi-block kernel via
 `T.Kernel(num_workers=N)` — including `alloc_shared` blocks (per-worker VTCM) and
-`T.gemm` (per-worker scratch), with a persistent pool (2–4.5× speedups). Unrecoverable
+`T.gemm` (historically per-worker scratch), with a persistent pool (2–4.5× speedups).
+Correctness is fresh; performance of the native-layout replacement has not yet been
+benchmarked against the earlier path. Unrecoverable
 device conditions (VTCM grant too small, per-worker HMX enable fails) propagate to the
 host as a raised error via the int32 kernel-status ABI rather than silent wrong output.
 

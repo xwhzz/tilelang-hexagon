@@ -48,18 +48,26 @@ offline matmul 256x256x256 on HMX vs golden: max abs err = 0.0009761  (PASS)
 0. **generate (pre-done, committed)** — `python generate.py` ran `tilelang.lower(..., target="hexagon")`
    (Layers 1–3 → cDSP C) and `_fastrpc.write_project` (Layer 5 → FastRPC project), then patched the
    `CMakeLists` include to a repo-relative path. Its output is the committed `project/` +
-   `generated_matmul_kernel.c`. You only re-run it if you change the kernel. The whole `T.gemm`
-   is one call:
+   `generated_matmul_kernel.c`. The checked-in artifacts use one logical DDR/native-
+   Crouton `T.copy` per matrix boundary and the current explicit-atom `T.gemm`
+   lowering over native buffers:
 
    ```c
    int32_t matmul_kernel(half* A, half* B, half* C) {
      for (bx = 0; bx < 4; ++bx) {
        uint8_t* buf = (uint8_t*)((char*)tl_vtcm_base() + 2048);   // VTCM arena
-       void* A_sh=buf+0; void* B_sh=buf+32768; void* C_sh=buf+65536;
+       void* A_hmx=buf+0; void* B_hmx=buf+32768; void* C_hmx=buf+67584;
        for (by = 0; by < 4; ++by) {
-         /* T.copy A,B -> VTCM as HVX half8 loops */
-         tl_hexagon_hmx_gemm(C_sh, A_sh, B_sh, 64, 64, 256, 0, 0);  // -> HMX matrix engine
-         /* T.copy C_sh -> global */
+         /* one logical T.copy: DDR matrix slice -> native Crouton VTCM */
+         tl_hexagon_hmx_pack_crouton(A_hmx, A + by*16384, 64, 256, 256, 1, 0);
+         tl_hexagon_hmx_pack_crouton(B_hmx, B + bx*64, 256, 64, 256, 1, 1);
+         tl_hexagon_hmx_acc_acquire(acc);
+         /* for each (mt,nt): clear; for kt: mma_atom; convert;
+            store(C_hmx[mt,nt]); // every native output tile is 2 KB aligned */
+         tl_hexagon_hmx_acc_release(acc);
+         /* one logical T.copy: native Crouton VTCM -> DDR matrix slice */
+         tl_hexagon_hmx_unpack_crouton(C + by*16384 + bx*64, C_hmx,
+                                       64, 64, 256, 1, 0);
        }
      }
      return TL_OK;                                                 // int32 status ABI

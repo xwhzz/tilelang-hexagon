@@ -34,7 +34,7 @@ flowchart TB
     B["通道② 指令 atom<br/>HMXIntrinEmitter.mma_atom/clear/store…<br/>Q8GemvIntrinEmitter.dot_32x1"]
     C["通道③ 普通循环<br/>elementwise · hexreduce · T.copy"]
     A --> SA["src/hexagon/op/gemm.cc SelectInst<br/>门控 → 'hexagon.hmx' 或回退 'cpu.scalar'"]
-    SA --> LA["gemm_hmx.py GemmHMX.lower<br/>→ call_extern('tl_hexagon_hmx_gemm', …)"]
+    SA --> LA["gemm_hmx.py GemmHMX.infer_layout/lower<br/>→ native Crouton + explicit HMX atoms"]
     B --> LB["T.hexagon_hmx_* TIR intrinsic<br/>（dependency token = access_ptr）"]
     C --> LC["reduce.cc → call_extern('tl_hvx_rowsum_mat')<br/>copy.cc → LowerNormalCopy（同步）<br/>elementwise → 原样进 codegen"]
     LA --> CG["codegen_hexagon.cc<br/>grid→C 循环 · VTCM 静态编排 · intrinsic→函数名映射<br/>HVX elementwise 向量化器 · worker-pool 发射"]
@@ -52,7 +52,7 @@ flowchart TB
 | `common.h` | 85 | 类型词汇表（`half`、`floatN` 向量）+ 状态码 ABI（`TL_OK/TL_ERR_*`） |
 | `vtcm.h` | 91 | 一次 acquire 的 VTCM arena + 2 KB 对齐 + high-water 契约 |
 | `worker.h` | 161 | 6 硬件线程的持久 worker 池（`tl_parallel`） |
-| `hmx.h` | 616 | HMX 全部：session/锁、Crouton pack/unpack、MAC、`T.gemm` 入口、显式 atom |
+| `hmx.h` | 616 | HMX session/锁、历史 pack/unpack/GEMM helper、当前显式 atom wrapper |
 | `qgemv.h` | 114 | Q8_0 的 `vrmpyacc` dot atom（刻意只做 dot） |
 | `hvx_math.h` | 334 | HVX lane 原语（widen/narrow、rsqrt、exp2、行归约） |
 | `qmatmul.h` | 198 | Q4 路径的辅助（历史 monolithic 路线） |
@@ -65,7 +65,7 @@ flowchart TB
 ### 2.2 `vtcm.h` —— arena 与两个不变量
 
 - **整块 acquire 一次**（`tl_vtcm_acquire`，幂等），alloc_shared 与 HMX scratch 共用一个 arena，避免双重申请。
-- **arena 基址强制 2 KB 对齐**（`vtcm.h:33-36`）：HMX `mxmem` 地址是 Crouton tile 地址，**低 11 位不是字节偏移** —— 这是很多"静默垃圾"问题的根源，对齐必须做在 arena 本身。
+- **arena 基址强制 2 KB 对齐**（`vtcm.h:33-36`）：HMX activation/output 地址要求 2 KB 对齐，weight 要求 128 B；arena 先满足最严格的基址约束，子分配再由 planner 按 operand 对齐。这是很多"静默垃圾"问题的根源。
 - **`tl_vtcm_shared_high_water`**（`vtcm.h:27-31`）：codegen 自底向上给 alloc_shared 分偏移并发布水位；HMX gemm 的 Crouton scratch 从顶向下生长，越界就返回 `-3` 拒绝，而不是覆盖活着的 tile。
 
 ### 2.3 `worker.h` —— 工作流 5 的现有底座
@@ -86,7 +86,7 @@ flowchart TB
 
    这一个公式就是"布局是 ABI"的核心：DSL 侧 `hmx_intrin.py` 的 `T.Layout` forward 函数（`((m%32)//2)*64 + (k%32)*2 + m%2`）与它**逐 bit 一致**，两处必须同步改。
 3. **HVX 快速 pack/unpack**（`hmx.h:203-270`）：行对交织恰好等于一条 `vshuff`——两行源数据一条指令变成一个 row-pair 跨度（比逐元素 pack 快约 64×）；unpack 用 `vdeal` 逆变换。要求连续维是 64 的倍数，否则回退共享的标量 pack（转置操作数也走标量——这是已标注的后续优化点，`hmx.h:271-275`）。
-4. **`T.gemm` 入口 `tl_hexagon_hmx_gemm`**（`hmx.h:356-408`）：操作数**保持 row-major** 进来（所以周边 `T.copy`/elementwise 都可向量化），函数内 pack→MAC→unpack。Crouton scratch 从 arena **顶向下**分配，和自底向上的 alloc_shared 用 high-water 互相拒绝（返回 -1 形状非法 / -2 无 VTCM / -3 会重叠）。多 worker 变体 `_mt`（`hmx.h:499-537`）改用本 worker 的 `region_end/op_floor`，pack/unpack 并行、只有 MAC 在 spinlock 上串行。
+4. **当前 `T.gemm` 入口是 emitter**：`GemmHMX.infer_layout` 给 A/B/C 分配 native Crouton，`lower` 直接编排下一项的 atoms；shared-memory planner 按 operand 传播 A/C 2 KB、B 128 B、config 256 B 对齐，每个结果直接写入最终 C tile。`tl_hexagon_hmx_gemm` 与 top-down scratch 保留给历史/手写路径，不再是 TileLang `T.gemm` 的 lowering 结果。
 5. **显式 atom**（`hmx.h:410-473`）：`tl_hexagon_hmx_acc_acquire/load_bias/clear_acc/mma_atom/convert_acc/store_cvt_state`——每个只包一条硬件协议操作。签名里的 `void *acc_state` 等参数**在 C 里全部 `(void)` 丢弃**：硬件状态本来就是隐式的，这些 token 只存在于 TIR 层，用来向编译器分析表达顺序与存活期（比如把 activation/weight 源指针一路携带到 store，阻止 shared-memory planner 在 HMX 流水线还占用它们时回收缓冲区，`hmx.h:457-473`）。
 
 ### 2.5 `qgemv.h` —— atom 的分层宣言（工作流 4 的样板）
@@ -104,7 +104,7 @@ pass pipeline **原样复用 CPU 的**（`register_pipeline(PassPipeline("hexago
 ### 3.2 指令选择（`src/hexagon/op/gemm.cc:39-45`）
 
 ```cpp
-bool hmx_ok = fp16(A) && fp16(B) && M%32==0 && N%32==0 && K%32==0
+bool hmx_ok = fp16(A) && fp16(B) && fp16(C) && M%32==0 && N%32==0 && K%32==0
            && A/B/C 都是 2D && 都是 shared(VTCM) && clear_accum 恒为 true;
 return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 ```
@@ -115,8 +115,8 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 两个设计决策值得记住：
 
-- **`infer_layout` 返回 `{}`**（`gemm_hmx.py:25-28`）：故意**不**给操作数 Crouton 布局，让它们在 VTCM 里保持 row-major——global→VTCM 的 `T.copy` 是连续 half8 拷贝可向量化，周边 softmax/elementwise 也不会被打乱的布局逼成标量代码。Crouton 转换整个藏进 runtime。
-- **防御检查**：`clear_accum=False` 与 sub-region gemm 直接 `raise NotImplementedError` 并给出改法（`gemm_hmx.py:33-61`），不静默出错。最终产物就一行：`T.call_extern("tl_hexagon_hmx_gemm", &C, &A, &B, M, N, K, ta, tb)`。
+- **`infer_layout` 返回 A/B/C 的 native Crouton layouts**；storage transpose 通过坐标复合表达，物理 HMX tile 不变。一次逻辑 FP16 `T.copy` 可以由 `src/hexagon/op/copy.cc` 识别为带 stride 的 DDR/VTCM <-> native VTCM Crouton pack/unpack；后续 DMA 可以在同一 copy plan 中替换 row-major transfer 阶段。
+- **`lower` 只接收 A/B/C**：内部准备 scale/bias 和 dependency tokens，并生成 `acquire -> for mt -> for nt -> clear -> for kt mma_atom -> convert -> store_C_tile -> release`。shared-memory planner 从各 HMX intrinsic 的对应参数传播 A/C 2 KB、B 128 B、config 256 B 对齐到最终 VTCM 子分配；full-region 与 `clear_accum=True` 仍是防御条件。
 
 ### 3.4 通道②：atom 怎么从 DSL 走到 C（`hmx_intrin.py` → codegen）
 
@@ -139,7 +139,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 - **函数发射 `AddFunction`（125-360）**：两条路径。串行路径把 grid 直接降成嵌套 for（`thread_extent` 处理在 492-538）。**worker-pool 路径**（`hexagon.num_workers` attr > 0）发射五件东西：① 预扫描 TIR 统计每 worker 的 VTCM 需求（alloc_shared 操作数 + gemm Crouton scratch 取 max → `wp_stride_`，200-252）；② 参数打包 struct；③ `_worker` 回调（按需 per-thread HMX enable，失败返回 `TL_ERR_HMX`）；④ 把 **blockIdx.x 循环条带化**：`for (bx = tl_wid; bx < extent; bx += tl_nw)`（516-523）；⑤ 入口按**运行时实际 VTCM 授予量**削减 worker 数，一个 region 都放不下就返回 `TL_ERR_VTCM`（319-338）。没有 blockIdx.x 网格循环的 num_workers kernel 会被 ICHECK 拒绝——否则每个 worker 会重复整个网格并产生写竞争。
 - **VTCM 静态编排 `VisitStmt_(AllocBufferNode)`（362-415）**：shared scope 的缓冲**编译期**分配固定偏移：`(T*)((char*)tl_vtcm_base() + offset)`，偏移从 2048 起（**首个 2 KB tile 保留给 HMX 输出 scale**，133）、按 2 KB 对齐递增、随手发布 high-water；worker 模式额外加 `tl_wid * wp_stride_`。整个内存规划没有运行期分配器——编译期算好，运行期只查界。
-- **worker 模式的 gemm 重写 `VisitExpr_(CallNode)`（457-488）**：`tl_hexagon_hmx_gemm` 调用被改写为 `_mt` 并**追加本 worker 的 `region_end/op_floor` 表达式**；其他 `tl_hexagon_hmx*` 调用（无 per-worker scratch 变体）直接 LOG(FATAL)。
+- **worker 模式 HMX 识别**：预扫描同时识别 HMX TIR intrinsic 和历史 `tl_hexagon_hmx_gemm`。当前 emitter atoms 使用每 worker 已静态分配的 shared buffers，不需要 `_mt` top-down scratch 重写。
 - **HVX elementwise 向量化器（564-870）**：这是"{gemm, copy, map, reduce} 基"里 **map** 的实现，也是工作流 4 最该精读的部分。动机：Hexagon 标量单元没有 fp16，标量循环会编译成逐元素 libcall（`__extendhfsf2`）。`TryEmitHvxElementwise` 识别规范形态——最内层 `for j in [0,N)`、N 是 64 的倍数、单条 fp16 标量 store、下标对 j 单位步长——然后按 64 列一组发射：`widen fp16→fp32(lo,hi) → fp32 计算 → narrow 回 fp16`。实现上先跑一遍 **probe（emit=false）** 确认整棵表达式树可发射，再真正 emit，保证不会发射一半再回退。还内置惯用法识别：`1.0/sqrt(x)` → `tl_hvx_rsqrt_vsf`（一条指令且更准）、`exp(x)` → `exp2(x·log2e)`；j 无关子式求值一次后 splat；对齐可证明时用对齐 load/store，否则 `vmemu`。不匹配的整体回退 CodeGenC 标量循环。
 - **杂项**：`PrintType` 支持到 128 lane（HVX 一寄存器 = 128×int8/64×fp16/32×fp32）；`Broadcast` 发射 `((float4)(v))` 的 splat 构造。
 
@@ -166,8 +166,8 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 ## 5. 建议阅读顺序（约半天）与练习
 
-1. `example_matmul.py` → 跑 `tilelang.compile(...)` 后 `print(kernel.get_kernel_source())`，对着生成的 C 认一遍：VTCM 偏移、grid 循环、`tl_hexagon_hmx_gemm` 调用。
-2. `hmx.h`：先读文件头注释，再按 §2.4 的五块读；重点吃透 cpos 公式和 top-down scratch。
+1. `example_matmul.py` → 跑 `tilelang.compile(...)` 后 `print(kernel.get_kernel_source())`，对着生成的 C 认一遍：VTCM 偏移、layout 地址和 HMX atom 循环。
+2. `hmx.h`：先读文件头注释，再按 §2.4 的五块读；重点吃透 cpos 公式与隐式 accumulator protocol。
 3. `gemm.cc` + `gemm_hmx.py`（各 <100 行）：门控与回退。
 4. `codegen_hexagon.cc`：`AddFunction`（worker-pool 发射）→ `AllocBufferNode` → `TryEmitHvxElementwise`。
 5. `hmx_intrin.py` + `example_qmatmul_kstream.py`：atom 通道全链路。

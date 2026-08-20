@@ -145,7 +145,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # explicit HMX qmatmul schedule.
     uses_qmatmul = (
         "tl_hexagon_hmx_pack_a_f32_pair_k32" in kernel_source
-        or "tl_hexagon_q4_0_dequant_group_128" in kernel_source
+        or "tl_hexagon_q4_0_" in kernel_source
     )
     qmatmul_include = (
         "#include <tl_templates/hexagon/qmatmul.h>\n" if uses_qmatmul else ""

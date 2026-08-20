@@ -46,8 +46,8 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
     ):
         with T.Kernel(1, threads=1) as _:
             A_hmx = T.alloc_shared((M, K), "float16", align=2048)
-            B_hmx = T.alloc_shared((KT, 32, 32), "float16", align=2048)
-            C_hmx = T.alloc_shared((M, 32), "float16", align=2048)
+            B_hmx = T.alloc_shared((K, 32), "float16", align=2048)
+            C_hmx = T.alloc_shared((32, 32), "float16", align=2048)
             bias_vtcm = T.alloc_shared((64,), "uint32", align=256)
             acc = T.alloc_hmx_accumulator()
             cvt = T.alloc_hmx_convert_state()
@@ -102,7 +102,7 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
                     # One native Q4 tile atom keeps four independent HVX
                     # register chains in flight. T.Layout still supplies the
                     # final weight-Crouton address and TileLang owns K order.
-                    Q.dequant_tile(B_hmx, W, (kt, 0, 0), (nt, kt, 0))
+                    Q.dequant_tile(B_hmx, W, (kt * 32, 0), (nt, kt, 0))
 
                 # Reuse this N-tile's dequantized weights for every M=32 HMX
                 # accumulator pass before advancing to the next N tile.
@@ -110,15 +110,7 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
                     E.clear(acc)
                     E.load_bias(bias, bias_vtcm)
 
-                    for kt in T.serial(KT):
-                        E.mma_atom(
-                            acc,
-                            A_hmx,
-                            B_hmx,
-                            a_m=mt * 32,
-                            a_k=kt * 32,
-                            weight_tile=kt,
-                        )
+                    E.mma_tile(acc, A_hmx, B_hmx, inst_m_idx=mt)
 
                     E.convert(cvt, acc, bias, bias_vtcm)
                     E.store(
@@ -260,16 +252,13 @@ def make_staged_hmx(M, N, K):
                 for mt in T.serial(MT):
                     E.clear(acc)
                     E.load_bias(bias, bias_vtcm)
-                    for kt in T.serial(KT):
-                        E.mma_atom(
-                            acc,
-                            A_hmx,
-                            B_hmx,
-                            a_m=mt * 32,
-                            a_k=kt * 32,
-                            b_k=kt * 32,
-                            weight_tile=nt,
-                        )
+                    E.mma_tile(
+                        acc,
+                        A_hmx,
+                        B_hmx,
+                        inst_m_idx=mt,
+                        b_prefix=(nt,),
+                    )
                     E.convert(cvt, acc, bias, bias_vtcm)
                     E.store(
                         cvt,

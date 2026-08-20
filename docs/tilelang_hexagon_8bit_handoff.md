@@ -137,7 +137,7 @@ briefing。目标读者是一个要继续"反思 tilelang↔Hexagon 的对接设
   Crouton,直到 `store` 才释放;有 completion token 的 ping-pong/worker overlap 是下一步性能调度,不能
   通过复用一个仍被 HMX 消费的 buffer 来假装异步。
 - 底层 runtime:两者都 lower 到 `hmx.h` 的 `tl_hexagon_hmx_*` 原语(**全 `__fp16`**)。
-- HMX activation/weight/result Crouton 基址必须 2 KB 对齐,bias 必须 256 B 对齐;activation 与 result
+- HMX activation/result Crouton 基址必须 2 KB 对齐,weight 必须 128 B 对齐,bias/config 必须 256 B 对齐;activation 与 result
   使用同一个 spatial-mask 编码。FP32 边界按 32 lane 转换,避免跨两个 HVX register 的 C vector ABI
   重排。
 - **worker-pool over 6 HVX**(`T.Kernel(num_workers=N)`)+ per-worker VTCM:**device-validated**

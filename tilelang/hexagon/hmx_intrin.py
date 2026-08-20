@@ -54,63 +54,104 @@ def _validate_matrix_shape(shape: tuple, name: str) -> tuple[int, int]:
     return rows, cols
 
 
-def _prefix_offset(indices, shape: tuple, matrix_elems: int):
-    prefix = 0
-    for index, extent in zip(indices[:-2], shape[:-2]):
-        prefix = prefix * _static_extent(extent, "prefix") + index
-    return prefix * matrix_elems
+def make_hmx_crouton_layout() -> T.Layout:
+    """Return the native 32x32 FP16 HMX Crouton layout atom."""
+
+    return T.Layout(
+        (TILE, TILE),
+        lambda row, col: [(row // 2) * (2 * TILE) + col * 2 + row % 2],
+    )
 
 
-def make_hmx_activation_layout(buffer_or_shape) -> T.Layout:
-    """Map logical ``[..., M, K]`` activation coordinates to Crouton VTCM."""
+def _expand_matrix_layout(
+    shape: tuple, tile_order: tuple[int, int], name: str
+) -> T.Layout:
+    rows, cols = _validate_matrix_shape(shape, name)
+    factors = (rows // TILE, cols // TILE)
+    layout = make_hmx_crouton_layout()
+    for dim in tile_order:
+        layout = layout.repeat(dim, factors[dim])
+    return layout.expand(shape[:-2])
+
+
+def make_hmx_activation_layout(buffer_or_shape, transposed: bool = False) -> T.Layout:
+    """Map activation storage to physical ``[..., mt, kt, cpos]``.
+
+    The normal logical shape is ``[..., M, K]``.  With ``transposed=True`` the
+    input buffer is ``[..., K, M]``, but its physical tile order remains the HMX
+    activation order for the mathematical ``[M, K]`` operand.
+    """
 
     shape = _shape_of(buffer_or_shape)
-    rows, cols = _validate_matrix_shape(shape, "activation")
-    tiles_k = cols // TILE
+    if not transposed:
+        return _expand_matrix_layout(shape, (1, 0), "activation")
+    base = _expand_matrix_layout(shape[:-2] + (shape[-1], shape[-2]), (1, 0), "activation")
 
     def forward(*indices):
-        m, k = indices[-2:]
-        tile = (m // TILE) * tiles_k + k // TILE
-        intra = ((m % TILE) // 2) * 64 + (k % TILE) * 2 + m % 2
-        return [_prefix_offset(indices, shape, rows * cols) + tile * TILE_ELEMS + intra]
+        return base(*(indices[:-2] + (indices[-1], indices[-2])))
 
     return T.Layout(shape, forward)
 
 
-def make_hmx_weight_layout(buffer_or_shape) -> T.Layout:
-    """Map logical ``[..., K, N]`` weight coordinates to Crouton VTCM."""
+def make_hmx_weight_layout(buffer_or_shape, transposed: bool = False) -> T.Layout:
+    """Map weight storage to physical ``[..., nt, kt, cpos]``.
+
+    The normal logical shape is ``[..., K, N]``.  With ``transposed=True`` the
+    input buffer is ``[..., N, K]``, while HMX still sees mathematical ``[K, N]``.
+    """
 
     shape = _shape_of(buffer_or_shape)
-    rows, cols = _validate_matrix_shape(shape, "weight")
-    tiles_k = rows // TILE
+    if not transposed:
+        return _expand_matrix_layout(shape, (0, 1), "weight")
+    base = _expand_matrix_layout(shape[:-2] + (shape[-1], shape[-2]), (0, 1), "weight")
 
     def forward(*indices):
-        k, n = indices[-2:]
-        tile = (n // TILE) * tiles_k + k // TILE
-        intra = ((k % TILE) // 2) * 64 + (n % TILE) * 2 + k % 2
-        return [_prefix_offset(indices, shape, rows * cols) + tile * TILE_ELEMS + intra]
+        return base(*(indices[:-2] + (indices[-1], indices[-2])))
 
     return T.Layout(shape, forward)
 
 
 def make_hmx_output_layout(buffer_or_shape) -> T.Layout:
-    """Map logical ``[..., M, N]`` output coordinates to Crouton VTCM."""
+    """Map logical ``[..., M, N]`` to physical ``[..., mt, nt, cpos]``."""
 
     shape = _shape_of(buffer_or_shape)
-    rows, cols = _validate_matrix_shape(shape, "output")
-    tiles_n = cols // TILE
+    return _expand_matrix_layout(shape, (1, 0), "output")
 
-    def forward(*indices):
-        m, n = indices[-2:]
-        tile = (m // TILE) * tiles_n + n // TILE
-        intra = ((m % TILE) // 2) * 64 + (n % TILE) * 2 + m % 2
-        return [_prefix_offset(indices, shape, rows * cols) + tile * TILE_ELEMS + intra]
 
-    return T.Layout(shape, forward)
+def _buffer_prefix(buffer, prefix, name: str) -> tuple:
+    prefix = () if prefix is None else tuple(prefix)
+    rank = len(getattr(buffer, "shape", ()))
+    expected = max(rank - 2, 0)
+    if len(prefix) != expected:
+        raise ValueError(
+            f"HMX {name} expects {expected} prefix indices for a rank-{rank} buffer; "
+            f"got {len(prefix)}"
+        )
+    return prefix
+
+
+def _validate_atom_index(index, extent: int, name: str):
+    if isinstance(index, int) and not 0 <= index < extent:
+        raise ValueError(f"HMX {name} must be in [0, {extent}); got {index}")
 
 
 class HMXIntrinEmitter:
-    """Compose explicit HMX state and 32x32x32 instruction atoms."""
+    """Compose explicit HMX state and 32x32x32 instruction atoms.
+
+    Unlike CUDA tensor cores, HMX exposes one implicit accumulator rather than
+    an addressable accumulator fragment array.  ``mma_tile()`` therefore reduces K
+    for exactly one ``(inst_m_idx, inst_n_idx)`` output tile.  The caller must
+    bracket each output tile with ``clear -> mma_tile -> convert -> store``.
+    For a multi-tile output, ``store`` addresses the requested native Crouton
+    tile directly. TileLang's shared-memory planner propagates the native VTCM
+    alignment contracts per operand: 2 KiB for activation/output, 128 B for
+    weight, and 256 B for the scale/bias config block.
+
+    Operands must already reside in caller-owned VTCM with the layouts returned
+    by this emitter.  Session/power setup and the cold-session accumulator-read
+    configuration remain runtime responsibilities; ``load_bias`` only loads
+    the conversion scale/bias block used by this instruction sequence.
+    """
 
     def __init__(
         self,
@@ -119,6 +160,8 @@ class HMXIntrinEmitter:
         K: int = TILE,
         a_dtype: str = "float16",
         b_dtype: str = "float16",
+        a_transposed: bool = False,
+        b_transposed: bool = False,
     ):
         if M <= 0 or N <= 0 or K <= 0 or M % TILE or N % TILE or K % TILE:
             raise ValueError("HMX dimensions must be positive multiples of 32")
@@ -127,14 +170,31 @@ class HMXIntrinEmitter:
         self.M, self.N, self.K = M, N, K
         self.MT, self.NT, self.KT = M // TILE, N // TILE, K // TILE
         self.a_dtype, self.b_dtype = a_dtype, b_dtype
+        self.a_transposed, self.b_transposed = a_transposed, b_transposed
 
-    @staticmethod
-    def activation_layout(buffer_or_shape) -> T.Layout:
-        return make_hmx_activation_layout(buffer_or_shape)
+    @property
+    def num_m_tiles(self) -> int:
+        """Number of output tiles along M; scheduled outside ``mma_tile``."""
 
-    @staticmethod
-    def weight_layout(buffer_or_shape) -> T.Layout:
-        return make_hmx_weight_layout(buffer_or_shape)
+        return self.MT
+
+    @property
+    def num_n_tiles(self) -> int:
+        """Number of output tiles along N; scheduled outside ``mma_tile``."""
+
+        return self.NT
+
+    @property
+    def num_k_atoms(self) -> int:
+        """Number of 32-wide K atoms reduced by ``mma_tile``."""
+
+        return self.KT
+
+    def activation_layout(self, buffer_or_shape) -> T.Layout:
+        return make_hmx_activation_layout(buffer_or_shape, self.a_transposed)
+
+    def weight_layout(self, buffer_or_shape) -> T.Layout:
+        return make_hmx_weight_layout(buffer_or_shape, self.b_transposed)
 
     @staticmethod
     def output_layout(buffer_or_shape) -> T.Layout:
@@ -176,35 +236,73 @@ class HMXIntrinEmitter:
         acc_state,
         activation,
         weight,
-        a_m=0,
-        a_k=0,
-        b_k=0,
-        b_n=0,
-        weight_tile=None,
+        inst_m_idx=0,
+        inst_n_idx=0,
+        k_inner=0,
+        a_prefix=(),
+        b_prefix=(),
     ):
-        """Emit one paired activation/weight HMX multiply operation."""
+        """Emit one HMX MAC atom for output tile ``(inst_m_idx, inst_n_idx)``.
 
-        if weight_tile is None:
-            @T.macro
-            def _mma(acc_state, activation, weight):
-                T.hexagon_hmx_mma(
-                    T.access_ptr(acc_state[0], "rw"),
-                    T.access_ptr(
-                        activation[a_m, a_k], "r", TILE_ELEMS
-                    ),
-                    T.access_ptr(weight[b_k, b_n], "r", TILE_ELEMS),
-                )
+        ``a_prefix`` and ``b_prefix`` address independent staged matrices.  The
+        The final dimensions follow the operand's logical storage shape
+        (``[M,K]``/``[K,N]`` or their transposes) and are rewritten by
+        ``T.Layout`` to the same native mathematical Crouton tiles.
+        """
+
+        _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
+        _validate_atom_index(inst_n_idx, self.NT, "inst_n_idx")
+        _validate_atom_index(k_inner, self.KT, "k_inner")
+        a_prefix = _buffer_prefix(activation, a_prefix, "activation")
+        b_prefix = _buffer_prefix(weight, b_prefix, "weight")
+        if self.a_transposed:
+            a_index = a_prefix + (k_inner * TILE, inst_m_idx * TILE)
         else:
-            @T.macro
-            def _mma(acc_state, activation, weight):
-                T.hexagon_hmx_mma(
-                    T.access_ptr(acc_state[0], "rw"),
-                    T.access_ptr(
-                        activation[a_m, a_k], "r", TILE_ELEMS
-                    ),
-                    T.access_ptr(
-                        weight[weight_tile, b_k, b_n], "r", TILE_ELEMS
-                    ),
+            a_index = a_prefix + (inst_m_idx * TILE, k_inner * TILE)
+        if self.b_transposed:
+            b_index = b_prefix + (inst_n_idx * TILE, k_inner * TILE)
+        else:
+            b_index = b_prefix + (k_inner * TILE, inst_n_idx * TILE)
+
+        @T.macro
+        def _mma(acc_state, activation, weight):
+            T.hexagon_hmx_mma(
+                T.access_ptr(acc_state[0], "rw"),
+                T.access_ptr(activation[a_index], "r", TILE_ELEMS),
+                T.access_ptr(weight[b_index], "r", TILE_ELEMS),
+            )
+
+        return _mma(acc_state, activation, weight)
+
+    def mma_tile(
+        self,
+        acc_state,
+        activation,
+        weight,
+        inst_m_idx=0,
+        inst_n_idx=0,
+        a_prefix=(),
+        b_prefix=(),
+    ):
+        """Reduce all K atoms for one output tile into the implicit accumulator."""
+
+        _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
+        _validate_atom_index(inst_n_idx, self.NT, "inst_n_idx")
+        a_prefix = _buffer_prefix(activation, a_prefix, "activation")
+        b_prefix = _buffer_prefix(weight, b_prefix, "weight")
+
+        @T.macro
+        def _mma(acc_state, activation, weight):
+            for k_inner in T.serial(self.KT):
+                self.mma_atom(
+                    acc_state,
+                    activation,
+                    weight,
+                    inst_m_idx,
+                    inst_n_idx,
+                    k_inner,
+                    a_prefix,
+                    b_prefix,
                 )
 
         return _mma(acc_state, activation, weight)
@@ -231,9 +329,15 @@ class HMXIntrinEmitter:
         bias_vtcm,
         activation,
         weight,
-        out_m=0,
-        out_n=0,
+        inst_m_idx=0,
+        inst_n_idx=0,
+        output_prefix=(),
     ):
+        _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
+        _validate_atom_index(inst_n_idx, self.NT, "inst_n_idx")
+        output_prefix = _buffer_prefix(output, output_prefix, "output")
+        output_index = output_prefix + (inst_m_idx * TILE, inst_n_idx * TILE)
+
         @T.macro
         def _store(
             cvt_state,
@@ -246,7 +350,7 @@ class HMXIntrinEmitter:
         ):
             T.hexagon_hmx_store(
                 T.access_ptr(cvt_state[0], "r"),
-                T.access_ptr(output[out_m, out_n], "w", TILE_ELEMS),
+                T.access_ptr(output[output_index], "w", TILE_ELEMS),
                 T.access_ptr(acc_state[0], "rw"),
                 T.access_ptr(bias_state[0], "r"),
                 T.access_ptr(bias_vtcm[0], "r", BIAS_WORDS),
@@ -273,6 +377,7 @@ __all__ = [
     "TILE_ELEMS",
     "TILE_BYTES",
     "BIAS_WORDS",
+    "make_hmx_crouton_layout",
     "make_hmx_activation_layout",
     "make_hmx_weight_layout",
     "make_hmx_output_layout",

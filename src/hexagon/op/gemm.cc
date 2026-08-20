@@ -2,10 +2,8 @@
  * \file tl/hexagon/op/gemm.cc
  * \brief Hexagon implementation for tl.gemm instruction selection.
  *
- * For now this selects the generic "scalar" instruction, lowered by the Python
- * GemmScalar impl (a triple loop that accumulates in the accum dtype, which
- * hexagon-clang auto-vectorizes onto HVX).  An HMX instruction key + Crouton
- * tile layout is the next step toward using the matrix engine.
+ * Select the explicit HMX instruction path for its validated native-Crouton
+ * surface and retain the scalar implementation as the general fallback.
  */
 
 #include "op/gemm.h"
@@ -32,12 +30,14 @@ struct Gemm {
     (void)block_size;
     (void)target;
     // Route to HMX only for the validated GemmHMX surface: fp16, 32-multiple,
-    // 2D, shared-shared (SS), overwrite (clear_accum is a compile-time true).
+    // 2D, shared-shared (SS), overwrite (clear_accum is true). Logical operand
+    // transposes are represented by composing the corresponding Crouton layout.
     // Everything else falls back to the scalar loop hexagon-clang auto-vectorizes
     // onto HVX — crucially the DEFAULT clear_accum=false (the accumulate K-loop
     // pattern) and fragment/sub-rank operands, which GemmHMX can't lower yet.
     bool hmx_ok = op.a_->dtype == DataType::Float(16) &&
-                  op.b_->dtype == DataType::Float(16) && op.m_ % 32 == 0 &&
+                  op.b_->dtype == DataType::Float(16) &&
+                  op.c_->dtype == DataType::Float(16) && op.m_ % 32 == 0 &&
                   op.n_ % 32 == 0 && op.k_ % 32 == 0 && op.a_->shape.size() == 2 &&
                   op.b_->shape.size() == 2 && op.c_->shape.size() == 2 &&
                   IsSharedBuffer(op.a_) && IsSharedBuffer(op.b_) &&

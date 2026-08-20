@@ -13,10 +13,13 @@ non-gemm primitives of the backend's {gemm, copy, map, reduce} basis:
     kernel stays plain `T.serial` + `T.exp`; the codegen does the vectorization.
 
 The running max/denominator (`m`, `l`, `scale`) are tiny per-row (M-length) updates
-left as scalar.  `S` is gemm-1's output *and* gemm-2's input with no relayout — the
-Hexagon advantage.  The HMX accumulator can't be preloaded, so the `clear_accum=False`
-accumulation of `O` is decomposed into an overwrite gemm to `temp` plus the HVX
-rescale-and-add into `acc_o`.
+left as scalar. HMX GEMM buffers use native Crouton layout, while the HVX row-reduce
+extern requires contiguous row-major input. `S_hmx -> S -> S_hmx` and
+`temp_hmx -> temp` make those layout boundaries explicit; Hexagon `T.copy` recognizes
+the exact HMX layout and lowers these VTCM-to-VTCM transforms to Crouton pack/unpack.
+DDR inputs likewise pass through row-major VTCM staging before that transform.
+The HMX accumulator can't be preloaded, so the `clear_accum=False` accumulation of `O`
+is decomposed into an overwrite gemm to `temp` plus the HVX rescale-and-add into `acc_o`.
 
 `hexreduce` invokes the reduce tile op directly on shared VTCM buffers — the stock
 `T.reduce_max` macro routes through register fragments, which Hexagon has no layout
@@ -50,10 +53,15 @@ def make_flash(M, SEQ, BN, D):
     def flash(Q: T.Tensor((M, D), "float16"), K: T.Tensor((SEQ, D), "float16"),
               V: T.Tensor((SEQ, D), "float16"), O: T.Tensor((M, D), "float16")):
         with T.Kernel(1, threads=1) as _:
+            Q_row = T.alloc_shared((M, D), "float16")
+            K_row = T.alloc_shared((BN, D), "float16")
+            V_row = T.alloc_shared((BN, D), "float16")
             Q_sh = T.alloc_shared((M, D), "float16")
             K_sh = T.alloc_shared((BN, D), "float16")
             V_sh = T.alloc_shared((BN, D), "float16")
+            S_hmx = T.alloc_shared((M, BN), "float16")
             S = T.alloc_shared((M, BN), "float16")
+            temp_hmx = T.alloc_shared((M, D), "float16")
             temp = T.alloc_shared((M, D), "float16")
             acc_o = T.alloc_shared((M, D), "float16")
             m = T.alloc_shared((M,), "float32")       # running max
@@ -61,7 +69,8 @@ def make_flash(M, SEQ, BN, D):
             rmax = T.alloc_shared((M,), "float32")    # reduce dst (also the new max)
             rsum = T.alloc_shared((M,), "float32")    # reduce dst
             scale = T.alloc_shared((M,), "float32")
-            T.copy(Q, Q_sh)
+            T.copy(Q, Q_row)
+            T.copy(Q_row, Q_sh)
             for i in T.serial(M):
                 for j in T.serial(D):
                     acc_o[i, j] = T.float16(0)                                  # map (HVX)
@@ -69,9 +78,12 @@ def make_flash(M, SEQ, BN, D):
                 m[i] = T.float32(NEG)
                 l[i] = T.float32(0)
             for kv in T.serial(SEQ // BN):
-                T.copy(K[kv * BN, 0], K_sh)
-                T.copy(V[kv * BN, 0], V_sh)
-                T.gemm(Q_sh, K_sh, S, transpose_B=True, clear_accum=True)       # S = Q@Kᵀ (HMX)
+                T.copy(K[kv * BN, 0], K_row)
+                T.copy(V[kv * BN, 0], V_row)
+                T.copy(K_row, K_sh)
+                T.copy(V_row, V_sh)
+                T.gemm(Q_sh, K_sh, S_hmx, transpose_B=True, clear_accum=True)   # S = Q@Kᵀ (HMX)
+                T.copy(S_hmx, S)                                                # Crouton -> row-major
                 hexreduce(S, rmax, "max", 1)                                    # rmax = rowmax(S) (HVX)
                 for i in T.serial(M):                                           # running max + rescale (scalar, M)
                     rmax[i] = T.max(m[i], rmax[i])
@@ -86,7 +98,9 @@ def make_flash(M, SEQ, BN, D):
                 for i in T.serial(M):
                     for j in T.serial(D):                                       # rescale acc_o (HVX map)
                         acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") * scale[i], "float16")
-                T.gemm(S, V_sh, temp, clear_accum=True)                         # temp = P@V (HMX)
+                T.copy(S, S_hmx)                                                # row-major -> Crouton
+                T.gemm(S_hmx, V_sh, temp_hmx, clear_accum=True)                 # temp = P@V (HMX)
+                T.copy(temp_hmx, temp)                                          # Crouton -> row-major
                 for i in T.serial(M):
                     for j in T.serial(D):                                       # acc_o += temp (HVX map)
                         acc_o[i, j] = T.cast(

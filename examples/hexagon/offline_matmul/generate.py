@@ -33,13 +33,13 @@ def make_matmul():
     def matmul(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"),
                C: T.Tensor((M, N), "float16")):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=1) as (bx, by):
-            A_sh = T.alloc_shared((BM, K), "float16")   # -> VTCM (on-chip)
-            B_sh = T.alloc_shared((K, BN), "float16")
-            C_sh = T.alloc_shared((BM, BN), "float16")
-            T.copy(A[by * BM, 0], A_sh)                  # global -> VTCM (HVX half8)
-            T.copy(B[0, bx * BN], B_sh)
-            T.gemm(A_sh, B_sh, C_sh, clear_accum=True)   # -> HMX matrix engine
-            T.copy(C_sh, C[by * BM, bx * BN])            # VTCM -> global
+            A_hmx = T.alloc_shared((BM, K), "float16")
+            B_hmx = T.alloc_shared((K, BN), "float16")
+            C_hmx = T.alloc_shared((BM, BN), "float16")
+            T.copy(A[by * BM, 0], A_hmx)                 # DDR -> Crouton VTCM
+            T.copy(B[0, bx * BN], B_hmx)
+            T.gemm(A_hmx, B_hmx, C_hmx, clear_accum=True)
+            T.copy(C_hmx, C[by * BM, bx * BN])           # Crouton VTCM -> DDR
     return matmul
 
 
