@@ -16,7 +16,7 @@ the consequence of that gulf.
 |---|---|---|---|
 | **Codegen** | whole-register HVX vectorization — 1024-bit width + "narrowest dtype fills a register" rule + native `ext_vector` `vec_type` | `src/transform/loop_vectorize.cc`, `src/tl_templates/hexagon/common.h`, `codegen_hexagon.cc` | ✅ committed, zero regression |
 | **DSL kernels** | fully-DSL q4_0 dequant (matches hand HVX) + fused dequant→VTCM→`T.gemm`→HMX matmul; compact resident scales | `examples/hexagon/example_qmatmul*.py` | ✅ device-correct (rel 2.5e-4) |
-| **HMX abstraction** | `HMXIntrinEmitter` — instruction-atom emitter (`pack_a/pack_b`=ldmatrix, `mma`=mxmem+MAC, `store`=stmatrix, `clear`=mxclracc), the Hexagon analog of tilelang's `TensorCoreIntrinEmitter` | `tilelang/hexagon/hmx_intrin.py` | ✅ device-correct K-streaming |
+| **HMX abstraction** | `HMXIntrinEmitter` — native Crouton layouts, 32x32x32 MAC atoms, and the implicit-accumulator protocol used by explicit kernels and `T.gemm` lowering | `tilelang/hexagon/{hmx_intrin,gemm_hmx}.py` | emitter and native-layout `T.gemm` device-correct |
 | **Runtime integration** | bridge (ride host VTCM+HMX), op registry (`tl_op_ctx`/`tl_dispatch`), the ggml intercept, embeddable-kernel emit | `src/tl_templates/hexagon/tl_{bridge,embed}.h`, `examples/hexagon/llama_cpp_integration/` | ✅ mechanism done |
 | **Device** | LFM2-1.2B on the NPU, tilelang q4_0 matmul A/B'd inside the model | (below) | ✅ verified end-to-end |
 
@@ -48,15 +48,21 @@ touch. (Gotcha found: HVX whole-register loads from `malloc`'d DDR need ≥128B 
    mixed-dtype loop must vectorize where the *narrowest* dtype fills whole registers (uint8
    needs ≥128 lanes), else it over-reads and faults. This one fact drove the codegen fix.
 2. **HMX has no `mma` and no addressable accumulator.** Loading the a/b Crouton tiles
-   (`mxmem`) *is* the MAC, into a single invisible per-core accumulator. So a matmul is
-   authored as instruction atoms (`clear → pack → mma → store`) around that implicit acc —
-   an `HMXIntrinEmitter`, **not** a monolithic `T.gemm` — which is what lets a dequant
-   interleave with the MAC (K-streaming). Modelled on tilelang's `TensorCoreIntrinEmitter`;
-   the one honest divergence is the invisible accumulator (no `C_local` fragment).
-3. **The Crouton pack is inherent.** Operands must be Crouton for `mxmem`, but the whole-
-   register dequant must be row-major — so a row-major→Crouton HVX pack sits between them.
-   `GemmHMX` deliberately keeps operands row-major + packs at runtime, because a Crouton-
-   layout *DSL* store is scalar (would scalarize the dequant).
+   (`mxmem`) *is* the MAC, into a single invisible per-core accumulator. The
+   `HMXIntrinEmitter` therefore exposes `clear -> mma_atom/mma_tile -> convert -> store`.
+   The `T.gemm` lowering receives only the three VTCM A/B/C buffers and composes those atoms
+   plus its internal state; explicit K-streaming kernels can still interleave
+   producer work with `mma_atom`. The honest CUDA divergence is the invisible accumulator
+   (no `C_local` fragment).
+   Result stores target each native C tile directly. The shared-memory planner propagates
+   role-specific alignment (activation/output 2 KB, weight 128 B, config 256 B), and each
+   32x32 FP16 output tile advances by exactly 2 KB.
+3. **The Crouton pack is inherent.** `GemmHMX.infer_layout` now makes its VTCM operands
+   native Crouton. A single logical `T.copy` can lower from a strided DDR matrix region
+   directly to Crouton VTCM (and back); the helper uses HVX Crouton pack/unpack on the
+   common 64-wide path and scalar fallbacks for transposed/non-64-wide forms. A future
+   DMA lowering can stage the same explicit row-major region, or directly transfer
+   prepacked Crouton DDR tiles.
 4. **Tile ops must be `@T.macro`.** Buffer uses inside a plain Python helper are invisible
    to the VTCM liveness/arena pass, which then aliases `alloc_shared` buffers → silent
    garbage (not a crash). Emitter methods build+return a nested `@T.macro` (the tensor-core

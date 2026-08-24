@@ -377,6 +377,16 @@ public:
   }
 
 private:
+  void VisitExprWithAlignment(const PrimExpr &expr, int alignment) {
+    bool old_alignment_scope = under_alignment_scope_;
+    int old_alignment_override = alignment_override_;
+    under_alignment_scope_ = true;
+    alignment_override_ = std::max(alignment_override_, alignment);
+    StmtExprVisitor::VisitExpr(expr);
+    alignment_override_ = old_alignment_override;
+    under_alignment_scope_ = old_alignment_scope;
+  }
+
   // Helper to record alignment for a shared/shared.dyn Var under alignment
   // scope
   void MarkSharedVarIfNeeded(const VarNode *op) {
@@ -389,31 +399,74 @@ private:
     if (scope == "shared" || scope == "shared.dyn") {
       auto target = Target::Current();
       ICHECK(target.defined()) << "Target is not defined";
-      // TMA bulk-copy operands have stricter shared-memory alignment than
-      // ordinary scalar/shared accesses. Hopper keeps the existing 1024-byte
-      // alignment used by the WGMMA/TMA path, while Blackwell/SM120 also needs
-      // TMA sources at least 128-byte aligned to avoid misaligned-address
-      // launch failures.
-      int alignment = 16;
-      if (TargetIsHopper(target)) {
-        alignment = 1024;
-      } else if (TargetHasBulkCopy(target)) {
-        alignment = 128;
+      int alignment = alignment_override_;
+      if (alignment <= 0) {
+        // TMA bulk-copy operands have stricter shared-memory alignment than
+        // ordinary scalar/shared accesses. Hopper keeps the existing 1024-byte
+        // alignment used by the WGMMA/TMA path, while Blackwell/SM120 also needs
+        // TMA sources at least 128-byte aligned to avoid misaligned-address
+        // launch failures.
+        alignment = 16;
+        if (TargetIsHopper(target)) {
+          alignment = 1024;
+        } else if (TargetHasBulkCopy(target)) {
+          alignment = 128;
+        }
       }
-      shmem_alignment_map_[op] = alignment;
+      auto it = shmem_alignment_map_.find(op);
+      if (it == shmem_alignment_map_.end()) {
+        shmem_alignment_map_[op] = alignment;
+      } else {
+        it->second = std::max(it->second, alignment);
+      }
     }
   }
 
   void VisitExpr_(const CallNode *op) {
+    if (op->op.same_as(tl::hexagon_hmx_load_bias())) {
+      ICHECK_EQ(op->args.size(), 2U);
+      VisitExprWithAlignment(op->args[1], 256);
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+    if (op->op.same_as(tl::hexagon_hmx_mma())) {
+      ICHECK_EQ(op->args.size(), 3U);
+      VisitExprWithAlignment(op->args[1], 2048); // activation
+      VisitExprWithAlignment(op->args[2], 128);  // weight
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+    if (op->op.same_as(tl::hexagon_hmx_convert())) {
+      ICHECK_EQ(op->args.size(), 5U);
+      VisitExprWithAlignment(op->args[3], 256); // scale/bias config
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+    if (op->op.same_as(tl::hexagon_hmx_store())) {
+      ICHECK_EQ(op->args.size(), 7U);
+      VisitExprWithAlignment(op->args[1], 2048); // output activation tile
+      VisitExprWithAlignment(op->args[4], 256);  // scale/bias config
+      // The final two operands are lifetime dependencies retained until the
+      // asynchronous HMX sequence completes. Preserve their native load
+      // alignment requirements without promoting the weight to 2 KiB.
+      VisitExprWithAlignment(op->args[5], 2048); // activation
+      VisitExprWithAlignment(op->args[6], 128);  // weight
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+
     if (op->op.same_as(tl::tl_gemm()) || op->op.same_as(tl::tl_gemm_sp()) ||
         op->op.same_as(tl::tma_load()) || op->op.same_as(tl::tma_store()) ||
         op->op.same_as(tl::initialize_wgmma_descriptor()) ||
         op->op.same_as(tl::initialize_tcgen05_descriptor())) {
       // These intrinsics introduce stricter SMEM alignment requirements; mark
       // the subtree.
+      bool old_alignment_scope = under_alignment_scope_;
+      int old_alignment_override = alignment_override_;
       under_alignment_scope_ = true;
       StmtExprVisitor::VisitExpr_(op);
-      under_alignment_scope_ = false;
+      alignment_override_ = old_alignment_override;
+      under_alignment_scope_ = old_alignment_scope;
     } else {
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -435,6 +488,7 @@ private:
   }
 
   bool under_alignment_scope_{false};
+  int alignment_override_{0};
 
   std::unordered_map<const VarNode *, int> shmem_alignment_map_;
 };

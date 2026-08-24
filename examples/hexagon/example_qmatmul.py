@@ -10,7 +10,9 @@ Two things make the DSL dequant vectorize to full HVX (see docs/hexagon_dsl_kern
     128-byte register (128 lanes).  Below that the codegen safely scalarizes.
   * widen to int16 BEFORE the nibble mask/shift (uint8 bitwise below full-register faults),
     and keep the constants int16 so the width isn't capped by an int32 promotion.
-The weight is pre-packed column-major (qcm[K/2][N]) so the dequant store is contiguous.
+The weight is pre-packed column-major (qcm[K/2][N]) so the dequant store into a
+row-major VTCM stage is contiguous.  A following `T.copy` uses the HMX layout
+inferred for B to invoke the Crouton pack helper instead of scalar scatter stores.
 
     python example_qmatmul.py --n 128 --k 2048
 
@@ -32,10 +34,11 @@ def make_qmatmul(M, N, K, W=128):
                 scb: T.Tensor((K, N), "float16"),     # per-(k,n) scale
                 C: T.Tensor((M, N), "float16")):
         with T.Kernel(1, threads=1) as _:
-            A_sh = T.alloc_shared((M, K), "float16")
-            B_sh = T.alloc_shared((K, N), "float16")  # dequantized weight, stays in VTCM
-            C_sh = T.alloc_shared((M, N), "float16")
-            T.copy(A, A_sh)
+            B_row = T.alloc_shared((K, N), "float16")  # dequantized row-major VTCM
+            A_hmx = T.alloc_shared((M, K), "float16")
+            B_hmx = T.alloc_shared((K, N), "float16")
+            C_hmx = T.alloc_shared((M, N), "float16")
+            T.copy(A, A_hmx)
             for j in T.serial(KH):                     # DSL q4_0 dequant -> full-width HVX
                 for no in T.serial(N // W):
                     for ni in T.vectorized(W):
@@ -43,10 +46,11 @@ def make_qmatmul(M, N, K, W=128):
                         q = T.Cast("int16", qcm[j, n])                       # widen first
                         lo = (q & T.Cast("int16", 0xF)) - T.Cast("int16", 8)  # low nibble
                         hi = (q >> T.Cast("int16", 4)) - T.Cast("int16", 8)   # high nibble
-                        B_sh[2 * j, n] = T.Cast("float16", lo) * scb[2 * j, n]
-                        B_sh[2 * j + 1, n] = T.Cast("float16", hi) * scb[2 * j + 1, n]
-            T.gemm(A_sh, B_sh, C_sh, clear_accum=True)  # -> HMX matrix engine
-            T.copy(C_sh, C)
+                        B_row[2 * j, n] = T.Cast("float16", lo) * scb[2 * j, n]
+                        B_row[2 * j + 1, n] = T.Cast("float16", hi) * scb[2 * j + 1, n]
+            T.copy(B_row, B_hmx)
+            T.gemm(A_hmx, B_hmx, C_hmx, clear_accum=True)
+            T.copy(C_hmx, C)
 
     return qmatmul
 

@@ -457,8 +457,8 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
   // In a worker-pool kernel a T.gemm (tl_hexagon_hmx_gemm) is REWRITTEN to the
   // region-aware tl_hexagon_hmx_gemm_mt so its Crouton scratch lives in THIS
   // worker's VTCM slice (the plain entry carves from the global VTCM top, which
-  // would collide across workers).  Any OTHER tl_hexagon_hmx* call has no per-worker
-  // variant (global scratch) and is rejected loudly.
+  // would collide across workers). Scratch-free Crouton pack/unpack calls are
+  // emitted unchanged; other tl_hexagon_hmx* externs are rejected loudly.
   if (wp_emit_ && !op->args.empty()) {
     if (const auto *s = op->args[0].as<StringImmNode>()) {
       if (s->value == "tl_hexagon_hmx_gemm") {
@@ -479,10 +479,18 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
            << "u + " << wp_operand_bytes_ << "u)"; // op_floor (operand high-water)
         return;
       }
+      // Crouton pack/unpack only transforms caller-owned buffers inside this
+      // worker's VTCM slice. They have no global scratch and are safe as-is.
+      if (s->value == "tl_hexagon_hmx_pack_crouton" ||
+          s->value == "tl_hexagon_hmx_unpack_crouton") {
+        CodeGenC::VisitExpr_(op, os);
+        return;
+      }
       if (s->value.find("tl_hexagon_hmx") == 0) {
         LOG(FATAL) << "CodeGenTileLangHexagon: this HMX call inside a "
-                      "hexagon.num_workers kernel is unsupported — only T.gemm "
-                      "(tl_hexagon_hmx_gemm) has a per-worker scratch variant.";
+                      "hexagon.num_workers kernel is unsupported — only "
+                      "scratch-free Crouton copy helpers and T.gemm "
+                      "(tl_hexagon_hmx_gemm) are worker-safe.";
       }
     }
   }

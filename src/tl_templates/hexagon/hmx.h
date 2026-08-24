@@ -5,8 +5,9 @@
 //
 // Codegen exposes two layers.  New quantized kernels use explicit
 // acquire/load-bias/clear/mma/convert/store/release atoms with T.Layout-defined
-// Crouton buffers; ordinary TileLang arithmetic writes the final weight Crouton
-// directly, so quantization formats do not become opaque HMX runtime calls.
+// Crouton buffers. Producers may either write the final Crouton directly (the
+// explicit quantized path) or use the row-major/native T.copy pack boundary below,
+// so quantization formats do not become opaque HMX runtime calls.
 // The compatibility layer remains:
 //   tl_hexagon_hmx_gemm(C,A,B,M,N,K,ta,tb)              <- a serial/tiled T.gemm; operands
 //       are row-major in VTCM (alloc_shared), HVX-packed to a top-of-VTCM Crouton
@@ -38,6 +39,17 @@
 #include <tl_templates/hexagon/worker.h> // HW-thread worker pool (multithreaded HMX/HVX)
 
 #define TL_HMX_INLINE static inline __attribute__((unused, always_inline))
+
+// DDR matrix slices are not guaranteed to retain 128-byte alignment.  Keep the
+// fused row-major <-> Crouton helpers correct for arbitrary submatrix bases;
+// hexagon-clang lowers the aligned(1) accesses to unaligned HVX vmem forms.
+typedef HVX_Vector tl_hmx_uvector __attribute__((aligned(1)));
+TL_HMX_INLINE HVX_Vector tl_hmx_loadu(const void *p) {
+  return *(const tl_hmx_uvector *)p;
+}
+TL_HMX_INLINE void tl_hmx_storeu(void *p, HVX_Vector value) {
+  *(tl_hmx_uvector *)p = value;
+}
 
 // ------------------------------ power -------------------------------------
 static int tl_hmx_power_ctx;
@@ -205,68 +217,86 @@ TL_HMX_INLINE void tl_hmx_pack_scalar(__fp16 *t, const __fp16 *src, int R, int C
 // tile, hi half -> the next tile).  ~64x the scalar element-by-element pack.  The
 // 64-column chunk spans 2 tiles, so the contiguous dim must be a 64-multiple;
 // otherwise fall back to the scalar pack.
-TL_HMX_INLINE void tl_hmx_pack_A(__fp16 *t, const __fp16 *A, int M, int K) {
+TL_HMX_INLINE void tl_hmx_pack_A_strided(__fp16 *t, const __fp16 *A, int M,
+                                         int K, int si, int sj) {
   int KT = K / TL_HMX_T;
-  if ((K & 63) == 0) {
+  if (sj == 1 && (K & 63) == 0) {
     for (int mt = 0; mt < M / TL_HMX_T; ++mt)
       for (int r = 0; r < TL_HMX_T / 2; ++r) { // 16 row-pairs per tile
-        const HVX_Vector *r0 =
-            (const HVX_Vector *)(A + (size_t)(mt * TL_HMX_T + 2 * r) * K);
-        const HVX_Vector *r1 =
-            (const HVX_Vector *)(A + (size_t)(mt * TL_HMX_T + 2 * r + 1) * K);
         for (int kc = 0; kc < K / 64; ++kc) { // 64 cols == 2 k-tiles
-          HVX_VectorPair vp = Q6_W_vshuff_VVR(r1[kc], r0[kc], -2);
-          ((HVX_Vector *)(t + (size_t)(mt * KT + 2 * kc) * TL_HMX_TILE_ELMS))[r] =
-              Q6_V_lo_W(vp);
-          ((HVX_Vector *)(t + (size_t)(mt * KT + 2 * kc + 1) * TL_HMX_TILE_ELMS))[r] =
-              Q6_V_hi_W(vp);
+          const __fp16 *r0 = A + (size_t)(mt * TL_HMX_T + 2 * r) * si + kc * 64;
+          const __fp16 *r1 =
+              A + (size_t)(mt * TL_HMX_T + 2 * r + 1) * si + kc * 64;
+          HVX_VectorPair vp =
+              Q6_W_vshuff_VVR(tl_hmx_loadu(r1), tl_hmx_loadu(r0), -2);
+          tl_hmx_storeu(t + (size_t)(mt * KT + 2 * kc) * TL_HMX_TILE_ELMS +
+                            r * 64,
+                        Q6_V_lo_W(vp));
+          tl_hmx_storeu(t + (size_t)(mt * KT + 2 * kc + 1) * TL_HMX_TILE_ELMS +
+                            r * 64,
+                        Q6_V_hi_W(vp));
         }
       }
     return;
   }
-  tl_hmx_pack_scalar(t, A, M, K, KT, K, 1, 0); // A[m*K+k], row-tile-major
+  tl_hmx_pack_scalar(t, A, M, K, KT, si, sj, 0);
 }
-TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
+TL_HMX_INLINE void tl_hmx_pack_A(__fp16 *t, const __fp16 *A, int M, int K) {
+  tl_hmx_pack_A_strided(t, A, M, K, K, 1);
+}
+TL_HMX_INLINE void tl_hmx_pack_B_strided(__fp16 *t, const __fp16 *B, int K,
+                                         int N, int si, int sj) {
   int KT = K / TL_HMX_T;
-  if ((N & 63) == 0) { // col-tile-major: cpos(k,n) interleaves K row-pairs over N
+  if (sj == 1 && (N & 63) == 0) {
     for (int kt = 0; kt < KT; ++kt)
       for (int r = 0; r < TL_HMX_T / 2; ++r) { // 16 k-row-pairs per k-tile
-        const HVX_Vector *r0 =
-            (const HVX_Vector *)(B + (size_t)(kt * TL_HMX_T + 2 * r) * N);
-        const HVX_Vector *r1 =
-            (const HVX_Vector *)(B + (size_t)(kt * TL_HMX_T + 2 * r + 1) * N);
         for (int nc = 0; nc < N / 64; ++nc) { // 64 cols == 2 n-tiles
-          HVX_VectorPair vp = Q6_W_vshuff_VVR(r1[nc], r0[nc], -2);
-          ((HVX_Vector *)(t + (size_t)((2 * nc) * KT + kt) * TL_HMX_TILE_ELMS))[r] =
-              Q6_V_lo_W(vp);
-          ((HVX_Vector *)(t + (size_t)((2 * nc + 1) * KT + kt) * TL_HMX_TILE_ELMS))[r] =
-              Q6_V_hi_W(vp);
+          const __fp16 *r0 = B + (size_t)(kt * TL_HMX_T + 2 * r) * si + nc * 64;
+          const __fp16 *r1 =
+              B + (size_t)(kt * TL_HMX_T + 2 * r + 1) * si + nc * 64;
+          HVX_VectorPair vp =
+              Q6_W_vshuff_VVR(tl_hmx_loadu(r1), tl_hmx_loadu(r0), -2);
+          tl_hmx_storeu(t + (size_t)((2 * nc) * KT + kt) * TL_HMX_TILE_ELMS +
+                            r * 64,
+                        Q6_V_lo_W(vp));
+          tl_hmx_storeu(t + (size_t)((2 * nc + 1) * KT + kt) * TL_HMX_TILE_ELMS +
+                            r * 64,
+                        Q6_V_hi_W(vp));
         }
       }
     return;
   }
-  tl_hmx_pack_scalar(t, B, N, K, KT, 1, N, 1); // B[k*N+n], col-tile-major (swap)
+  tl_hmx_pack_scalar(t, B, N, K, KT, sj, si, 1);
 }
-TL_HMX_INLINE void tl_hmx_unpack_C(__fp16 *C, const __fp16 *t, int M, int N) {
+TL_HMX_INLINE void tl_hmx_pack_B(__fp16 *t, const __fp16 *B, int K, int N) {
+  tl_hmx_pack_B_strided(t, B, K, N, N, 1);
+}
+TL_HMX_INLINE void tl_hmx_unpack_C_strided(__fp16 *C, const __fp16 *t, int M,
+                                           int N, int si, int sj) {
   int NT = N / TL_HMX_T;
-  if ((N & 63) == 0) { // HVX: vdeal de-interleaves a row-pair span back to 2 rows
+  if (sj == 1 && (N & 63) == 0) {
     for (int mt = 0; mt < M / TL_HMX_T; ++mt)
       for (int r = 0; r < TL_HMX_T / 2; ++r) {
-        HVX_Vector *o0 = (HVX_Vector *)(C + (size_t)(mt * TL_HMX_T + 2 * r) * N);
-        HVX_Vector *o1 = (HVX_Vector *)(C + (size_t)(mt * TL_HMX_T + 2 * r + 1) * N);
         for (int nc = 0; nc < N / 64; ++nc) {
-          HVX_Vector lo = ((const HVX_Vector *)(t + (size_t)(mt * NT + 2 * nc) * TL_HMX_TILE_ELMS))[r];
-          HVX_Vector hi = ((const HVX_Vector *)(t + (size_t)(mt * NT + 2 * nc + 1) * TL_HMX_TILE_ELMS))[r];
+          HVX_Vector lo = tl_hmx_loadu(
+              t + (size_t)(mt * NT + 2 * nc) * TL_HMX_TILE_ELMS + r * 64);
+          HVX_Vector hi = tl_hmx_loadu(
+              t + (size_t)(mt * NT + 2 * nc + 1) * TL_HMX_TILE_ELMS + r * 64);
           HVX_VectorPair vp = Q6_W_vdeal_VVR(hi, lo, -2);
-          o0[nc] = Q6_V_lo_W(vp);
-          o1[nc] = Q6_V_hi_W(vp);
+          tl_hmx_storeu(C + (size_t)(mt * TL_HMX_T + 2 * r) * si + nc * 64,
+                        Q6_V_lo_W(vp));
+          tl_hmx_storeu(C + (size_t)(mt * TL_HMX_T + 2 * r + 1) * si + nc * 64,
+                        Q6_V_hi_W(vp));
         }
       }
     return;
   }
   for (int m = 0; m < M; ++m)
     for (int n = 0; n < N; ++n)
-      C[(size_t)m * N + n] = t[tl_hmx_off(m, n, NT, 0)];
+      C[(size_t)m * si + (size_t)n * sj] = t[tl_hmx_off(m, n, NT, 0)];
+}
+TL_HMX_INLINE void tl_hmx_unpack_C(__fp16 *C, const __fp16 *t, int M, int N) {
+  tl_hmx_unpack_C_strided(C, t, M, N, N, 1);
 }
 // Scalar transposed packs (HVX would need strided/gathered source loads): A stored
 // [K,M] (trans_a) / B stored [N,K] (trans_b).  trans_a=false is the usual case;
@@ -279,6 +309,83 @@ TL_HMX_INLINE void tl_hmx_pack_A_T(__fp16 *t, const __fp16 *A, int M, int K) {
 TL_HMX_INLINE void tl_hmx_pack_B_T(__fp16 *t, const __fp16 *B, int K, int N) {
   tl_hmx_pack_scalar(t, B, N, K, K / TL_HMX_T, K, 1, 1); // B[n*K+k], col-tile (swap)
 }
+
+// Layout kinds shared with src/hexagon/op/copy.cc.  Public pack/unpack wrappers
+// lower one logical T.copy.  The row-major endpoint may be a strided DDR/VTCM
+// matrix region; the Crouton endpoint is always a complete caller-owned VTCM
+// buffer.  A future DMA path can still stage a row-major region before invoking
+// the same strided transform without changing this interface.
+enum {
+  TL_HMX_LAYOUT_ACTIVATION = 0,
+  TL_HMX_LAYOUT_WEIGHT = 1,
+  TL_HMX_LAYOUT_ACTIVATION_TRANSPOSED = 2,
+  TL_HMX_LAYOUT_WEIGHT_TRANSPOSED = 3,
+};
+
+TL_HMX_INLINE void tl_hexagon_hmx_pack_crouton(__fp16 *dst,
+                                               const __fp16 *src, int rows,
+                                               int cols, int src_stride0,
+                                               int src_stride1,
+                                               int layout_kind) {
+  switch (layout_kind) {
+  case TL_HMX_LAYOUT_ACTIVATION:
+    tl_hmx_pack_A_strided(dst, src, rows, cols, src_stride0, src_stride1);
+    return;
+  case TL_HMX_LAYOUT_WEIGHT:
+    tl_hmx_pack_B_strided(dst, src, rows, cols, src_stride0, src_stride1);
+    return;
+  case TL_HMX_LAYOUT_ACTIVATION_TRANSPOSED:
+    // Storage is [K,M], while the physical activation coordinates are [M,K].
+    tl_hmx_pack_scalar(dst, src, cols, rows, rows / TL_HMX_T, src_stride1,
+                       src_stride0, 0);
+    return;
+  case TL_HMX_LAYOUT_WEIGHT_TRANSPOSED:
+    // Storage and physical outer coordinates are both [N,K].
+    tl_hmx_pack_scalar(dst, src, rows, cols, cols / TL_HMX_T, src_stride0,
+                       src_stride1, 1);
+    return;
+  default:
+    return;
+  }
+}
+
+TL_HMX_INLINE void tl_hexagon_hmx_unpack_crouton(__fp16 *dst,
+                                                 const __fp16 *src, int rows,
+                                                 int cols, int dst_stride0,
+                                                 int dst_stride1,
+                                                 int layout_kind) {
+  if (layout_kind == TL_HMX_LAYOUT_ACTIVATION) {
+    tl_hmx_unpack_C_strided(dst, src, rows, cols, dst_stride0, dst_stride1);
+    return;
+  }
+
+  if (layout_kind == TL_HMX_LAYOUT_WEIGHT) {
+    // Logical dst is B[K,N]; physical B tiles are [nt,kt,cpos(k,n)].
+    for (int k = 0; k < rows; ++k)
+      for (int n = 0; n < cols; ++n)
+        dst[(size_t)k * dst_stride0 + (size_t)n * dst_stride1] =
+            src[tl_hmx_off(n, k, rows / TL_HMX_T, 1)];
+    return;
+  }
+
+  if (layout_kind == TL_HMX_LAYOUT_ACTIVATION_TRANSPOSED) {
+    // Logical dst is A_storage[K,M]; physical A coordinates are [m,k].
+    for (int k = 0; k < rows; ++k)
+      for (int m = 0; m < cols; ++m)
+        dst[(size_t)k * dst_stride0 + (size_t)m * dst_stride1] =
+            src[tl_hmx_off(m, k, rows / TL_HMX_T, 0)];
+    return;
+  }
+
+  if (layout_kind == TL_HMX_LAYOUT_WEIGHT_TRANSPOSED) {
+    // Logical dst is B_storage[N,K]; physical B coordinates are [nt,kt].
+    for (int n = 0; n < rows; ++n)
+      for (int k = 0; k < cols; ++k)
+        dst[(size_t)n * dst_stride0 + (size_t)k * dst_stride1] =
+            src[tl_hmx_off(n, k, cols / TL_HMX_T, 1)];
+  }
+}
+
 TL_HMX_INLINE void tl_hmx_matmul_tiles(__fp16 *c, const __fp16 *a,
                                        const __fp16 *b, int M, int N, int K,
                                        const __fp16 *scales) {

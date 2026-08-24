@@ -1,73 +1,122 @@
-"""Hexagon HMX implementation of ``T.gemm`` (Level-1).
+"""Hexagon HMX implementation of ``T.gemm`` over native Crouton VTCM tiles.
 
-The operands stay **row-major** in VTCM — so the global→VTCM ``T.copy`` that fills
-them auto-vectorizes onto HVX (a contiguous half8 copy) — and the gemm lowers to
-``tl_hexagon_hmx_gemm``, which HVX-packs them to a Crouton scratch (top of VTCM),
-runs the HMX MAC, and HVX-unpacks the result back to row-major C.  Keeping the
-operands row-major also means any surrounding elementwise/softmax loops stay
-vectorizable (vs the permuted Crouton layout, which forces scalar code).
+This implementation owns only the GEMM instruction sequence.  Layout inference
+assigns the HMX activation, weight, and output layouts to the three shared
+buffers; surrounding producers and ``T.copy`` operations are responsible for
+placing logical values into those layouts.
 
-SS variant, clear_accum=True (overwrite).  trans_a/trans_b are handled in the
-pack (scalar transposed pack for the rarer transposed operand).  Accumulate
-(clear_accum=False) and fragment/RS operands stay on the scalar fallback.
+The currently supported surface is a full-buffer FP16 SS GEMM (including logical
+operand transposes) with ``clear_accum=True``.  Other variants stay on the scalar
+selector fallback.
 """
 
 from __future__ import annotations
 
-from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang import language as T
+from tilelang.hexagon.hmx_intrin import BIAS_WORDS, HMXIntrinEmitter
+from tilelang.tileop.gemm.gemm_base import GemmBase
+
 
 GEMM_INST_HMX = "hexagon.hmx"
 
 
 class GemmHMX(GemmBase):
+    """Lower one logical GEMM into explicit HMX 32x32x32 instruction atoms."""
+
+    def _make_emitter(self) -> HMXIntrinEmitter:
+        return HMXIntrinEmitter(
+            self.M,
+            self.N,
+            self.K,
+            a_dtype=str(self.a_dtype),
+            b_dtype=str(self.b_dtype),
+            a_transposed=self.trans_A,
+            b_transposed=self.trans_B,
+        )
 
     def infer_layout(self, target, thread_nums: int):
-        # No Crouton layout: operands stay row-major (fast vectorized loads); the
-        # runtime packs to Crouton with HVX inside tl_hexagon_hmx_gemm.
-        return {}
+        emitter = self._make_emitter()
+        return {
+            self.A: emitter.activation_layout(self.A),
+            self.B: emitter.weight_layout(self.B),
+            self.C: emitter.output_layout(self.C),
+        }
+
+    @staticmethod
+    def _is_full_region(region, buffer) -> bool:
+        """Return whether a static 2-D region covers its complete buffer."""
+
+        try:
+            return (
+                len(region.region) == 2
+                and all(int(dim.min) == 0 for dim in region.region)
+                and int(region.region[0].extent) == int(buffer.shape[0])
+                and int(region.region[1].extent) == int(buffer.shape[1])
+            )
+        except (TypeError, ValueError):
+            return False
 
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
-        # SelectInst (src/hexagon/op/gemm.cc) gates HMX on clear_accum=const-true,
-        # SS operands and static 32-multiple 2D shapes — these are defensive.
+        # SelectInst applies the same restrictions.  Keep these checks here so a
+        # direct construction cannot silently emit an invalid HMX sequence.
         if not self.clear_accum:
+            raise NotImplementedError("GemmHMX requires clear_accum=True")
+        if str(self.C.dtype) != "float16":
+            raise NotImplementedError("GemmHMX currently stores FP16 output tiles")
+
+        A_buf = self.ARegion.buffer
+        B_buf = self.BRegion.buffer
+        C_buf = self.CRegion.buffer
+        if not (
+            self._is_full_region(self.ARegion, A_buf)
+            and self._is_full_region(self.BRegion, B_buf)
+            and self._is_full_region(self.CRegion, C_buf)
+        ):
             raise NotImplementedError(
-                "GemmHMX: clear_accum=False (accumulate) is not supported yet — "
-                "the HMX accumulator can't be preloaded, so accumulate must add the "
-                "fp16 tile into VTCM via HVX (decompose into an overwrite gemm + add).")
-        M, N, K = self.M, self.N, self.K
-        A_buf, B_buf, C_buf = self.ARegion.buffer, self.BRegion.buffer, self.CRegion.buffer
-        a0, a1 = self.ARegion.region[0].min, self.ARegion.region[1].min
-        b0, b1 = self.BRegion.region[0].min, self.BRegion.region[1].min
-        c0, c1 = self.CRegion.region[0].min, self.CRegion.region[1].min
-        # The gemm reads each operand row-major as its full M/N/K, which only
-        # matches the buffer when the region spans the whole buffer — reject a
-        # sub-region gemm loudly rather than silently corrupt.
-        def _full(region, buf):
-            # A symbolic region min/extent (e.g. a strided sub-region A_sh[ko*64:...]
-            # inside a serial loop) is by definition not a static full-buffer span;
-            # int() would raise TypeError, so treat non-const as "not full" and let
-            # the NotImplementedError below report it cleanly.
-            try:
-                return all(int(r.min) == 0 for r in region.region) and \
-                    int(region.region[0].extent) == int(buf.shape[0]) and \
-                    int(region.region[1].extent) == int(buf.shape[1])
-            except (TypeError, ValueError):
-                return False
-        if not (_full(self.ARegion, A_buf) and _full(self.BRegion, B_buf) and _full(self.CRegion, C_buf)):
-            raise NotImplementedError(
-                "GemmHMX: sub-region gemm (operands that don't span their whole "
-                "shared buffer) is not supported yet — make the shared buffers "
-                "exactly the gemm tile.")
-        ta, tb = (1 if self.trans_A else 0), (1 if self.trans_B else 0)
+                "GemmHMX requires each GEMM region to span its complete shared buffer"
+            )
+
+        emitter = self._make_emitter()
 
         @T.prim_func
         def _gemm_hmx() -> None:
-            T.call_extern(
-                "int32", "tl_hexagon_hmx_gemm",
-                T.address_of(C_buf[c0, c1]),
-                T.address_of(A_buf[a0, a1]),
-                T.address_of(B_buf[b0, b1]),
-                M, N, K, ta, tb)
+            # HMX conversion reads 32 u32 scale words followed by 32 bias words;
+            # each scale word carries FP16 1.0 in its low half.
+            # Keep this block internal for now so T.gemm's public contract remains
+            # exactly A/B/C in VTCM.
+            bias_vtcm = T.alloc_shared((BIAS_WORDS,), "uint32", align=256)
+            acc = T.alloc_hmx_accumulator()
+            cvt = T.alloc_hmx_convert_state()
+            bias = T.alloc_hmx_bias_state()
+
+            for i in T.serial(BIAS_WORDS // 2):
+                bias_vtcm[i] = T.Cast("uint32", 0x3C00)
+                bias_vtcm[BIAS_WORDS // 2 + i] = T.Cast("uint32", 0)
+
+            emitter.acquire(acc)
+            for inst_m_idx in T.serial(emitter.num_m_tiles):
+                for inst_n_idx in T.serial(emitter.num_n_tiles):
+                    emitter.clear(acc)
+                    emitter.load_bias(bias, bias_vtcm)
+                    emitter.mma_tile(
+                        acc,
+                        A_buf,
+                        B_buf,
+                        inst_m_idx=inst_m_idx,
+                        inst_n_idx=inst_n_idx,
+                    )
+                    emitter.convert(cvt, acc, bias, bias_vtcm)
+                    emitter.store(
+                        cvt,
+                        acc,
+                        C_buf,
+                        bias,
+                        bias_vtcm,
+                        A_buf,
+                        B_buf,
+                        inst_m_idx=inst_m_idx,
+                        inst_n_idx=inst_n_idx,
+                    )
+            emitter.release(acc)
 
         return _gemm_hmx

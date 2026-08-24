@@ -27,7 +27,7 @@ Hexagon 是 **VLIW DSP + HVX + HMX + VTCM + DMA**,和 GPGPU 之间有一条鸿�
 |---|---|---|---|
 | **Codegen** | 满寄存器 HVX 向量化(1024-bit 宽度 + 最窄 dtype 填满寄存器 + 原生 `ext_vector` 的 `vec_type`) | `src/transform/loop_vectorize.cc`、`src/tl_templates/hexagon/common.h`、`codegen_hexagon.cc` | ✅ 已提交,零回归 |
 | **DSL kernel** | 全 DSL q4_0 反量化(追平手写 HVX)+ 反量化→VTCM→`T.gemm`→HMX 融合 matmul;紧凑常驻 scale | `examples/hexagon/example_qmatmul*.py` | ✅ 设备验证(rel 2.5e-4) |
-| **HMX 抽象** | `HMXIntrinEmitter` —— 指令原子级 emitter(`pack_a/pack_b`=ldmatrix、`mma`=mxmem+MAC、`store`=stmatrix、`clear`=mxclracc),对齐 tilelang 的 `TensorCoreIntrinEmitter` | `tilelang/hexagon/hmx_intrin.py` | ✅ 设备验证 K-流式 |
+| **HMX 抽象** | `HMXIntrinEmitter` —— 原生 Crouton layout、32x32x32 MAC atom 和隐式 accumulator protocol；供显式 kernel 与 `T.gemm` lowering 复用 | `tilelang/hexagon/{hmx_intrin,gemm_hmx}.py` | emitter 与 native-layout `T.gemm` 均已真机验证 |
 | **运行时集成** | bridge(蹭 host 的 VTCM+HMX)、op registry(`tl_op_ctx`/`tl_dispatch`)、ggml 拦截、可嵌入 kernel emit、快路径 adapter | `src/tl_templates/hexagon/tl_{bridge,embed}.h`、`examples/hexagon/llama_cpp_integration/` | ✅ 完成 |
 | **设备** | LFM2-1.2B 跑在 NPU 上,tilelang q4_0 matmul 在模型里 A/B | 见 §4 | ✅ 端到端验证,**追平** |
 
@@ -64,21 +64,43 @@ hi = (q >> T.Cast("int16", 4)) - T.Cast("int16", 8)    # int16 常量 → 不被
 
 ### 3.3 HMX 抽象:`HMXIntrinEmitter`(commit `76ada132`)
 
-HMX 没有 mma、累加器不可见,所以 matmul 用**指令原子**围着那个隐式累加器拼,而不是黑盒
-`T.gemm`。这是 tilelang `TensorCoreIntrinEmitter` 的 Hexagon 对应物:
+HMX 没有可寻址的 accumulator fragment,所以 emitter 用**指令原子**围着唯一的隐式累加器拼。
+它是 `T.gemm` lowering 的底层能力,也是 tilelang `TensorCoreIntrinEmitter` 的 Hexagon
+对应物,但接口按 HMX 的真实存储层级命名:
 
 | tensor core | `HMXIntrinEmitter` | 指令 |
 |---|---|---|
-| `ldmatrix_a/b`(shared→register fragment) | `pack_a/pack_b`(行主 VTCM→Crouton VTCM) | HVX `vshuff` |
-| `mma`/`mma_atom` | `mma`(mxmem activation+weight load 对 = MAC) | `{activation=mxmem; weight=mxmem}` |
-| `stmatrix` | `store`(`cvt`→Crouton→unpack) | `cvt.hf=acc; mxmem=cvt` |
+| shared-memory fragment layout | `activation_layout` / `weight_layout` | A `[M,K]` / B `[K,N]`（含 storage transpose）的 VTCM Crouton 地址 |
+| `mma_atom(...,m,n,k)` | 一个 32x32x32 MAC atom | `{activation=mxmem; weight=mxmem}` |
+| `mma` 的 K 步 | `mma_tile(...,m,n)` | 一个输出 tile 的完整 K-loop |
+| accumulator store layout | `output_layout` / `store` | 在 2 KB 对齐的 C `[M,N]` 原生 Crouton tile 上直接执行 `mxmem=cvt` |
 | `T.clear(C_local)` | `clear` | `mxclracc` |
 
-诚实的分歧:HMX 累加器**不可寻址、全核唯一**,所以 `clear/mma/store` 操作**隐式累加器**
-(不像 CUDA 传 `C_local`);A/B 的「fragment」就是 `pack_*` 产出的 Crouton VTCM tile。用起来
-就是 quickstart 的形状:`clear` → K-loop 里 `pack_b`/`mma` → `store`,反量化夹在 `pack_b` 和
-`mma` 之间。方法内**建-返回一个 nested `@T.macro`** —— 必须这样,否则 Crouton scratch 的
-buffer 使用对 VTCM liveness 分析不可见,会把 `alloc_shared` 叠在一起 → 静默算垃圾。
+32x32 FP16 layout atom 为
+`cpos(r,c)=(r//2)*64+c*2+r%2`。A/C 用
+`atom.repeat(1, tiles_col).repeat(0, tiles_row)`,物理 tile 轴分别是 `[mt,kt]` / `[mt,nt]`;
+B 用 `atom.repeat(0,KT).repeat(1,NT)`,物理 tile 轴是 `[nt,kt]`。额外 staging 维通过
+`expand` 加在最前面。`T.Layout` 只重写地址,不表示 FP16 packing、2048-byte 对齐或 HMX
+instruction protocol;这些仍由 producer、allocator 和 emitter 分别负责。
+
+诚实的分歧:HMX 累加器**不可寻址、全核唯一**,所以不能像 CUDA 一样先对全部 `(m,n)`
+发 atom 再统一 store。每个输出 tile 必须执行 `clear -> mma(K-loop) -> convert -> store`,完成
+后才能切换下一个 `(m,n)`。`mxmem=cvt` 的目标地址低 11 bit 不参与编码，因此每个输出 tile
+必须 2048-byte 对齐；32x32 FP16 tile 本身恰好是 2048 bytes，所以满足起始对齐后可以在多个
+C tile 地址间直接 store，不需要固定 `output_atom` 或额外 HVX copy。A/B 的 `mxmem`
+load 可能异步消费 VTCM,因此 `store` 保留整块 A/B
+作为生命周期依赖。session/power/VTCM ownership 以及 cold-session 的 accumulator-read 初始化
+属于 embedding runtime;`load_bias` 只加载本次 convert 使用的 scale/bias block。
+
+`GemmHMX.lower` 只从 `T.gemm(A, B, C)` 接收三个已经位于 VTCM、并带上述 layout 的 buffer。
+lowering 自己分配 dependency-only 的 accumulator/convert/bias state,准备内部
+scale/bias block,然后生成 `acquire -> for m -> for n -> clear ->
+mma_tile -> convert -> store_C_tile -> release`。因此这些 state 和 bias
+都不是用户 `T.gemm` 的额外参数。shared-memory planner 按 intrinsic operand 分别传播
+A/C 2048-byte、B 128-byte、scale/bias config 256-byte 对齐约束，`infer_layout` 同时为 A/B/C
+分配 native Crouton layout,旧的 `tl_hexagon_hmx_gemm` 单体模板不再参与这条路径。当前已完成
+host lowering/codegen、v79 DSP/Android 构建和真机数值验证：32×128×128 q4 的 rel err 为
+0.000351，融合 copy 的 256×256×256 FP16 路径 max abs err 为 0.0009766。
 
 ### 3.4 运行时集成(commits `3d570a15`、`f567ab15`)
 
@@ -122,12 +144,15 @@ llama.cpp 有自己的 DSP skel,tilelang kernel 要作为它图里的一个 op �
 
 1. **HVX 没有亚寄存器操作** —— 每条指令整个 128B 寄存器,所以混合 dtype 循环必须在最窄 dtype
    填满寄存器处向量化(uint8 需 ≥128 lane),否则越界 fault。这一条驱动了整个 codegen 修复。
-2. **HMX 没有 mma、累加器不可寻址** —— load 即 MAC,进一个全核唯一的隐式累加器。所以 matmul
-   用指令原子(`clear→pack→mma→store`)围着隐式累加器拼,是 `HMXIntrinEmitter` 而**不是** monolithic
-   `T.gemm` —— 这样反量化才能夹进 MAC(K-流式)。
-3. **Crouton pack 是固有的** —— 操作数进 `mxmem` 要 Crouton,但满寄存器反量化要行主,中间**必然**
-   有一次行主→Crouton 的 HVX pack。`GemmHMX` 故意让操作数保持行主 + 运行时 HVX-pack,因为 Crouton
-   layout 的 DSL 存储是标量(会把反量化打回标量)。
+2. **HMX 没有 mma、累加器不可寻址** —— load 即 MAC,进一个全核唯一的隐式累加器。所以
+   `HMXIntrinEmitter` 必须表达 `clear -> mma_atom/mma_tile -> convert -> store` 的真实顺序;
+   `T.gemm` 之后只负责把 A/B/C buffer lowering 成这组原子。需要把反量化夹进 K-loop 的自定义
+   kernel 仍可直接调用 `mma_atom`。
+3. **Crouton pack 是固有的** —— `GemmHMX.infer_layout` 现在让 VTCM 操作数直接采用 Crouton,
+   producer/`T.copy` 的逻辑坐标会被 layout lowering 改写。一次逻辑 `T.copy` 可以直接处理
+   `DDR <-> Crouton VTCM`：row-major 端的 base offset/leading stride 显式传给 pack/unpack，
+   连续维为 64 倍数时调用 HVX `vshuff/vdeal`，转置或非 64 倍数时回退标量。后续 DMA 可以
+   在同一 copy plan 中先把该 row-major region 搬到 VTCM，或直接搬运预打包的 Crouton DDR tile。
 4. **tile op 必须 `@T.macro`** —— 普通 Python helper 里的 buffer 使用对 VTCM liveness 分析不可见,
    会把 `alloc_shared` 叠在一起 → **静默算垃圾**(不 crash)。emitter 方法内建-返回 nested macro。
 5. **测 compute,别测单次墙钟** —— standalone kernel 的单次调用被 FastRPC marshal 主导;真 compute

@@ -60,32 +60,47 @@ template** (~1.4 ms/512K weights) — so the template is not needed; the DSL gen
 VTCM (`alloc_shared`) and never hits DDR. `T.gemm` needs `clear_accum=True` on Hexagon (the
 HMX accumulator must be `mxclracc`'d, else NaN).
 
-For **K-streaming** (dequant one K-tile at a time, interleaved with the MAC so it hides under
-the MAC — like ggml-hexagon), HMX is driven at **instruction-atom granularity** via
+For explicit scheduling, HMX is driven at **instruction-atom granularity** via
 `tilelang/hexagon/hmx_intrin.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
 `TensorCoreIntrinEmitter` (`tilelang/cuda/intrinsics/macro/mma_macro_generator.py`). Like the
-tensor-core emitter, it turns the matmul's tiling config into `@T.macro` atoms so the kernel
-composes the K-loop itself (interleaving the dequant), instead of a black-box `T.gemm`:
+tensor-core emitter, it turns the matmul's tiling config into `@T.macro` atoms so either an
+explicit kernel or `T.gemm` lowering can compose the operation:
 
 | tensor core | `HMXIntrinEmitter` | instruction |
 |---|---|---|
-| `ldmatrix_a`/`ldmatrix_b` (shared → reg fragment) | `pack_a`/`pack_b` (row-major VTCM → Crouton VTCM) | HVX `vshuff` |
-| `mma`/`mma_atom` | `mma` (the `mxmem` activation+weight load pair, which IS the MAC) | `{activation=mxmem; weight=mxmem}` |
-| `stmatrix` | `store` (`cvt` → Crouton → unpack) | `cvt.hf=acc; mxmem=cvt` |
+| shared-memory fragment layout | `activation_layout` / `weight_layout` | A `[M,K]` / B `[K,N]` (including storage transposes) in VTCM Crouton |
+| `mma_atom(...,m,n,k)` | one 32x32x32 MAC atom | `{activation=mxmem; weight=mxmem}` |
+| one K step of `mma` | `mma_tile(...,m,n)` | the complete K-loop for one output tile |
+| accumulator store layout | `output_layout` / `store` | direct `mxmem=cvt` into a 2 KB-aligned native C `[M,N]` tile |
 | `T.clear(C_local)` | `clear` | `mxclracc` |
 
 **Honest divergence from tensor cores:** HMX has no `mma` instruction and NO addressable
 accumulator fragment — loading the a/b Crouton tiles is what triggers the MAC, into a single
-invisible per-core accumulator. So `clear`/`mma`/`store` operate on that implicit accumulator
-(no `C_local` is threaded through); the A/B "fragments" are the Crouton VTCM tiles that
-`pack_a`/`pack_b` produce (`E.a_frag_shape` etc. give the sizes). Granularity matches the CUDA
-emitter: `mma`/`clear` are true single instructions, `pack_*`/`store` are multi-instruction
-layout moves. The methods build a nested `@T.macro` and return its call (the tensor-core
-pattern) — **required**, so the Crouton-scratch buffer uses (`T.address_of`) are visible to the
-eager builder's VTCM liveness/arena pass, else the scratch aliases other `alloc_shared` buffers
-and you get silent garbage. Lowers to the `tl_hexagon_hmx_*` primitives in `hmx.h`. See
-`examples/hexagon/example_qmatmul_kstream.py`. Single M-tile; N>32 loops `clear → mac-K →
-store` per N-tile (one physical accumulator).
+invisible per-core accumulator. Consequently `mma_tile()` reduces K for exactly one `(m,n)` tile;
+the caller must complete `clear -> mma_tile -> convert -> store` before selecting another output
+tile. The 32x32 atom uses `cpos(r,c)=(r//2)*64+c*2+r%2`; `repeat` constructs the A/C
+`[mt,*t,cpos]` and B `[nt,kt,cpos]` tile orders, while `expand` adds staging dimensions.
+`T.Layout` only rewrites addresses: packing, operand-specific allocation alignment, and the HMX
+protocol remain explicit. Whole-buffer A/B dependencies are carried to `store` because HMX may
+consume `mxmem` operands asynchronously. Session/power/VTCM ownership and cold-session
+accumulator-read setup stay with the embedding runtime.
+
+The shared-memory planner propagates each native VTCM requirement from its HMX operand:
+activation/output 2 KB, weight 128 B, and scale/bias config 256 B. Because every 32x32 FP16
+Crouton output tile is exactly 2 KB, the emitter stores repeated tiles directly at their native
+C addresses without an internal staging atom or HVX commit.
+
+`GemmHMX.lower` takes only `T.gemm(A, B, C)`. Layout inference assigns native Crouton layouts
+to those VTCM buffers, while lowering owns the dependency-only HMX states, internal scale/bias
+block, and outer M/N loops. It emits the same explicit atoms and no longer calls the legacy
+monolithic `tl_hexagon_hmx_gemm` template. Kernels may use one logical `T.copy` to move a
+strided DDR matrix region directly to/from an inferred HMX layout; the lowering passes the
+row-major base/stride to
+`tl_hexagon_hmx_pack_crouton`/`unpack_crouton`; normal 64-wide forms use HVX
+`vshuff`/`vdeal`, while transposed and remainder forms remain scalar. The DDR/VTCM leg is the
+future DMA boundary. The native-layout `T.gemm` path is device-validated on v79: a staged
+32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has
+maximum absolute error 0.0009766.
 
 **Status: device-validated correct** (atom-granular K-streaming, single- and multi-N-tile, rel
 2–4e-4). The perf/hiding optimization (whole-register 64-feature dequant slices vs the

@@ -1,13 +1,13 @@
 """Worker pool over Hexagon's 1 HMX + 6 HVX units, via `T.Kernel(num_workers=N)`.
 
 `num_workers=N` fans the grid's outermost block loop across the (up to 6) HW threads.
-The 6 HVX units run pack/unpack/elementwise in parallel; the single HMX matrix engine
-is serialized by an accumulator spinlock — so the same multi-block kernel parallelizes
+The 6 HVX units run copies/elementwise work in parallel; the single HMX matrix engine
+is serialized by an accumulator spinlock, so the same multi-block kernel parallelizes
 whether it's pure-HVX or uses `T.gemm`.
 
 Two demos:
   1. Batched matmul — each block does a `T.gemm` (HMX), parallelized across workers.
-     Each worker gets a private VTCM slice (operands + gemm scratch), so concurrent
+     Each worker gets a private VTCM slice for native Crouton operands, so concurrent
      gemms don't collide. Shows correctness.
   2. A compute-heavy HVX kernel — timed at num_workers=1 vs N to show the wall-clock
      speedup (this kernel is compute-bound, so the speedup is visible end-to-end;
@@ -31,13 +31,13 @@ def make_batched_matmul(NB, M, N, K, num_workers):
     def batched(A: T.Tensor((NB, M, K), "float16"), B: T.Tensor((NB, K, N), "float16"),
                 C: T.Tensor((NB, M, N), "float16")):
         with T.Kernel(NB, threads=1, num_workers=num_workers) as bx:
-            A_sh = T.alloc_shared((M, K), "float16")   # per-worker VTCM slice
-            B_sh = T.alloc_shared((K, N), "float16")
-            C_sh = T.alloc_shared((M, N), "float16")
-            T.copy(A[bx, :, :], A_sh)
-            T.copy(B[bx, :, :], B_sh)
-            T.gemm(A_sh, B_sh, C_sh, clear_accum=True)  # HMX (per-worker scratch)
-            T.copy(C_sh, C[bx, :, :])
+            A_hmx = T.alloc_shared((M, K), "float16")  # per-worker Crouton tiles
+            B_hmx = T.alloc_shared((K, N), "float16")
+            C_hmx = T.alloc_shared((M, N), "float16")
+            T.copy(A[bx, :, :], A_hmx)
+            T.copy(B[bx, :, :], B_hmx)
+            T.gemm(A_hmx, B_hmx, C_hmx, clear_accum=True)
+            T.copy(C_hmx, C[bx, :, :])
     return batched
 
 

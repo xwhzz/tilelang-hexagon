@@ -1,9 +1,9 @@
 """Tiled FP16 matmul on the Qualcomm Hexagon HMX matrix engine.
 
-You write the SAME tilelang you'd write for a GPU — `T.copy` into on-chip memory
-(`T.alloc_shared`, which the Hexagon backend places in VTCM) and `T.gemm` — and the
-backend lowers `T.gemm` onto the HMX matrix engine. The HMX recipe (the Crouton tile
-pack/unpack + the `mxmem` MAC) lives in the runtime template, not in your kernel.
+Each `T.copy` crosses the DDR/native-Crouton boundary directly.  The Hexagon copy
+lowering preserves the DDR matrix stride and emits a fused Crouton pack/unpack
+helper (HVX `vshuff`/`vdeal` for the common 64-wide case).  `T.gemm` itself receives
+only caller-owned native-Crouton A/B/C buffers and lowers to explicit HMX atoms.
 
 Requires a Hexagon device (e.g. OnePlus 13 / Snapdragon 8 Gen 4) reachable over adb,
 the Hexagon SDK, and an authorized device. See README.md.
@@ -22,13 +22,13 @@ def make_matmul(M, N, K, BM, BN):
                C: T.Tensor((M, N), "float16")):
         # 2-D grid of BM x BN output tiles; one HW thread per block (for now).
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=1) as (bx, by):
-            A_sh = T.alloc_shared((BM, K), "float16")   # -> VTCM (on-chip)
-            B_sh = T.alloc_shared((K, BN), "float16")
-            C_sh = T.alloc_shared((BM, BN), "float16")
-            T.copy(A[by * BM, 0], A_sh)                  # global -> VTCM (HVX half8 copy)
-            T.copy(B[0, bx * BN], B_sh)
-            T.gemm(A_sh, B_sh, C_sh, clear_accum=True)   # -> HMX matrix engine
-            T.copy(C_sh, C[by * BM, bx * BN])            # VTCM -> global
+            A_hmx = T.alloc_shared((BM, K), "float16")  # native Crouton VTCM
+            B_hmx = T.alloc_shared((K, BN), "float16")
+            C_hmx = T.alloc_shared((BM, BN), "float16")
+            T.copy(A[by * BM, 0], A_hmx)                 # DDR -> Crouton VTCM
+            T.copy(B[0, bx * BN], B_hmx)
+            T.gemm(A_hmx, B_hmx, C_hmx, clear_accum=True)
+            T.copy(C_hmx, C[by * BM, bx * BN])           # Crouton VTCM -> DDR
     return matmul
 
 
