@@ -62,6 +62,8 @@ from tvm.tirx.script.builder.ir import alloc_buffer as allocate  # noqa: F401
 from .copy_op import (  # noqa: F401
     copy,
     async_copy,
+    dma_copy,
+    dma_wait,
     tma_copy,
     tma_gather4,
     tma_gather4_bytes,

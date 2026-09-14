@@ -327,8 +327,6 @@ class HMXIntrinEmitter:
         output,
         bias_state,
         bias_vtcm,
-        activation,
-        weight,
         inst_m_idx=0,
         inst_n_idx=0,
         output_prefix=(),
@@ -345,8 +343,6 @@ class HMXIntrinEmitter:
             output,
             bias_state,
             bias_vtcm,
-            activation,
-            weight,
         ):
             T.hexagon_hmx_store(
                 T.access_ptr(cvt_state[0], "r"),
@@ -354,11 +350,6 @@ class HMXIntrinEmitter:
                 T.access_ptr(acc_state[0], "rw"),
                 T.access_ptr(bias_state[0], "r"),
                 T.access_ptr(bias_vtcm[0], "r", BIAS_WORDS),
-                # These are whole-buffer lifetime dependencies, not additional
-                # hardware operands. Passing the Buffer itself keeps store()
-                # valid for both 2-D Croutons and staged 3-D K-tile arrays.
-                T.access_ptr(activation, "r"),
-                T.access_ptr(weight, "r"),
             )
 
         return _store(
@@ -367,8 +358,6 @@ class HMXIntrinEmitter:
             output,
             bias_state,
             bias_vtcm,
-            activation,
-            weight,
         )
 
 

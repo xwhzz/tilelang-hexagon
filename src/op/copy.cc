@@ -528,6 +528,11 @@ LayoutMap CopyNode::InferSIMTLayout(const LayoutInferArgs &T,
 // Lowers the copy operation by dispatching to the selected target
 // implementation.
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  if (auto dma = annotations.Get("is_dma_copy")) {
+    ICHECK(!Downcast<IntImm>(dma.value())->value ||
+           T.target->kind->name == "hexagon")
+        << "T.dma_copy is supported only on Hexagon";
+  }
   return LowerCopyForTarget(*this, T, analyzer);
 }
 
@@ -573,6 +578,12 @@ TIR_REGISTER_TL_TILE_OP(Copy, copy)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TVM_REGISTER_OP("tl.dma_wait")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "dma_wait")
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                             Integer(CallEffectKind::kOpaque));
+
 TVM_REGISTER_OP("tl.tileop.async_copy")
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "async_copy")
     .set_attr<OpBuilderFunc>("TLOpBuilder",
@@ -580,6 +591,20 @@ TVM_REGISTER_OP("tl.tileop.async_copy")
                                 Map<String, ObjectRef> annotations) {
                                Map<String, ObjectRef> ann = annotations;
                                ann.Set("is_async_copy",
+                                       IntImm(DataType::Int(32), 1));
+                               return Copy(args, ann);
+                             })
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TVM_REGISTER_OP("tl.tileop.dma_copy")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "dma_copy")
+    .set_attr<OpBuilderFunc>("TLOpBuilder",
+                             [](Array<PrimExpr> args,
+                                Map<String, ObjectRef> annotations) {
+                               Map<String, ObjectRef> ann = annotations;
+                               ann.Set("is_dma_copy",
                                        IntImm(DataType::Int(32), 1));
                                return Copy(args, ann);
                              })

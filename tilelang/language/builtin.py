@@ -323,10 +323,8 @@ def hexagon_hmx_store(
     acc_state,
     bias_state,
     bias_ptr,
-    activation_ptr,
-    weight_ptr,
 ):
-    """Store HMX convert state while retaining all asynchronous operands."""
+    """Store HMX convert state to its VTCM output tile."""
 
     return tirx.call_intrin(
         "void",
@@ -336,8 +334,6 @@ def hexagon_hmx_store(
         acc_state,
         bias_state,
         bias_ptr,
-        activation_ptr,
-        weight_ptr,
     )
 
 

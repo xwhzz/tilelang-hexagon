@@ -87,11 +87,11 @@ int32_t tl_q4_hmx_staged_m32_n256_k8192_compute_kernel(half* A_hmx, half* B_hmx,
           for (int32_t nt = 0; nt < 8; ++nt) {
             tl_hexagon_hmx_clear_acc((&(acc[0])));
             tl_hexagon_hmx_load_bias((&(bias[0])), (&(bias_vtcm[0])));
-            for (int32_t kt = 0; kt < 256; ++kt) {
-              tl_hexagon_hmx_mma_atom((&(acc[0])), (&(A_hmx[(kt * 1024)])), (&(B_hmx[((nt * 262144) + (kt * 1024))])));
+            for (int32_t k_inner = 0; k_inner < 256; ++k_inner) {
+              tl_hexagon_hmx_mma_atom((&(acc[0])), (&(A_hmx[(k_inner * 1024)])), (&(B_hmx[((nt * 262144) + (k_inner * 1024))])));
             }
             tl_hexagon_hmx_convert_acc((&(cvt[0])), (&(acc[0])), (&(bias[0])), (&(bias_vtcm[0])), 2);
-            tl_hexagon_hmx_store_cvt_state((&(cvt[0])), (&(C_hmx[0])), (&(acc[0])), (&(bias[0])), (&(bias_vtcm[0])), (&(A_hmx[0])), (&(B_hmx[0])));
+            tl_hexagon_hmx_store_cvt_state((&(cvt[0])), (&(C_hmx[0])), (&(acc[0])), (&(bias[0])), (&(bias_vtcm[0])));
             if ((nt * 32) < dst_stride) {
               for (int32_t mpair = 0; mpair < 16; ++mpair) {
                 tl_hexagon_hmx_unpack_c_f32_pair_n32((&(C[((((int64_t)nt) * (int64_t)32) + ((((int64_t)mpair) * ((int64_t)dst_stride)) * (int64_t)2))])), (&(C[((((int64_t)nt) * (int64_t)32) + (((((int64_t)mpair) * (int64_t)2) + (int64_t)1) * ((int64_t)dst_stride)))])), (&(C_hmx[(mpair * 64)])));

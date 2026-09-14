@@ -87,8 +87,6 @@ def _make_hmx_coordinate_probe():
                 C_hmx,
                 bias,
                 bias_vtcm,
-                A_hmx,
-                B_hmx,
                 1,
                 1,
             )
@@ -144,8 +142,6 @@ def _make_hmx_vtcm_gemm_probe():
                         C_hmx,
                         bias,
                         bias_vtcm,
-                        A_hmx,
-                        B_hmx,
                         inst_m_idx=inst_m_idx,
                         inst_n_idx=inst_n_idx,
                     )
@@ -183,8 +179,6 @@ def _make_hmx_operand_alignment_probe():
                 ee_output,
                 bias,
                 cc_config,
-                dd_activation,
-                bb_weight,
             )
             emitter.release(acc)
             aa_padding[0] = ee_output[0, 0]
@@ -343,6 +337,10 @@ def test_hmx_atom_uses_standard_tile_coordinates():
     assert "A_hmx[3072]" in mma_call
     assert "B_hmx[3072]" in mma_call
     assert "C_hmx[3072]" in store_call
+    # A/W lifetime ends at the multiply packet, so store must not retain either
+    # source through dependency-only arguments.
+    assert "A_hmx" not in store_call
+    assert "B_hmx" not in store_call
 
 
 def test_hmx_vtcm_gemm_composes_from_three_operand_buffers():

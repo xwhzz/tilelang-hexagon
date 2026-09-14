@@ -47,7 +47,7 @@ int32_t matmul_kernel(half* A, half* B, half* C) {
                   tl_hexagon_hmx_mma_atom((&(acc[0])), (&(((half*)A_hmx)[((inst_m_idx * 8192) + (k_inner * 1024))])), (&(((half*)B_hmx)[((inst_n_idx * 8192) + (k_inner * 1024))])));
                 }
                 tl_hexagon_hmx_convert_acc((&(cvt[0])), (&(acc[0])), (&(bias[0])), (&(((uint32_t*)bias_vtcm)[0])), 2);
-                tl_hexagon_hmx_store_cvt_state((&(cvt[0])), (&(((half*)C_hmx)[((inst_m_idx * 2048) + (inst_n_idx * 1024))])), (&(acc[0])), (&(bias[0])), (&(((uint32_t*)bias_vtcm)[0])), (&(((half*)A_hmx)[0])), (&(((half*)B_hmx)[0])));
+                tl_hexagon_hmx_store_cvt_state((&(cvt[0])), (&(((half*)C_hmx)[((inst_m_idx * 2048) + (inst_n_idx * 1024))])), (&(acc[0])), (&(bias[0])), (&(((uint32_t*)bias_vtcm)[0])));
               }
             }
             tl_hexagon_hmx_acc_release((&(acc[0])));

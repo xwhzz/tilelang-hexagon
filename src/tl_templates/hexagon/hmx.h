@@ -518,8 +518,8 @@ static int tl_hexagon_hmx_gemm(__fp16 *C, const __fp16 *A, const __fp16 *B, int 
 // These thin wrappers expose the accumulator protocol one instruction at a time.
 // A DSL kernel decides where dequantization sits relative to clear/MAC/convert/
 // store and owns every Crouton buffer through alloc_shared. TILE = 32; one tile
-// is 1024 fp16 = 2 KB. Reusing a source tile requires a real HMX completion
-// boundary; dependency operands below keep all issued sources live through store.
+// is 1024 fp16 = 2 KB. On one Q6 thread, a source tile is reusable after its
+// final multiply packet; accumulator convert and output store do not access A/W.
 // `tl_hexagon_hmx` prefix so _fastrpc.py pulls in this header.
 //
 // The atom wrappers retain the dependency-only TIR state tokens as C parameters.
@@ -563,17 +563,11 @@ TL_HMX_INLINE void tl_hexagon_hmx_convert_acc(void *cvt_state,
 }
 TL_HMX_INLINE void tl_hexagon_hmx_store_cvt_state(
     void *cvt_state, __fp16 *output, void *acc_state, void *bias_state,
-    const void *bias_source, const void *activation_source,
-    const void *weight_source) {
+    const void *bias_source) {
   (void)cvt_state;
   (void)acc_state;
   (void)bias_state;
   (void)bias_source;
-  // These source operands are dependency-only: carrying them to the completed
-  // store prevents the shared-memory planner from recycling an mxmem input
-  // while the asynchronous HMX pipeline still owns it.
-  (void)activation_source;
-  (void)weight_source;
   // Conversion is a separate TileLang atom. This instruction only transfers
   // the explicit HMX convert-state token to its Crouton VTCM destination.
   tl_hmx_store_cvt(output);

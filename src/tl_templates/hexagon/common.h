@@ -23,6 +23,7 @@ using half = __fp16;
 #define TL_OK 0
 #define TL_ERR_VTCM 1 // VTCM region unavailable / no worker region fits the grant
 #define TL_ERR_HMX 2  // HMX could not be enabled for a worker thread
+#define TL_ERR_DMA 3  // User-DMA submission or completion failed
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))

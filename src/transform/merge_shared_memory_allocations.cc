@@ -443,14 +443,9 @@ private:
       return;
     }
     if (op->op.same_as(tl::hexagon_hmx_store())) {
-      ICHECK_EQ(op->args.size(), 7U);
+      ICHECK_EQ(op->args.size(), 5U);
       VisitExprWithAlignment(op->args[1], 2048); // output activation tile
       VisitExprWithAlignment(op->args[4], 256);  // scale/bias config
-      // The final two operands are lifetime dependencies retained until the
-      // asynchronous HMX sequence completes. Preserve their native load
-      // alignment requirements without promoting the weight to 2 KiB.
-      VisitExprWithAlignment(op->args[5], 2048); // activation
-      VisitExprWithAlignment(op->args[6], 128);  // weight
       StmtExprVisitor::VisitExpr_(op);
       return;
     }
@@ -1707,11 +1702,27 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
       if (target.value()->kind->name == "hexagon" && eff_align < 128)
         eff_align = 128;
     }
+    // A DMA source/destination remains live beyond its submission statement.
+    // Until interval-aware async liveness is available, do not overlay VTCM
+    // allocations in managed async kernels. Explicit ping/pong is unaffected.
+    bool async_dma = false;
+    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
+      if (target.value()->kind->name == "hexagon") {
+        PostOrderVisit(f->body, [&](const ObjectRef &node) {
+          if (const auto *call = node.as<CallNode>()) {
+            if (call->op.same_as(builtin::call_extern()) && !call->args.empty()) {
+              if (const auto *name = call->args[0].as<StringImmNode>())
+                async_dma |= name->value.find("tl_hexagon_dma_async_copy_") == 0;
+            }
+          }
+        });
+      }
+    }
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocations(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
         eff_align, debug_merge_shared_memory_allocations, preserve_aliases,
-        disable_reuse);
+        disable_reuse || async_dma);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",

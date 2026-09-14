@@ -159,8 +159,28 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   FP16 VTCM-to-VTCM `T.copy` with exactly one HMX-layout endpoint is recognized by the
   Hexagon copy lowering and uses those helpers. Widths not divisible by 64 and transposed
   source storage retain scalar fallbacks. The row-major stride is explicit in the helper
-  ABI, so a future DMA lowering can stage the same region without changing the Crouton
-  transform contract.
+  ABI. DMA remains a separate row-major staging operation: the DMA descriptor can move
+  contiguous/row-strided rectangles but cannot express the Crouton permutation.
+
+- **DMA primitives are invoked explicitly.** `dma.h` provides raw User-DMA
+  instruction wrappers, 1D/type-9 2D descriptor construction, cache maintenance,
+  and a caller-owned descriptor ring with start/link/poll/wait/pop/flush operations.
+  The queue allocates nothing and does not acquire or reset DMA0; its caller must
+  own and serialize the engine. Synchronous 1D/2D copy helpers remain available
+  through explicit extern calls. `T.dma_copy` submits to a per-kernel FIFO and
+  `T.dma_wait(n)` completes/reclaims all but its newest n entries (one copy per
+  entry). The kernel drains outstanding transfers before returning. Capacity is
+  configured with `hexagon.dma_queue_capacity` (default 16, range 1..256); a full
+  queue fails without a hidden wait. Regions must have equal scalar dtypes, static
+  positive extents/strides, unit innermost stride, and provable bounds. Unsupported
+  async copies fail lowering. Managed async kernels disable automatic VTCM
+  allocation reuse and require a manual serial schedule and exclusive DMA0
+  ownership; compiler pipelines and mixing raw DMA calls are rejected. Scope-based
+  cleanup drains DMA and releases an acquired HMX atom lock on errors; these DSP
+  projects compile with `-fno-exceptions` to avoid unsupported unwinder symbols.
+  `T.copy` has no DMA-specific lowering; native
+  Crouton endpoints retain HMX pack/unpack. DMA calls inside `num_workers` are
+  rejected until engine ownership and queue state are worker-local.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
   pipeline axis** — you reduce the whole inner-K for an output tile in one `mxclracc`
@@ -218,7 +238,7 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   to it directly.
 - **Surface a device-side failure** (VTCM/HMX unavailable, an unmet precondition):
   the generated kernel entry returns an `int32` status — `TL_OK` / `TL_ERR_VTCM` /
-  `TL_ERR_HMX` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel the worker
+  `TL_ERR_HMX` / `TL_ERR_DMA` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel the worker
   callback returns the code and `tl_parallel` OR-reduces them into the entry. The
   FastRPC skel maps any nonzero to `AEE_EFAILED`, so the host's `run()` *raises* rather
   than returning unwritten/partial output (the silent-wrong-output trap). The codegen
@@ -246,9 +266,21 @@ benchmarked against the earlier path. Unrecoverable
 device conditions (VTCM grant too small, per-worker HMX enable fails) propagate to the
 host as a raised error via the int32 kernel-status ABI rather than silent wrong output.
 
-**Optional, not yet done:** a qtimer path to measure *codegen-kernel* speedups
-on-device (today only the standalone HMX bench is qtimer-instrumented); autotune
-(`num_workers` + tile sizes as knobs); DMA double-buffering for >VTCM tiles.
+The DMA primitive layer is device-validated on v79 with two linked 1D descriptors and a
+strided type-9 2D descriptor in both directions. This establishes descriptor, dmlink,
+done-bit reclamation, cache, stride, and error-propagation semantics.
+`example_dma_hmx_matmul.py` expresses a two-slot
+output-block prefetch schedule in TileLang: submit two blocks, complete the
+oldest A/B pair, pack it into separate native Crouton buffers, and submit block
+i+2 into the released row-major slot before executing the current block's HMX
+MACs. Each output block spans the full K dimension. `benchmark_dma_matmul.py`
+compares serial and prefetch versions using DSP-local SDK timing; neither file
+imports a handwritten C/C++ compute or DMA scheduling kernel.
+
+**Optional, not yet done:** autotune (`num_workers` + tile sizes as knobs);
+DMA engine ownership integration with worker pools; automatic software-pipeline
+DMA lowering; and schedules for blocks larger than VTCM. Explicit DSL DMA
+submission/wait and DSP timing are available in the examples above.
 
 ---
 

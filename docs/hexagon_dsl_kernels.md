@@ -97,8 +97,12 @@ monolithic `tl_hexagon_hmx_gemm` template. Kernels may use one logical `T.copy` 
 strided DDR matrix region directly to/from an inferred HMX layout; the lowering passes the
 row-major base/stride to
 `tl_hexagon_hmx_pack_crouton`/`unpack_crouton`; normal 64-wide forms use HVX
-`vshuff`/`vdeal`, while transposed and remainder forms remain scalar. The DDR/VTCM leg is the
-future DMA boundary. The native-layout `T.gemm` path is device-validated on v79: a staged
+`vshuff`/`vdeal`, while transposed and remainder forms remain scalar. DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
+permutation. `dma.h` exposes raw instructions, descriptor builders, synchronous
+copy helpers, and a caller-owned linked queue through explicit extern calls;
+`T.dma_copy` / `T.dma_wait` expose a managed per-kernel FIFO for explicit
+manual DMA schedules. `T.copy` has no DMA-specific lowering. The native-layout
+`T.gemm` path is device-validated on v79: a staged
 32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has
 maximum absolute error 0.0009766.
 
