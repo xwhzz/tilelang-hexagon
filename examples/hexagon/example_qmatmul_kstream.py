@@ -96,8 +96,8 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
             E.acquire(acc)
 
             for nt in T.serial(NT):
-                # Keep every in-flight K tile distinct until the completed
-                # accumulator store. Reusing one tile here races HMX mxmem.
+                # Precompute this N tile's native weights.  Streaming variants
+                # may instead reuse a slot immediately after its multiply packet.
                 for kt in T.serial(KT):
                     # One native Q4 tile atom keeps four independent HVX
                     # register chains in flight. T.Layout still supplies the
@@ -119,8 +119,6 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
                         C_hmx,
                         bias,
                         bias_vtcm,
-                        A_hmx,
-                        B_hmx,
                     )
 
                     if output_dtype == "float32":
@@ -266,8 +264,6 @@ def make_staged_hmx(M, N, K):
                         C_hmx,
                         bias,
                         bias_vtcm,
-                        A_hmx,
-                        B_hmx,
                     )
                     for mpair in T.serial(16):
                         m = mt * 32 + 2 * mpair

@@ -42,10 +42,12 @@ public:
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   // Serialize the GPU-style grid: bind each thread_extent IterVar to a loop.
   void VisitStmt_(const AttrStmtNode *op) final;         // NOLINT(*)
+  // Propagate synchronous DMA copy failures through the kernel status ABI.
+  void VisitStmt_(const EvaluateNode *op) final;         // NOLINT(*)
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
   void VisitExpr_(const MinNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
-  // Reject HMX gemm/matmul calls inside a worker-pool kernel (scratch is global).
+  // Apply worker-pool restrictions to target runtime calls.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
   // HVX-vectorize an innermost elementwise loop (the `map` half of the backend's
   // primitive basis); fall back to CodeGenC's scalar loop otherwise.
@@ -60,6 +62,8 @@ private:
   /*! \brief compile-time bump offset (bytes) for placing alloc_shared buffers
    *  in the VTCM arena; reset per function in AddFunction. */
   size_t vtcm_offset_ = 0;
+  bool dma_async_ = false;
+  int dma_capacity_ = 16;
 
   /*! \brief worker-pool (multithreaded grid) state, set per function.  When the
    *  device func carries `hexagon.num_workers` > 0, the outermost block loop is

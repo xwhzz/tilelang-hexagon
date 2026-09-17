@@ -8,6 +8,8 @@ for how the adaptation works.
 
 | Example | Shows |
 |---|---|
+| `benchmark_dma_matmul.py` | DSP-timed serial vs output-block prefetch, entirely DSL DMA/copy/HMX scheduling |
+| `example_dma_hmx_matmul.py` | DSL output-block DMA prefetch + Crouton packing + HMX matmul |
 | `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
 | `example_flash_attention.py` | two HMX gemms + an HVX online softmax, composed on-chip |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
@@ -36,6 +38,7 @@ persistent on-device agent (kept warm across calls); rebuilds are cached in-proc
 cd examples/hexagon
 
 python example_matmul.py --m 256 --n 256 --k 256 --block 64
+python example_dma_hmx_matmul.py
 python example_flash_attention.py --seq 256
 python example_worker_pool.py
 python example_rmsnorm.py --m 64 --n 256
@@ -47,6 +50,14 @@ python example_qmatmul_kstream.py --n 128 --k 512 --io-dtype float32
 
 ```
 matmul 256x256x256 (block 64) on HMX: max abs err = 0.001947  (PASS)
+
+Hexagon DMA primitives: linked-1D=PASS, 2D=PASS
+
+Hexagon DMA double buffer: tiles=8, max abs err = 0 (PASS)
+
+Hexagon DMA+HMX double-buffer matmul (native ping/pong source buffers):
+32x32x256, trials=5, worst max abs err = 0.000243545 (PASS). Recompiled and
+device-validated on v79 on 2026-09-13, including explicit finite-output checks.
 
 flash attention (M=64, SEQ=256, BN=64, D=64) on HMX+HVX: max abs err = 7.492e-05  (PASS)
 
@@ -80,6 +91,29 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   helps HVX-heavy and batched/multi-block work; a single HMX-bound matmul is limited
   by the one matrix engine (the spinlock serializes the MACs). The compute-heavy demo
   is HVX-bound, so its speedup is visible end-to-end.
+- **Explicit async DMA is available as `T.dma_copy(src, dst)` and
+  `T.dma_wait(pending=0)`.** One copy submits one FIFO entry; wait completes and
+  reclaims all but the newest `pending` entries. No separate commit is required.
+  Wait before reading a destination or modifying a source. The kernel also drains
+  the queue at exit. Capacity defaults to 16; set
+  `T.func_attr({"hexagon.dma_queue_capacity": 4})` to configure it (1..256).
+  Submitting to a full queue reports an error instead of silently waiting.
+  Static, in-bounds 1D/2D row-major DDR ↔ VTCM regions are supported. Crouton
+  conversion remains a separate `T.copy`; unsupported async regions fail lowering.
+  Use a manual `T.serial` schedule: worker pools, automatic `T.Pipelined`, and mixing
+  the managed queue with raw DMA calls are unsupported. The caller must exclusively
+  own DMA0. Managed async kernels conservatively disable automatic VTCM allocation
+  reuse; explicit ping/pong still works. Their generated DSP project uses
+  `-fno-exceptions` for scope-based error cleanup.
+  `example_dma_hmx_matmul.py` demonstrates output-block prefetch (BK=K):
+  pack the current row-major slot, submit block i+2 into that slot, then execute
+  HMX from separate native Crouton buffers. `benchmark_dma_matmul.py` compares
+  serial and prefetch schedules using the same DSL operations.
+- **The DMA primitive layer includes caller-owned linked descriptor queues and
+  1D/2D submission primitives.** These remain available for backend integration;
+  `T.copy` has no DMA-specific lowering. Native Crouton endpoints use the HMX
+  pack/unpack path. DMA inside `num_workers` is rejected until engine ownership
+  and queue state are worker-local.
 - The flash-attention softmax runs on **HVX**: the elementwise `T.serial` maps
   (`exp`, rescale, `/l`) are vectorized to 64-lane HVX by the Hexagon codegen, and the
   row reductions go through the reduce tile op (`hexreduce`). It's spelled with explicit
@@ -87,3 +121,31 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   because the backend has no single-thread fragment-layout inference — see the kernel
   comments and the adaptation doc.
 - If a run reports an agent/VTCM error, clear stale agents: `adb shell pkill -f _agent`.
+
+## DMA matmul example and benchmark
+
+`example_dma_hmx_matmul.py` computes a matrix product with output-block DMA
+prefetch (BK=K), using `T.dma_copy`, `T.dma_wait`, Crouton `T.copy`, and
+`HMXIntrinEmitter` atoms. Its default shape is 256×512×2048 with 128×128 output
+blocks. Two row-major staging slots are reused after packing into separate
+native HMX buffers; block i+2 is submitted before block i's HMX computation.
+
+`benchmark_dma_matmul.py` contains a standalone DSL kernel and host runner for
+serial vs prefetch comparison. It imports only the SDK timer header and calls
+`HAP_perf_get_time_us()`; there is no imported C/C++ compute or scheduling kernel.
+
+```bash
+source /home/lyn/workspace/hexagon-env.sh
+export CMAKE_BUILD_PARALLEL_LEVEL=1
+python examples/hexagon/example_dma_hmx_matmul.py
+python examples/hexagon/benchmark_dma_matmul.py --out /tmp/dma-bench
+```
+
+The benchmark uses three correctness seeds, five warmup batches per mode, and
+fifteen alternating samples with ten DSP repetitions per sample.
+`--configs '256,512,2048,128,128'` selects M,N,K,BM,BN; `--samples` and `--repeats`
+override the defaults. Outputs include generated C, individual DSP times,
+medians, errors, and speedups. Each configuration closes its agent, including
+on validation failures. Measurements use warm resident inputs and exclude
+FastRPC round trips; they do not measure cold DDR bandwidth or automatic
+software pipelining.

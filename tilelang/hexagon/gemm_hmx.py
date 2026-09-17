@@ -112,8 +112,6 @@ class GemmHMX(GemmBase):
                         C_buf,
                         bias,
                         bias_vtcm,
-                        A_buf,
-                        B_buf,
                         inst_m_idx=inst_m_idx,
                         inst_n_idx=inst_n_idx,
                     )

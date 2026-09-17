@@ -31,6 +31,25 @@ bool IsHexagonHMXIntrinsic(const CallNode *call) {
          call->op.same_as(tl::hexagon_hmx_store());
 }
 
+bool IsHexagonDMAExtern(const CallNode *call) {
+  if (!call->op.same_as(tirx::builtin::call_extern()) || call->args.empty())
+    return false;
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name && name->value.find("tl_hexagon_dma_") == 0;
+}
+
+bool IsHexagonAsyncCopy(const CallNode *call) {
+  if (!IsHexagonDMAExtern(call))
+    return false;
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name->value == "tl_hexagon_dma_async_copy_1d" ||
+         name->value == "tl_hexagon_dma_async_copy_2d";
+}
+
+bool IsDMAWait(const CallNode *call) {
+  return call->op.same_as(Op::Get("tl.dma_wait"));
+}
+
 } // namespace
 
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
@@ -151,6 +170,31 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   if (auto nw = f->GetAttr<Integer>("hexagon.num_workers")) {
     wp_num_workers_ = static_cast<int>(nw.value()->value);
   }
+  dma_async_ = false;
+  bool raw_dma = false;
+  tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (IsHexagonAsyncCopy(call) || IsDMAWait(call))
+        dma_async_ = true;
+      else if (IsHexagonDMAExtern(call))
+        raw_dma = true;
+    }
+  });
+  dma_capacity_ = 16;
+  if (auto capacity = f->GetAttr<Integer>("hexagon.dma_queue_capacity")) {
+    ICHECK(capacity.value()->value > 0 && capacity.value()->value <= 256)
+        << "hexagon.dma_queue_capacity must be in [1, 256]";
+    dma_capacity_ = static_cast<int>(capacity.value()->value);
+  }
+  if (dma_async_) {
+    ICHECK_EQ(wp_num_workers_, 0)
+        << "Hexagon async DMA does not support worker pools";
+    ICHECK(!raw_dma)
+        << "Hexagon async DMA cannot share a kernel with raw DMA calls";
+    name_supply_->ReserveName("tl_dma_async");
+    decl_stream << "#include <tl_templates/hexagon/dma.h>\n";
+  }
+
   // Reserve the worker callback's fixed identifiers BEFORE assigning param ids, so a
   // kernel parameter named e.g. "tl_nw" can't collide with them (mirrors how the
   // CUDA backend reserves its runtime helper names).
@@ -349,7 +393,14 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+  if (dma_async_) {
+    stream << "  tl_hexagon_dma_async_context<" << dma_capacity_
+           << "> tl_dma_async;\n";
+    stream << "  if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
+  }
   this->PrintStmt(f->body);
+  if (dma_async_)
+    stream << "  if (tl_dma_async.wait(0) != TL_OK) return TL_ERR_DMA;\n";
   // VTCM is acquired+checked once at session _open and held, so a serial kernel
   // can't fail mid-run here; emit success.  (Worker-pool entries return earlier.)
   this->PrintIndent();
@@ -492,9 +543,49 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                       "scratch-free Crouton copy helpers and T.gemm "
                       "(tl_hexagon_hmx_gemm) are worker-safe.";
       }
+      if (s->value.find("tl_hexagon_dma_") == 0) {
+        LOG(FATAL) << "CodeGenTileLangHexagon: DMA calls inside a "
+                      "hexagon.num_workers kernel are unsupported until DMA "
+                      "engine ownership and queue state are worker-local.";
+      }
     }
   }
   CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
+  const auto *call = op->value.as<CallNode>();
+  if (dma_async_ && call &&
+      (call->op.same_as(tl::hexagon_hmx_acquire()) ||
+       call->op.same_as(tl::hexagon_hmx_release()))) {
+    CodeGenC::VisitStmt_(op);
+    PrintIndent();
+    stream << "tl_dma_async.release_hmx = "
+           << (call->op.same_as(tl::hexagon_hmx_acquire())
+                   ? "tl_hmx_unit_release" : "nullptr") << ";\n";
+    return;
+  }
+  if (call && (IsHexagonAsyncCopy(call) || IsDMAWait(call))) {
+    ICHECK(dma_async_ && !wp_emit_);
+    PrintIndent();
+    stream << "if (tl_dma_async.";
+    if (IsDMAWait(call)) {
+      const auto *pending = call->args[0].as<IntImmNode>();
+      ICHECK(pending && pending->value >= 0 && pending->value <= dma_capacity_)
+          << "T.dma_wait pending must be static and within queue capacity";
+      stream << "wait(" << pending->value;
+    } else {
+      const auto *name = call->args[0].as<StringImmNode>();
+      stream << (name->value == "tl_hexagon_dma_async_copy_1d" ? "copy_1d(" : "copy_2d(");
+      for (size_t i = 1; i < call->args.size(); ++i) {
+        if (i != 1) stream << ", ";
+        stream << PrintExpr(call->args[i]);
+      }
+    }
+    stream << ") != TL_OK) return TL_ERR_DMA;\n";
+    return;
+  }
+  CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {

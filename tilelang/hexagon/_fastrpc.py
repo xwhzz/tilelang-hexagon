@@ -134,6 +134,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # kernel references the `tl_hvx` prefix (self-contained, needs only -mhvx).
     uses_hvx = "tl_hvx" in kernel_source
     hvx_include = "#include <tl_templates/hexagon/hvx_math.h>\n" if uses_hvx else ""
+    # User-DMA primitives are header-only.  They use QuRT cache maintenance and
+    # Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
+    uses_dma = "tl_hexagon_dma_" in kernel_source
+    dma_include = "#include <tl_templates/hexagon/dma.h>\n" if uses_dma else ""
     # Q8_0 GEMV instruction atoms.  qgemv.h pulls in its own HVX arithmetic
     # helpers; keep detection separate so a dot-only kernel does not depend on
     # spelling an internal tl_hvx_* symbol in generated source.
@@ -170,6 +174,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{vtcm_include}"
         f"{worker_include}"
         f"{hmx_include}"
+        f"{dma_include}"
         f"{hvx_include}"
         f"{qgemv_include}"
         f"{qmatmul_include}"
@@ -376,12 +381,15 @@ int main(int argc, char** argv) {{
 """
 
 
-def gen_cmake(iface: str, template_dir: str, with_agent: bool = True) -> str:
+def gen_cmake(iface: str, template_dir: str, with_agent: bool = True,
+              async_dma: bool = False) -> str:
     # Mirrors mini-htp/CMakeLists.txt: host exe (stub + driver) and DSP skel
     # (skel + impl, compiled with HVX/HMX enabled).  ``template_dir`` is the
     # parent of ``tl_templates`` so the kernel's <tl_templates/hexagon/...>
     # include resolves (matches how nvcc/hipcc get -I TILELANG_TEMPLATE_PATH).
     # The persistent agent target is emitted only when the kernel is agent-eligible.
+    # Scope-based queue cleanup must not import an unavailable DSP C++ unwinder.
+    exception_flags = " -fno-exceptions" if async_dma else ""
     agent_block = ("""
     # Persistent agent: same FastRPC stub, served over a TCP socket (reuses the
     # IDL artifacts from IFACE_test, ordered via add_dependencies).
@@ -440,7 +448,7 @@ else()
     )
     build_idl({iface}.idl {iface}_skel)
     set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error")
-    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error")
+    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error{exception_flags}")
     copy_binaries({iface}_skel)
 endif()
 """
@@ -472,7 +480,10 @@ def write_project(workdir: str, kernel_name: str, kernel_source: str, params, re
         f"{iface}.idl": gen_idl(iface, plans),
         f"{iface}_dsp.cc": gen_dsp(iface, kernel_name, kernel_source, plans),
         f"{iface}_host.c": gen_host(iface, plans),
-        "CMakeLists.txt": gen_cmake(iface, TILELANG_TEMPLATE_PATH, with_agent=with_agent),
+        "CMakeLists.txt": gen_cmake(
+            iface, TILELANG_TEMPLATE_PATH, with_agent=with_agent,
+            async_dma="tl_hexagon_dma_async_context<" in kernel_source,
+        ),
     }
     if with_agent:
         files[f"{iface}_agent.c"] = gen_agent(iface, plans)
