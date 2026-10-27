@@ -324,16 +324,18 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_merge_all(const tl_hvx_reg<A> *part, int i0) {
                                  tl_reduce_merge_all<K, A, M / 2>(part, i0 + M / 2));
 }
 
-// Rows [0, N) of a block, N a power of two, rows from n on padding. Short
-// rows (up to two registers) all inline into one tree. Long rows run in a
-// loop over groups of four, whose trees meet in a tree of the groups, so the
-// code holds four row loops whatever N is.
+// Rows [0, N) of a block, N a power of two, rows from n on padding. Rows of
+// one or two whole steps all inline into one tree. Other rows run in a loop
+// over groups of four, whose trees meet in a tree of the groups, so the code
+// holds four row bodies whatever N is: 64 inlined rows with tails spill to a
+// 17 KB stack frame, past what a FastRPC thread's stack holds.
 template <int K, typename A, typename S, bool Aligned, int N>
 TL_DEVICE tl_hvx_reg<A> tl_reduce_rows_of(const S *src, int src_stride,
                                           int cols, int n) {
   constexpr int G = 4;
+  constexpr int E = tl_reduce_step<A, S>;
   if constexpr (N > G) {
-    if (cols * static_cast<int>(sizeof(S)) > 256) {
+    if (cols % E != 0 || cols > 2 * E) {
       tl_hvx_reg<A> part[N / G];
 #pragma clang loop unroll(disable)
       for (int g = 0; g < N / G; ++g)
