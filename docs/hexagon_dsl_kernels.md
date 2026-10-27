@@ -125,21 +125,13 @@ C addresses without an internal staging atom or HVX commit.
 `GemmHMX.lower` takes only `T.gemm(A, B, C)`. Layout inference assigns native Crouton layouts
 to those VTCM buffers, while lowering owns the dependency-only HMX states, internal scale/bias
 block, and outer M/N loops. It emits the same explicit atoms and no longer calls the legacy
-monolithic `tl_hexagon_hmx_gemm` template. Kernels may use one logical `T.copy` to move a
-strided DDR matrix region directly to/from an inferred HMX layout; the lowering passes the
-row-major base/stride to
-`tl_hexagon_hmx_pack_crouton`/`unpack_crouton`; normal 64-wide forms use HVX
-`vshuff`/`vdeal`. Contiguous aligned W[N,K] with K divisible by 64 uses a
-32x64 register-shuffle transpose; other transposed/remainder forms retain the
-scalar fallback. Activation/output Crouton copies also support FP32 row-major
-endpoints, fusing FP32↔FP16 conversion with the layout change.
-
-`T.copy(..., annotations={"hexagon.copy_workers": 6})` partitions a complete
-activation/output or transposed-weight layout copy into disjoint native tiles
-using TileLang's persistent pool. It returns after all tiles complete, uses no
-private allocation, and can overlap the caller's DMA of a different input slot.
-This annotation cannot nest inside a `num_workers` kernel. The operator still
-expresses its A/W/C lifetimes and HMX schedule in DSL.
+monolithic `tl_hexagon_hmx_gemm` template. Kernels may use one logical `T.copy` to move any
+region of a strided matrix, in DDR or VTCM, fp16 or fp32, to or from a Crouton buffer: the
+lowering passes the region's origin and the matrix strides to one `tl_crouton_copy`, which
+converts fp32 on the way. Row pairs of a row-contiguous matrix move as HVX registers
+(`vshuff`/`vdeal`), with masked stores for partial tiles at the region's edges; packing a
+column-contiguous fp16 matrix (a transposed weight in row-major storage) goes through a
+32x32 word transpose in registers; other strides go element by element.
 
 DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
 permutation. `dma.h` exposes raw instructions, descriptor builders, synchronous

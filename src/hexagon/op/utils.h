@@ -1,10 +1,12 @@
 /*!
  * \file tl/hexagon/op/utils.h
- * \brief Region helpers shared by the Hexagon copy and DMA lowerings.
+ * \brief Helpers shared by the Hexagon tile-op lowerings.
  */
 
 #ifndef TVM_TL_HEXAGON_OP_UTILS_H_
 #define TVM_TL_HEXAGON_OP_UTILS_H_
+
+#include "op/operator.h"
 
 #include <tvm/ir/expr.h>
 #include <tvm/tirx/buffer.h>
@@ -28,6 +30,13 @@ PrimExpr MakeAccessPtrAtRegion(const tirx::Buffer &buffer,
                                const ffi::Array<Range> &region,
                                const ffi::Array<PrimExpr> &strides, int rw_mask,
                                const PrimExpr &extent, int64_t offset = 0);
+
+/*!
+ * \brief Whether the elements of `buffer` sit at their row-major positions:
+ * it has no layout, or one that maps every index there (a fragment one thread
+ * holds whole).
+ */
+bool RowMajor(const tirx::Buffer &buffer, const LayoutMap &layout_map);
 
 } // namespace hexagon
 } // namespace tl

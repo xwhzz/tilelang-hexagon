@@ -1,10 +1,11 @@
 /*!
  * \file tl/hexagon/op/utils.cc
- * \brief Region helpers shared by the Hexagon copy and DMA lowerings.
+ * \brief Helpers shared by the Hexagon tile-op lowerings.
  */
 
 #include "utils.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
@@ -49,6 +50,26 @@ PrimExpr MakeAccessPtrAtRegion(const Buffer &buffer, const Array<Range> &region,
   Array<PrimExpr> args{ptype, buffer->data, first, extent,
                        IntImm(DataType::Int(32), rw_mask)};
   return Call(DataType::Handle(), builtin::tvm_access_ptr(), args);
+}
+
+bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
+  Optional<Layout> layout = layout_map.Get(buffer);
+  if (!layout)
+    return true;
+  if (const auto *fragment = layout.value().as<FragmentNode>()) {
+    if (!is_one(fragment->ThreadExtent()) ||
+        !is_one(fragment->ReplicateExtent()))
+      return false;
+  }
+  PrimExpr row_major = make_zero(DataType::Int(32));
+  Array<PrimExpr> shape = layout.value()->InputShape();
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    row_major = row_major * shape[i] + InputPlaceholder(i);
+    analyzer.Bind(InputPlaceholder(i), Range(0, shape[i]));
+  }
+  return analyzer.CanProveEqual(layout.value()->GetLinearizedForwardIndex(),
+                                row_major);
 }
 
 } // namespace hexagon

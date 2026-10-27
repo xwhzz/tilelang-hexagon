@@ -111,6 +111,13 @@ TVM_DLL const Op &hexagon_load_lanes();
 // of a vector of `lanes`.
 TVM_DLL const Op &hexagon_broadcast_lane();
 
+// tl_crouton_copy<pack, column_tiles>(crouton, row_tiles, col_tiles, r0, c0,
+// rows, cols, matrix, rs, cs) (crouton.h): copies the region [r0, r0 + rows) x
+// [c0, c0 + cols) of a Crouton matrix to (pack: from) the strided matrix whose
+// element (r0 + i, c0 + j) is matrix[i * rs + j * cs]. `pack` and
+// `column_tiles` ("true" or "false") print as template arguments.
+TVM_DLL const Op &hexagon_crouton_copy();
+
 // tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();

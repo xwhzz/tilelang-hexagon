@@ -17,15 +17,13 @@ HMX 指令顺序都位于 `examples/hexagon/example_demo_ops.py`，没有手写 
   每行归一化系数留在寄存器。
   优化路径要求完整 tile、N 为 32 倍数；非整齐形状保留基础实现。
 - **通用复制**：修复 `vec_type` 隐式结构体复制变为逐 128-byte `memcpy` 调用的问题，
-  显式复制 native vector。`T.copy` 可以融合 FP32↔FP16 与 activation/output Crouton
-  布局转换；转置 W 的连续 32×64 tile 使用寄存器 shuffle，其他布局保留标量路径。
-- **并行布局转换**：`T.copy(..., annotations={"hexagon.copy_workers": 6})`
-  在普通 kernel 内同步分配互不重叠的布局 tile；同时允许调用线程预取下一个槽位。
-  这是通用布局复制原语，不含 GEMM、RMSNorm 或预取策略。禁止在 `num_workers`
-  kernel 中嵌套分发；只支持已匹配的完整 activation/output、转置 weight 布局。
+  显式复制 native vector。`T.copy` 在 Crouton buffer 的任意区域和 DDR/VTCM 中带
+  stride 的 FP16/FP32 矩阵之间复制，生成一次 `tl_crouton_copy`，同时完成 FP32↔FP16
+  转换。行连续矩阵按行对整寄存器复制，区域边缘的部分 tile 用 masked store；按列连续的
+  FP16 矩阵（行主序存放的转置 W）打包时在寄存器里做 32×32 字转置；其他 stride 逐元素复制。
 - **GEMM 接口**：FP32 A `[M,K]`、FP16 W `[N,K]`、FP32 C `[M,N]`，计算 `A @ W.T`。
   内部使用 FP16 HMX，每次调用执行转换和打包，不要求预打包权重。K 整段累加，
-  一个 HMX 单元，HVX workers 负责复制/布局转换。M/N/K/BN 为正的 32 倍数，
+  一个 HMX 单元。M/N/K/BN 为正的 32 倍数，
   N 可被 BN 整除，live set 必须放入实际 VTCM。
 
 队列必须由同一 QuRT 线程提交和完成，不混用 raw/外部 DMA。并发 DDR 写须独占

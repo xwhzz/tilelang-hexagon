@@ -29,6 +29,12 @@ template <bool Aligned> TL_DEVICE HVX_Vector tl_hvx_load(const void *p) {
   else
     return tl_hvx_loadu(p);
 }
+template <bool Aligned> TL_DEVICE void tl_hvx_store(void *p, HVX_Vector v) {
+  if constexpr (Aligned)
+    *(HVX_Vector *)p = v;
+  else
+    tl_hvx_storeu(p, v);
+}
 
 // The `nbytes` (1..128) bytes at `p` in the low bytes of a register; the other
 // bytes are undefined. Reads only the aligned blocks that hold those bytes, so

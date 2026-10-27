@@ -124,7 +124,7 @@ def test_async_hmx_dsl_schedule():
     # Double buffering: two output blocks of two copies each are in flight.
     assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async;" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in source
-    assert "tl_hexagon_hmx_pack_crouton" in source
+    assert "tl_crouton_copy<true," in source
     assert "tl_hexagon_hmx_mma_atom" in source
     assert "tl_hexagon_dma_copy_hmx_matmul_double_buffer" not in source
 

@@ -137,6 +137,9 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
     uses_dma = "tl_hexagon_dma_" in kernel_source
     dma_include = "#include <tl_templates/hexagon/dma.h>\n" if uses_dma else ""
+    # Copies between Crouton matrices and strided matrices (T.copy).
+    uses_crouton = "tl_crouton_" in kernel_source
+    crouton_include = "#include <tl_templates/hexagon/crouton.h>\n" if uses_crouton else ""
     # Q8_0 GEMV instruction atoms.  qgemv.h pulls in its own HVX arithmetic
     # helpers; keep detection separate so a dot-only kernel does not depend on
     # spelling an internal tl_hvx_* symbol in generated source.
@@ -168,6 +171,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{hmx_include}"
         f"{dma_include}"
         f"{hvx_include}"
+        f"{crouton_include}"
         f"{qgemv_include}"
         f"{qmatmul_include}"
         "// ---- the tilelang-generated device kernel ----\n"

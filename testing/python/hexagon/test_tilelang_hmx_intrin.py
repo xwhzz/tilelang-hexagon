@@ -252,7 +252,7 @@ def test_hmx_crouton_layout_contract():
     assert _offset(atom, 0, 1) == 2
 
     activation = make_hmx_activation_layout((64, 64))
-    assert _output_shape(activation) == (2, 2, 1024)
+    assert _output_shape(activation) == (4096,)
     assert _offset(activation, 0, 0) == 0
     assert _offset(activation, 1, 0) == 1
     assert _offset(activation, 0, 1) == 2
@@ -260,7 +260,7 @@ def test_hmx_crouton_layout_contract():
     assert _offset(activation, 32, 0) == 2048
 
     weight = make_hmx_weight_layout((64, 64))
-    assert _output_shape(weight) == (2, 2, 1024)
+    assert _output_shape(weight) == (4096,)
     assert _offset(weight, 0, 0) == 0
     assert _offset(weight, 1, 0) == 1
     assert _offset(weight, 0, 1) == 2
@@ -272,12 +272,12 @@ def test_hmx_crouton_layout_contract():
             assert _offset(weight, 2 * kpair + 1, n) == kpair * 64 + 2 * n + 1
 
     output = make_hmx_output_layout((64, 64))
-    assert _output_shape(output) == (2, 2, 1024)
+    assert _output_shape(output) == (4096,)
     assert _offset(output, 0, 32) == 1024
     assert _offset(output, 32, 0) == 2048
 
     staged = make_hmx_weight_layout((2, 32, 32))
-    assert _output_shape(staged) == (2, 1024)
+    assert _output_shape(staged) == (2048,)
     assert _offset(staged, 1, 0, 0) == 1024
 
     assert len({_offset(weight, k, n) for k in range(64) for n in range(64)}) == 4096
@@ -307,21 +307,9 @@ def test_hmx_emitter_native_interface_contract():
     assert emitter.num_m_tiles == 2
     assert emitter.num_n_tiles == 3
     assert emitter.num_k_atoms == 4
-    assert _output_shape(emitter.activation_layout((64, 128))) == (
-        2,
-        4,
-        1024,
-    )
-    assert _output_shape(emitter.weight_layout((128, 96))) == (
-        3,
-        4,
-        1024,
-    )
-    assert _output_shape(emitter.output_layout((64, 96))) == (
-        2,
-        3,
-        1024,
-    )
+    assert _output_shape(emitter.activation_layout((64, 128))) == (8192,)
+    assert _output_shape(emitter.weight_layout((128, 96))) == (12288,)
+    assert _output_shape(emitter.output_layout((64, 96))) == (6144,)
     assert not hasattr(emitter, "make_mma_load_layout")
     assert not hasattr(emitter, "make_mma_store_layout")
     assert not hasattr(emitter, "mma_num_inst_m")
@@ -417,12 +405,11 @@ def test_t_gemm_lowers_to_native_hmx_layout_and_atoms():
         offsets[name] = int(match.group(1))
         assert offsets[name] % 2048 == 0
 
-    # Each logical DDR/native-Crouton boundary becomes one strided helper call.
-    assert source.count("tl_hexagon_hmx_pack_crouton") == 2
-    assert source.count("tl_hexagon_hmx_unpack_crouton") == 1
-    assert "tl_hexagon_hmx_pack_crouton((&(((half*)A_hmx)[0])), (&(A[0])), 64, 64, 64, 1, 0)" in source
-    assert "tl_hexagon_hmx_pack_crouton((&(((half*)B_hmx)[0])), (&(B[0])), 64, 64, 64, 1, 1)" in source
-    assert "tl_hexagon_hmx_unpack_crouton((&(C[0])), (&(((half*)C_hmx)[0])), 64, 64, 64, 1, 0)" in source
+    # Each logical DDR/native-Crouton boundary becomes one Crouton copy.
+    assert source.count("tl_crouton_copy<") == 3
+    assert "tl_crouton_copy<true, false>((&(((half*)A_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(A[0])), 64, 1);" in source
+    assert "tl_crouton_copy<true, true>((&(((half*)B_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(B[0])), 64, 1);" in source
+    assert "tl_crouton_copy<false, false>((&(((half*)C_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(C[0])), 64, 1);" in source
 
 
 def test_t_gemm_transposed_operands_use_composed_native_layouts():
@@ -431,8 +418,9 @@ def test_t_gemm_transposed_operands_use_composed_native_layouts():
 
     assert "A_hmx)[(inst_m_idx * 2048)]" in transposed_a
     assert "B_hmx)[(inst_n_idx * 2048)]" in transposed_b
-    assert "(&(((half*)A_hmx)[0])), (&(A[0])), 64, 64, 64, 1, 2)" in transposed_a
-    assert "(&(((half*)B_hmx)[0])), (&(B[0])), 64, 64, 64, 1, 3)" in transposed_b
+    # A transposed operand's matrix runs down its storage columns.
+    assert "tl_crouton_copy<true, false>((&(((half*)A_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(A[0])), 1, 64);" in transposed_a
+    assert "tl_crouton_copy<true, true>((&(((half*)B_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(B[0])), 1, 64);" in transposed_b
     for source in (transposed_a, transposed_b):
         assert "tl_hexagon_hmx_mma_atom" in source
         assert "tl_hexagon_hmx_gemm" not in source
@@ -454,19 +442,17 @@ def test_flash_attention_keeps_row_reduce_outside_crouton_buffers():
         assert "(&(((half*)S)[0]))" in line, line
 
     assert source.count("tl_hexagon_hmx_mma_atom") == 2
-    assert source.count("tl_hexagon_hmx_pack_crouton") == 4
-    assert source.count("tl_hexagon_hmx_unpack_crouton") == 2
+    assert source.count("tl_crouton_copy<true,") == 4
+    assert source.count("tl_crouton_copy<false,") == 2
     assert "tl_hexagon_hmx_gemm" not in source
 
 
 def test_hmx_copy_matches_singleton_tile_axes_and_dequant_staging():
     source = _lower_source(make_qmatmul(32, 128, 128))
 
-    assert source.count("tl_hexagon_hmx_pack_crouton") == 2
-    assert source.count("tl_hexagon_hmx_unpack_crouton") == 1
-    assert "(&(((half*)A_hmx)[0])), (&(A[0])), 32, 128, 128, 1, 0)" in source
-    assert "(&(((half*)B_row)[0])), 128, 128, 128, 1, 1)" in source
-    assert "tl_hexagon_hmx_unpack_crouton((&(C[0])), (&(((half*)C_hmx)[0])), 32, 128, 128, 1, 0)" in source
+    assert "tl_crouton_copy<true, false>((&(((half*)A_hmx)[0])), 1, 4, 0, 0, 32, 128, (&(A[0])), 128, 1);" in source
+    assert "tl_crouton_copy<true, true>((&(((half*)B_hmx)[0])), 4, 4, 0, 0, 128, 128, (&(((half*)B_row)[0])), 128, 1);" in source
+    assert "tl_crouton_copy<false, false>((&(((half*)C_hmx)[0])), 1, 4, 0, 0, 32, 128, (&(C[0])), 128, 1);" in source
     assert "A_row" not in source
     assert "C_row" not in source
     assert not any("B_hmx)[" in line and "=" in line for line in source.splitlines())
@@ -475,19 +461,17 @@ def test_hmx_copy_matches_singleton_tile_axes_and_dequant_staging():
 def test_hmx_copy_fuses_global_matrix_slices_with_one_logical_copy():
     source = _lower_source(_make_fused_copy_probe())
 
-    assert source.count("tl_hexagon_hmx_pack_crouton") == 2
-    assert source.count("tl_hexagon_hmx_unpack_crouton") == 1
-    assert "tl_hexagon_hmx_pack_crouton((&(((half*)A_hmx)[0])), (&(A[(by * 8192)])), 64, 64, 128, 1, 0)" in source
-    assert "tl_hexagon_hmx_pack_crouton((&(((half*)B_hmx)[0])), (&(B[(bx * 64)])), 64, 64, 128, 1, 1)" in source
-    assert "tl_hexagon_hmx_unpack_crouton((&(C[((by * 8192) + (bx * 64))])), (&(((half*)C_hmx)[0])), 64, 64, 128, 1, 0)" in source
+    assert "tl_crouton_copy<true, false>((&(((half*)A_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(A[(by * 8192)])), 128, 1);" in source
+    assert "tl_crouton_copy<true, true>((&(((half*)B_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(B[(bx * 64)])), 128, 1);" in source
+    assert "tl_crouton_copy<false, false>((&(((half*)C_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(C[((by * 8192) + (bx * 64))])), 128, 1);" in source
 
 
 def test_hmx_pack_unpack_is_worker_local():
     source = _lower_source(make_batched_matmul(2, 64, 64, 64, 2))
 
     assert "tl_parallel" in source
-    assert source.count("tl_hexagon_hmx_pack_crouton") == 2
-    assert source.count("tl_hexagon_hmx_unpack_crouton") == 1
+    assert source.count("tl_crouton_copy<true,") == 2
+    assert source.count("tl_crouton_copy<false,") == 1
     assert source.count("tl_hexagon_hmx_mma_atom") == 1
     assert "A_row" not in source
     assert "B_row" not in source

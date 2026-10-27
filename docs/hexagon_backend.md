@@ -83,7 +83,8 @@ These are the decisions that keep the adaptation small and the code navigable.
   (`VisitStmt_(ForNode)`); place `alloc_shared` in the tile program's VTCM arena
   (`VisitStmt_(AllocBufferNode)`).
 - **Layer 4** — the recipe headers (Section 6/7). `common.h` (types), `vtcm.h` (the
-  arena), `hmx.h` (the HMX matmul + HVX Crouton pack/unpack + session), `worker.h`
+  arena), `hmx.h` (the HMX atoms + session), `crouton.h` (copies to and from
+  Crouton matrices), `worker.h`
   (the HW-thread pool).
 - **Layer 5** — `tilelang/hexagon/runtime/`: `fastrpc.py` generates the IDL + skel +
   host + CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK
@@ -157,14 +158,13 @@ attention, worker pool) live in [`examples/hexagon/`](../examples/hexagon/).
 | `T.Kernel(grid)` | nested `for` loops (grid serialized on one HW thread) | — |
 | `T.Kernel(..., num_workers=N)` | one `tl_parallel_for` over the linearized grid: up to N HW threads run its tile programs, each worker with a private VTCM arena | `worker.h` |
 | `T.alloc_shared` | a byte offset into the tile program's VTCM arena (`tl_vtcm_arena()+off`, or the worker's `tl_arena+off`) | `vtcm.h` |
-| `T.copy(global, hmx_shared)` | strided DDR -> native Crouton pack (`vshuff` on the common path) | Hexagon copy/layout lowering |
-| `T.copy(hmx_shared, global)` | native Crouton -> strided DDR unpack (`vdeal` on the common path) | Hexagon copy/layout lowering |
-| `T.copy(row_shared, hmx_shared)` | native Crouton pack/unpack | Hexagon copy/layout lowering |
+| `T.copy(matrix, crouton_shared)` | one `tl_crouton_copy`: pack a region of a strided fp16/fp32 matrix (DDR or VTCM) into Crouton tiles | `copy.cc`, `crouton.h` |
+| `T.copy(crouton_shared, matrix)` | one `tl_crouton_copy`: unpack a Crouton region into a strided matrix | `copy.cc`, `crouton.h` |
 | `T.gemm(A,B,C)` | explicit HMX atom loops; each result stores directly into its 2 KB-aligned native C tile | `gemm_hmx.py`, `hmx.h` |
 
-Reading generated C for a tiled matmul now shows the grid loops, strided
-`tl_hexagon_hmx_pack_crouton`/`unpack_crouton` calls at the DDR/native boundary,
-native Crouton VTCM offsets, and explicit HMX atoms.
+Reading generated C for a tiled matmul now shows the grid loops, one
+`tl_crouton_copy` per matrix at the DDR/Crouton boundary, Crouton VTCM offsets,
+and explicit HMX atoms.
 
 ---
 
@@ -173,11 +173,14 @@ native Crouton VTCM offsets, and explicit HMX atoms.
 - **Crouton layout.** HMX reads operands from VTCM in a mandatory 32×32-tile layout:
   `cpos(i,j) = (i&~1)*32 + j*2 + (i&1)` — a **row-pair interleave**. That interleave
   is exactly one HVX `Q6_W_vshuff_VVR` of two source rows per 64-column span (and
-  `vdeal` to unpack). `GemmHMX.infer_layout` assigns this native layout directly. A full
-  FP16 VTCM-to-VTCM `T.copy` with exactly one HMX-layout endpoint is recognized by the
-  Hexagon copy lowering and uses those helpers. Widths not divisible by 64 and transposed
-  source storage retain scalar fallbacks. The row-major stride is explicit in the helper
-  ABI. DMA remains a separate row-major staging operation: the DMA descriptor can move
+  `vdeal` to unpack). `GemmHMX.infer_layout` assigns a `CroutonLayout` to every
+  operand. A `T.copy` between any region of a Crouton buffer and a strided fp16 or
+  fp32 matrix lowers to one `tl_crouton_copy`, which converts on the way. Row pairs
+  of a row-contiguous matrix move as whole registers (masked at the region's
+  edges); packing a column-contiguous fp16 matrix (a transposed operand in
+  row-major storage) goes through a 32x32 word transpose in registers; other
+  strides go element by element. DMA remains a
+  separate row-major staging operation: the DMA descriptor can move
   contiguous/row-strided rectangles but cannot express the Crouton permutation.
 
 - **DMA primitives are invoked explicitly.** `dma.h` provides raw User-DMA
@@ -200,8 +203,8 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   ownership; compiler pipelines and mixing raw DMA calls are rejected. Scope-based
   cleanup drains DMA and releases an acquired HMX atom lock on errors; these DSP
   projects compile with `-fno-exceptions` to avoid unsupported unwinder symbols.
-  `T.copy` has no DMA-specific lowering; native
-  Crouton endpoints retain HMX pack/unpack. In a `num_workers` kernel every tile
+  `T.copy` has no DMA-specific lowering; a
+  Crouton endpoint makes it a `tl_crouton_copy`. In a `num_workers` kernel every tile
   program owns its DMA queue; raw DMA calls are rejected there.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the

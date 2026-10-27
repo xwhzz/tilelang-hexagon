@@ -20,6 +20,7 @@
 #include "backend/common/op/reduce.h"
 #include "backend/common/target_utils.h"
 #include "hexagon/op/builtin.h"
+#include "hexagon/op/utils.h"
 #include "layout/layout.h"
 #include "op/utils.h"
 
@@ -67,29 +68,6 @@ DataType AccType(const ReduceOpNode &op) {
       (op.clear || dst == DataType::Float(16)))
     return DataType::Float(16);
   return DataType::Float(32);
-}
-
-// Whether the elements of `buffer` sit at their row-major positions: it has no
-// layout, or one that maps every index there (a fragment one thread holds
-// whole).
-bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
-  Optional<Layout> layout = layout_map.Get(buffer);
-  if (!layout)
-    return true;
-  if (const auto *fragment = layout.value().as<FragmentNode>()) {
-    if (!is_one(fragment->ThreadExtent()) ||
-        !is_one(fragment->ReplicateExtent()))
-      return false;
-  }
-  PrimExpr row_major = make_zero(DataType::Int(32));
-  Array<PrimExpr> shape = layout.value()->InputShape();
-  arith::Analyzer analyzer;
-  for (size_t i = 0; i < shape.size(); ++i) {
-    row_major = row_major * shape[i] + InputPlaceholder(i);
-    analyzer.Bind(InputPlaceholder(i), Range(0, shape[i]));
-  }
-  return analyzer.CanProveEqual(layout.value()->GetLinearizedForwardIndex(),
-                                row_major);
 }
 
 // The stride of `axis` in a compact row-major buffer, in elements.

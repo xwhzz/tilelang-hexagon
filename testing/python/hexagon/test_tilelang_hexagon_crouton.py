@@ -1,0 +1,168 @@
+"""Crouton layouts and T.copy between Crouton and row-major buffers on Hexagon."""
+
+import os
+
+import pytest
+
+import tilelang
+from tilelang import tvm
+from tilelang.backend.target import determine_target
+from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import (
+    CroutonLayout,
+    make_hmx_activation_layout,
+    make_hmx_output_layout,
+    make_hmx_weight_layout,
+)
+
+DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+
+KINDS = {
+    "activation": lambda b: make_hmx_activation_layout(b),
+    "weight": lambda b: make_hmx_weight_layout(b),
+    "activation_t": lambda b: make_hmx_activation_layout(b, transposed=True),
+    "weight_t": lambda b: make_hmx_weight_layout(b, transposed=True),
+}
+R, C = 64, 96
+REGIONS = {"full": (0, R, 0, C), "partial": (3, 61, 5, 91)}
+
+
+def _source(func):
+    target = determine_target("hexagon", return_object=True)
+    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
+        return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
+
+
+def _round_trip(kind, dtype, endpoint, region):
+    """X[region] -> zeroed Crouton tiles -> Y, the whole tile matrix."""
+    r0, r1, c0, c1 = REGIONS[region]
+
+    @T.prim_func
+    def kernel(X: T.Tensor((R, C), dtype), Y: T.Tensor((R, C), dtype)):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((R, C), "float16")
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.fill(tiles, 0)
+            if endpoint == "vtcm":
+                x = T.alloc_shared((R, C), dtype)
+                y = T.alloc_shared((R, C), dtype)
+                T.copy(X, x)
+                T.copy(x[r0:r1, c0:c1], tiles[r0:r1, c0:c1])
+                T.copy(tiles, y)
+                T.copy(y, Y)
+            else:
+                T.copy(X[r0:r1, c0:c1], tiles[r0:r1, c0:c1])
+                T.copy(tiles, Y)
+
+    return kernel
+
+
+def test_hmx_layouts_are_crouton_layout_objects():
+    activation = make_hmx_activation_layout((64, 128))
+    weight = make_hmx_weight_layout((128, 96), transposed=True)
+    assert isinstance(activation, CroutonLayout)
+    assert (bool(activation.column_tiles), bool(activation.transposed)) == (False, False)
+    assert (bool(weight.column_tiles), bool(weight.transposed)) == (True, True)
+    assert isinstance(make_hmx_output_layout((2, 32, 64)), CroutonLayout)
+
+
+def test_a_region_copy_passes_its_origin_and_strides():
+    source = _source(_round_trip("activation", "float16", "ddr", "partial"))
+    # Rows [3, 61) and columns [5, 91) of a 2 x 3 tile matrix, from X[3, 5].
+    assert "tl_crouton_copy<true, false>((&(tiles[0])), 2, 3, 3, 5, 58, 86, (&(X[293])), 96, 1);" in source
+    assert "tl_crouton_copy<false, false>((&(tiles[0])), 2, 3, 0, 0, 64, 96, (&(Y[0])), 96, 1);" in source
+
+
+def test_a_transposed_layout_swaps_the_matrix_axes():
+    source = _source(_round_trip("weight_t", "float32", "ddr", "partial"))
+    # Storage [64, 96] holds the matrix [96, 64]: its rows run down the
+    # storage columns.
+    assert "tl_crouton_copy<true, true>((&(tiles[0])), 3, 2, 5, 3, 86, 58, (&(X[293])), 1, 96);" in source
+
+
+def test_batched_crouton_buffers_copy_one_matrix():
+    @T.prim_func
+    def kernel(X: T.Tensor((64, 64), "float32"), Y: T.Tensor((64, 64), "float32")):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((2, 64, 64), "float16")
+            T.annotate_layout({tiles: make_hmx_activation_layout(tiles)})
+            T.copy(X, tiles[1, :, :])
+            T.copy(tiles[1, :, :], Y)
+
+    source = _source(kernel)
+    assert "tl_crouton_copy<true, false>((&(tiles[4096])), 2, 2, 0, 0, 64, 64, (&(X[0])), 64, 1);" in source
+    assert "tl_crouton_copy<false, false>((&(tiles[4096])), 2, 2, 0, 0, 64, 64, (&(Y[0])), 64, 1);" in source
+
+
+def test_crouton_to_crouton_copies_go_element_by_element():
+    @T.prim_func
+    def kernel(X: T.Tensor((64, 64), "float16"), Y: T.Tensor((64, 64), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((64, 64), "float16")
+            w = T.alloc_shared((64, 64), "float16")
+            T.annotate_layout({a: make_hmx_activation_layout(a), w: make_hmx_weight_layout(w)})
+            T.copy(X, a)
+            T.copy(a, w)
+            T.copy(w, Y)
+
+    source = _source(kernel)
+    assert source.count("tl_crouton_copy<") == 2
+
+
+@DEVICE
+@pytest.mark.parametrize("region", sorted(REGIONS))
+@pytest.mark.parametrize("endpoint", ["ddr", "vtcm"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_region_round_trips_match_torch(kind, dtype, endpoint, region):
+    import torch
+
+    kernel = tilelang.compile(_round_trip(kind, dtype, endpoint, region), out_idx=[1], target="hexagon")
+    try:
+        x = torch.randn(R, C, generator=torch.Generator().manual_seed(17)).to(getattr(torch, dtype))
+        y = kernel(x)
+        r0, r1, c0, c1 = REGIONS[region]
+        expected = torch.zeros(R, C, dtype=x.dtype)
+        expected[r0:r1, c0:c1] = x[r0:r1, c0:c1].half().to(x.dtype)
+        torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+def _gemm(transpose_a, transpose_b, a_dtype):
+    """C = A @ B through Crouton copies and HMX, A from fp16 or fp32."""
+    a_shape = (128, 64) if transpose_a else (64, 128)
+    b_shape = (96, 128) if transpose_b else (128, 96)
+
+    @T.prim_func
+    def kernel(A: T.Tensor(a_shape, a_dtype), B: T.Tensor(b_shape, "float16"), C: T.Tensor((64, 96), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared(a_shape, "float16")
+            b = T.alloc_shared(b_shape, "float16")
+            c = T.alloc_shared((64, 96), "float16")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, c, transpose_A=transpose_a, transpose_B=transpose_b, clear_accum=True)
+            T.copy(c, C)
+
+    return kernel
+
+
+@DEVICE
+@pytest.mark.parametrize("a_dtype", ["float16", "float32"])
+@pytest.mark.parametrize("transpose_b", [False, True])
+@pytest.mark.parametrize("transpose_a", [False, True])
+def test_hmx_gemm_operands_match_torch(transpose_a, transpose_b, a_dtype):
+    import torch
+
+    kernel = tilelang.compile(_gemm(transpose_a, transpose_b, a_dtype), out_idx=[2], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(23)
+        a = (torch.randn(64, 128, generator=gen) * 0.5).half()
+        b = (torch.randn(128, 96, generator=gen) * 0.5).half()
+        a_in = (a.T.contiguous() if transpose_a else a).to(getattr(torch, a_dtype))
+        b_in = b.T.contiguous() if transpose_b else b
+        c = kernel(a_in, b_in)
+        torch.testing.assert_close(c, (a.float() @ b.float()).half().float(), rtol=2e-3, atol=2e-3)
+    finally:
+        kernel.adapter.close()

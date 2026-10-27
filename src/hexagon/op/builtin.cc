@@ -115,6 +115,11 @@ TIR_DEFINE_TL_BUILTIN(hexagon_broadcast_lane)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
+TIR_DEFINE_TL_BUILTIN(hexagon_crouton_copy)
+    .set_num_inputs(12)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(hexagon_exclusive_pointer)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -128,14 +128,6 @@ private:
   std::unordered_set<const VarNode *> used_by_program_;
 };
 
-bool IsWorkerSafeHMXCall(const std::string &name) {
-  // Crouton pack/unpack only transforms caller-owned buffers.
-  return name == "tl_hexagon_hmx_pack_crouton" ||
-         name == "tl_hexagon_hmx_unpack_crouton" ||
-         name == "tl_hexagon_hmx_pack_crouton_f32" ||
-         name == "tl_hexagon_hmx_unpack_crouton_f32";
-}
-
 // Rejects runtime calls whose state is not per worker.
 void CheckWorkerBody(const Stmt &body) {
   PostOrderVisit(body, [](const ObjectRef &node) {
@@ -147,20 +139,14 @@ void CheckWorkerBody(const Stmt &body) {
     if (!name)
       return;
     const std::string &callee = name->value;
-    ICHECK(callee != "tl_hexagon_hmx_copy_crouton_parallel")
-        << "hexagon.copy_workers cannot nest inside T.Kernel(num_workers=...): "
-           "both distribute work across the worker pool";
-    if (callee.rfind("tl_hexagon_hmx", 0) == 0) {
-      ICHECK(IsWorkerSafeHMXCall(callee))
-          << "`" << callee
-          << "` is not worker-safe: inside T.Kernel(num_workers=...) only the "
-             "Crouton pack/unpack helpers and the T.hmx atoms may use HMX";
-    } else {
-      ICHECK(callee.rfind("tl_hexagon_dma_", 0) != 0)
-          << "`" << callee
-          << "` is not worker-safe: inside T.Kernel(num_workers=...) use "
-             "T.dma_copy and T.dma_wait, whose queue belongs to the program";
-    }
+    ICHECK(callee.rfind("tl_hexagon_hmx", 0) != 0)
+        << "`" << callee
+        << "` is not worker-safe: inside T.Kernel(num_workers=...) only the "
+           "T.hmx atoms may use HMX";
+    ICHECK(callee.rfind("tl_hexagon_dma_", 0) != 0)
+        << "`" << callee
+        << "` is not worker-safe: inside T.Kernel(num_workers=...) use "
+           "T.dma_copy and T.dma_wait, whose queue belongs to the program";
   });
 }
 

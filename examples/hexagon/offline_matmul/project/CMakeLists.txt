@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.14.3)
 project(tl_matmul_kernel C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+option(TL_HEXAGON_LEGACY_COMPUTE_RES "Use the legacy compute-resource API for a BSP without v2" OFF)
 
 if(HEXAGON_SDK_ROOT)
     include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
@@ -54,7 +55,13 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/tl_matmul_kernel_dsp.cc
     )
     build_idl(tl_matmul_kernel.idl tl_matmul_kernel_skel)
+    if(TL_HEXAGON_LEGACY_COMPUTE_RES)
+        target_compile_definitions(tl_matmul_kernel_skel PRIVATE TL_HEXAGON_LEGACY_COMPUTE_RES=1)
+    endif()
+    # No -mhvx-ieee-fp: the SM8750 (v79) cDSP returns zeros for the IEEE .sf/.hf
+    # HVX arithmetic it selects, although hexagon-sim computes it. Vector float
+    # ops stay a qfloat op plus a conversion.
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mhmx -mhvx -Wno-error")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mhmx -mhvx -Wno-error")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mhmx -mhvx -Wno-error -fno-exceptions")
     copy_binaries(tl_matmul_kernel_skel)
 endif()

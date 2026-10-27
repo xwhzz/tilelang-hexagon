@@ -1,6 +1,8 @@
 """Host lowering contracts for Hexagon demo operators and layout copies."""
 
 import os
+import re
+
 import pytest
 import tilelang
 from tilelang.backend.target import determine_target
@@ -26,7 +28,7 @@ def make_reduce_probe(rows, cols, dtype="float32"):
     return reduce_probe
 
 
-def make_weight_copy_probe(cols, start=64, workers=1):
+def make_weight_copy_probe(cols, start=64):
     """Exercise the generic transposed weight layout with strided endpoints."""
     # Two N tiles distinguish weight-transposed from the equivalent
     # activation-transposed layout of a single N tile.
@@ -39,7 +41,7 @@ def make_weight_copy_probe(cols, start=64, workers=1):
             T.annotate_layout({native: emitter.weight_layout(native)})
             for i, j in T.Parallel(64, cols + 4):
                 O[i, j] = T.float16(8192)
-            T.copy(X[:, start : start + cols], native, annotations={"hexagon.copy_workers": workers} if workers > 1 else {})
+            T.copy(X[:, start : start + cols], native)
             T.copy(native, O[:, 2 : cols + 2])
 
     return weight_copy
@@ -90,8 +92,10 @@ def test_gemm_preserves_interface_and_dma_completion(shape):
     source = lower(make_gemm_f16_io(*shape))
     assert "float* A, half* W, float* C" in source
     assert "tl_hexagon_hmx_mma_atom(" in source
-    assert "tl_hexagon_hmx_pack_crouton(" in source
-    assert "tl_hexagon_hmx_unpack_crouton(" in source
+    # A from FP32, W transposed, C to FP32: each one Crouton copy.
+    assert source.count("tl_crouton_copy<true, false>(") == 1
+    assert source.count("tl_crouton_copy<true, true>(") == 1
+    assert source.count("tl_crouton_copy<false, false>(") == 1
     assert "tl_hexagon_dma_async_context<" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
     assert "demo_parallel_pack" not in source
@@ -113,17 +117,21 @@ def test_gemm_bad_block_is_rejected_before_lowering():
 
 def test_transposed_weight_copy_preserves_source_and_destination_strides():
     source = lower(make_weight_copy_probe(128, 64))
-    assert "(&(X[64])), 64, 128, 192, 1, 3)" in source
-    assert "tl_hexagon_hmx_unpack_crouton((&(O[2]))" in source
-    assert ", 64, 128, 132, 1, 3)" in source
+    # The weight is [N, K] = [64, 128] in storage, the matrix [K, N]: 4 x 2
+    # tiles by columns, and K is the contiguous axis of both endpoints.
+    assert "tl_crouton_copy<true, true>((&(native[0])), 4, 2, 0, 0, 128, 64, (&(X[64])), 1, 192);" in source
+    assert "tl_crouton_copy<false, true>((&(native[0])), 4, 2, 0, 0, 128, 64, (&(O[2])), 1, 132);" in source
 
 
-def test_gemm_fused_parallel_layout_copies_remain_dsl():
-    source = lower(make_gemm_f16_io(256, 512, 2048, 256, copy_workers=6, fused_copy=True))
-    assert source.count("tl_hexagon_hmx_copy_crouton_parallel(") == 3
+def test_gemm_casts_in_its_layout_copies():
+    source = lower(make_gemm_f16_io(256, 512, 2048, 256))
+    assert "tl_crouton_copy<true, false>((&(((half*)a_native)[0])), 8, 64, 0, 0, 256, 2048, (&(((float*)a_dma)[0])), 2048, 1);" in source
+    assert re.search(
+        r"tl_crouton_copy<false, false>\(\(&\(\(\(half\*\)c_native\)\[0\]\)\), 8, 8, 0, 0, 256, 256, \(&\(C\[\(ni\w* \* 256\)\]\)\), 512, 1\);",
+        source,
+    )
     assert "tl_hexagon_hmx_mma_atom(" in source
     assert "a_row" not in source and "c_row" not in source
-    assert "demo_parallel_pack" not in source
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
@@ -160,37 +168,8 @@ def test_tiled_rmsnorm_vector_partials_cover_full_width(width):
 def test_wide_gemm_keeps_single_raw_slot_within_vtcm_budget():
     import re
 
-    source = lower(make_gemm_f16_io(256, 2048, 2048, 512, copy_workers=6, fused_copy=True))
+    source = lower(make_gemm_f16_io(256, 2048, 2048, 512))
     high = max(map(int, re.findall(r"tl_vtcm_shared_high_water = (\d+)u", source)))
     assert high <= 8 * 1024 * 1024
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
     assert "tl_hexagon_hmx_mma_atom(" in source
-
-
-@pytest.mark.parametrize("workers", [0, 7])
-def test_parallel_copy_rejects_bad_worker_count(workers):
-    e = HMXIntrinEmitter(32, 32, 64)
-
-    @T.prim_func
-    def probe(A: T.Tensor((32, 64), "float16")):
-        with T.Kernel(1):
-            native = T.alloc_shared((32, 64), "float16")
-            T.annotate_layout({native: e.activation_layout(native)})
-            T.copy(A, native, annotations={"hexagon.copy_workers": workers})
-
-    with pytest.raises(Exception, match="copy_workers must be"):
-        lower(probe)
-
-
-def test_parallel_copy_cannot_nest_worker_dispatch():
-    e = HMXIntrinEmitter(32, 32, 64)
-
-    @T.prim_func
-    def probe(A: T.Tensor((32, 64), "float16")):
-        with T.Kernel(1, num_workers=2):
-            native = T.alloc_shared((32, 64), "float16")
-            T.annotate_layout({native: e.activation_layout(native)})
-            T.copy(A, native, annotations={"hexagon.copy_workers": 2})
-
-    with pytest.raises(Exception, match="cannot nest"):
-        lower(probe)

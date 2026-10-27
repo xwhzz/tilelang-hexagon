@@ -51,7 +51,7 @@ class HexagonAgentSession:
         self._base = [adb] + (["-s", serial] if serial else [])
         self.workdir = workdir
         self.device_port = device_port
-        self.host_port = host_port or device_port
+        self.host_port = host_port  # adb picks one when None
 
         self._sh(f"mkdir -p {workdir}")
         self._push(skel_path)
@@ -59,7 +59,12 @@ class HexagonAgentSession:
         self._sh(f"chmod 755 {exe}")
         self._exe_name = os.path.basename(exe)
 
-        subprocess.run(self._base + ["forward", f"tcp:{self.host_port}", f"tcp:{self.device_port}"], check=True, capture_output=True)
+        if host_port is None:
+            # adb picks a free host port: on a shared host, a fixed one may be taken.
+            done = subprocess.run(self._base + ["forward", "tcp:0", f"tcp:{self.device_port}"], check=True, capture_output=True, text=True)
+            self.host_port = int(done.stdout.split()[-1])
+        else:
+            subprocess.run(self._base + ["forward", f"tcp:{self.host_port}", f"tcp:{self.device_port}"], check=True, capture_output=True)
 
         adsp = os.pathsep.join([workdir, *_DEFAULT_ADSP_DIRS])
         cmd = f"cd {workdir} && LD_LIBRARY_PATH={workdir} ADSP_LIBRARY_PATH={adsp} ./{self._exe_name} {self.device_port}"
@@ -121,12 +126,20 @@ class HexagonAgentSession:
         with contextlib.suppress(Exception):
             self._sock.sendall(b"\x02")  # shutdown
             self._sock.close()
-        with contextlib.suppress(Exception):
-            # Match exe name AND port so concurrent adapters for the same kernel
-            # (distinct ports, see HexagonKernelAdapter) don't kill each other.
-            self._sh(f"pkill -f '{self._exe_name} {self.device_port}'")
-        with contextlib.suppress(Exception):
-            self._proc.terminate()
+        # The agent exits after closing its FastRPC session, which releases
+        # its VTCM. Wait for that, so that the next session (another worker's,
+        # once a device lock is released) finds the DSP free.
+        try:
+            self._proc.wait(timeout=5)
+        except Exception:
+            with contextlib.suppress(Exception):
+                # Match exe name AND port so concurrent adapters for the same
+                # kernel (distinct ports, see HexagonKernelAdapter) don't kill
+                # each other.
+                self._sh(f"pkill -f '{self._exe_name} {self.device_port}'")
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
         subprocess.run(self._base + ["forward", "--remove", f"tcp:{self.host_port}"], capture_output=True)
 
     def __enter__(self):
