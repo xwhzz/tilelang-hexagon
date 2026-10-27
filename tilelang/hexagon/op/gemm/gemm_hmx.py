@@ -13,7 +13,7 @@ selector fallback.
 from __future__ import annotations
 
 from tilelang.hexagon import language as T
-from tilelang.hexagon.hmx_intrin import BIAS_WORDS, HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import BIAS_WORDS, HMXIntrinEmitter
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
 
@@ -83,9 +83,9 @@ class GemmHMX(GemmBase):
             # Keep this block internal for now so T.gemm's public contract remains
             # exactly A/B/C in VTCM.
             bias_vtcm = T.alloc_shared((BIAS_WORDS,), "uint32", align=256)
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
 
             for i in T.serial(BIAS_WORDS // 2):
                 bias_vtcm[i] = T.Cast("uint32", 0x3C00)

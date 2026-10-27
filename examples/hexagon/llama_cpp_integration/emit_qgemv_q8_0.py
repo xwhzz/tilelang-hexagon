@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 import tilelang
-from tilelang.hexagon.qgemv import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
+from tilelang.hexagon.intrinsics.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
 
 
 def emit(k: int, output_dir: Path, *, with_bias: bool) -> None:

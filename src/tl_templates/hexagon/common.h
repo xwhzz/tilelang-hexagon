@@ -17,9 +17,10 @@ using half = __fp16;
 
 // Kernel status ABI.  A tilelang Hexagon kernel entry returns int32_t — 0 on
 // success, nonzero on an unrecoverable device condition.  The FastRPC skel maps
-// nonzero to AEE_EFAILED (tl_hexagon_forward_kernel_status in _fastrpc.py), so
-// the host's run() raises instead of silently returning unwritten/partial
-// output.  The codegen emits these codes into the kernel/worker source.
+// nonzero to AEE_EFAILED (tl_hexagon_forward_kernel_status in
+// runtime/fastrpc.py), so the host's run() raises instead of silently returning
+// unwritten/partial output.  The codegen emits these codes into the
+// kernel/worker source.
 #define TL_OK 0
 #define TL_ERR_VTCM                                                            \
   1 // VTCM region unavailable / no worker region fits the grant

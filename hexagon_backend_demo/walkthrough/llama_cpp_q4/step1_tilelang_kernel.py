@@ -6,8 +6,8 @@ stages: activation pack, parallel-range Q4 dequant, and explicit HMX compute.
 """
 
 from tilelang.hexagon import language as T
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
-from tilelang.hexagon.qmatmul import Q4HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.q4_0 import Q4HMXIntrinEmitter
 
 
 M = 32
@@ -93,9 +93,9 @@ def make_compute_stage():
         output: T.Tensor((M, dst_stride), "float32"),
     ):
         with T.Kernel(1, threads=1):
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout(
                 {
                     activation_hmx: hmx.activation_layout(activation_hmx),

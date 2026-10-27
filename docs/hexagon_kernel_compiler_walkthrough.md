@@ -34,8 +34,8 @@ flowchart TB
     B["通道② 指令 atom<br/>HMXIntrinEmitter.mma_atom/clear/store…<br/>Q8GemvIntrinEmitter.dot_32x1"]
     C["通道③ 普通循环<br/>elementwise · hexreduce · T.copy"]
     A --> SA["src/hexagon/op/gemm.cc SelectInst<br/>门控 → 'hexagon.hmx' 或回退 'cpu.scalar'"]
-    SA --> LA["gemm_hmx.py GemmHMX.infer_layout/lower<br/>→ native Crouton + explicit HMX atoms"]
-    B --> LB["T.hexagon_hmx_* TIR intrinsic<br/>（dependency token = access_ptr）"]
+    SA --> LA["op/gemm/gemm_hmx.py GemmHMX.infer_layout/lower<br/>→ native Crouton + explicit HMX atoms"]
+    B --> LB["T.hmx.* TIR intrinsic<br/>（dependency token = access_ptr）"]
     C --> LC["reduce.cc → call_extern('tl_hvx_rowsum_mat_f16')<br/>copy.cc → LowerNormalCopy（同步）<br/>elementwise → 原样进 codegen"]
     LA --> CG["codegen_hexagon.cc<br/>grid→C 循环 · VTCM 静态编排 · intrinsic→函数名映射<br/>HVX elementwise 向量化器 · worker-pool 发射"]
     LB --> CG
@@ -84,7 +84,7 @@ flowchart TB
    cpos(i,j) = (i & ~1)*32 + j*2 + (i & 1)   // 行对交织（row-pair interleave）
    ```
 
-   这一个公式就是"布局是 ABI"的核心：DSL 侧 `hmx_intrin.py` 的 `T.Layout` forward 函数（`((m%32)//2)*64 + (k%32)*2 + m%2`）与它**逐 bit 一致**，两处必须同步改。
+   这一个公式就是"布局是 ABI"的核心：DSL 侧 `intrinsics/crouton.py` 的 `T.Layout` forward 函数（`((m%32)//2)*64 + (k%32)*2 + m%2`）与它**逐 bit 一致**，两处必须同步改。
 3. **HVX 快速 pack/unpack**（`hmx.h:203-270`）：行对交织恰好等于一条 `vshuff`——两行源数据一条指令变成一个 row-pair 跨度（比逐元素 pack 快约 64×）；unpack 用 `vdeal` 逆变换。要求连续维是 64 的倍数，否则回退共享的标量 pack（转置操作数也走标量——这是已标注的后续优化点，`hmx.h:271-275`）。
 4. **当前 `T.gemm` 入口是 emitter**：`GemmHMX.infer_layout` 给 A/B/C 分配 native Crouton，`lower` 直接编排下一项的 atoms；shared-memory planner 按 operand 传播 A/C 2 KB、B 128 B、config 256 B 对齐，每个结果直接写入最终 C tile。旧 `tl_hexagon_hmx_gemm/gemm_mt` 及隐式 top-down scratch 路径已删除。
 5. **显式 atom**（`hmx.h:410-473`）：`tl_hexagon_hmx_acc_acquire/load_bias/clear_acc/mma_atom/convert_acc/store_cvt_state`——每个只包一条硬件协议操作。签名里的 `void *acc_state` 等参数**在 C 里全部 `(void)` 丢弃**：硬件状态本来就是隐式的，这些 token 只存在于 TIR 层，用来向编译器分析表达顺序与存活期（比如把 activation/weight 源指针一路携带到 store，阻止 shared-memory planner 在 HMX 流水线还占用它们时回收缓冲区，`hmx.h:457-473`）。
@@ -111,16 +111,16 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 不满足门控就**回退标量三重循环**（hexagon-clang 自动向量化到 HVX）——尤其是默认 `clear_accum=False` 的累加式 K-loop 和 fragment 操作数，HMX 路径还不支持，但用户代码依然能跑对。这是"每层都能拒绝"哲学的第一层。
 
-### 3.3 通道①的 Python lower（`tilelang/hexagon/gemm_hmx.py`）
+### 3.3 通道①的 Python lower（`tilelang/hexagon/op/gemm/gemm_hmx.py`）
 
 两个设计决策值得记住：
 
 - **`infer_layout` 返回 A/B/C 的 native Crouton layouts**；storage transpose 通过坐标复合表达，物理 HMX tile 不变。一次逻辑 FP16 `T.copy` 可以由 `src/hexagon/op/copy.cc` 识别为带 stride 的 DDR/VTCM <-> native VTCM Crouton pack/unpack；后续 DMA 可以在同一 copy plan 中替换 row-major transfer 阶段。
 - **`lower` 只接收 A/B/C**：内部准备 scale/bias 和 dependency tokens，并生成 `acquire -> for mt -> for nt -> clear -> for kt mma_atom -> convert -> store_C_tile -> release`。shared-memory planner 从各 HMX intrinsic 的对应参数传播 A/C 2 KB、B 128 B、config 256 B 对齐到最终 VTCM 子分配；full-region 与 `clear_accum=True` 仍是防御条件。
 
-### 3.4 通道②：atom 怎么从 DSL 走到 C（`hmx_intrin.py` → codegen）
+### 3.4 通道②：atom 怎么从 DSL 走到 C（`intrinsics/hmx.py` → codegen）
 
-`HMXIntrinEmitter` 每个方法 **build 并返回一个嵌套 `@T.macro`**（铁律：否则 VTCM liveness pass 看不到 scratch 的使用，缓冲区会被别名——静默垃圾），宏体发射 `T.hexagon_hmx_*` TIR intrinsic，参数全部是 `T.access_ptr`（含 dependency token）。codegen 里只有一张**名字映射表**（`codegen_hexagon.cc:428-455`）：
+`HMXIntrinEmitter` 每个方法 **build 并返回一个嵌套 `@T.macro`**（铁律：否则 VTCM liveness pass 看不到 scratch 的使用，缓冲区会被别名——静默垃圾），宏体发射 `T.hmx.*` TIR intrinsic，参数全部是 `T.access_ptr`（含 dependency token）。codegen 里只有一张**名字映射表**（`codegen_hexagon.cc:428-455`）：
 
 | TIR intrinsic | 生成的 C 调用（hmx.h） |
 |---|---|
@@ -131,7 +131,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 | `hexagon_hmx_convert` | `tl_hexagon_hmx_convert_acc` |
 | `hexagon_hmx_store` | `tl_hexagon_hmx_store_cvt_state` |
 
-三个 `make_hmx_*_layout` 的 `T.Layout` forward 函数就是 §2.4 的 cpos 公式在 Python 侧的镜像（`hmx_intrin.py:64-109`）——Q4 kernel 的显式 dequant 之所以能"逻辑坐标写入、物理落到 Crouton"，全靠它。**给新指令族加原语的套路照此**：runtime 写 atom（可单测）→ 定义 TIR op → emitter 发射 → codegen 加一行映射。
+三个 `make_hmx_*_layout` 的 `T.Layout` forward 函数就是 §2.4 的 cpos 公式在 Python 侧的镜像（`tilelang/hexagon/intrinsics/crouton.py`）——Q4 kernel 的显式 dequant 之所以能"逻辑坐标写入、物理落到 Crouton"，全靠它。**给新指令族加原语的套路照此**：runtime 写 atom（可单测）→ 定义 TIR op → emitter 发射 → codegen 加一行映射。
 
 ### 3.5 codegen 本体（`src/hexagon/codegen/codegen_hexagon.cc`，873 行）
 
@@ -150,7 +150,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 ### 3.7 出口
 
-生成的 C 以 `extern "C"` + `int32_t` 状态码收尾，由 `_fastrpc.py` 包成 FastRPC 工程（skel 把非零映射为 `AEE_EFAILED`）；或者由 `kernel.get_kernel_source()` 直接取走嵌入 llama.cpp（Mode B，见[对接 walkthrough](lfm2_hexagon_report/tilelang_operator_integration.md)）。
+生成的 C 以 `extern "C"` + `int32_t` 状态码收尾，由 `runtime/fastrpc.py` 包成 FastRPC 工程（skel 把非零映射为 `AEE_EFAILED`）；或者由 `kernel.get_kernel_source()` 直接取走嵌入 llama.cpp（Mode B，见[对接 walkthrough](lfm2_hexagon_report/tilelang_operator_integration.md)）。
 
 ---
 
@@ -158,7 +158,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 1. **薄 codegen、厚 runtime**：新指令族的正确姿势是先写 runtime atom（可脱离编译器单测），再加 TIR op + emitter + codegen 一行名字映射。不要把硬件序列拼在 codegen 的字符串流里。
 2. **拒绝优于静默**：每一层都有拒绝手段——SelectInst 回退 scalar、Python lower `raise NotImplementedError`、tileop `ICHECK` 带改法提示、runtime 返回 -1/-2/-3、kernel 状态码让 host `raise`。设备上最贵的 bug 是静默垃圾，本仓库的所有检查都是被真实事故换来的。
-3. **布局是 ABI**：Crouton 的 cpos 公式在 `hmx.h` 与 `hmx_intrin.py` 各有一份镜像，Q8 的 1152 B tile 在 `qgemv.h` 宏与 `qgemv.py` layout 各一份——改任何一侧必须同步另一侧并跑 layout 契约测试（`testing/python/hexagon/`）。
+3. **布局是 ABI**：Crouton 的 cpos 公式在 `hmx.h` 与 `intrinsics/crouton.py` 各有一份镜像，Q8 的 1152 B tile 在 `qgemv.h` 宏与 `intrinsics/q8_0.py` layout 各一份——改任何一侧必须同步另一侧并跑 layout 契约测试（`testing/python/hexagon/`）。
 4. **已固化的铁律**：emitter 方法必须 build+return 嵌套 `@T.macro`；HMX 用 dependency token 表达隐式状态与缓冲存活期；`T.gemm` 必须 `clear_accum=True`；elementwise 最窄 dtype 填满 128 B、bitwise 前加宽 int16。
 5. **注释记录"为什么"**：仓库风格是在坑位处写清约束成因（如 spinlock 为什么可以裸 store 释放、`aligned(1)` 为什么不损失向量化）。新代码照此办理——这些注释就是下一个人的走读文档。
 
@@ -170,7 +170,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 2. `hmx.h`：先读文件头注释，再按 §2.4 的五块读；重点吃透 cpos 公式与隐式 accumulator protocol。
 3. `gemm.cc` + `gemm_hmx.py`（各 <100 行）：门控与回退。
 4. `codegen_hexagon.cc`：`AddFunction`（worker-pool 发射）→ `AllocBufferNode` → `TryEmitHvxElementwise`。
-5. `hmx_intrin.py` + `example_qmatmul_kstream.py`：atom 通道全链路。
+5. `intrinsics/hmx.py` + `example_qmatmul_kstream.py`：atom 通道全链路。
 6. Q8 三件套：`qgemv.py` → `qgemv.h` → `kernel_qgemv_q8_0_k2048.c` + `tl_ggml_qgemv.cc`（模型集成侧）。
 
 练习（无真机也能做前两个）：

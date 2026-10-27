@@ -440,7 +440,7 @@ class JITKernel(Generic[_P, _T]):
                 compile_flags=compile_flags,
             )
         elif execution_backend == "hexagon":
-            from tilelang.hexagon.adapter import HexagonKernelAdapter
+            from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
 
             adapter = create_adapter(
                 HexagonKernelAdapter,

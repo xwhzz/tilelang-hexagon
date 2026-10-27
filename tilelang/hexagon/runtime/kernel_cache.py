@@ -16,7 +16,7 @@ from hashlib import sha256
 
 from tilelang.cache.kernel_cache import KernelCache
 
-from .runtime_config import cache_identity
+from .config import cache_identity
 
 
 class HexagonKernelCache(KernelCache):

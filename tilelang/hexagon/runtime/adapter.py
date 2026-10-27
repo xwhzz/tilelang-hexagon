@@ -1,7 +1,7 @@
 """Adapter that runs a tilelang-generated Hexagon kernel on a real device.
 
 Flow: take the generated kernel C source + its :class:`KernelParam`s, emit a
-FastRPC project (:mod:`._fastrpc`), build it with the Hexagon SDK
+FastRPC project (:mod:`.fastrpc`), build it with the Hexagon SDK
 (:mod:`.build`), deploy the skel + host driver over adb (:mod:`.device`), and
 return a torch-callable.  Each call marshals input tensors to ``.bin`` files,
 pushes them, runs the host driver (which FastRPC-invokes the cDSP kernel), and
@@ -22,11 +22,11 @@ import torch
 
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
-from . import _fastrpc
+from . import fastrpc
 from .build import build_cmake_fastrpc
 from .device import AdbConnection, HexagonConnection
 from .env import HexagonSDK
-from .runtime_config import device_serial
+from .config import device_serial
 
 # The kernel entry is the non-static generated function.  Hexagon kernels return
 # int32_t so the FastRPC skel can propagate failures; older/source kernels may
@@ -96,7 +96,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         return self._conn
 
     def _deploy(self) -> None:
-        proj, iface = _fastrpc.write_project(self._workdir, self.kernel_name, self.kernel_source, self._param_list, self._result_idx)
+        proj, iface = fastrpc.write_project(self._workdir, self.kernel_name, self.kernel_source, self._param_list, self._result_idx)
         self._iface = iface
         if self.verbose:
             print(f"[hexagon] FastRPC project: {proj} (iface={iface})")

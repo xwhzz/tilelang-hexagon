@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 import tilelang
-from tilelang.hexagon.qgemv import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
+from tilelang.hexagon.intrinsics.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
 
 
 def pack_weight_tile(q: np.ndarray, scales: np.ndarray) -> np.ndarray:

@@ -10,7 +10,7 @@ import tilelang
 from tilelang.hexagon import language as T
 from tilelang import tvm
 from tilelang.backend.target import determine_target
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -234,11 +234,11 @@ def test_normal_copy_does_not_create_dma_queue():
 
 
 def test_async_dsp_build_avoids_exception_runtime():
-    from tilelang.hexagon import _fastrpc
+    from tilelang.hexagon.runtime import fastrpc
 
-    cmake = _fastrpc.gen_cmake("test_async", "/templates", async_dma=True)
+    cmake = fastrpc.gen_cmake("test_async", "/templates", async_dma=True)
     assert "-fno-exceptions" in cmake
-    assert "-fno-exceptions" not in _fastrpc.gen_cmake("test_sync", "/templates")
+    assert "-fno-exceptions" not in fastrpc.gen_cmake("test_sync", "/templates")
 
 
 def test_async_hmx_error_cleanup_is_armed_and_disarmed():
@@ -265,9 +265,9 @@ def make_hmx_probe():
             bn = T.alloc_shared((64, 32), "float16")
             cn = T.alloc_shared((32, 32), "float16")
             config = T.alloc_shared((64,), "uint32")
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout({an: e.activation_layout(an), bn: e.weight_layout(bn), cn: e.output_layout(cn)})
             for i in T.serial(32):
                 config[i] = T.uint32(0x3C00)

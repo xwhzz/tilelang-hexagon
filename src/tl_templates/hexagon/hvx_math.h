@@ -17,7 +17,7 @@
 // needed: `exp2` is a degree-5 minimax polynomial (≈3e-6 rel err, fp16-exact
 // after rounding) plus integer exponent construction.
 //
-// Pulled in on demand by _fastrpc.py when a kernel references `tl_hvx`.
+// Pulled in on demand by runtime/fastrpc.py when a kernel references `tl_hvx`.
 #include <cmath>           // scalar fallbacks for the ragged tail
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>

@@ -87,7 +87,7 @@ flowchart LR
 ### 2.1 工作流 1：HMX 指令底层原语适配 —— 【在做】
 
 - **范围**：activation/weight load（pack）、convert、mma、bias、acquire/release 等指令 atom 的完整稳定表面。
-- **已有基础**：`hmx_intrin.py` 全套 atom（acquire/load_bias/clear/mma/convert/store/release）+ `hmx.h` runtime；
+- **已有基础**：`intrinsics/hmx.py` 全套 atom（acquire/load_bias/clear/mma/convert/store/release）+ `hmx.h` runtime；
   隐式硬件状态（累加器等）用 1-byte dependency token 表达；最近的 Q4 显式 HMX prefill kernel
   （真机 rel err ≈3.4–3.5e-4）就是本工作流的进行中产物。
 - **待办（大纲）**：
@@ -176,7 +176,7 @@ flowchart TB
     CODEGEN --> A1
     CODEGEN --> B1
     subgraph PATHA["路径 A · standalone FastRPC（研发 / 单测 / bench）"]
-        A1["_fastrpc.py 生成工程<br/>hexagon-clang → skel.so"]
+        A1["runtime/fastrpc.py 生成工程<br/>hexagon-clang → skel.so"]
         A2["adapter.py 一次一发<br/>或 agent.py 常驻 session（bench 必用）"]
         A3["torch-callable kernel<br/>真机数值 / 性能"]
         A1 --> A2 --> A3

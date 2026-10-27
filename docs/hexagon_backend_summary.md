@@ -16,7 +16,7 @@ the consequence of that gulf.
 |---|---|---|---|
 | **Codegen** | whole-register HVX vectorization — 1024-bit width + "narrowest dtype fills a register" rule + native `ext_vector` `vec_type` | `src/transform/loop_vectorize.cc`, `src/tl_templates/hexagon/common.h`, `codegen_hexagon.cc` | ✅ committed, zero regression |
 | **DSL kernels** | fully-DSL q4_0 dequant (matches hand HVX) + fused dequant→VTCM→`T.gemm`→HMX matmul; compact resident scales | `examples/hexagon/example_qmatmul*.py` | ✅ device-correct (rel 2.5e-4) |
-| **HMX abstraction** | `HMXIntrinEmitter` — native Crouton layouts, 32x32x32 MAC atoms, and the implicit-accumulator protocol used by explicit kernels and `T.gemm` lowering | `tilelang/hexagon/{hmx_intrin,gemm_hmx}.py` | emitter and native-layout `T.gemm` device-correct |
+| **HMX abstraction** | `HMXIntrinEmitter` — native Crouton layouts, 32x32x32 MAC atoms, and the implicit-accumulator protocol used by explicit kernels and `T.gemm` lowering | `tilelang/hexagon/{intrinsics/hmx,op/gemm/gemm_hmx}.py` | emitter and native-layout `T.gemm` device-correct |
 | **Runtime integration** | bridge (ride host VTCM+HMX), op registry (`tl_op_ctx`/`tl_dispatch`), the ggml intercept, embeddable-kernel emit | `src/tl_templates/hexagon/tl_{bridge,embed}.h`, `examples/hexagon/llama_cpp_integration/` | ✅ mechanism done |
 | **Device** | LFM2-1.2B on the NPU, tilelang q4_0 matmul A/B'd inside the model | (below) | ✅ verified end-to-end |
 

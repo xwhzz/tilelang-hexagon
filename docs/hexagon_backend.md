@@ -82,9 +82,9 @@ These are the decisions that keep the adaptation small and the code navigable.
 - **Layer 4** — the recipe headers (Section 6/7). `common.h` (types), `vtcm.h` (the
   arena), `hmx.h` (the HMX matmul + HVX Crouton pack/unpack + session), `worker.h`
   (the HW-thread pool).
-- **Layer 5** — `tilelang/hexagon/`: `_fastrpc.py` generates the IDL + skel + host +
-  CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK build;
-  `agent.py` runs a persistent on-DSP agent over a socket (`adb forward`);
+- **Layer 5** — `tilelang/hexagon/runtime/`: `fastrpc.py` generates the IDL + skel +
+  host + CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK
+  build; `agent.py` runs a persistent on-DSP agent over a socket (`adb forward`);
   `adapter.py` marshals torch tensors and invokes.
 
 ---
@@ -97,11 +97,14 @@ The backend registers itself through upstream's backend plugin interface
 - `tilelang/hexagon/backend.py` — the `BackendModule` manifest: pipeline, device
   codegen (`target.build.tilelang_hexagon`) and the `hexagon` execution backend;
   imported from `tilelang/__init__.py`
-- `tilelang/hexagon/pipeline.py` — the pass order, plus `register_gemm_impl(...)`
-  for the gemm dispatch
+- `tilelang/hexagon/pipeline.py` — the pass order
+- `tilelang/hexagon/op/` — tile-op implementations; `op/gemm/` registers the
+  gemm dispatch (`register_gemm_impl(...)`)
+- `tilelang/hexagon/intrinsics/` — Crouton layouts, the HMX emitter and the
+  Q4_0/Q8_0 atoms
 - `tilelang/hexagon/language/` — the Hexagon dialect: `T.Kernel(num_workers=...)`,
-  `T.dma_copy`/`T.dma_wait`, `T.alloc_hmx_*` and `T.hexagon_hmx_*`. Kernels import it
-  as `from tilelang.hexagon import language as T`
+  `T.dma_copy`/`T.dma_wait`, and the expert HMX atoms under `T.hmx`. Kernels import
+  it as `from tilelang.hexagon import language as T`
 - `tilelang/cache/__init__.py` + `jit/kernel.py` — `_dispatch_map["hexagon"]` →
   `HexagonKernelCache` (in-memory only — a Hexagon "artifact" is a live device
   deployment, not a serializable `.so`) and the `HexagonKernelAdapter`
@@ -126,7 +129,7 @@ see them all.
 CodeGenTileLangHexagon  ─►  C + HVX/HMX intrinsics   (the generated kernel)
    +  src/tl_templates/hexagon/*.h                   (the hardware recipe)
    ▼
-_fastrpc.write_project  ─►  FastRPC skel (.idl/.c/.cc) + host + CMake
+fastrpc.write_project   ─►  FastRPC skel (.idl/.c/.cc) + host + CMake
    ▼
 hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP user PD
    ▲                                                              │
@@ -238,7 +241,7 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   add it to the CMake GLOB (touch `CMakeLists.txt` to force re-glob).
 - **Add a hardware recipe** (e.g. a new HMX kernel): put the C in
   `tl_templates/hexagon/*.h`, call it via `T.call_extern(...)` from an op's `lower`,
-  and make `_fastrpc.gen_dsp` `#include` the header when the source mentions its name
+  and make `fastrpc.gen_dsp` `#include` the header when the source mentions its name
   (the lazy-include scheme). No compiler rebuild needed.
 - **Make it idiomatic** (a tile-op instead of `call_extern`): register a
   `GemmBase`-style impl + `register_gemm_impl` (see `gemm_hmx.py`), so `T.gemm` lowers
@@ -306,9 +309,9 @@ hardware.
 ### HMX K-tile packets
 
 `HMXIntrinEmitter.mma_tile()` reduces K for one output tile in DSL chunks of
-at most 32 contiguous native tiles. Each `hexagon_hmx_mma` intrinsic carries
+at most 32 contiguous native tiles. Each `T.hmx.mma` intrinsic carries
 an explicit tile count and matching operand read extents; `tl_hmx_mac_tiles`
 emits one `:deep` packet and requires `1 <= n <= 32`. The caller handles the
-final partial chunk. `mma_atom()` and `T.hexagon_hmx_mma()` default to one tile
+final partial chunk. `mma_atom()` and `T.hmx.mma()` default to one tile
 for existing explicit schedules. Accumulator acquisition, clear, conversion,
 and output storage remain separate operations.

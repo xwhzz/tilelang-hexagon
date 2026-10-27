@@ -18,8 +18,8 @@ import torch
 
 import tilelang
 from tilelang.hexagon import language as T
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
-from tilelang.hexagon.qmatmul import Q4HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.q4_0 import Q4HMXIntrinEmitter
 
 
 Q4_TILE_BYTES = 576
@@ -49,9 +49,9 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
             B_hmx = T.alloc_shared((K, 32), "float16", align=2048)
             C_hmx = T.alloc_shared((32, 32), "float16", align=2048)
             bias_vtcm = T.alloc_shared((64,), "uint32", align=256)
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
 
             T.annotate_layout(
                 {
@@ -232,9 +232,9 @@ def make_staged_hmx(M, N, K):
         C: T.Tensor((M, dst_stride), "float32"),
     ):
         with T.Kernel(1, threads=1) as _:
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout(
                 {
                     A_hmx: E.activation_layout(A_hmx),

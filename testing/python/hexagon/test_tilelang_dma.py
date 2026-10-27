@@ -5,7 +5,7 @@ import pytest
 import tilelang
 from tilelang.hexagon import language as T
 from tilelang import tvm
-from tilelang.hexagon import _fastrpc
+from tilelang.hexagon.runtime import fastrpc
 from tilelang.backend.target import determine_target
 
 
@@ -59,7 +59,7 @@ def test_hexagon_dma_raw_value_call_is_not_treated_as_status_code():
 
 def test_hexagon_dma_fastrpc_wrapper_includes_template():
     source = _lower_source(_make_dma_raw_poll_probe())
-    wrapper = _fastrpc.gen_dsp("tl_dma_probe", "dma_raw_poll_probe_kernel", source, [])
+    wrapper = fastrpc.gen_dsp("tl_dma_probe", "dma_raw_poll_probe_kernel", source, [])
 
     assert "#include <tl_templates/hexagon/dma.h>" in wrapper
 

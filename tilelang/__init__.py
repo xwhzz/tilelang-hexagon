@@ -228,11 +228,7 @@ if not env.is_light_import():
     from . import rocm as rocm  # noqa: F401
     from . import metal as metal  # noqa: F401
     from . import webgpu as webgpu  # noqa: F401
-
-    # Register the Hexagon backend manifest. We import the submodule directly
-    # (not via the package __init__) so the lean build/deploy harness in
-    # tilelang.hexagon stays importable without the tilelang native library.
-    from .hexagon import backend as _hexagon_backend  # noqa: F401
+    from . import hexagon as hexagon  # noqa: F401
 
     if env.get_lower_trace_mode() is not None:
         from .tools.lower_trace import enable as _lower_trace_enable

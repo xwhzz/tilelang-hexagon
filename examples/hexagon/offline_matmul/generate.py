@@ -19,7 +19,7 @@ import tilelang
 from tilelang.hexagon import language as T
 from tilelang import tvm
 from tilelang.env import TILELANG_TEMPLATE_PATH
-from tilelang.hexagon import _fastrpc
+from tilelang.hexagon.runtime import fastrpc
 
 M = N = K = 256
 BM = BN = 64
@@ -48,7 +48,7 @@ def main():
     with tvm.target.Target("hexagon"):  # Layers 1-3: TIR -> cDSP C
         res = tilelang.lower(make_matmul(), target="hexagon")
 
-    proj, iface = _fastrpc.write_project(  # Layer 5: C -> FastRPC project
+    proj, iface = fastrpc.write_project(  # Layer 5: C -> FastRPC project
         os.path.join(HERE, "project"), "matmul_kernel", res.kernel_source, res.params, result_idx=[2]
     )
 

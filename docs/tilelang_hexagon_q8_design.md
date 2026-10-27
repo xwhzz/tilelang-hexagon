@@ -148,9 +148,9 @@ VTCM、DMA queue 和 worker pool。谁申请、谁释放，不能跨边界混用
 
 | 文件 | 作用 |
 |---|---|
-| `tilelang/hexagon/qgemv.py` | `Q8_0TiledLayout`、`Q8GemvIntrinEmitter`、embeddable PrimFunc factory |
+| `tilelang/hexagon/intrinsics/q8_0.py` | `Q8_0TiledLayout`、`Q8GemvIntrinEmitter`、embeddable PrimFunc factory |
 | `src/tl_templates/hexagon/qgemv.h` | v79 HVX Q8_0 `32x1` dot atom |
-| `tilelang/hexagon/_fastrpc.py` | standalone kernel 自动包含 `qgemv.h` |
+| `tilelang/hexagon/runtime/fastrpc.py` | standalone kernel 自动包含 `qgemv.h` |
 | `examples/hexagon/example_qgemv_q8_0.py` | Q8 pack、golden 和真实设备数值验证 |
 | `examples/hexagon/llama_cpp_integration/emit_qgemv_q8_0.py` | 生成 K=2048/8192 embeddable kernels + manifest |
 | `examples/hexagon/llama_cpp_integration/tl_ggml_qgemv.cc` | model registry/dispatch，调用生成 kernel |

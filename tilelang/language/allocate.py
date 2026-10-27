@@ -358,33 +358,6 @@ def alloc_reducer(shape: ShapeType, dtype: DType, op: ReducerOp = "sum", replica
 
 
 DescKind = Literal["wgmma", "tcgen05_smem", "tcgen05_instr"]
-HMXStateKind = Literal["accumulator", "convert", "bias"]
-
-
-def alloc_hmx_state(kind: HMXStateKind) -> Buffer:
-    """Allocate an IR token for an implicit Hexagon HMX state register set.
-
-    HMX accumulator, convert, and bias state are not addressable storage.  The
-    one-byte buffer exists only to carry dependencies through TIR; Hexagon
-    codegen preserves the token in intrinsic calls and the device wrapper
-    ignores its address.
-    """
-
-    if kind not in ("accumulator", "convert", "bias"):
-        raise ValueError(f"Unsupported HMX state kind: {kind}")
-    return _with_span(T.sblock_alloc_buffer([1], _dtypes.uint8, scope=f"local.hmx_state.{kind}"))
-
-
-def alloc_hmx_accumulator() -> Buffer:
-    return alloc_hmx_state("accumulator")
-
-
-def alloc_hmx_convert_state() -> Buffer:
-    return alloc_hmx_state("convert")
-
-
-def alloc_hmx_bias_state() -> Buffer:
-    return alloc_hmx_state("bias")
 
 
 def alloc_descriptor(

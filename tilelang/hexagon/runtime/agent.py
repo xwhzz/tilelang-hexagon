@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 
-from . import _fastrpc
+from . import fastrpc
 from .device import _DEFAULT_ADSP_DIRS
 
 
@@ -47,7 +47,7 @@ class HexagonAgentSession:
     ) -> None:
         self.params = list(params)
         self.result_idx = list(result_idx if isinstance(result_idx, (list, tuple)) else [result_idx])
-        self.plans = _fastrpc._plan(self.params, self.result_idx)
+        self.plans = fastrpc._plan(self.params, self.result_idx)
         self._base = [adb] + (["-s", serial] if serial else [])
         self.workdir = workdir
         self.device_port = device_port

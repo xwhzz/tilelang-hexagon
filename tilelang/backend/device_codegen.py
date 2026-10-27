@@ -31,11 +31,18 @@ def global_func_device_codegen(global_func_name: str) -> DeviceCodegenFunc:
 
 @dataclass(frozen=True, slots=True)
 class DeviceCodegen:
-    """Device codegen entry points for one backend target variant."""
+    """Device codegen entry points for one backend target variant.
+
+    ``direct_call`` marks targets whose device functions are plain functions
+    that the host calls directly, such as C source, instead of kernels with the
+    device-launch calling convention. Lowering uses it to tell host functions
+    from device functions after the host/device split.
+    """
 
     name: str
     build: DeviceCodegenFunc | None = None
     build_without_compile: DeviceCodegenFunc | None = None
+    direct_call: bool = False
 
     def lower(self, mod: IRModule, target: Target, *, compile_device: bool) -> IRModule:
         build_func = self.build if compile_device else self.build_without_compile

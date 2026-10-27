@@ -123,11 +123,11 @@ briefing。目标读者是一个要继续"反思 tilelang↔Hexagon 的对接设
 
 ### 4a. 两层 DSL 抽象 [源码,已 device-validated]
 
-- **Tier 1 · `T.gemm` → `GemmHMX`**(`tilelang/hexagon/gemm_hmx.py`):最简。用户写 GPU 风格
+- **Tier 1 · `T.gemm` → `GemmHMX`**(`tilelang/hexagon/op/gemm/gemm_hmx.py`):最简。用户写 GPU 风格
   `alloc_shared`(→VTCM)+ `T.copy` + `T.gemm(A,B,C, clear_accum=True)`。融合的 dequant 就是
   `T.gemm` 前的普通 DSL 算术。**故意 monolithic**:operands 保持 row-major(`infer_layout→{}`),
   Crouton pack/MAC/unpack 藏在 C 模板里。`GemmHMX` 只接受 fp16、32 倍数、2D、clear_accum。
-- **Tier 2 · `HMXIntrinEmitter`**(`tilelang/hexagon/hmx_intrin.py`):instruction-atom,用户**手驱 K-loop**
+- **Tier 2 · `HMXIntrinEmitter`**(`tilelang/hexagon/intrinsics/hmx.py`):instruction-atom,用户**手驱 K-loop**
   (`acquire / load_bias / clear / mma / convert / store / release`)。CUDA
   `TensorCoreIntrinEmitter` 的 Hexagon 对应。A/B/C 用 `T.Layout` 表达 Crouton 地址；accumulator、
   convert、bias 是 1-byte dependency token,只给 TIR 表达隐式硬件状态的顺序和存活期,不是可寻址 fragment。
@@ -300,7 +300,7 @@ adb shell "cd /data/local/tmp/llamahtp && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.:
 
 ## 10. 文件地图
 
-**tilelang 后端**:`tilelang/hexagon/{hmx_intrin.py, gemm_hmx.py, pipeline.py, adapter.py, mini_htp.py, ...}`;
+**tilelang 后端**:`tilelang/hexagon/{intrinsics/hmx.py, op/gemm/gemm_hmx.py, pipeline.py, runtime/adapter.py, ...}`;
 runtime 模板 `src/tl_templates/hexagon/{hmx.h, tl_bridge.h, tl_embed.h, common.h}`;codegen
 `src/hexagon/`、`src/transform/loop_vectorize.cc`。
 

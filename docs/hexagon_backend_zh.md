@@ -27,7 +27,7 @@ Hexagon 是 **VLIW DSP + HVX + HMX + VTCM + DMA**,和 GPGPU 之间有一条鸿�
 |---|---|---|---|
 | **Codegen** | 满寄存器 HVX 向量化(1024-bit 宽度 + 最窄 dtype 填满寄存器 + 原生 `ext_vector` 的 `vec_type`) | `src/transform/loop_vectorize.cc`、`src/tl_templates/hexagon/common.h`、`codegen_hexagon.cc` | ✅ 已提交,零回归 |
 | **DSL kernel** | 全 DSL q4_0 反量化(追平手写 HVX)+ 反量化→VTCM→`T.gemm`→HMX 融合 matmul;紧凑常驻 scale | `examples/hexagon/example_qmatmul*.py` | ✅ 设备验证(rel 2.5e-4) |
-| **HMX 抽象** | `HMXIntrinEmitter` —— 原生 Crouton layout、32x32x32 MAC atom 和隐式 accumulator protocol；供显式 kernel 与 `T.gemm` lowering 复用 | `tilelang/hexagon/{hmx_intrin,gemm_hmx}.py` | emitter 与 native-layout `T.gemm` 均已真机验证 |
+| **HMX 抽象** | `HMXIntrinEmitter` —— 原生 Crouton layout、32x32x32 MAC atom 和隐式 accumulator protocol；供显式 kernel 与 `T.gemm` lowering 复用 | `tilelang/hexagon/{intrinsics/hmx,op/gemm/gemm_hmx}.py` | emitter 与 native-layout `T.gemm` 均已真机验证 |
 | **运行时集成** | bridge(蹭 host 的 VTCM+HMX)、op registry(`tl_op_ctx`/`tl_dispatch`)、ggml 拦截、可嵌入 kernel emit、快路径 adapter | `src/tl_templates/hexagon/tl_{bridge,embed}.h`、`examples/hexagon/llama_cpp_integration/` | ✅ 完成 |
 | **设备** | LFM2-1.2B 跑在 NPU 上,tilelang q4_0 matmul 在模型里 A/B | 见 §4 | ✅ 端到端验证,**追平** |
 
@@ -210,7 +210,7 @@ adb shell "cd /data/local/tmp/llamahtp && LD_LIBRARY_PATH=. \
 | 满寄存器 codegen | `src/transform/loop_vectorize.cc`、`src/tl_templates/hexagon/common.h`、`src/hexagon/codegen/codegen_hexagon.cc` |
 | HMX / VTCM 运行时模板 | `src/tl_templates/hexagon/{hmx,vtcm,common,hvx_math}.h` |
 | bridge / registry | `src/tl_templates/hexagon/{tl_bridge,tl_embed}.h` |
-| HMX emitter | `tilelang/hexagon/hmx_intrin.py` |
+| HMX emitter / Crouton layout | `tilelang/hexagon/intrinsics/{hmx,crouton}.py` |
 | 全 DSL q4_0 matmul | `examples/hexagon/example_qmatmul.py`、`example_qmatmul_kstream.py` |
 | llama.cpp 集成(adapter、patch、可嵌入 emit) | `examples/hexagon/llama_cpp_integration/` |
 | 细节文档 | `docs/{edge_tilelang_vs_cuda,hexagon_dsl_kernels,llama_cpp_integration,lfm2_1.2b_compute_graph,llama_cpp_reproduce,llama_cpp_inference_flow}.md` |

@@ -17,6 +17,7 @@ BACKEND = register_backend(
                 "hexagon",
                 build=codegen.build_hexagon,
                 build_without_compile=codegen.build_hexagon,
+                direct_call=True,
             )
         },
         host_codegens=STANDARD_HOST_CODEGENS,

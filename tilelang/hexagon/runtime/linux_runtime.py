@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from .device import AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
-from .runtime_config import device_serial
+from .config import device_serial
 
 
 def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, build_host, verbose):

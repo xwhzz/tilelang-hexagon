@@ -13,7 +13,7 @@ from tilelang.jit.adapter.cython.kernel_cache import CythonKernelCache
 from tilelang.jit.adapter.nvrtc.kernel_cache import NVRTCKernelCache
 from tilelang.jit.adapter.torch.kernel_cache import TorchKernelCache
 from tilelang.jit.adapter.kernel_cache import TVMFFIKernelCache
-from tilelang.hexagon.kernel_cache import HexagonKernelCache
+from tilelang.hexagon.runtime.kernel_cache import HexagonKernelCache
 from tilelang.ascend.kernel_cache import AscendCythonKernelCache, AscendTVMFFIKernelCache
 
 if TYPE_CHECKING:

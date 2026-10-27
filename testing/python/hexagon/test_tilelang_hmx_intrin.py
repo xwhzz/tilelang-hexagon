@@ -20,14 +20,14 @@ from examples.hexagon.llama_cpp_integration.emit_embeddable import emit
 from examples.hexagon.llama_cpp_integration.emit_staged_qmatmul import (
     emit as emit_staged,
 )
-from tilelang.hexagon import _fastrpc
-from tilelang.hexagon.hmx_intrin import (
-    HMXIntrinEmitter,
+from tilelang.hexagon.runtime import fastrpc
+from tilelang.hexagon.intrinsics.crouton import (
     make_hmx_activation_layout,
     make_hmx_crouton_layout,
     make_hmx_output_layout,
     make_hmx_weight_layout,
 )
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 from tilelang.backend.target import determine_target
 
 
@@ -67,9 +67,9 @@ def _make_hmx_coordinate_probe():
         bias_vtcm: T.Tensor((64,), "uint32"),
     ):
         with T.Kernel(1, threads=1) as _:
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout(
                 {
                     A_hmx: emitter.activation_layout(A_hmx),
@@ -109,9 +109,9 @@ def _make_hmx_vtcm_gemm_probe():
     ):
         with T.Kernel(1, threads=1) as _:
             bias_vtcm = T.alloc_shared((64,), "uint32", align=256)
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout(
                 {
                     A_hmx: emitter.activation_layout(A_hmx),
@@ -164,9 +164,9 @@ def _make_hmx_operand_alignment_probe():
             cc_config = T.alloc_shared((64,), "uint32")  # 256 bytes
             dd_activation = T.alloc_shared((32, 32), "float16")
             ee_output = T.alloc_shared((32, 32), "float16")
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
 
             aa_padding[0] = T.float16(0)
             emitter.acquire(acc)
@@ -533,7 +533,7 @@ def test_hmx_atom_q4_codegen():
     assert offsets["A_hmx"] + 32 * 64 * 2 <= offsets["B_hmx"]
     assert offsets["B_hmx"] + 2 * 32 * 32 * 2 <= offsets["C_hmx"]
 
-    dsp_wrapper = _fastrpc.gen_dsp(
+    dsp_wrapper = fastrpc.gen_dsp(
         "tl_qmatmul_hmx_atoms_kernel",
         "qmatmul_hmx_atoms_kernel",
         source,
@@ -671,7 +671,7 @@ def test_hmx_deep_chunk_bounds_and_native_offsets(tiles):
     @T.prim_func
     def probe(A: T.Tensor((32, tiles * 32), "float16"), B: T.Tensor((32, tiles * 32), "float16")):
         with T.Kernel(1, threads=1):
-            acc = T.alloc_hmx_accumulator()
+            acc = T.hmx.alloc_accumulator()
             T.annotate_layout({A: emitter.activation_layout(A), B: emitter.weight_layout(B)})
             emitter.acquire(acc)
             emitter.clear(acc)
@@ -715,4 +715,4 @@ def test_hmx_deep_chunk_bounds_and_native_offsets(tiles):
 @pytest.mark.parametrize("count", [0, -1, 33])
 def test_hmx_deep_rejects_invalid_constant_count(count):
     with pytest.raises(ValueError, match="num_tiles"):
-        T.hexagon_hmx_mma(0, 0, 0, count)
+        T.hmx.mma(0, 0, 0, count)

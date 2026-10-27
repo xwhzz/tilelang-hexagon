@@ -624,8 +624,8 @@ static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 // clear/MAC/convert/ store and owns every Crouton buffer through alloc_shared.
 // TILE = 32; one tile is 1024 fp16 = 2 KB. On one Q6 thread, a source tile is
 // reusable after its final multiply packet; accumulator convert and output
-// store do not access A/W. `tl_hexagon_hmx` prefix so _fastrpc.py pulls in this
-// header.
+// store do not access A/W. `tl_hexagon_hmx` prefix so runtime/fastrpc.py pulls
+// in this header.
 //
 // The atom wrappers retain the dependency-only TIR state tokens as C
 // parameters. Hardware state remains implicit; the tokens only expose ordering

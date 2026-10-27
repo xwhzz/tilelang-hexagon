@@ -8,11 +8,6 @@ outer loop across the worker pool. The sequence below is the CPU pass order
 this backend was validated against, plus Hexagon's VTCM arena planning
 (``MergeSharedMemoryAllocations``). Target copy/GEMM hooks lower Crouton
 operations and explicit async-copy submissions.
-
-This module is imported through :mod:`tilelang.hexagon.backend` at tilelang
-init time (and *not* by ``tilelang.hexagon.__init__``), so the lean
-build/deploy harness in that package stays importable without the tilelang
-native library.
 """
 
 from __future__ import annotations
@@ -29,9 +24,6 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
     should_enable_race_check,
     should_force_let_inline,
 )
-from tilelang.tileop.gemm.registry import register_gemm_impl
-from tilelang.cpu.op.gemm.gemm_scalar import GEMM_INST_SCALAR, GemmScalar
-from tilelang.hexagon.gemm_hmx import GEMM_INST_HMX, GemmHMX
 
 
 def _check_dma_schedule(mod: IRModule) -> None:
@@ -147,10 +139,3 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
     return mod
-
-
-# The C++ hexagon GemmImpl (src/hexagon/op/gemm.cc) selects "hexagon.hmx" for fp16
-# 32-multiple gemms (-> GemmHMX: Crouton VTCM operands + HMX MAC), else "cpu.scalar"
-# (-> GemmScalar: a triple loop hexagon-clang auto-vectorizes onto HVX).
-register_gemm_impl("hexagon.scalar", GEMM_INST_SCALAR, lambda t: t.kind.name == "hexagon", GemmScalar)
-register_gemm_impl("hexagon.hmx", GEMM_INST_HMX, lambda t: t.kind.name == "hexagon", GemmHMX)

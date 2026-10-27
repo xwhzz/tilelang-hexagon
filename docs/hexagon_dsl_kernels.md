@@ -61,7 +61,7 @@ VTCM (`alloc_shared`) and never hits DDR. `T.gemm` needs `clear_accum=True` on H
 HMX accumulator must be `mxclracc`'d, else NaN).
 
 For explicit scheduling, HMX is driven at **instruction-atom granularity** via
-`tilelang/hexagon/hmx_intrin.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
+`tilelang/hexagon/intrinsics/hmx.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
 `TensorCoreIntrinEmitter` (`tilelang/cuda/intrinsics/macro/mma_macro_generator.py`). Like the
 tensor-core emitter, it turns the matmul's tiling config into `@T.macro` atoms so either an
 explicit kernel or `T.gemm` lowering can compose the operation:

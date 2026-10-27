@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tilelang.hexagon import adapter, build, device, elf_crc, env, linux_build, linux_runtime
+from tilelang.hexagon.runtime import adapter, build, device, elf_crc, env, linux_build, linux_runtime
 
 
 @pytest.fixture(autouse=True)

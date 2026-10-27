@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tilelang.hexagon import device
-from tilelang.hexagon.kernel_cache import HexagonKernelCache
+from tilelang.hexagon.runtime import device
+from tilelang.hexagon.runtime.kernel_cache import HexagonKernelCache
 
 
 @pytest.fixture

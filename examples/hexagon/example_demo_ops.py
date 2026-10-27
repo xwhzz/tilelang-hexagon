@@ -7,7 +7,7 @@ copy/reduce/HMX instruction primitives are selected by the backend.
 
 from tilelang.hexagon import language as T
 from tvm import tirx
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 from tilelang.hexagon.language import macro
 from tilelang.utils.language import to_tile_region
 
@@ -206,9 +206,9 @@ def make_gemm_f16_io(M, N, K, BN=128, copy_workers=1, fused_copy=False):
             c_native = T.alloc_shared((M, BN), "float16", align=2048)
             c_row = T.alloc_shared((M, BN), "float16", align=2048)
             config = T.alloc_shared((64,), "uint32", align=256)
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias_state = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias_state = T.hmx.alloc_bias_state()
             T.annotate_layout(
                 {
                     a_native: emitter.activation_layout(a_native),

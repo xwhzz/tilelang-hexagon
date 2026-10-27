@@ -46,7 +46,7 @@ offline matmul 256x256x256 on HMX vs golden: max abs err = 0.0009761  (PASS)
 ## What each step does
 
 0. **generate (pre-done, committed)** — `python generate.py` ran `tilelang.lower(..., target="hexagon")`
-   (Layers 1–3 → cDSP C) and `_fastrpc.write_project` (Layer 5 → FastRPC project), then patched the
+   (Layers 1–3 → cDSP C) and `fastrpc.write_project` (Layer 5 → FastRPC project), then patched the
    `CMakeLists` include to a repo-relative path. Its output is the committed `project/` +
    `generated_matmul_kernel.c`. The checked-in artifacts use one logical DDR/native-
    Crouton `T.copy` per matrix boundary and the current explicit-atom `T.gemm`

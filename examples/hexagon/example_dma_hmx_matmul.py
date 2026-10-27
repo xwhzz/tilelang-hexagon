@@ -8,7 +8,7 @@ before the current block's HMX computation.
 import torch
 import tilelang
 from tilelang.hexagon import language as T
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 
 
 def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
@@ -33,9 +33,9 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
             bn = T.alloc_shared((K, BN), "float16", align=2048)
             cn = T.alloc_shared((BM, BN), "float16", align=2048)
             config = T.alloc_shared((64,), "uint32", align=256)
-            acc = T.alloc_hmx_accumulator()
-            cvt = T.alloc_hmx_convert_state()
-            bias = T.alloc_hmx_bias_state()
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
             T.annotate_layout({an: E.activation_layout(an), bn: E.weight_layout(bn), cn: E.output_layout(cn)})
             for i in T.serial(32):
                 config[i] = T.uint32(0x3C00)

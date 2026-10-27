@@ -6,7 +6,7 @@ import tilelang
 from tilelang.backend.target import determine_target
 from examples.hexagon.example_demo_ops import hexreduce, make_elementwise, make_gemm_f16_io, make_map_tiled, make_rmsnorm_fp32
 from tilelang.hexagon import language as T
-from tilelang.hexagon.hmx_intrin import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 
 
 def make_reduce_probe(rows, cols, dtype="float32"):

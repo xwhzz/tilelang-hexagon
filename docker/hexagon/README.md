@@ -142,7 +142,7 @@ For an Android/v79 phone, create a new container with
 `TILELANG_HEXAGON_DEVICE` serial. The launcher skips SSH initialization on this
 path; the Android host and persistent agent continue to use ADB and the NDK.
 
-Linux-specific orchestration and transport live in `tilelang/hexagon/linux_runtime.py`.
+Linux-specific orchestration and transport live in `tilelang/hexagon/runtime/linux_runtime.py`.
 The original `device.py` is unchanged. `adapter.py` selects that connection only
 for Linux, and `build.py` dispatches to its Linux build function. The architecture
 priority is explicit argument, then `HEXAGON_DSP_ARCH`, then the existing v79 default.

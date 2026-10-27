@@ -19,26 +19,21 @@ from tilelang.instrumentation import (
 )
 
 
-def is_cpu_device_backend(target: Target):
-    # Hexagon kernels are emitted as sequential C (like the CPU "c" backend);
-    # treat them the same way for the host/device split.
-    return target.kind.name in ("c", "hexagon")
-
-
 def has_device_kernel_launch(attrs) -> bool:
     """Check if the attributes indicate a device kernel launch."""
     return bool(attrs and "calling_conv" in attrs and attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH)
 
 
-def is_device_call_c_device(func: tirx.PrimFunc):
+def is_direct_call_device(func: tirx.PrimFunc, device_kind: str) -> bool:
+    """Whether ``func`` is a device function of a direct-call device target.
+
+    Such functions keep the device target and are not packed: the host calls
+    them like ordinary C functions (see ``DeviceCodegen.direct_call``).
+    """
     attrs = func.attrs
     calling_conv = attrs.get("calling_conv", CallingConv.DEFAULT)
-    is_cpacked = calling_conv == CallingConv.C_PACKED_FUNC
-
-    # Check if it's a C target
-    if "target" in attrs and attrs["target"].kind.name in ("c", "hexagon") and not is_cpacked:
+    if "target" in attrs and attrs["target"].kind.name == device_kind and calling_conv != CallingConv.C_PACKED_FUNC:
         return True
-
     return has_device_kernel_launch(attrs)
 
 
@@ -46,12 +41,16 @@ def is_device_call(func: tirx.PrimFunc):
     return has_device_kernel_launch(func.attrs)
 
 
-def get_device_call(is_device_c: bool = False) -> Callable[[tirx.PrimFunc], bool]:
-    return is_device_call_c_device if is_device_c else is_device_call
+def get_device_call(direct_call_kind: str | None = None) -> Callable[[tirx.PrimFunc], bool]:
+    """Return the device-function predicate; ``direct_call_kind`` names a direct-call target."""
+    if direct_call_kind is None:
+        return is_device_call
+    return lambda func: is_direct_call_device(func, direct_call_kind)
 
 
-def get_host_call(is_device_c: bool = False) -> Callable[[tirx.PrimFunc], bool]:
-    return lambda func: not get_device_call(is_device_c)(func)
+def get_host_call(direct_call_kind: str | None = None) -> Callable[[tirx.PrimFunc], bool]:
+    device_call = get_device_call(direct_call_kind)
+    return lambda func: not device_call(func)
 
 
 def extrac_params(func: tirx.PrimFunc) -> list[KernelParam]:
@@ -129,8 +128,10 @@ def lower_to_host_device_ir(
             target = context.target
             target_host = context.target_host
 
-            _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
-            _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
+            device_codegen = context.module.device_codegens[target.kind.name]
+            direct_call_kind = target.kind.name if device_codegen.direct_call else None
+            _is_host_call = get_host_call(direct_call_kind)
+            _is_device_call = get_device_call(direct_call_kind)
 
             # Run backend-independent semantic checks before target-specific lowering.
             PreLowerSemanticCheck(mod)
