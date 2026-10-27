@@ -7,6 +7,8 @@
 
 #include "op/builtin_registry.h"
 
+#include <tvm/tirx/op_attr_types.h>
+
 namespace tvm {
 namespace tl {
 
@@ -68,6 +70,26 @@ TIR_DEFINE_TL_BUILTIN(hexagon_dma_wait)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+#define TL_HEXAGON_MATH_BUILTIN(Name)                                          \
+  TIR_DEFINE_TL_BUILTIN(Name)                                                  \
+      .set_num_inputs(1)                                                       \
+      .set_attr<TCallEffectKind>("TCallEffectKind",                            \
+                                 Integer(CallEffectKind::kPure))               \
+      .set_attr<TVectorizable>("TVectorizable", true)
+
+TL_HEXAGON_MATH_BUILTIN(hexagon_exp);
+TL_HEXAGON_MATH_BUILTIN(hexagon_exp2);
+TL_HEXAGON_MATH_BUILTIN(hexagon_log);
+TL_HEXAGON_MATH_BUILTIN(hexagon_log2);
+TL_HEXAGON_MATH_BUILTIN(hexagon_sqrt);
+TL_HEXAGON_MATH_BUILTIN(hexagon_rsqrt);
+TL_HEXAGON_MATH_BUILTIN(hexagon_tanh);
+TL_HEXAGON_MATH_BUILTIN(hexagon_sigmoid);
+TL_HEXAGON_MATH_BUILTIN(hexagon_erf);
+TL_HEXAGON_MATH_BUILTIN(hexagon_fabs);
+
+#undef TL_HEXAGON_MATH_BUILTIN
 
 } // namespace tl
 } // namespace tvm

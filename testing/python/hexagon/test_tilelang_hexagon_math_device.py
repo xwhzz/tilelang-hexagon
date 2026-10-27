@@ -1,0 +1,96 @@
+"""Accuracy of the HVX math functions on the device, against torch in float64.
+
+Vector min and max, which are exact, are checked here as well.
+"""
+
+import os
+
+import pytest
+
+import tilelang
+from tilelang.hexagon import language as T
+
+pytestmark = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+
+LANES = 4096
+
+# Function: torch reference, fp32 relative error bound, and input ranges for
+# fp32 and fp16 (geometric if positive). The fp16 ranges keep inputs and
+# results normal fp16 numbers.
+CASES = {
+    "exp": ("exp", 1e-5, (-20.0, 20.0), (-9.0, 10.0)),
+    "exp2": ("exp2", 1e-5, (-30.0, 30.0), (-13.0, 15.0)),
+    "log": ("log", 1e-6, (1e-6, 1e6), (1e-4, 6e4)),
+    "log2": ("log2", 1e-6, (1e-6, 1e6), (1e-4, 6e4)),
+    "sqrt": ("sqrt", 1e-6, (1e-6, 1e6), (1e-4, 6e4)),
+    "rsqrt": ("rsqrt", 1e-6, (1e-6, 1e6), (1e-4, 6e4)),
+    "tanh": ("tanh", 1e-5, (-8.0, 8.0), (-8.0, 8.0)),
+    "sigmoid": ("sigmoid", 1e-5, (-16.0, 16.0), (-8.0, 8.0)),
+    "erf": ("erf", 1e-5, (-4.0, 4.0), (-4.0, 4.0)),
+    "abs": ("abs", 0.0, (-8.0, 8.0), (-8.0, 8.0)),
+}
+
+
+def _inputs(torch, lo, hi):
+    if lo > 0:
+        return torch.logspace(torch.log10(torch.tensor(lo)), torch.log10(torch.tensor(hi)), LANES, dtype=torch.float64)
+    return torch.linspace(lo, hi, LANES, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16"])
+@pytest.mark.parametrize("fn", sorted(CASES))
+def test_math_matches_torch(fn, dtype):
+    import torch
+
+    ref, fp32_bound, fp32_range, fp16_range = CASES[fn]
+    op = getattr(T, fn)
+
+    @T.prim_func
+    def math(A: T.Tensor((LANES,), dtype), B: T.Tensor((LANES,), dtype)):
+        with T.Kernel(1):
+            for j in T.Parallel(LANES):
+                B[j] = op(A[j])
+
+    kernel = tilelang.compile(math, out_idx=[1], target="hexagon")
+    try:
+        x = _inputs(torch, *(fp32_range if dtype == "float32" else fp16_range)).to(getattr(torch, dtype))
+        expected = getattr(torch, ref)(x.double())
+        absolute = (kernel(x).double() - expected).abs()
+        # Near a zero of the function relative error is ill-conditioned, so
+        # bound the absolute error there.
+        near_zero = expected.abs() < 1e-3
+        relative = absolute[~near_zero] / expected[~near_zero].abs()
+        # fp16 results round once: half an fp16 ulp on top of the fp32 error.
+        bound = fp32_bound if dtype == "float32" else 2.0**-11 + fp32_bound
+        print(
+            f"{fn:8s} {dtype}: max rel {relative.max().item():.3g}, max abs near 0 {absolute[near_zero].max().item() if near_zero.any() else 0:.3g}"
+        )
+        assert relative.max().item() <= bound
+        assert not near_zero.any() or absolute[near_zero].max().item() <= 1e-5
+    finally:
+        kernel.adapter.close()
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "int8"])
+def test_min_and_max_match_torch(dtype):
+    import torch
+
+    @T.prim_func
+    def clamp(A: T.Tensor((LANES,), dtype), B: T.Tensor((LANES,), dtype), Lo: T.Tensor((LANES,), dtype), Hi: T.Tensor((LANES,), dtype)):
+        with T.Kernel(1):
+            for j in T.Parallel(LANES):
+                Lo[j] = T.min(A[j], B[j])
+                Hi[j] = T.max(A[j], B[j])
+
+    kernel = tilelang.compile(clamp, out_idx=[2, 3], target="hexagon")
+    try:
+        torch.manual_seed(0)
+        if dtype == "int8":
+            a, b = (torch.randint(-128, 128, (LANES,), dtype=torch.int8) for _ in range(2))
+        else:
+            a, b = (torch.randn(LANES).to(getattr(torch, dtype)) for _ in range(2))
+        lo, hi = kernel(a, b)
+        torch.testing.assert_close(lo, torch.minimum(a, b), rtol=0, atol=0)
+        torch.testing.assert_close(hi, torch.maximum(a, b), rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()

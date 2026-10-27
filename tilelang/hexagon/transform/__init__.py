@@ -33,3 +33,12 @@ def PlanDMAQueue():
     drains it at the end.
     """
     return _ffi_api.PlanDMAQueue()  # type: ignore
+
+
+def LowerMath():
+    """Lower the fp16/fp32 math intrinsics to the HVX math builtins.
+
+    Runs before layout inference so their loops vectorize; the codegen prints the
+    builtins as the scalar or vector ``hvx_math.h`` functions.
+    """
+    return _ffi_api.LowerMath()  # type: ignore

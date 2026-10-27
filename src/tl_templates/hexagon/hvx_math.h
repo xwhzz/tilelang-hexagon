@@ -1,24 +1,14 @@
 #pragma once
-// HVX math primitives for tilelang-generated Hexagon kernels.
+// HVX math for tilelang-generated Hexagon kernels.
 //
-// These implement the `map` and `reduce` halves of the backend's primitive
-// basis {gemm, copy, map, reduce}.  `gemm` runs on HMX (hmx.h) and `copy` is
-// the codegen's half8 path; everything pointwise/reductive (softmax, layernorm,
-// rmsnorm, gelu/silu, bias, residual) composes from the small set here:
-//
-//   transcendental lane funcs  : exp2, recip, rsqrt        (the irreducible HW)
-//   row reductions             : max, sum                  (over a contiguous
-//   row)
-//
-// All compute happens in fp32 (32 lanes / HVX vector) for accuracy; fp16 rows
-// are widened on the way in and narrowed on the way out.  Activations are
-// base-2 (`exp2`) so softmax can fold log2e into its score scale and run with
-// no per-element base conversion (FlashAttention-2 style).  No VTCM LUT is
-// needed: `exp2` is a degree-5 minimax polynomial (≈3e-6 rel err, fp16-exact
-// after rounding) plus integer exponent construction.
+// The codegen prints the fp16/fp32 math builtins (LowerMath) as the
+// tl_hvx_<fn> functions here, for scalars and for the codegen's vectors
+// (vec_type, common.h), and a float vector division as tl_hvx_div. Each
+// transcendental is one 32-lane fp32 register kernel (tl_hvx_<fn>_vsf) built
+// from exp2, recip and rsqrt; fp16 computes in fp32 and rounds once. The reduce
+// tile op lowers to the row reductions at the end (max, sum).
 //
 // Pulled in on demand by runtime/fastrpc.py when a kernel references `tl_hvx`.
-#include <cmath>           // scalar fallbacks for the ragged tail
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h> // vec_type, the codegen's vectors
@@ -124,35 +114,6 @@ TL_DEVICE HVX_Vector tl_hvx_narrow_hf(HVX_Vector lo, HVX_Vector hi) {
 }
 
 // ---------------------------------------------------------------------------
-// Row map: out[j] = exp2(in[j] - bias), contiguous fp16 row of length n.
-// `bias` is the per-row scalar (the running max in softmax; 0 for a plain
-// exp2).  Inputs are assumed base-2 already (fold log2e into the score scale).
-// The row base is assumed HVX-aligned (VTCM tiles whose width is a multiple of
-// 64 fp16 satisfy this); the ragged tail < 64 falls back to scalar.
-// ---------------------------------------------------------------------------
-TL_DEVICE void tl_hvx_exp2_bias_row(__fp16 *out, const __fp16 *in, float bias,
-                                    int n) {
-  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
-    for (int j = 0; j < n; ++j)
-      out[j] = (__fp16)exp2f((float)in[j] - bias);
-    return;
-  }
-  HVX_Vector vb = tl_hvx_splat_f(bias);
-  int nv = n / TL_HVX_F16_LANES;
-  const HVX_Vector *vin = (const HVX_Vector *)in;
-  HVX_Vector *vout = (HVX_Vector *)out;
-  for (int v = 0; v < nv; ++v) {
-    HVX_Vector lo, hi;
-    tl_hvx_widen_hf(vin[v], &lo, &hi);
-    lo = tl_hvx_exp2_vsf(tl_hvx_sub_sf(lo, vb));
-    hi = tl_hvx_exp2_vsf(tl_hvx_sub_sf(hi, vb));
-    vout[v] = tl_hvx_narrow_hf(lo, hi);
-  }
-  for (int j = nv * TL_HVX_F16_LANES; j < n; ++j)
-    out[j] = (__fp16)exp2f((float)in[j] - bias);
-}
-
-// ---------------------------------------------------------------------------
 // recip / rsqrt over 32 fp32 lanes.  HVX has no hardware seed, so we start from
 // the classic bit-pattern approximation and refine with Newton-Raphson (3 steps
 // → ~fp32 accuracy, far more than fp16 output needs).
@@ -176,6 +137,247 @@ TL_DEVICE HVX_Vector tl_hvx_rsqrt_vsf(HVX_Vector x) {
 }
 
 // ---------------------------------------------------------------------------
+// Math functions of the codegen's scalars and vectors (LowerMath prints
+// tl.hexagon_<fn> as tl_hvx_<fn>). Each has one 32-lane fp32 register kernel,
+// tl_hvx_<fn>_vsf, built from the polynomials above; fp16 computes in fp32 and
+// rounds once, and a scalar runs the same kernel on a splat, so a result does
+// not depend on whether its loop vectorized.
+// ---------------------------------------------------------------------------
+TL_DEVICE HVX_Vector tl_hvx_bits(int b) { return Q6_V_vsplat_R(b); }
+
+// x where q, else y.
+TL_DEVICE HVX_Vector tl_hvx_select(HVX_VectorPred q, HVX_Vector x,
+                                   HVX_Vector y) {
+  return Q6_V_vmux_QVV(q, x, y);
+}
+
+TL_DEVICE HVX_Vector tl_hvx_exp_vsf(HVX_Vector x) {
+  return tl_hvx_exp2_vsf(tl_hvx_mul_sf(x, tl_hvx_splat_f(1.4426950408889634f)));
+}
+
+// x = m·2^e with m in [sqrt(1/2), sqrt(2)); ln m = 2·atanh(s) with
+// s = (m - 1)/(m + 1), |s| <= 0.172, so five series terms are below 1e-9.
+TL_DEVICE HVX_Vector tl_hvx_log2_vsf(HVX_Vector x) {
+  // Scale subnormals into the normal range first.
+  HVX_VectorPred subnormal = Q6_Q_vcmp_gt_VwVw(tl_hvx_bits(0x00800000), x);
+  HVX_Vector scaled = tl_hvx_mul_sf(x, tl_hvx_splat_f(8388608.0f)); // 2^23
+  HVX_Vector v = tl_hvx_select(subnormal, scaled, x);
+  HVX_Vector e = Q6_Vw_vsub_VwVw(
+      Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(v, 23), tl_hvx_bits(0xff)),
+      tl_hvx_select(subnormal, tl_hvx_bits(127 + 23), tl_hvx_bits(127)));
+  HVX_Vector m = Q6_V_vor_VV(Q6_V_vand_VV(v, tl_hvx_bits(0x007fffff)),
+                             tl_hvx_bits(0x3f800000));
+  HVX_VectorPred big = Q6_Q_vcmp_gt_VwVw(m, tl_hvx_bits(0x3fb504f3)); // sqrt 2
+  m = tl_hvx_select(big, Q6_Vw_vsub_VwVw(m, tl_hvx_bits(0x00800000)), m);
+  e = tl_hvx_select(big, Q6_Vw_vadd_VwVw(e, tl_hvx_bits(1)), e);
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector s = tl_hvx_mul_sf(tl_hvx_sub_sf(m, one),
+                               tl_hvx_recip_vsf(tl_hvx_add_sf(m, one)));
+  HVX_Vector s2 = tl_hvx_mul_sf(s, s);
+  HVX_Vector p = tl_hvx_splat_f(1.0f / 9.0f);
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, s2), tl_hvx_splat_f(1.0f / 7.0f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, s2), tl_hvx_splat_f(1.0f / 5.0f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, s2), tl_hvx_splat_f(1.0f / 3.0f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, s2), one);
+  // log2 x = e + 2·s·p·log2(e)
+  HVX_Vector r = tl_hvx_add_sf(
+      Q6_Vsf_equals_Vw(e),
+      tl_hvx_mul_sf(tl_hvx_mul_sf(s, p), tl_hvx_splat_f(2.8853900817779268f)));
+  // 0 -> -inf; negative or NaN -> NaN; +inf -> +inf.
+  HVX_Vector magnitude = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  r = tl_hvx_select(Q6_Q_vcmp_gt_VwVw(magnitude, tl_hvx_bits(0x7f7fffff)), x,
+                    r);
+  r = tl_hvx_select(Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(), x), tl_hvx_bits(0x7fc00000),
+                    r);
+  return tl_hvx_select(Q6_Q_vcmp_eq_VwVw(magnitude, Q6_V_vzero()),
+                       tl_hvx_bits((int)0xff800000), r);
+}
+
+TL_DEVICE HVX_Vector tl_hvx_log_vsf(HVX_Vector x) {
+  return tl_hvx_mul_sf(tl_hvx_log2_vsf(x), tl_hvx_splat_f(0.6931471805599453f));
+}
+
+// The Newton-Raphson seed overflows for subnormals, so those are scaled by
+// 2^24 first, and the result by 2^12 (rsqrt) or 2^-12 (sqrt).
+TL_DEVICE HVX_VectorPred tl_hvx_is_subnormal(HVX_Vector x) {
+  HVX_Vector magnitude = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  return Q6_Q_and_QQ(Q6_Q_vcmp_gt_VwVw(tl_hvx_bits(0x00800000), magnitude),
+                     Q6_Q_vcmp_gt_VwVw(magnitude, Q6_V_vzero()));
+}
+
+TL_DEVICE HVX_Vector tl_hvx_rsqrt_scaled_vsf(HVX_Vector x) {
+  HVX_VectorPred subnormal = tl_hvx_is_subnormal(x);
+  HVX_Vector v = tl_hvx_select(
+      subnormal, tl_hvx_mul_sf(x, tl_hvx_splat_f(16777216.0f)), x); // 2^24
+  HVX_Vector r = tl_hvx_rsqrt_vsf(v);
+  return tl_hvx_select(subnormal, tl_hvx_mul_sf(r, tl_hvx_splat_f(4096.0f)),
+                       r); // 2^12
+}
+
+// rsqrt with IEEE special values: 0 -> inf, +inf -> 0, negative -> NaN.
+TL_DEVICE HVX_Vector tl_hvx_rsqrt_ieee_vsf(HVX_Vector x) {
+  HVX_Vector r = tl_hvx_rsqrt_scaled_vsf(x);
+  HVX_Vector magnitude = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  r = tl_hvx_select(Q6_Q_vcmp_eq_VwVw(x, tl_hvx_bits(0x7f800000)), Q6_V_vzero(),
+                    r);
+  r = tl_hvx_select(Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(), x), tl_hvx_bits(0x7fc00000),
+                    r);
+  return tl_hvx_select(
+      Q6_Q_vcmp_eq_VwVw(magnitude, Q6_V_vzero()),
+      Q6_V_vor_VV(tl_hvx_bits(0x7f800000),
+                  Q6_V_vand_VV(x, tl_hvx_bits((int)0x80000000))),
+      r);
+}
+
+// sqrt(x) = x·rsqrt(x); +-0 and +inf map to themselves, negative to NaN.
+TL_DEVICE HVX_Vector tl_hvx_sqrt_vsf(HVX_Vector x) {
+  HVX_Vector r = tl_hvx_mul_sf(x, tl_hvx_rsqrt_scaled_vsf(x));
+  HVX_Vector magnitude = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  r = tl_hvx_select(Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(), x), tl_hvx_bits(0x7fc00000),
+                    r);
+  HVX_VectorPred same = Q6_Q_vcmp_eq_VwVw(magnitude, Q6_V_vzero());
+  same = Q6_Q_or_QQ(same, Q6_Q_vcmp_eq_VwVw(x, tl_hvx_bits(0x7f800000)));
+  return tl_hvx_select(same, x, r);
+}
+
+// sigmoid(x) = 1/(1 + e^-x); exp2's clamp keeps it finite at both ends.
+TL_DEVICE HVX_Vector tl_hvx_sigmoid_vsf(HVX_Vector x) {
+  HVX_Vector e = tl_hvx_exp_vsf(Q6_V_vxor_VV(x, tl_hvx_bits((int)0x80000000)));
+  return tl_hvx_recip_vsf(tl_hvx_add_sf(tl_hvx_splat_f(1.0f), e));
+}
+
+// tanh(x) = 1 - 2/(e^2x + 1), which saturates to +-1. Below |x| = 1/4 that
+// form loses digits to cancellation, so an odd Taylor polynomial takes over.
+TL_DEVICE HVX_Vector tl_hvx_tanh_vsf(HVX_Vector x) {
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector e = tl_hvx_exp_vsf(tl_hvx_add_sf(x, x));
+  HVX_Vector q = tl_hvx_recip_vsf(tl_hvx_add_sf(e, one));
+  HVX_Vector large = tl_hvx_sub_sf(one, tl_hvx_add_sf(q, q));
+  HVX_Vector x2 = tl_hvx_mul_sf(x, x);
+  HVX_Vector p = tl_hvx_splat_f(-17.0f / 315.0f);
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, x2), tl_hvx_splat_f(2.0f / 15.0f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, x2), tl_hvx_splat_f(-1.0f / 3.0f));
+  HVX_Vector small = tl_hvx_add_sf(x, tl_hvx_mul_sf(tl_hvx_mul_sf(p, x2), x));
+  HVX_Vector magnitude = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  return tl_hvx_select(Q6_Q_vcmp_gt_VwVw(tl_hvx_bits(0x3e800000), magnitude),
+                       small, large);
+}
+
+// erf by Abramowitz-Stegun 7.1.26 (absolute error below 1.5e-7):
+// erf(x) = sign(x)·(1 - t·(a1 + t·(a2 + ...))·e^(-x^2)), t = 1/(1 + p|x|).
+// Below |x| = 1/2 its relative error grows, and the Taylor series
+// (2/sqrt(pi))·x·(1 - x^2/3 + x^4/10 - x^6/42 + x^8/216 - x^10/1320) takes
+// over.
+TL_DEVICE HVX_Vector tl_hvx_erf_vsf(HVX_Vector x) {
+  HVX_Vector sign = Q6_V_vand_VV(x, tl_hvx_bits((int)0x80000000));
+  HVX_Vector a = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector t = tl_hvx_recip_vsf(
+      tl_hvx_add_sf(one, tl_hvx_mul_sf(a, tl_hvx_splat_f(0.3275911f))));
+  HVX_Vector p = tl_hvx_splat_f(1.061405429f);
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(-1.453152027f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(1.421413741f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(-0.284496736f));
+  p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(0.254829592f));
+  p = tl_hvx_mul_sf(p, t);
+  HVX_Vector g = tl_hvx_exp_vsf(
+      Q6_V_vxor_VV(tl_hvx_mul_sf(a, a), tl_hvx_bits((int)0x80000000)));
+  HVX_Vector y = Q6_V_vor_VV(tl_hvx_sub_sf(one, tl_hvx_mul_sf(p, g)), sign);
+  HVX_Vector x2 = tl_hvx_mul_sf(x, x);
+  HVX_Vector s = tl_hvx_splat_f(-1.0f / 1320.0f);
+  s = tl_hvx_add_sf(tl_hvx_mul_sf(s, x2), tl_hvx_splat_f(1.0f / 216.0f));
+  s = tl_hvx_add_sf(tl_hvx_mul_sf(s, x2), tl_hvx_splat_f(-1.0f / 42.0f));
+  s = tl_hvx_add_sf(tl_hvx_mul_sf(s, x2), tl_hvx_splat_f(1.0f / 10.0f));
+  s = tl_hvx_add_sf(tl_hvx_mul_sf(s, x2), tl_hvx_splat_f(-1.0f / 3.0f));
+  s = tl_hvx_add_sf(tl_hvx_mul_sf(s, x2), one);
+  HVX_Vector small =
+      tl_hvx_mul_sf(tl_hvx_mul_sf(s, x), tl_hvx_splat_f(1.1283791670955126f));
+  return tl_hvx_select(Q6_Q_vcmp_gt_VwVw(tl_hvx_bits(0x3f000000), a), small, y);
+}
+
+// Applies a register kernel to every register of a vector. This loop and the
+// division's unroll in full: rolled, they pass every register through the stack
+// and run the registers' dependency chains one after another, which made exp
+// over 64 fp16 lanes 2.5x slower than two interleaved chains.
+template <HVX_Vector (*F)(HVX_Vector), int N>
+TL_DEVICE vec_type<float, N> tl_hvx_apply(const vec_type<float, N> &x) {
+  static_assert(N % TL_HVX_F32_LANES == 0, "HVX math needs whole registers");
+  vec_type<float, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
+    HVX_Vector v;
+    __builtin_memcpy(&v, (const char *)&x.v + 128 * i, 128);
+    v = F(v);
+    __builtin_memcpy((char *)&out.v + 128 * i, &v, 128);
+  }
+  return out;
+}
+
+template <HVX_Vector (*F)(HVX_Vector), int N>
+TL_DEVICE vec_type<half, N> tl_hvx_apply(const vec_type<half, N> &x) {
+  static_assert(N % TL_HVX_F16_LANES == 0, "HVX math needs whole registers");
+  vec_type<half, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F16_LANES; ++i) {
+    HVX_Vector v, lo, hi;
+    __builtin_memcpy(&v, (const char *)&x.v + 128 * i, 128);
+    tl_hvx_widen_hf(v, &lo, &hi);
+    v = tl_hvx_narrow_hf(F(lo), F(hi));
+    __builtin_memcpy((char *)&out.v + 128 * i, &v, 128);
+  }
+  return out;
+}
+
+template <HVX_Vector (*F)(HVX_Vector)> TL_DEVICE float tl_hvx_apply(float x) {
+  HVX_Vector v = F(tl_hvx_splat_f(x));
+  float r;
+  __builtin_memcpy(&r, &v, 4);
+  return r;
+}
+
+#define TL_HVX_MATH(name, kernel)                                              \
+  template <int N>                                                             \
+  TL_DEVICE vec_type<float, N> tl_hvx_##name(const vec_type<float, N> &x) {    \
+    return tl_hvx_apply<kernel>(x);                                            \
+  }                                                                            \
+  template <int N>                                                             \
+  TL_DEVICE vec_type<half, N> tl_hvx_##name(const vec_type<half, N> &x) {      \
+    return tl_hvx_apply<kernel>(x);                                            \
+  }                                                                            \
+  TL_DEVICE float tl_hvx_##name(float x) { return tl_hvx_apply<kernel>(x); }   \
+  /* __fp16 is storage-only: the result is the fp32 value, rounded once by */  \
+  /* the store, as scalar fp16 arithmetic is computed in fp32 anyway. */       \
+  TL_DEVICE float tl_hvx_##name(const half &x) {                               \
+    return tl_hvx_apply<kernel>((float)x);                                     \
+  }
+
+TL_HVX_MATH(exp, tl_hvx_exp_vsf)
+TL_HVX_MATH(exp2, tl_hvx_exp2_vsf)
+TL_HVX_MATH(log, tl_hvx_log_vsf)
+TL_HVX_MATH(log2, tl_hvx_log2_vsf)
+TL_HVX_MATH(sqrt, tl_hvx_sqrt_vsf)
+TL_HVX_MATH(rsqrt, tl_hvx_rsqrt_ieee_vsf)
+TL_HVX_MATH(tanh, tl_hvx_tanh_vsf)
+TL_HVX_MATH(sigmoid, tl_hvx_sigmoid_vsf)
+TL_HVX_MATH(erf, tl_hvx_erf_vsf)
+#undef TL_HVX_MATH
+
+// |x| is one vector and that clears the sign bit; clang scalarizes a float
+// vector fabs on HVX.
+template <int N>
+TL_DEVICE vec_type<float, N> tl_hvx_fabs(const vec_type<float, N> &x) {
+  typedef int32_t bits_t __attribute__((ext_vector_type(N)));
+  return (typename vec_type<float, N>::nat_t)((bits_t)x.v & 0x7fffffff);
+}
+template <int N>
+TL_DEVICE vec_type<half, N> tl_hvx_fabs(const vec_type<half, N> &x) {
+  typedef int16_t bits_t __attribute__((ext_vector_type(N)));
+  return (typename vec_type<half, N>::nat_t)((bits_t)x.v & (int16_t)0x7fff);
+}
+TL_DEVICE float tl_hvx_fabs(float x) { return __builtin_fabsf(x); }
+TL_DEVICE float tl_hvx_fabs(const half &x) { return __builtin_fabsf((float)x); }
+
+// ---------------------------------------------------------------------------
 // Division of the codegen's float vectors (vec_type<float|half, N>, N whole
 // registers). HVX has no divide and clang scalarizes a vector `/`, so the
 // codegen prints a / b as tl_hvx_div(a, b): a times the reciprocal of b. fp16
@@ -186,6 +388,7 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
                                         const vec_type<float, N> &b) {
   static_assert(N % TL_HVX_F32_LANES == 0, "tl_hvx_div needs whole registers");
   vec_type<float, N> out;
+#pragma clang loop unroll(full)
   for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
     HVX_Vector x, y;
     __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
@@ -201,6 +404,7 @@ TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
                                        const vec_type<half, N> &b) {
   static_assert(N % TL_HVX_F16_LANES == 0, "tl_hvx_div needs whole registers");
   vec_type<half, N> out;
+#pragma clang loop unroll(full)
   for (int i = 0; i < N / TL_HVX_F16_LANES; ++i) {
     HVX_Vector x, y, xlo, xhi, ylo, yhi;
     __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
@@ -212,47 +416,6 @@ TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
     __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
   }
   return out;
-}
-
-// Row maps: out[j] = f(in[j]); fp16 row, fp32 internal.  `tl_hvx_rsqrt_eps_row`
-// adds eps before the rsqrt (LayerNorm/RMSNorm variance term).
-TL_DEVICE void tl_hvx_recip_row(__fp16 *out, const __fp16 *in, int n) {
-  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
-    for (int j = 0; j < n; ++j)
-      out[j] = (__fp16)(1.0f / (float)in[j]);
-    return;
-  }
-  int nv = n / TL_HVX_F16_LANES;
-  const HVX_Vector *vin = (const HVX_Vector *)in;
-  HVX_Vector *vout = (HVX_Vector *)out;
-  for (int v = 0; v < nv; ++v) {
-    HVX_Vector lo, hi;
-    tl_hvx_widen_hf(vin[v], &lo, &hi);
-    vout[v] = tl_hvx_narrow_hf(tl_hvx_recip_vsf(lo), tl_hvx_recip_vsf(hi));
-  }
-  for (int j = nv * TL_HVX_F16_LANES; j < n; ++j)
-    out[j] = (__fp16)(1.0f / (float)in[j]);
-}
-TL_DEVICE void tl_hvx_rsqrt_eps_row(__fp16 *out, const __fp16 *in, float eps,
-                                    int n) {
-  if (!tl_hvx_aligned_128(in) || !tl_hvx_aligned_128(out)) {
-    for (int j = 0; j < n; ++j)
-      out[j] = (__fp16)(1.0f / sqrtf((float)in[j] + eps));
-    return;
-  }
-  HVX_Vector ve = tl_hvx_splat_f(eps);
-  int nv = n / TL_HVX_F16_LANES;
-  const HVX_Vector *vin = (const HVX_Vector *)in;
-  HVX_Vector *vout = (HVX_Vector *)out;
-  for (int v = 0; v < nv; ++v) {
-    HVX_Vector lo, hi;
-    tl_hvx_widen_hf(vin[v], &lo, &hi);
-    lo = tl_hvx_rsqrt_vsf(tl_hvx_add_sf(lo, ve));
-    hi = tl_hvx_rsqrt_vsf(tl_hvx_add_sf(hi, ve));
-    vout[v] = tl_hvx_narrow_hf(lo, hi);
-  }
-  for (int j = nv * TL_HVX_F16_LANES; j < n; ++j)
-    out[j] = (__fp16)(1.0f / sqrtf((float)in[j] + eps));
 }
 
 // ---------------------------------------------------------------------------
@@ -390,10 +553,9 @@ TL_DEVICE void tl_hvx_rowmax_mat_f32(float *out, const float *in, int rows,
 
 // ---------------------------------------------------------------------------
 // q4_0 dequantize -> row-major fp16, vectorized on HVX.  This is the perf-
-// critical "codec" primitive.  The codegen's elementwise vectorizer
-// (EmitHvxExpr) handles fp16 add/sub/mul but NOT the nibble unpack, so the
-// packed->fp16 decode is expressed here as explicit vector ops and reached from
-// the DSL via T.call_extern (a `dequantize` tile op).  Intrinsic sequence
+// critical "codec" primitive.  The packed->fp16 decode is expressed here as
+// explicit vector ops and reached from the DSL via T.call_extern (a
+// `dequantize` tile op).  Intrinsic sequence
 // mirrors ggml-hexagon's dequantize_tiled_weight_to_fp16_task_q4_0:
 //   vand/vlsr (nibbles) -> vsub 8 -> vshuff (interleave to K order) ->
 //   vunpack b->h (sign-extend) -> hf<-h -> vmpy by per-block scale.

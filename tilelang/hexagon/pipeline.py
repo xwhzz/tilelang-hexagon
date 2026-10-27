@@ -66,6 +66,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.BindTarget(target)(mod)
     mod = tilelang.hexagon.transform.LowerKernelLaunch()(mod)
     mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=False, unsupported_annotations=["cluster_dims"])(mod)
+    mod = tilelang.hexagon.transform.LowerMath()(mod)
     pass_ctx = tilelang.transform.get_pass_context()
 
     if should_force_let_inline():

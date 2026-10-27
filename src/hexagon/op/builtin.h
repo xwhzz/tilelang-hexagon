@@ -74,6 +74,21 @@ TVM_DLL const Op &hexagon_dma_commit();
  * hexagon_dma_wait(groups), with a constant count. */
 TVM_DLL const Op &hexagon_dma_wait();
 
+// HVX math. LowerMath rewrites the fp16/fp32 tirx math intrinsics into these
+// before vectorization: they are vectorizable, and the codegen prints scalar
+// and vector forms as the same hvx_math.h function, so a result does not
+// depend on whether its loop vectorized.
+TVM_DLL const Op &hexagon_exp();
+TVM_DLL const Op &hexagon_exp2();
+TVM_DLL const Op &hexagon_log();
+TVM_DLL const Op &hexagon_log2();
+TVM_DLL const Op &hexagon_sqrt();
+TVM_DLL const Op &hexagon_rsqrt();
+TVM_DLL const Op &hexagon_tanh();
+TVM_DLL const Op &hexagon_sigmoid();
+TVM_DLL const Op &hexagon_erf();
+TVM_DLL const Op &hexagon_fabs();
+
 } // namespace tl
 } // namespace tvm
 

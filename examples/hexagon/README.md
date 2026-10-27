@@ -119,12 +119,10 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   `T.copy` has no DMA-specific lowering. Native Crouton endpoints use the HMX
   pack/unpack path. See the [DMA/worker implementation boundaries](../../docs/hexagon_dsl_demo_ops_zh.md#实现边界)
   for the currently validated composition and cleanup rules.
-- The flash-attention softmax runs on **HVX**: the elementwise `T.serial` maps
-  (`exp`, rescale, `/l`) are vectorized to 64-lane HVX by the Hexagon codegen, and the
-  row reductions go through the reduce tile op (`hexreduce`). It's spelled with explicit
-  `T.serial` loops + a direct reduce call rather than `T.reduce_max`/`T.Parallel`
-  because the backend has no single-thread fragment-layout inference — see the kernel
-  comments and the adaptation doc.
+- The flash-attention softmax runs on **HVX**: the elementwise `T.Parallel` maps
+  (`exp`, rescale, `/l`) vectorize onto whole HVX registers, with `T.exp` and division
+  lowered to the HVX math functions, and the row reductions go through the reduce tile
+  op (`hexreduce`) rather than `T.reduce_max` until #23 lands fragments.
 - If a run reports an agent/VTCM error, clear stale agents: `adb shell pkill -f _agent`.
 
 ## DMA matmul example and benchmark

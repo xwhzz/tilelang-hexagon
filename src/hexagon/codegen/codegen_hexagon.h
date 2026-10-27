@@ -13,11 +13,8 @@
 
 #include "backend/common/codegen/codegen_c_base.h"
 #include "tvm/target/codegen.h"
-#include <optional>
 #include <string>
-#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
-#include <unordered_set>
 #include <vector>
 
 namespace tvm {
@@ -51,9 +48,7 @@ public:
   void VisitExpr_(const DivNode *op, std::ostream &os) final; // NOLINT(*)
   // Print Hexagon builtins as calls to their runtime template functions.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
-  // Print a worker loop as a tl_parallel_for call. HVX-vectorize an innermost
-  // elementwise loop (the `map` half of the backend's primitive basis); fall
-  // back to CodeGenC's scalar loop otherwise.
+  // Print a worker loop as a tl_parallel_for call.
   void VisitStmt_(const ForNode *op) final; // NOLINT(*)
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
@@ -84,32 +79,6 @@ private:
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,
                                    std::ostream &os); // NOLINT(*)
-
-  // ---- HVX elementwise ("map") vectorizer (see codegen_hexagon.cc) ----
-  // A subexpression's value as a pair of 32-lane fp32 HVX vectors backing 64
-  // fp16 lanes; `bcast` means lo == hi (a splatted j-independent scalar).
-  struct HvxLanes {
-    std::string lo, hi;
-    bool bcast;
-  };
-  // Try to emit `op` (an innermost loop) as a full-width HVX elementwise loop;
-  // returns false (emitting nothing) if the loop isn't a vectorizable map.
-  bool TryEmitHvxElementwise(const ForNode *op);
-  // One recursive walk for both phases: emit=false is the side-effect-free
-  // supportability probe (returns nullopt if `e` isn't a supported elementwise
-  // expr); emit=true writes the HVX statements and returns the result lanes.
-  // Single op-set — no separate detection function to drift out of sync.
-  std::optional<HvxLanes> EmitHvxExpr(const PrimExpr &e, const tirx::Var &j,
-                                      arith::Analyzer *ana, bool emit);
-  HvxLanes EmitHvxOp(const HvxLanes &a, const HvxLanes &b, const char *fn,
-                     bool emit);
-  HvxLanes EmitHvxUnary(const HvxLanes &a, const char *fn, bool emit);
-  // Whether a vectorized access buf[idx] (idx = base + j, j stepping 64 fp16)
-  // is 128-byte (HVX vector) aligned: shared VTCM tiles are merge-aligned to
-  // 128, so it reduces to base % 64 == 0 (provable via the analyzer).  Drives
-  // the aligned-vmem vs unaligned-vmemu choice.
-  bool AccessAligned128(const BufferNode *buf, const PrimExpr &idx,
-                        const tirx::Var &j, arith::Analyzer *ana);
 };
 
 } // namespace codegen

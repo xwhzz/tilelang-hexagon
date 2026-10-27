@@ -102,3 +102,16 @@ TL_DEFINE_VEC(uint8_t)
 TL_DEFINE_VEC(uint16_t)
 TL_DEFINE_VEC(uint32_t)
 TL_DEFINE_VEC(uint64_t)
+
+// Vector min and max, which the codegen prints for vector Min/Max: one HVX
+// vmin/vmax for every fp32, fp16 and integer lane type.
+template <typename T, int N>
+TL_DEVICE vec_type<T, N> tl_vec_min(const vec_type<T, N> &a,
+                                    const vec_type<T, N> &b) {
+  return __builtin_elementwise_min(a.v, b.v);
+}
+template <typename T, int N>
+TL_DEVICE vec_type<T, N> tl_vec_max(const vec_type<T, N> &a,
+                                    const vec_type<T, N> &b) {
+  return __builtin_elementwise_max(a.v, b.v);
+}

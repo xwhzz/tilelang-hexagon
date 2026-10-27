@@ -30,6 +30,12 @@ plus a conversion: `-mhvx-ieee-fp` would select single IEEE `.hf`/`.sf` instruct
 the SM8750 (v79) cDSP returns zeros for them, although hexagon-sim computes them correctly.
 HVX has no divide, and clang scalarizes a vector `/`, so the codegen prints float vector
 division as `tl_hvx_div` (`hvx_math.h`): a times the Newton-Raphson reciprocal of b, in fp32.
+The fp16/fp32 math intrinsics (`T.exp`, `T.exp2`, `T.log`, `T.log2`, `T.sqrt`, `T.rsqrt`,
+`T.tanh`, `T.sigmoid`, `T.erf`, `T.abs`) become Hexagon builtins before layout inference
+(`LowerMath`), so their loops vectorize, and print as the `hvx_math.h` functions. A scalar
+runs the same 32-lane kernel on a splat, so a result never depends on whether its loop
+vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` print as
+`tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type.
 
 Practical: **DSL guidance** — for a loop that touches uint8, use `T.vectorized(≥128)` (a
 multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 20 ms → 1.4 ms.

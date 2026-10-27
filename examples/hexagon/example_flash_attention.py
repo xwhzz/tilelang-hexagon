@@ -7,13 +7,12 @@ non-gemm primitives of the backend's {gemm, copy, map, reduce} basis:
 
   * **reduce** — `hexreduce(S, rmax, "max", 1)` / `"sum"` lower the structured reduce
     tile op straight to the HVX row-reduction primitives.
-  * **map** — the elementwise `T.serial` loops (`exp(S − m)`, the `acc_o` rescale, the
-    `+ temp` accumulate, the final `/l`) are recognised by the Hexagon codegen and
-    emitted as full-width (64-lane) HVX: widen fp16→fp32, compute, narrow back.  The
-    kernel stays plain `T.serial` + `T.exp`; the codegen does the vectorization.
+  * **map** — the elementwise `T.Parallel` loops (`exp(S − m)`, the `acc_o` rescale,
+    the `+ temp` accumulate, the final `/l`) vectorize onto whole HVX registers through
+    the standard lowering; `T.exp` and the division become the HVX math functions.
 
-The running max/denominator (`m`, `l`, `scale`) are tiny per-row (M-length) updates
-left as scalar. HMX GEMM buffers use native Crouton layout, while the HVX row-reduce
+The running max/denominator (`m`, `l`, `scale`) are per-row (M-length) maps of the
+same kind. HMX GEMM buffers use native Crouton layout, while the HVX row-reduce
 extern requires contiguous row-major input. `S_hmx -> S -> S_hmx` and
 `temp_hmx -> temp` make those layout boundaries explicit; Hexagon `T.copy` recognizes
 the exact HMX layout and lowers these VTCM-to-VTCM transforms to Crouton pack/unpack.
@@ -72,10 +71,9 @@ def make_flash(M, SEQ, BN, D):
             scale = T.alloc_shared((M,), "float32")
             T.copy(Q, Q_row)
             T.copy(Q_row, Q_sh)
-            for i in T.serial(M):
-                for j in T.serial(D):
-                    acc_o[i, j] = T.float16(0)  # map (HVX)
-            for i in T.serial(M):
+            for i, j in T.Parallel(M, D):
+                acc_o[i, j] = T.float16(0)
+            for i in T.Parallel(M):
                 m[i] = T.float32(NEG)
                 l[i] = T.float32(0)
             for kv in T.serial(SEQ // BN):
@@ -86,28 +84,24 @@ def make_flash(M, SEQ, BN, D):
                 T.gemm(Q_sh, K_sh, S_hmx, transpose_B=True, clear_accum=True)  # S = Q@Kᵀ (HMX)
                 T.copy(S_hmx, S)  # Crouton -> row-major
                 hexreduce(S, rmax, "max", 1)  # rmax = rowmax(S) (HVX)
-                for i in T.serial(M):  # running max + rescale (scalar, M)
+                for i in T.Parallel(M):  # running max + rescale
                     rmax[i] = T.max(m[i], rmax[i])
                     scale[i] = T.exp(m[i] - rmax[i])
-                for i in T.serial(M):
-                    for j in T.serial(BN):  # P = exp(S − m) (HVX map)
-                        S[i, j] = T.cast(T.exp(T.cast(S[i, j], "float32") - rmax[i]), "float16")
+                for i, j in T.Parallel(M, BN):  # P = exp(S − m)
+                    S[i, j] = T.cast(T.exp(T.cast(S[i, j], "float32") - rmax[i]), "float16")
                 hexreduce(S, rsum, "sum", 1)  # rsum = rowsum(P) (HVX)
-                for i in T.serial(M):  # denominator update (scalar, M)
+                for i in T.Parallel(M):  # denominator update
                     l[i] = l[i] * scale[i] + rsum[i]
                     m[i] = rmax[i]
-                for i in T.serial(M):
-                    for j in T.serial(D):  # rescale acc_o (HVX map)
-                        acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") * scale[i], "float16")
+                for i, j in T.Parallel(M, D):  # rescale acc_o
+                    acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") * scale[i], "float16")
                 T.copy(S, S_hmx)  # row-major -> Crouton
                 T.gemm(S_hmx, V_sh, temp_hmx, clear_accum=True)  # temp = P@V (HMX)
                 T.copy(temp_hmx, temp)  # Crouton -> row-major
-                for i in T.serial(M):
-                    for j in T.serial(D):  # acc_o += temp (HVX map)
-                        acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") + T.cast(temp[i, j], "float32"), "float16")
-            for i in T.serial(M):
-                for j in T.serial(D):  # O = acc_o / l (HVX map)
-                    acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") / l[i], "float16")
+                for i, j in T.Parallel(M, D):  # acc_o += temp
+                    acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") + T.cast(temp[i, j], "float32"), "float16")
+            for i, j in T.Parallel(M, D):  # O = acc_o / l
+                acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") / l[i], "float16")
             T.copy(acc_o, O)
 
     return flash

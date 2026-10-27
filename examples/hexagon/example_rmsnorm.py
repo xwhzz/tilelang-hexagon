@@ -8,12 +8,10 @@ the backend isn't softmax-shaped.  Per row:
     inv[i]   = rsqrt(ssq[i]/N + eps)       (per-row scalar — M of them)
     O[i,j]   = X[i,j] · inv[i] · gamma[j]  (normalize: HVX map)
 
-Every elementwise `T.serial` loop is emitted as 64-lane HVX by the Hexagon codegen
-(widen fp16→fp32, compute, narrow); the row reduction goes through the reduce tile
-op (`hexreduce`).  `inv[i]` is per-row, so it stays a small scalar `T.rsqrt` (which
-lowers to `1/sqrtf`).  The codegen ALSO vectorizes a *per-element* `T.rsqrt`
-(recognizing `1/sqrtf(x)` → the HVX `rsqrt` lane primitive) for kernels that need
-it — see the wiring in codegen_hexagon.cc.
+Every elementwise `T.Parallel` loop vectorizes onto whole HVX registers through the
+standard lowering (fp16 loads, fp32 arithmetic, fp16 stores); `T.rsqrt` becomes the HVX
+`rsqrt`, so the per-row `inv[i]` map vectorizes too. The row reduction goes through the
+reduce tile op (`hexreduce`).
 
 `hexreduce` invokes the reduce tile op directly on shared VTCM tiles (the stock
 `T.reduce_sum` macro routes through register fragments Hexagon can't infer).
@@ -52,15 +50,13 @@ def make_rmsnorm(M, N):
             inv = T.alloc_shared((M,), "float32")
             T.copy(X, X_sh)
             T.copy(G, G_sh)
-            for i in T.serial(M):
-                for j in T.serial(N):  # X² (HVX map)
-                    Xsq[i, j] = T.cast(T.cast(X_sh[i, j], "float32") * T.cast(X_sh[i, j], "float32"), "float16")
+            for i, j in T.Parallel(M, N):  # X²
+                Xsq[i, j] = T.cast(T.cast(X_sh[i, j], "float32") * T.cast(X_sh[i, j], "float32"), "float16")
             hexreduce(Xsq, ssq, "sum", 1)  # Σ_j X² (HVX reduce, fp32 accum)
-            for i in T.serial(M):  # per-row inverse-RMS (scalar)
+            for i in T.Parallel(M):  # per-row inverse RMS
                 inv[i] = T.rsqrt(ssq[i] / T.float32(N) + T.float32(EPS))
-            for i in T.serial(M):
-                for j in T.serial(N):  # O = X · inv · gamma (HVX map)
-                    O_sh[i, j] = T.cast(T.cast(X_sh[i, j], "float32") * inv[i] * T.cast(G_sh[j], "float32"), "float16")
+            for i, j in T.Parallel(M, N):  # O = X · inv · gamma
+                O_sh[i, j] = T.cast(T.cast(X_sh[i, j], "float32") * inv[i] * T.cast(G_sh[j], "float32"), "float16")
             T.copy(O_sh, O)
 
     return rmsnorm

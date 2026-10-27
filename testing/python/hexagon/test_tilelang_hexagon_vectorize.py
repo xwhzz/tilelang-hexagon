@@ -68,3 +68,44 @@ def test_vector_division_uses_the_hvx_reciprocal(dtype, vector):
     source = _source(divide)
     assert f"tl_hvx_div(*({vector}*)(A + " in source
     assert "(A[(bx * 256)] / B[((bx * 256) + 1)])" in source
+
+
+@pytest.mark.parametrize("dtype,vector", [("float32", "float32"), ("float16", "half64"), ("int8", "int8_t128")])
+def test_vector_min_and_max_are_hvx_instructions(dtype, vector):
+    @T.prim_func
+    def clamp(A: T.Tensor((4, 256), dtype), B: T.Tensor((4, 256), dtype)):
+        with T.Kernel(4) as bx:
+            for j in T.Parallel(256):
+                B[bx, j] = T.min(T.max(A[bx, j], T.cast(0, dtype)), T.cast(1, dtype))
+            # A scalar min stays a C conditional.
+            B[bx, 0] = T.min(A[bx, 1], A[bx, 2])
+
+    source = _source(clamp)
+    assert f"tl_vec_min(tl_vec_max(*({vector}*)(A + " in source
+    assert ") < (" in source
+
+
+# DSL function: the hvx_math.h function it prints as.
+MATH = {fn: f"tl_hvx_{fn}" for fn in ["exp", "exp2", "log", "log2", "sqrt", "rsqrt", "tanh", "sigmoid", "erf"]}
+MATH["abs"] = "tl_hvx_fabs"
+
+
+@pytest.mark.parametrize("fn", sorted(MATH))
+@pytest.mark.parametrize("dtype,vector", [("float32", "float32"), ("float16", "half64")])
+def test_math_vectorizes_to_hvx_functions(fn, dtype, vector):
+    op = getattr(T, fn)
+
+    @T.prim_func
+    def math(A: T.Tensor((4, 256), dtype), B: T.Tensor((4, 256), dtype)):
+        with T.Kernel(4) as bx:
+            for j in T.Parallel(256):
+                B[bx, j] = op(A[bx, j])
+            # A scalar runs the same HVX kernel.
+            B[bx, 0] = op(A[bx, 1])
+
+    source = _source(math)
+    assert f"{MATH[fn]}(*({vector}*)(A + " in source
+    assert f"{MATH[fn]}(A[" in source
+    # No libm call, scalar or vector.
+    for libm in ("expf", "exp2f", "logf", "log2f", "sqrtf", "tanhf", "erff", "fabsf"):
+        assert f"{libm}(" not in source

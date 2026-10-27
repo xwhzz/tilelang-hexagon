@@ -73,7 +73,9 @@ def test_rmsnorm_stays_fp32_and_composes_reduction():
     source = lower(make_rmsnorm_fp32(32, 2048))
     assert "tl_hvx_rowsum_mat_f32(" in source
     assert "float32*" in source
-    assert "sqrtf" in source
+    # The scalar rsqrt runs the HVX kernel too, not libm.
+    assert "tl_hvx_rsqrt(" in source
+    assert "sqrtf" not in source
     assert "half" not in source
     assert "tl_parallel_for(" in source
 
