@@ -1,5 +1,7 @@
 """The Hexagon launch grid in TIR: a serial loop nest, or one worker-pool loop."""
 
+import os
+
 import pytest
 
 import tilelang
@@ -138,3 +140,36 @@ def test_one_kernel_per_prim_func():
 
     with pytest.raises(Exception, match="one T.Kernel per prim_func"):
         _lower(two_launches)
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_hmx_workers_run_on_the_device():
+    import torch
+
+    blocks, size = 6, 64
+
+    @T.prim_func
+    def batched(
+        A: T.Tensor((blocks, size, size), "float16"),
+        B: T.Tensor((blocks, size, size), "float16"),
+        C: T.Tensor((blocks, size, size), "float16"),
+    ):
+        # HMX in workers, without DMA: the worker scope's destructor must not
+        # pull the C++ unwinder into the skel.
+        with T.Kernel(blocks, num_workers=6) as bx:
+            A_hmx = T.alloc_shared((size, size), "float16")
+            B_hmx = T.alloc_shared((size, size), "float16")
+            C_hmx = T.alloc_shared((size, size), "float16")
+            T.copy(A[bx, :, :], A_hmx)
+            T.copy(B[bx, :, :], B_hmx)
+            T.gemm(A_hmx, B_hmx, C_hmx, clear_accum=True)
+            T.copy(C_hmx, C[bx, :, :])
+
+    kernel = tilelang.compile(batched, out_idx=[2], target="hexagon")
+    try:
+        torch.manual_seed(0)
+        a = torch.randn(blocks, size, size).half()
+        b = torch.randn(blocks, size, size).half()
+        torch.testing.assert_close(kernel(a, b).float(), torch.bmm(a.float(), b.float()), rtol=2e-2, atol=2e-2)
+    finally:
+        kernel.adapter.close()

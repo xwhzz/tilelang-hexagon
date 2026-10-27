@@ -236,12 +236,12 @@ def test_normal_copy_does_not_create_dma_queue():
     assert "tl_dma_async" not in lower(probe)
 
 
-def test_async_dsp_build_avoids_exception_runtime():
+def test_dsp_build_avoids_exception_runtime():
     from tilelang.hexagon.runtime import fastrpc
 
-    cmake = fastrpc.gen_cmake("test_async", "/templates", async_dma=True)
-    assert "-fno-exceptions" in cmake
-    assert "-fno-exceptions" not in fastrpc.gen_cmake("test_sync", "/templates")
+    # Scope-based cleanup (DMA queues, worker HMX scopes) must not import the
+    # C++ unwinder, which the DSP does not have.
+    assert "-fno-exceptions" in fastrpc.gen_cmake("test", "/templates")
 
 
 def test_async_hmx_error_cleanup_is_armed_and_disarmed():

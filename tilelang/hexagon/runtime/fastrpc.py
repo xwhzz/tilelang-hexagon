@@ -367,14 +367,15 @@ int main(int argc, char** argv) {{
 """
 
 
-def gen_cmake(iface: str, template_dir: str, with_agent: bool = True, async_dma: bool = False) -> str:
+def gen_cmake(iface: str, template_dir: str, with_agent: bool = True) -> str:
     # Mirrors mini-htp/CMakeLists.txt: host exe (stub + driver) and DSP skel
     # (skel + impl, compiled with HVX/HMX enabled).  ``template_dir`` is the
     # parent of ``tl_templates`` so the kernel's <tl_templates/hexagon/...>
     # include resolves (matches how nvcc/hipcc get -I TILELANG_TEMPLATE_PATH).
     # The persistent agent target is emitted only when the kernel is agent-eligible.
-    # Scope-based queue cleanup must not import an unavailable DSP C++ unwinder.
-    exception_flags = " -fno-exceptions" if async_dma else ""
+    # Kernels clean up by scope (DMA queues, worker HMX scopes) and never throw;
+    # -fno-exceptions keeps those destructors from importing the C++ unwinder,
+    # which the DSP does not have.
     agent_block = (
         (
             """
@@ -443,7 +444,7 @@ else()
         target_compile_definitions({iface}_skel PRIVATE TL_HEXAGON_LEGACY_COMPUTE_RES=1)
     endif()
     set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error")
-    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error{exception_flags}")
+    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions")
     copy_binaries({iface}_skel)
 endif()
 """
@@ -473,12 +474,7 @@ def write_project(workdir: str, kernel_name: str, kernel_source: str, params, re
         f"{iface}.idl": gen_idl(iface, plans),
         f"{iface}_dsp.cc": gen_dsp(iface, kernel_name, kernel_source, plans),
         f"{iface}_host.c": gen_host(iface, plans),
-        "CMakeLists.txt": gen_cmake(
-            iface,
-            TILELANG_TEMPLATE_PATH,
-            with_agent=with_agent,
-            async_dma="tl_hexagon_dma_async_context<" in kernel_source,
-        ),
+        "CMakeLists.txt": gen_cmake(iface, TILELANG_TEMPLATE_PATH, with_agent=with_agent),
     }
     if with_agent:
         files[f"{iface}_agent.c"] = gen_agent(iface, plans)
