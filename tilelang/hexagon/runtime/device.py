@@ -149,8 +149,11 @@ class AdbConnection(HexagonConnection):
 
     @classmethod
     def list_devices(cls, adb: str = "adb") -> list[str]:
-        """Return serials of authorized, attached devices."""
-        proc = subprocess.run([adb, "devices"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        """Return serials of authorized, attached devices; none without adb."""
+        try:
+            proc = subprocess.run([adb, "devices"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        except FileNotFoundError:
+            return []
         out = []
         for line in proc.stdout.splitlines()[1:]:
             parts = line.split()
