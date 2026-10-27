@@ -102,6 +102,19 @@ TVM_DLL const Op &hexagon_fabs();
 // as template arguments.
 TVM_DLL const Op &hexagon_reduce_rows();
 
+// Lanes of HVX registers (hvx_math.h); the first argument, the vector's lane
+// count, prints as a template argument.
+// tl_hvx_load_lanes<lanes>(ptr, count): the `count` elements at `ptr` in the
+// low lanes of a vector of `lanes`; reads no memory past them.
+TVM_DLL const Op &hexagon_load_lanes();
+// tl_hvx_broadcast_lane<lanes>(vector, i): lane i of a register, in every lane
+// of a vector of `lanes`.
+TVM_DLL const Op &hexagon_broadcast_lane();
+
+// tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
+// memory with its arena's other buffers, as its own allocation to LLVM.
+TVM_DLL const Op &hexagon_exclusive_pointer();
+
 } // namespace tl
 } // namespace tvm
 

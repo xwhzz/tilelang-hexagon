@@ -12,6 +12,7 @@
 #include <hexagon_types.h>
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/hvx_lanes.h>
 
 #include <limits>
 #include <type_traits>
@@ -50,47 +51,6 @@ TL_DEVICE To tl_hvx_bitcast(const From &x) {
   To y;
   __builtin_memcpy(&y, &x, sizeof(To));
   return y;
-}
-
-// ---------------------------------------------------------------------------
-// Memory: whole registers at any address, and parts of one register.
-// ---------------------------------------------------------------------------
-typedef HVX_Vector tl_hvx_reduce_uvector __attribute__((aligned(1)));
-
-template <bool Aligned> TL_DEVICE HVX_Vector tl_hvx_reduce_load(const void *p) {
-  if constexpr (Aligned)
-    return *(const HVX_Vector *)p;
-  else
-    return *(const tl_hvx_reduce_uvector *)p;
-}
-
-// The `nbytes` (1..128) bytes at `p` in the low bytes of a register; the other
-// bytes are undefined. Reads only the aligned blocks that hold those bytes, so
-// it never touches memory past them.
-TL_DEVICE HVX_Vector tl_hvx_load_bytes(const void *p, int nbytes) {
-  uintptr_t a = reinterpret_cast<uintptr_t>(p);
-  int off = static_cast<int>(a & 127);
-  const HVX_Vector *block =
-      reinterpret_cast<const HVX_Vector *>(a & ~uintptr_t(127));
-  HVX_Vector lo = block[0];
-  HVX_Vector hi = off + nbytes > 128 ? block[1] : lo;
-  return Q6_V_valign_VVR(hi, lo, off);
-}
-
-// Stores the low `nbytes` (1..128) bytes of `v` at `p`, leaving the bytes
-// around them unchanged.
-TL_DEVICE void tl_hvx_store_bytes(void *p, HVX_Vector v, int nbytes) {
-  uintptr_t a = reinterpret_cast<uintptr_t>(p);
-  int off = static_cast<int>(a & 127);
-  HVX_Vector *block = reinterpret_cast<HVX_Vector *>(a & ~uintptr_t(127));
-  // Byte i of v goes to byte off + i of the two blocks.
-  HVX_Vector rotated = Q6_V_vror_VR(v, (128 - off) & 127);
-  int end = off + nbytes;
-  HVX_VectorPred first =
-      Q6_Q_and_QQn(Q6_Q_vsetq2_R(end < 128 ? end : 128), Q6_Q_vsetq_R(off));
-  Q6_vmem_QRIV(first, block, rotated);
-  if (end > 128)
-    Q6_vmem_QRIV(Q6_Q_vsetq_R(end - 128), block + 1, rotated);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +173,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_load_step(const S *p) {
   HVX_Vector x[tl_reduce_step_regs<A, S>];
 #pragma clang loop unroll(full)
   for (int r = 0; r < tl_reduce_step_regs<A, S>; ++r)
-    x[r] = tl_hvx_reduce_load<Aligned>(p + r * tl_hvx_lanes<S>);
+    x[r] = tl_hvx_load<Aligned>(p + r * tl_hvx_lanes<S>);
   return tl_reduce_step_value<K, A, S>(x);
 }
 

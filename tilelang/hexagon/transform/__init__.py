@@ -51,3 +51,27 @@ def LowerMath():
     builtins as the scalar or vector ``hvx_math.h`` functions.
     """
     return _ffi_api.LowerMath()  # type: ignore
+
+
+def BroadcastFromRegisters():
+    """Broadcast per-row scalars of vectorized maps from registers.
+
+    A row loop that broadcasts ``b[i]`` into the vectors of row ``i`` runs in
+    strips of one register's worth of rows: each strip loads its rows'
+    scalars into a register once, and each row broadcasts its lane from it.
+    The loop then reads only the tile, so it does not stall on a scalar load
+    per row, and LLVM can software-pipeline it. Runs after ``VectorizeLoop``.
+    """
+    return _ffi_api.BroadcastFromRegisters()  # type: ignore
+
+
+def MarkExclusiveBuffers():
+    """Give the VTCM buffers that share no memory pointers of their own.
+
+    Runs after ``MergeSharedMemoryAllocations``. LLVM sees every buffer of an
+    arena as one object, so its software pipeliner serializes maps that read
+    one buffer and write another. A buffer no other buffer overlaps gets its
+    pointer through ``tl_vtcm_exclusive``, which LLVM treats as a separate
+    allocation.
+    """
+    return _ffi_api.MarkExclusiveBuffers()  # type: ignore

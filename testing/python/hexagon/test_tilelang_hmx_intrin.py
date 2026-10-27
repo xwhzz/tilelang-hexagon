@@ -378,7 +378,7 @@ def test_hmx_operand_alignment_is_propagated_per_role():
         "dd_activation",
         "ee_output",
     ):
-        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\);", source)
+        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
         assert match is not None
         offsets[name] = int(match.group(1))
 
@@ -412,7 +412,7 @@ def test_t_gemm_lowers_to_native_hmx_layout_and_atoms():
 
     offsets = {}
     for name in ("A_hmx", "B_hmx", "C_hmx"):
-        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\);", source)
+        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
         assert match is not None
         offsets[name] = int(match.group(1))
         assert offsets[name] % 2048 == 0
@@ -526,7 +526,7 @@ def test_hmx_atom_q4_codegen():
 
     offsets = {}
     for name in ("A_hmx", "B_hmx", "C_hmx"):
-        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\);", source)
+        match = re.search(rf"void\* {name} = .*buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
         assert match is not None
         offsets[name] = int(match.group(1))
         assert offsets[name] % 2048 == 0

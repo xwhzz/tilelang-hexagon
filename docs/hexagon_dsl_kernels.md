@@ -37,6 +37,17 @@ runs the same 32-lane kernel on a splat, so a result never depends on whether it
 vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` print as
 `tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type.
 
+Two passes let LLVM's software pipeliner overlap the iterations of these maps; a map it
+does not pipeline issues about one instruction per packet. `BroadcastFromRegisters`
+handles a scalar broadcast per row (`S[i, j] - rmax[i]`, `x[i, j] * inv[i]`): such a row
+loop runs in strips of one register's worth of rows; a strip loads its rows' scalars
+into a register once (`tl_hvx_load_lanes`) and each row broadcasts its lane from it
+(`tl_hvx_broadcast_lane`, a rotate and a delta-network copy), instead of a scalar VTCM
+load at the head of every iteration. `MarkExclusiveBuffers` gives each VTCM buffer that
+shares no memory with another a pointer of its own (`tl_vtcm_exclusive`, which LLVM
+treats as a fresh allocation): the buffers of an arena are otherwise one object to LLVM,
+so a map that reads one buffer and writes another runs one iteration at a time.
+
 `T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`

@@ -109,3 +109,93 @@ def test_math_vectorizes_to_hvx_functions(fn, dtype, vector):
     # No libm call, scalar or vector.
     for libm in ("expf", "exp2f", "logf", "log2f", "sqrtf", "tanhf", "erff", "fabsf"):
         assert f"{libm}(" not in source
+
+
+# ---------------------------------------------------------------------------
+# Per-row scalars broadcast from registers (BroadcastFromRegisters).
+# ---------------------------------------------------------------------------
+
+
+def _row_map(rows, cols, row_dtype):
+    """S[i, j] = exp(S[i, j] - r[i]) in fp32 over an fp16 tile, as in softmax."""
+
+    @T.prim_func
+    def kernel(X: T.Tensor((rows, cols), "float16"), R: T.Tensor((rows,), row_dtype), Y: T.Tensor((rows, cols), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((rows, cols), "float16")
+            r = T.alloc_shared((rows,), row_dtype)
+            T.copy(X, s)
+            T.copy(R, r)
+            for i, j in T.Parallel(rows, cols):
+                s[i, j] = T.cast(T.exp(T.cast(s[i, j], "float32") - T.cast(r[i], "float32")), "float16")
+            T.copy(s, Y)
+
+    return kernel
+
+
+def test_row_scalars_come_from_one_register_per_strip():
+    source = _source(_row_map(64, 64, "float32"))
+    # Strips of 32 rows: one register of fp32 scalars each, broadcast per row.
+    assert "for (int32_t i_strip = 0; i_strip < 2; ++i_strip) {" in source
+    assert "float32 r_lanes = tl_hvx_load_lanes<32>((&(((float*)r)[(i_strip * 32)])), 32);" in source
+    assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
+    assert "tl_hvx_broadcast_lane<32>(r_lanes, i_lane)" in source
+    # The row loop reads no scalar of r.
+    assert "((float*)r)[" not in source.split("i_strip")[1].split("tl_hvx_load_lanes")[0]
+
+
+def test_fp16_row_scalars_fill_a_strip_of_64_rows():
+    source = _source(_row_map(128, 64, "float16"))
+    assert "half64 r_lanes = tl_hvx_load_lanes<64>((&(((half*)r)[(i_strip * 64)])), 64);" in source
+
+
+def test_the_last_strip_loads_only_its_rows():
+    source = _source(_row_map(70, 64, "float32"))
+    assert "for (int32_t i_strip = 0; i_strip < 3; ++i_strip) {" in source
+    assert "int32_t v_ = 70 - (i_strip * 32);" in source
+    assert "tl_hvx_load_lanes<32>((&(((float*)r)[(i_strip * 32)])), ((32) < (v_) ? (32) : (v_)));" in source
+
+
+def test_rows_of_several_registers_split_into_rows_and_columns():
+    # 256 fp16 columns are 4 registers per row: T.Parallel fuses them into one
+    # loop over all 256 vectors, which splits back into rows of 4.
+    source = _source(_row_map(64, 256, "float32"))
+    assert "for (int32_t i_strip = 0; i_strip < 2; ++i_strip) {" in source
+    assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
+    assert "for (int32_t i_col = 0; i_col < 4; ++i_col) {" in source
+    assert "tl_hvx_broadcast_lane<32>(r_lanes, i_lane)" in source
+
+
+def test_scalars_that_do_not_step_with_the_row_stay_loads():
+    @T.prim_func
+    def kernel(X: T.Tensor((64, 64), "float32"), R: T.Tensor((128,), "float32"), Y: T.Tensor((64, 64), "float32")):
+        with T.Kernel(1):
+            s = T.alloc_shared((64, 64), "float32")
+            r = T.alloc_shared((128,), "float32")
+            T.copy(X, s)
+            T.copy(R, r)
+            for i, j in T.Parallel(64, 64):
+                s[i, j] = s[i, j] * r[i * 2]
+            T.copy(s, Y)
+
+    source = _source(kernel)
+    assert "tl_hvx_broadcast_lane" not in source
+
+
+@pytest.mark.skipif(__import__("os").environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+@pytest.mark.parametrize(
+    "rows,cols,row_dtype", [(64, 64, "float32"), (70, 64, "float32"), (128, 64, "float16"), (100, 64, "float16"), (48, 256, "float32")]
+)
+def test_row_broadcast_maps_match_torch(rows, cols, row_dtype):
+    import torch
+
+    kernel = tilelang.compile(_row_map(rows, cols, row_dtype), out_idx=[2], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(3)
+        x = (torch.randn(rows, cols, generator=gen) * 0.5).half()
+        r = torch.randn(rows, generator=gen).to(getattr(torch, row_dtype))
+        y = kernel(x, r)
+        expected = torch.exp(x.float() - r.float()[:, None]).half()
+        torch.testing.assert_close(y, expected, rtol=2e-3, atol=2e-3)
+    finally:
+        kernel.adapter.close()

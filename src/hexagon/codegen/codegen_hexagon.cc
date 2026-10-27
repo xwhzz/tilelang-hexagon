@@ -69,6 +69,11 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_fabs(), "tl_hvx_fabs", false},
       {tl::hexagon_reduce_rows(), "tl_hvx_reduce_rows", false, false, false, -1,
        3},
+      {tl::hexagon_load_lanes(), "tl_hvx_load_lanes", false, false, false, -1,
+       1},
+      {tl::hexagon_broadcast_lane(), "tl_hvx_broadcast_lane", false, false,
+       false, -1, 1},
+      {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))

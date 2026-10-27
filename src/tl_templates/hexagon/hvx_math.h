@@ -12,6 +12,7 @@
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h> // vec_type, the codegen's vectors
+#include <tl_templates/hexagon/hvx_lanes.h>
 #include <tl_templates/hexagon/hvx_reduce.h>
 
 #ifndef TL_DEVICE
@@ -39,18 +40,6 @@ TL_DEVICE HVX_Vector tl_hvx_sub_sf(HVX_Vector a, HVX_Vector b) {
 }
 TL_DEVICE HVX_Vector tl_hvx_mul_sf(HVX_Vector a, HVX_Vector b) {
   return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, b));
-}
-
-// Unaligned 1024-bit load/store.  The shared-memory merge pass packs VTCM tiles
-// at element-aligned (not 128-byte) offsets, so the codegen's elementwise
-// vectorizer must not assume HVX alignment.  `aligned(1)` makes hexagon-clang
-// emit the unaligned vmemu form.
-typedef HVX_Vector tl_hvx_uvector __attribute__((aligned(1)));
-TL_DEVICE HVX_Vector tl_hvx_loadu(const void *p) {
-  return *(const tl_hvx_uvector *)p;
-}
-TL_DEVICE void tl_hvx_storeu(void *p, HVX_Vector v) {
-  *(tl_hvx_uvector *)p = v;
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ def _source(func):
 def _offsets(source, *names):
     offsets = {}
     for name in names:
-        match = re.search(rf"void\* {name} = \(\(void\*\)\(\(char\*\)buf_dyn_shmem \+ (\d+)\)\);", source)
+        match = re.search(rf"void\* {name} = (?:tl_vtcm_exclusive\()?\(\(void\*\)\(\(char\*\)buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
         assert match is not None, source
         offsets[name] = int(match.group(1))
     return offsets
@@ -78,6 +78,31 @@ def test_dma_buffer_is_reused_after_its_wait():
     # it out, so t takes its place.
     offsets = _offsets(_source(kernel), "s", "t")
     assert offsets["s"] == offsets["t"]
+
+
+def test_buffers_alone_in_their_memory_get_their_own_pointer():
+    @T.prim_func
+    def kernel(A: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16"), C: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            t = T.alloc_shared((256,), "float16")
+            u = T.alloc_shared((256,), "float16")
+            T.dma_copy(A, s)
+            T.dma_wait()
+            T.copy(s, B)
+            T.fill(t, 2)
+            for i in T.Parallel(256):
+                u[i] = t[i] * 3
+            T.copy(u, C)
+
+    # t reuses s's memory, so both stay offsets into the arena, which LLVM
+    # sees as one object; u shares memory with no buffer, so LLVM sees it as
+    # its own allocation (MarkExclusiveBuffers).
+    source = _source(kernel)
+    assert _offsets(source, "s", "t")["s"] == _offsets(source, "s", "t")["t"]
+    assert re.search(r"void\* s = \(\(void\*\)", source)
+    assert re.search(r"void\* t = \(\(void\*\)", source)
+    assert re.search(r"void\* u = tl_vtcm_exclusive\(\(\(void\*\)", source)
 
 
 def test_dma_destination_stays_live_until_its_wait():
