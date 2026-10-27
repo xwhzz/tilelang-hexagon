@@ -16,11 +16,13 @@ namespace {
 
 namespace refl = tvm::ffi::reflection;
 
-// HVX registers are 1024 bits wide (64 fp16 or 128 int8 lanes). The
-// vectorizer reads this instead of its GPU-sized default.
+// HVX registers are 1024 bits wide (64 fp16 or 128 int8 lanes), and every
+// HVX instruction works on whole registers. The vectorizer reads both limits
+// instead of its GPU-sized default.
 [[maybe_unused]] TargetKindRegEntry &hexagon_kind =
-    TargetKindRegEntry::RegisterOrGet("hexagon").add_attr_option<int64_t>(
-        "max_vector_bits", refl::DefaultValue(1024));
+    TargetKindRegEntry::RegisterOrGet("hexagon")
+        .add_attr_option<int64_t>("max_vector_bits", refl::DefaultValue(1024))
+        .add_attr_option<int64_t>("min_vector_bits", refl::DefaultValue(1024));
 
 } // namespace
 } // namespace tvm

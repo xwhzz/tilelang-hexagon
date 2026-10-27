@@ -21,6 +21,7 @@
 #include <cmath>           // scalar fallbacks for the ragged tail
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>
+#include <tl_templates/hexagon/common.h> // vec_type, the codegen's vectors
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))
@@ -172,6 +173,45 @@ TL_DEVICE HVX_Vector tl_hvx_rsqrt_vsf(HVX_Vector x) {
     y = tl_hvx_mul_sf(
         y, tl_hvx_sub_sf(c15, tl_hvx_mul_sf(xhalf, tl_hvx_mul_sf(y, y))));
   return y;
+}
+
+// ---------------------------------------------------------------------------
+// Division of the codegen's float vectors (vec_type<float|half, N>, N whole
+// registers). HVX has no divide and clang scalarizes a vector `/`, so the
+// codegen prints a / b as tl_hvx_div(a, b): a times the reciprocal of b. fp16
+// divides in fp32, so the quotient is rounded once.
+// ---------------------------------------------------------------------------
+template <int N>
+TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
+                                        const vec_type<float, N> &b) {
+  static_assert(N % TL_HVX_F32_LANES == 0, "tl_hvx_div needs whole registers");
+  vec_type<float, N> out;
+  for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
+    HVX_Vector x, y;
+    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
+    __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
+    HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
+    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  }
+  return out;
+}
+
+template <int N>
+TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
+                                       const vec_type<half, N> &b) {
+  static_assert(N % TL_HVX_F16_LANES == 0, "tl_hvx_div needs whole registers");
+  vec_type<half, N> out;
+  for (int i = 0; i < N / TL_HVX_F16_LANES; ++i) {
+    HVX_Vector x, y, xlo, xhi, ylo, yhi;
+    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
+    __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
+    tl_hvx_widen_hf(x, &xlo, &xhi);
+    tl_hvx_widen_hf(y, &ylo, &yhi);
+    HVX_Vector q = tl_hvx_narrow_hf(tl_hvx_mul_sf(xlo, tl_hvx_recip_vsf(ylo)),
+                                    tl_hvx_mul_sf(xhi, tl_hvx_recip_vsf(yhi)));
+    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  }
+  return out;
 }
 
 // Row maps: out[j] = f(in[j]); fp16 row, fp32 internal.  `tl_hvx_rsqrt_eps_row`

@@ -20,8 +20,10 @@ def _no_arch_env(monkeypatch):
 
 
 def test_every_hexagon_target_has_the_hvx_vector_width():
-    # A kind default, so even targets that skip normalization carry it.
+    # Kind defaults, so even targets that skip normalization carry them. HVX
+    # instructions work only on whole 1024-bit registers.
     assert int(Target("hexagon").attrs["max_vector_bits"]) == 1024
+    assert int(Target("hexagon").attrs["min_vector_bits"]) == 1024
 
 
 @pytest.mark.parametrize("spec", ["hexagon", {"kind": "hexagon"}, Target("hexagon"), json.dumps({"kind": "hexagon"})])

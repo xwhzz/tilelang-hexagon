@@ -300,19 +300,17 @@ public:
     // The vector width must divide the innermost loop's trip count.
     vector_size_ = arith::ZeroAwareGCD(loop_extent_vector_size_, vector_size_);
 
-    // Hexagon: HVX has no sub-register vector ops — every instruction works on
-    // a full 128-byte register.  The GCD above minimizes across dtypes, so a
-    // loop mixing a wide and a NARROW dtype (e.g. fp16 output + uint8 input)
-    // picks the wide dtype's 1-register width (fp16 -> 64 lanes), at which the
-    // narrow dtype is sub-register (uint8 at 64 lanes = 64B = half a register).
-    // The codegen then emits e.g. `uint8_t64 & ...`, which clang lowers to a
-    // full-register op that over-reads and faults on device.  Enforce that the
-    // NARROWEST dtype fills whole registers: vector_size must be a multiple of
-    // (1024/min_bits). Bump to that width (wider dtypes just use a VectorPair)
-    // if the loop extent and every buffer access still vectorize there;
-    // otherwise scalarize (safe).
-    if (vector_size_ > 1 && inner_for_.defined() &&
-        TargetIsHexagon(Target::Current(false))) {
+    // A target whose vector instructions work only on whole registers
+    // (min_vector_bits, e.g. 1024-bit HVX) cannot run a narrower vector: clang
+    // lowers it to a full-register op that over-reads. The GCD above minimizes
+    // across dtypes, so a loop mixing a wide and a narrow dtype (fp16 output,
+    // uint8 input) gets the wide dtype's one-register width, at which the
+    // narrow dtype fills half a register. Widen until the narrowest dtype
+    // fills whole registers, if the loop extent and every access still
+    // vectorize there (wider dtypes then take several registers); otherwise
+    // scalarize.
+    int min_vector_bits = MinVectorBits(target);
+    if (vector_size_ > 1 && inner_for_.defined() && min_vector_bits > 0) {
       int min_bits = 0;
       for (const auto &info : buffer_vector_infos_) {
         if (!info.buffer.defined())
@@ -321,7 +319,7 @@ public:
         if (b > 0 && (min_bits == 0 || b < min_bits))
           min_bits = b;
       }
-      int reg_lanes = min_bits > 0 ? 1024 / min_bits : 0;
+      int reg_lanes = min_bits > 0 ? min_vector_bits / min_bits : 0;
       if (reg_lanes > 1 && vector_size_ % reg_lanes != 0) {
         const int64_t *ext = as_const_int(inner_for_->extent);
         bool ok = ext && (*ext % reg_lanes == 0);
@@ -344,7 +342,7 @@ public:
         }
         vector_size_ = ok ? reg_lanes : 1;
         if (verbose) {
-          std::cerr << "  [Hexagon whole-register] min_bits=" << min_bits
+          std::cerr << "  [whole vector registers] min_bits=" << min_bits
                     << ", reg_lanes=" << reg_lanes
                     << " -> vector_size=" << vector_size_ << "\n";
         }
@@ -1401,6 +1399,14 @@ bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
   return allow_broadcast ||
          analyzer->CanProveEqual(
              FloorMod(ramp_node->base, target_size_for_expr), zero_expr);
+}
+
+int MinVectorBits(const Target &target) {
+  if (!target.defined())
+    return 0;
+  if (auto bits = target->GetAttr<Integer>("min_vector_bits"))
+    return static_cast<int>(bits.value()->value);
+  return 0;
 }
 
 int MaxVectorLoadBits(const Target &target, bool global_only_access) {

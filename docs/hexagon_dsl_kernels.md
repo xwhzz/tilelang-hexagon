@@ -18,14 +18,17 @@ register.** This one fact drives everything:
   the emitted op (`uint8_t64 & ...`) lowers to a full-register op that **over-reads and
   faults on device**.
 
-The codegen enforces this (`src/transform/loop_vectorize.cc`, Plan): for Hexagon it uses a
-**1024-bit** vector width (was 128-bit, a GPU inheritance) and then requires the final
-vector size to be a multiple of `1024 / min_dtype_bits`; it bumps to that width when the
-loop extent and buffer accesses allow, else **scalarizes (safe)**. Backing this,
+The vectorizer enforces this from two target attributes (`src/hexagon/target.cc`):
+`max_vector_bits` = 1024 sets the vector width, and `min_vector_bits` = 1024 requires the
+final vector size to be a multiple of `1024 / min_dtype_bits`
+(`src/transform/loop_vectorize.cc`, Plan). It bumps to that width when the loop extent and
+buffer accesses allow, else **scalarizes (safe)**. Backing this,
 `src/tl_templates/hexagon/common.h`'s `vec_type` is a native clang `ext_vector` (so
 `a * b`, `a & mask` become real HVX ops, not scalar struct loops), and `PrintType` emits
-vector spellings up to 128 lanes. Zero regression (matmul/rmsnorm/flash-attn pass); any
-pointwise fp16 DSL kernel (silu/gelu/gating/bias/residual) now vectorizes to full HVX.
+vector spellings up to 128 lanes. Kernels build with `-mhvx-ieee-fp`, so fp16/fp32 vector
+arithmetic is one IEEE `.hf`/`.sf` instruction rather than a qfloat op and a conversion.
+HVX has no divide, and clang scalarizes a vector `/`, so the codegen prints float vector
+division as `tl_hvx_div` (`hvx_math.h`): a times the Newton-Raphson reciprocal of b, in fp32.
 
 Practical: **DSL guidance** — for a loop that touches uint8, use `T.vectorized(≥128)` (a
 multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 20 ms → 1.4 ms.

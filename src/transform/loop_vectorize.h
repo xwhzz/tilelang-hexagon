@@ -43,6 +43,11 @@ using namespace tirx;
 // the cap the vectorizer will later enforce on it.
 int MaxVectorLoadBits(const Target &target, bool global_only_access);
 
+// Narrowest vector, in bits, the target's vector instructions operate on: the
+// `min_vector_bits` target attribute, or 0 if the target has none. Hexagon HVX
+// sets it to its 1024-bit register.
+int MinVectorBits(const Target &target);
+
 // Extract an existing BufferLoad, optionally wrapped in address_of/access_ptr.
 // tvm_access_ptr carries a flat offset instead and must be handled separately.
 ffi::Optional<BufferLoad> ExtractBufferLoadForAtomic(const PrimExpr &expr);

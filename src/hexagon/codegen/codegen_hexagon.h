@@ -47,6 +47,8 @@ public:
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
   void VisitExpr_(const MinNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
+  // HVX has no divide: print float vector division as tl_hvx_div (hvx_math.h).
+  void VisitExpr_(const DivNode *op, std::ostream &os) final; // NOLINT(*)
   // Print Hexagon builtins as calls to their runtime template functions.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
   // Print a worker loop as a tl_parallel_for call. HVX-vectorize an innermost

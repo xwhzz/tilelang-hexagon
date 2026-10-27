@@ -454,6 +454,15 @@ void CodeGenTileLangHexagon::VisitExpr_(const MaxNode *op,
   PrintTernaryCondExpr(op, ">", os);
 }
 
+void CodeGenTileLangHexagon::VisitExpr_(const DivNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  if (op->dtype.is_float() && op->dtype.lanes() > 1) {
+    os << "tl_hvx_div(" << PrintExpr(op->a) << ", " << PrintExpr(op->b) << ")";
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
 template <typename T>
 inline void
 CodeGenTileLangHexagon::PrintTernaryCondExpr(const T *op, const char *compare,

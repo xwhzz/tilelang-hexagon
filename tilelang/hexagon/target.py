@@ -3,8 +3,10 @@
 A normalized Hexagon target names its DSP architecture in ``mcpu``
 (``hexagonv79``) and carries the capabilities compilation reads:
 
-* ``max_vector_bits``: the HVX vector width, 1024. It is a kind default
-  (``src/hexagon/target.cc``), so every Hexagon target has it.
+* ``max_vector_bits`` and ``min_vector_bits``: the HVX register width, 1024.
+  HVX instructions work on whole registers, so the vectorizer widens a loop
+  until its narrowest dtype fills them, or scalarizes it. Both are kind
+  defaults (``src/hexagon/target.cc``), so every Hexagon target has them.
 * ``vtcm-capacity``: VTCM bytes available to a kernel.
 * ``num-cores``: hardware threads available to the worker pool.
 
