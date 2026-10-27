@@ -138,19 +138,19 @@ llama.cpp graph (host, ARM64)
 
 `hmx.h`/`vtcm.h` were written for Mode A: they lazily **acquire** the VTCM region
 (`tl_vtcm_acquire` via `HAP_compute_res`) and set up an HMX session
-(`tl_hmx_session_init`: power + VTCM + HMX + per-thread enable + fill the fp16
-unit-scale tile at `base+0`). Inside the host skel, all of that is **already
-owned by the host** — re-acquiring is at best wasteful and at worst a fault.
+(`tl_hmx_session_init`: power + VTCM + HMX + per-thread enable). Inside the host
+skel, all of that is **already owned by the host** — re-acquiring is at best
+wasteful and at worst a fault.
 
 The bridge makes the tilelang runtime *ride* the host's resources instead:
 
 ```c
-// tl_ggml_bridge.h
-static inline void tl_bridge_enter(void *vtcm_base, unsigned int vtcm_size) {
-  tl_vtcm_base_ptr = (uint8_t *)vtcm_base;   // → tl_vtcm_acquire() now no-ops
-  tl_vtcm_total    = vtcm_size;
-  tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr);  // our scales @ base+0
-  tl_hmx_inited    = 1;                        // trust the caller's HMX lock
+// src/tl_templates/hexagon/tl_bridge.h
+static inline int tl_bridge_enter(void *vtcm_base, unsigned int vtcm_size) {
+  if (tl_vtcm_bind_region(vtcm_base, vtcm_size) != 0)  // → tl_vtcm_acquire() now no-ops
+    return -1;
+  tl_hmx_inited = 1;                                    // trust the caller's HMX lock
+  return 0;
 }
 ```
 

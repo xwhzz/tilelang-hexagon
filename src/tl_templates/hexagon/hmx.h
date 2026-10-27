@@ -140,15 +140,6 @@ TL_HMX_INLINE void tl_hmx_clear_acc(void) {
 TL_HMX_INLINE void tl_hmx_set_scales(const void *s) {
   asm volatile("bias = mxmem2(%0)" ::"r"(s) : "memory");
 }
-// Fill a 256-byte HMX output-scale region: per-column scale = fp16 1.0 (u32 low
-// half == 0x3c00), per-column bias = 0. Single source for the u32 scale-word
-// layout, initialized by standalone sessions and the embedding bridge.
-TL_HMX_INLINE void tl_hmx_fill_unit_scales(uint32_t *s) {
-  for (int i = 0; i < 32; ++i)
-    s[i] = 0x00003c00u;
-  for (int i = 32; i < 64; ++i)
-    s[i] = 0u;
-}
 TL_HMX_INLINE void tl_hmx_mac_tiles(const __fp16 *a, const __fp16 *w,
                                     size_t n) {
   // Caller guarantees 1 <= n <= 32 and contiguous native tiles.
@@ -590,10 +581,6 @@ static void tl_hmx_session_init(void) {
   // ready while enable was a silent no-op (ctx==0) and every later MAC runs
   // with HMX never locked.
   if (tl_vtcm_base_ptr && tl_hmx_enable() == 0) {
-    // Initialize the reserved scale tile consistently with the embedding
-    // bridge. Explicit atoms use their DSL-provided bias buffers and
-    // accumulator locks.
-    tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr);
     tl_hmx_session_tid =
         qurt_thread_get_id(); // this enable is bound to this thread
     tl_hmx_inited = 1;

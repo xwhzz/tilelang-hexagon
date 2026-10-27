@@ -92,6 +92,28 @@ def test_queue_is_sized_for_the_copies_in_flight():
     assert _queue(_lower(double_buffered)) == (2, 2)
 
 
+def test_waits_list_the_buffers_they_complete():
+    @T.prim_func
+    def two(A: T.Tensor((2, 256), "float16"), B: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            t = T.alloc_shared((256,), "float16")
+            T.dma_copy(A[0, :], s)
+            T.dma_copy(A[1, :], t)
+            T.dma_wait(1)  # completes the copy into s
+            T.copy(s, B)
+            T.dma_wait()  # and the one into t
+            T.copy(t, B)
+
+    artifact = _lower(two)
+    waits = [call for call in _dma_calls(artifact) if call.op.name == "tl.hexagon_dma_wait"]
+    # The buffers keep the waits as their last accesses for memory planning.
+    assert [[str(arg) for arg in call.args[1:]] for call in waits] == [["s"], ["t"]]
+    source = str(artifact.kernel_source)
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 1))" in source
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0))" in source
+
+
 def test_queue_bound_covers_both_branches():
     @T.prim_func
     def branches(A: T.Tensor((3, 256), "float16"), flag: T.int32):

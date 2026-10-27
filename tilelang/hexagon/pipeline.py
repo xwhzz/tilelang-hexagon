@@ -6,8 +6,10 @@ threads, and the launch grid becomes a loop nest in TIR: ``LowerKernelLaunch``
 marks the grid loops, and after the loop transformations ``MaterializeGrid``
 turns them into the program loop nest, or into one parallel loop for
 ``T.Kernel(num_workers=...)``. The sequence below is the CPU pass order, plus
-Hexagon's VTCM arena planning (``MergeSharedMemoryAllocations``). Target
-copy/GEMM hooks lower Crouton operations and explicit async-copy submissions.
+Hexagon's VTCM arena: ``MergeSharedMemoryAllocations`` lays out the shared
+buffers of each tile program, and ``VerifyVTCMArena`` checks that the arenas fit.
+Target copy/GEMM hooks lower Crouton operations and explicit async-copy
+submissions.
 """
 
 from __future__ import annotations
@@ -125,12 +127,16 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.SplitHostDevice()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 
-    # Shared buffers live in one VTCM arena per tile program; this pass also
-    # applies the HMX operand alignments and keeps managed-DMA buffers from
-    # overlapping.
+    # The shared buffers of a tile program become one VTCM arena. Every buffer
+    # starts on a whole HVX vector (128 bytes), HMX operands on the alignment
+    # their instruction declares, and a DMA buffer stays live until the wait
+    # that completes it (PlanDMAQueue lists it on that wait).
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, disable_reuse=disable_reuse)(mod)
+    mod = tilelang.transform.MergeSharedMemoryAllocations(
+        enable_aggressive_merge=enable_aggressive_merge, align_bytes=128, disable_reuse=disable_reuse
+    )(mod)
+    mod = tilelang.hexagon.transform.VerifyVTCMArena()(mod)
 
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)

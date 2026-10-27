@@ -152,11 +152,11 @@ def test_reject_invalid_wait_argument(pending):
 def test_managed_worker_queue_is_local_and_drained():
     source = lower(make_queue_probe(workers=2))
     entry, program = source.split(" -> int32_t {", 1)
-    assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(2048u), " in entry
+    assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(512u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
     # Each tile program owns its queue and its buffers in the worker's arena.
     assert "tl_hexagon_dma_async_context<1, 1> tl_dma_async;" in program
-    assert "(tl_arena + 0)" in program
+    assert "half* s = (half*)tl_arena;" in program
     assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")
 
 

@@ -35,6 +35,15 @@ def PlanDMAQueue():
     return _ffi_api.PlanDMAQueue()  # type: ignore
 
 
+def VerifyVTCMArena():
+    """Check that the VTCM arena of every tile program fits the target.
+
+    Runs after ``MergeSharedMemoryAllocations``. ``T.Kernel(num_workers=N)``
+    needs N arenas, one per worker.
+    """
+    return _ffi_api.VerifyVTCMArena()  # type: ignore
+
+
 def LowerMath():
     """Lower the fp16/fp32 math intrinsics to the HVX math builtins.
 

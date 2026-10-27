@@ -108,5 +108,18 @@ def test_vtcm_capacity_is_checked_at_compile_time():
             T.copy(A_s, B)
 
     _lower(kernel, "hexagon")
-    with pytest.raises(Exception, match="exceeds the target's VTCM capacity"):
+    with pytest.raises(Exception, match="take 2097152 bytes of VTCM, more than the target's 1048576"):
         _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 1 << 20})
+
+
+def test_worker_arenas_must_fit_the_vtcm_together():
+    @T.prim_func
+    def kernel(A: T.Tensor((8, 512, 1024), "float16"), B: T.Tensor((8, 512, 1024), "float16")):
+        with T.Kernel(8, num_workers=6) as bx:
+            A_s = T.alloc_shared((512, 1024), "float16")  # 1 MiB per worker
+            T.copy(A[bx, :, :], A_s)
+            T.copy(A_s, B[bx, :, :])
+
+    _lower(kernel, "hexagon")  # six 1 MiB arenas fit 8 MiB
+    with pytest.raises(Exception, match=r"num_workers=6\) needs a VTCM arena of 1048576 bytes per worker.*use num_workers=4 or fewer"):
+        _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 4 << 20})

@@ -12,13 +12,12 @@
 // ---------------------------------------------------------------------------
 #include <tl_templates/hexagon/hmx.h>
 
-// Bind the tilelang VTCM arena to the caller's region and prime the HMX scales.
+// Bind the tilelang VTCM arena to the caller's region.
 // Precondition: the caller already holds the HMX lock on this thread and owns
 // `vtcm_base` for the kernel's duration.
 static inline int tl_bridge_enter(void *vtcm_base, unsigned int vtcm_size) {
   if (tl_vtcm_bind_region(vtcm_base, vtcm_size) != 0)
     return -1;
-  tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr); // unit scales @ base+0
   tl_hmx_inited = 1; // ride the caller's HMX lock
   return 0;
 }

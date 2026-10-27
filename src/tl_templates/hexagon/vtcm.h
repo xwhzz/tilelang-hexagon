@@ -3,14 +3,14 @@
 //
 // Buffers with storage scope `shared` (alloc_shared) are placed in VTCM rather
 // than on the stack, because the HMX matrix engine reads its operands from VTCM
-// (`mxmem`) and HVX wants the tightly-coupled scratch.  The codegen assigns
-// each shared buffer a compile-time byte offset into the kernel arena and
-// emits `(T*)(tl_vtcm_arena() + offset)`; a worker loop splits the arena into
-// per-worker arenas instead (tl_vtcm_worker_arenas in worker.h).
+// (`mxmem`) and HVX wants the tightly-coupled scratch.  The compiler lays out
+// the shared buffers of a tile program in one arena, which the codegen binds
+// to `tl_vtcm_arena()`; a worker loop splits the region into per-worker arenas
+// instead (tl_vtcm_worker_arenas in worker.h).
 //
 // One acquisition is held for the whole FastRPC session (idempotent, lazy on
-// first use); the bump offsets are emitted by the codegen, so this header only
-// owns the acquire/release of the region itself.
+// first use); the layout comes from the compiler, so this header only owns the
+// acquire/release of the region itself.
 //
 // Compiled into the FastRPC skel (.cc) with the Hexagon SDK on the include
 // path; it pulls in HAP headers, so it is only included when a kernel uses
@@ -47,7 +47,7 @@ static uint8_t *tl_vtcm_base_ptr;  // base of the acquired VTCM region
 static unsigned int tl_vtcm_total; // bytes acquired (capacity guard)
 static int tl_vtcm_ctx;            // HAP_compute_res handle
 
-// Static alloc_shared VTCM usage of the current serial kernel, in bytes from
+// The VTCM arena of the current serial kernel, in bytes from
 // tl_vtcm_base_ptr. Codegen publishes this for embedding/export capacity
 // checks. Worker loops size their per-worker arenas at run time instead and do
 // not write it.
@@ -113,20 +113,14 @@ TL_VTCM_INLINE void *tl_vtcm_base(void) {
   return tl_vtcm_base_ptr;
 }
 
-// The first 2 KiB of the region hold the HMX output scales (hmx.h); the kernel
-// arena starts above them.
-#define TL_VTCM_ARENA_OFFSET 2048u
-
-// Base of the kernel arena (lazily acquires), or NULL without VTCM.
+// Base of the kernel arena, the whole region (lazily acquires), or NULL
+// without VTCM.
 TL_VTCM_INLINE uint8_t *tl_vtcm_arena(void) {
-  uint8_t *base = (uint8_t *)tl_vtcm_base();
-  return base ? base + TL_VTCM_ARENA_OFFSET : 0;
+  return (uint8_t *)tl_vtcm_base();
 }
 
 // Bytes of the kernel arena (0 without VTCM).
 TL_VTCM_INLINE unsigned int tl_vtcm_arena_bytes(void) {
   tl_vtcm_acquire();
-  return tl_vtcm_total > TL_VTCM_ARENA_OFFSET
-             ? tl_vtcm_total - TL_VTCM_ARENA_OFFSET
-             : 0u;
+  return tl_vtcm_total;
 }

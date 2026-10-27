@@ -60,12 +60,8 @@ private:
   /*! \brief names of the kernel functions emitted in this module */
   ffi::Array<ffi::String> function_names_;
 
-  /*! \brief compile-time bump offset (bytes) for placing alloc_shared buffers
-   *  in the current VTCM arena: the kernel's, or a worker's. */
-  size_t vtcm_offset_ = 0;
-  /*! \brief the target's vtcm-capacity in bytes; 0 when the target has none
-   *  and only the runtime checks the grant. */
-  size_t vtcm_capacity_ = 0;
+  /*! \brief whether the current tile program's VTCM arena is bound */
+  bool arena_bound_ = false;
   /*! \brief whether a tile program's DMA queue (tl_dma_async) is in scope */
   bool dma_in_scope_ = false;
   /*! \brief whether any emitted kernel uses the managed DMA queue */

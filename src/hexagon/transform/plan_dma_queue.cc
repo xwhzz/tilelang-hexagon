@@ -8,6 +8,10 @@
  * point of the program, declares the queue with those capacities at the start
  * of the tile program scope, and drains it at the end unless the program
  * already waits for everything.
+ *
+ * A transfer keeps its VTCM buffers in use until the wait that completes it,
+ * so every wait lists the VTCM buffers whose transfers it may complete, after
+ * its count. Shared memory planning sees them as accesses there.
  */
 
 #include "hexagon/op/builtin.h"
@@ -21,8 +25,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
-#include <numeric>
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -59,11 +65,34 @@ bool UsesDMA(const Stmt &stmt) {
   return found;
 }
 
-// What may be in flight: the descriptors of each committed, pending group
-// (oldest first), and of the open group.
+bool IsVTCMBuffer(const VarNode *var) {
+  const auto *ptr = var->type_annotation.as<PointerTypeNode>();
+  return ptr &&
+         (ptr->storage_scope == "shared" || ptr->storage_scope == "shared.dyn");
+}
+
+// Descriptors in flight, and the VTCM buffers they access, numbered in order
+// of their first submission.
+struct Group {
+  int64_t descriptors = 0;
+  std::set<int> buffers;
+
+  bool operator==(const Group &other) const {
+    return descriptors == other.descriptors && buffers == other.buffers;
+  }
+
+  static Group Join(const Group &a, const Group &b) {
+    Group out{std::max(a.descriptors, b.descriptors), a.buffers};
+    out.buffers.insert(b.buffers.begin(), b.buffers.end());
+    return out;
+  }
+};
+
+// What may be in flight: each committed, pending group (oldest first), and the
+// open group.
 struct Queue {
-  std::deque<int64_t> groups;
-  int64_t open = 0;
+  std::deque<Group> groups;
+  Group open;
 
   bool operator==(const Queue &other) const {
     return groups == other.groups && open == other.open;
@@ -72,12 +101,14 @@ struct Queue {
   // A queue that bounds both: waits keep the newest groups, so align them.
   static Queue Join(const Queue &a, const Queue &b) {
     Queue out;
-    out.open = std::max(a.open, b.open);
+    out.open = Group::Join(a.open, b.open);
     size_t n = std::max(a.groups.size(), b.groups.size());
     for (size_t i = 0; i < n; ++i) {
-      int64_t x = i < a.groups.size() ? a.groups[a.groups.size() - 1 - i] : 0;
-      int64_t y = i < b.groups.size() ? b.groups[b.groups.size() - 1 - i] : 0;
-      out.groups.push_front(std::max(x, y));
+      Group x =
+          i < a.groups.size() ? a.groups[a.groups.size() - 1 - i] : Group();
+      Group y =
+          i < b.groups.size() ? b.groups[b.groups.size() - 1 - i] : Group();
+      out.groups.push_front(Group::Join(x, y));
     }
     return out;
   }
@@ -87,6 +118,10 @@ class QueueBound : public StmtVisitor {
 public:
   int64_t descriptors = 0;
   int64_t groups = 0;
+  // The VTCM buffers each submission accesses, in order of first submission.
+  std::vector<Var> buffers;
+  // The buffers whose transfers each wait may complete.
+  std::unordered_map<const CallNode *, std::set<int>> completes;
 
   void Run(const Stmt &body) {
     VisitStmt(body);
@@ -94,7 +129,17 @@ public:
   }
 
   //! True if nothing can be in flight at the end of the body.
-  bool Drained() const { return queue_.groups.empty() && queue_.open == 0; }
+  bool Drained() const {
+    return queue_.groups.empty() && queue_.open.descriptors == 0;
+  }
+
+  //! The buffers of the transfers that may be in flight at the end.
+  std::set<int> InFlightBuffers() const {
+    std::set<int> out = queue_.open.buffers;
+    for (const Group &group : queue_.groups)
+      out.insert(group.buffers.begin(), group.buffers.end());
+    return out;
+  }
 
 private:
   void VisitStmt_(const EvaluateNode *op) final {
@@ -102,20 +147,37 @@ private:
     if (!call || !IsDMACall(call))
       return;
     if (call->op.same_as(hexagon_dma_submit())) {
-      ++queue_.open;
+      ++queue_.open.descriptors;
+      for (const PrimExpr &arg : call->args) {
+        PostOrderVisit(arg, [this](const ObjectRef &node) {
+          if (const auto *var = node.as<VarNode>(); var && IsVTCMBuffer(var))
+            queue_.open.buffers.insert(BufferIndex(var));
+        });
+      }
       descriptors = std::max(descriptors, InFlight());
     } else if (call->op.same_as(hexagon_dma_commit())) {
-      queue_.groups.push_back(queue_.open);
-      queue_.open = 0;
+      queue_.groups.push_back(std::move(queue_.open));
+      queue_.open = Group();
       groups = std::max(groups, static_cast<int64_t>(queue_.groups.size()));
     } else {
       const auto *pending = call->args[0].as<IntImmNode>();
       ICHECK(pending && pending->value >= 0)
           << "T.dma_wait needs a constant, nonnegative count";
-      while (static_cast<int64_t>(queue_.groups.size()) > pending->value)
+      std::set<int> &done = completes[call];
+      while (static_cast<int64_t>(queue_.groups.size()) > pending->value) {
+        const std::set<int> &retired = queue_.groups.front().buffers;
+        done.insert(retired.begin(), retired.end());
         queue_.groups.pop_front();
+      }
     }
     Check();
+  }
+
+  int BufferIndex(const VarNode *var) {
+    auto [it, inserted] = index_.emplace(var, static_cast<int>(buffers.size()));
+    if (inserted)
+      buffers.push_back(GetRef<Var>(var));
+    return it->second;
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
@@ -164,8 +226,10 @@ private:
   }
 
   int64_t InFlight() const {
-    return std::accumulate(queue_.groups.begin(), queue_.groups.end(),
-                           queue_.open);
+    int64_t n = queue_.open.descriptors;
+    for (const Group &group : queue_.groups)
+      n += group.descriptors;
+    return n;
   }
 
   void Check() const {
@@ -182,6 +246,34 @@ private:
 
   Queue queue_;
   int unknown_trips_ = 0;
+  std::unordered_map<const VarNode *, int> index_;
+};
+
+// Appends to every wait the VTCM buffers whose transfers it may complete.
+class WaitCompletions : public StmtExprMutator {
+public:
+  explicit WaitCompletions(const QueueBound &bound) : bound_(bound) {}
+
+  static Call Wait(PrimExpr pending, const std::set<int> &buffers,
+                   const std::vector<Var> &vars) {
+    Array<PrimExpr> args{std::move(pending)};
+    for (int i : buffers)
+      args.push_back(vars[i]);
+    return Call(DataType::Int(32), hexagon_dma_wait(), args);
+  }
+
+private:
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(hexagon_dma_wait()))
+      return StmtExprMutator::VisitExpr_(op);
+    ICHECK_EQ(op->args.size(), 1U) << "hexagon_dma_wait is planned once";
+    auto it = bound_.completes.find(op);
+    if (it == bound_.completes.end() || it->second.empty())
+      return GetRef<PrimExpr>(op);
+    return Wait(op->args[0], it->second, bound_.buffers);
+  }
+
+  const QueueBound &bound_;
 };
 
 // Declares the queue at the start of every tile program that uses DMA and
@@ -199,10 +291,11 @@ private:
     Stmt queue =
         Evaluate(Call(DataType::Int(32), hexagon_dma_queue(),
                       {capacity(bound.descriptors), capacity(bound.groups)}));
-    Array<Stmt> body{queue, op->body};
+    Array<Stmt> body{queue, WaitCompletions(bound)(op->body)};
     if (!bound.Drained()) {
-      body.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_wait(),
-                                   {IntImm(DataType::Int(32), 0)})));
+      body.push_back(Evaluate(
+          WaitCompletions::Wait(IntImm(DataType::Int(32), 0),
+                                bound.InFlightBuffers(), bound.buffers)));
     }
     return AttrStmt(op->node, op->attr_key, op->value, SeqStmt::Flatten(body),
                     op->span);

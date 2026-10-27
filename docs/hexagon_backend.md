@@ -221,10 +221,14 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   in declaration order. Fix: `OrderByHostParams` for `kDLHexagon`. *Lesson: validate
   with non-alphabetical param names + non-square shapes, or symmetry hides the bug.*
 
-- **VTCM is one arena; partition it carefully.** Codegen bump-allocates `alloc_shared`
-  bottom-up and publishes `tl_vtcm_shared_high_water` for embedding/export capacity
-  checks. Under the worker pool, `tl_parallel_for` gives every worker its own arena
-  and runs no more workers than arenas fit in the grant.
+- **VTCM is one arena per tile program.** `MergeSharedMemoryAllocations` lays out a
+  tile program's shared buffers in one allocation and reuses the space of buffers
+  whose lifetimes do not overlap; a DMA buffer stays live until the wait that
+  completes it. The codegen binds the arena to the VTCM base and publishes
+  `tl_vtcm_shared_high_water` for embedding/export capacity checks. Under the worker
+  pool, `tl_parallel_for` gives every worker its own slice and runs no more workers
+  than slices fit in the grant; `VerifyVTCMArena` rejects at compile time a
+  `num_workers` whose slices exceed the target's `vtcm-capacity`.
   HMX atoms and Crouton copies use explicit shared buffers; there is no hidden
   top-down GEMM scratch allocation.
 

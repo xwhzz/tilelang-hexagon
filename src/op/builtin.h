@@ -58,6 +58,13 @@ inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(
 static constexpr const char *kDebugMergeSharedMemoryAllocations =
     "tl.debug_merge_shared_memory_allocations";
 static constexpr const char *kSmemAlignmentMap = "tl.smem_alignment_map";
+// Op attribute: for each argument, the byte alignment the shared buffer it
+// points into needs (0 for none). An instruction whose memory operands need a
+// fixed alignment declares it here, and MergeSharedMemoryAllocations places
+// those buffers accordingly, whoever emitted the call.
+using TSharedOperandAlignment = ffi::Array<Integer>;
+static constexpr const char *kSharedOperandAlignment =
+    "TSharedOperandAlignment";
 static constexpr const char *kDisableSafeMemoryLegalize =
     "tl.disable_safe_memory_legalize";
 static constexpr const char *kConfigIndexBitwidth = "tl.config_index_bitwidth";

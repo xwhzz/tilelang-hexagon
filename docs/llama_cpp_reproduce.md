@@ -206,11 +206,11 @@ if (tl_dispatch(&octx) == 0) return 0;          // 有 tilelang 算子接了就�
 **③ bridge(蹭 host 的 VTCM + HMX,不自己申请)——这是端侧和 CUDA 的关键差异所在:**
 ```c
 // src/tl_templates/hexagon/tl_bridge.h
-static inline void tl_bridge_enter(void *vtcm_base, unsigned vtcm_size) {
-  tl_vtcm_base_ptr = (uint8_t *)vtcm_base;       // tl_vtcm_acquire() 变 no-op → 用 host 的 VTCM
-  tl_vtcm_total    = vtcm_size;
-  tl_hmx_fill_unit_scales((uint32_t *)tl_vtcm_base_ptr);  // 我们的 HMX 输出尺度 @ base+0
-  tl_hmx_inited    = 1;                           // 蹭调用方已持有的 HMX 锁,不做第二次 acquire
+static inline int tl_bridge_enter(void *vtcm_base, unsigned int vtcm_size) {
+  if (tl_vtcm_bind_region(vtcm_base, vtcm_size) != 0)  // tl_vtcm_acquire() 变 no-op → 用 host 的 VTCM
+    return -1;
+  tl_hmx_inited = 1;                                    // 蹭调用方已持有的 HMX 锁,不做第二次 acquire
+  return 0;
 }
 ```
 

@@ -177,7 +177,11 @@ struct tl_worker_arenas {
   unsigned int count;
 };
 
+// Per-worker arenas for a tile program whose arena takes `bytes`. Each starts
+// on a whole HMX tile, like the region itself, so that it keeps the alignment
+// the program's buffers were laid out with.
 static inline tl_worker_arenas tl_vtcm_worker_arenas(unsigned int bytes) {
+  bytes = (bytes + TL_VTCM_HMX_ALIGNMENT - 1u) & ~(TL_VTCM_HMX_ALIGNMENT - 1u);
   uint8_t *base = tl_vtcm_arena();
   unsigned int count = base && bytes ? tl_vtcm_arena_bytes() / bytes : 0u;
   return {base, bytes, count};

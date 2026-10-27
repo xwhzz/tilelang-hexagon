@@ -70,8 +70,13 @@ TVM_DLL const Op &hexagon_dma_submit();
  * commit. */
 TVM_DLL const Op &hexagon_dma_commit();
 
-/*! \brief Wait until at most `groups` committed groups are pending:
- * hexagon_dma_wait(groups), with a constant count. */
+/*!
+ * \brief Wait until at most `groups` committed groups are pending:
+ * hexagon_dma_wait(groups, buffers...), with a constant count. PlanDMAQueue
+ * appends the data vars of the VTCM buffers whose transfers the wait may
+ * complete; they keep those buffers live in shared memory planning, and the
+ * codegen does not print them.
+ */
 TVM_DLL const Op &hexagon_dma_wait();
 
 // HVX math. LowerMath rewrites the fp16/fp32 tirx math intrinsics into these

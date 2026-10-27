@@ -27,7 +27,6 @@
 #include "common/attr.h"
 #include "common/storage_size.h"
 #include "cuda/op/builtin.h"
-#include "hexagon/op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include <tvm/tirx/function.h>
@@ -84,8 +83,12 @@ static PrimExpr SharedByteOffsetToLogicalIndexOffset(PrimExpr byte_offset,
   return indexdiv(byte_offset, dtype.bytes() * dtype.lanes());
 }
 
+namespace {
 /*!
  * \brief collect the mapping from the buffer var to its allocate
+ *
+ * In an anonymous namespace: lower_thread_allreduce.cc has a different
+ * tl::AllocateCollector, and two definitions of one class break the ODR.
  */
 class AllocateCollector : public StmtExprVisitor {
 public:
@@ -95,8 +98,14 @@ public:
     } else if (IsStaticSharedMemory(op->buffer->data)) {
       static_shmem_allocs_[op->buffer->data.get()] = op;
     }
+    alloc_order_.emplace(op->buffer->data.get(),
+                         static_cast<int>(alloc_order_.size()));
     StmtExprVisitor::VisitStmt_(op);
   }
+  // The program order of every allocation. Buffers may share a name, so the
+  // planner breaks ties between equal names with it: the layout, and so the
+  // generated source, must not depend on pointer values.
+  std::unordered_map<const VarNode *, int> alloc_order_;
   // The dynamic mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocBufferNode *>
       dyn_shmem_allocs_;
@@ -104,6 +113,7 @@ public:
   std::unordered_map<const VarNode *, const AllocBufferNode *>
       static_shmem_allocs_;
 };
+} // namespace
 
 // Find a linear pattern of storage access
 // Used for liveness analysis.
@@ -419,44 +429,48 @@ private:
       // An explicit requirement recorded at lowering time is exact; keep it.
       if (explicit_alignment_map_->count(op))
         return;
-      // Hexagon HMX operands carry an exact per-operand VTCM alignment
-      // (alignment_override_). TMA bulk-copy and MMA-descriptor operands have
-      // stricter shared-memory alignment than ordinary shared accesses, and
-      // the exact requirement depends on the operand's swizzle mode (up to
-      // 1024B for 128B swizzle). Buffers without an explicit kSmemAlignmentMap
-      // entry get the worst case: a misaligned base is not a launch error but
-      // silent data corruption, so never under-align here.
+      // An operand of an op with TSharedOperandAlignment carries its exact
+      // alignment (alignment_override_). TMA bulk-copy and MMA-descriptor
+      // operands have stricter shared-memory alignment than ordinary shared
+      // accesses, and the exact requirement depends on the operand's swizzle
+      // mode (up to 1024B for 128B swizzle). Buffers without an explicit
+      // kSmemAlignmentMap entry get the worst case: a misaligned base is not a
+      // launch error but silent data corruption, so never under-align here.
       int alignment = alignment_override_ > 0 ? alignment_override_ : 1024;
       int &slot = shmem_alignment_map_[op];
       slot = std::max(slot, alignment);
     }
   }
 
+  // The operand alignments the call's op declares, if any.
+  static std::optional<TSharedOperandAlignment>
+  SharedOperandAlignments(const CallNode *call) {
+    // No op may declare the attribute in a build without such a target.
+    static const bool declared = Op::HasAttrMap(kSharedOperandAlignment);
+    const auto *callee = call->op.as<OpNode>();
+    if (!declared || callee == nullptr)
+      return std::nullopt;
+    static const auto attr =
+        Op::GetAttrMap<TSharedOperandAlignment>(kSharedOperandAlignment);
+    Op op = GetRef<Op>(callee);
+    if (!attr.count(op))
+      return std::nullopt;
+    return attr[op];
+  }
+
   void VisitExpr_(const CallNode *op) {
-    if (op->op.same_as(tl::hexagon_hmx_load_bias())) {
-      ICHECK_EQ(op->args.size(), 2U);
-      VisitExprWithAlignment(op->args[1], 256);
-      StmtExprVisitor::VisitExpr_(op);
-      return;
-    }
-    if (op->op.same_as(tl::hexagon_hmx_mma())) {
-      ICHECK_EQ(op->args.size(), 4U);
-      VisitExprWithAlignment(op->args[1], 2048); // activation
-      VisitExprWithAlignment(op->args[2], 128);  // weight
-      StmtExprVisitor::VisitExpr_(op);
-      return;
-    }
-    if (op->op.same_as(tl::hexagon_hmx_convert())) {
-      ICHECK_EQ(op->args.size(), 5U);
-      VisitExprWithAlignment(op->args[3], 256); // scale/bias config
-      StmtExprVisitor::VisitExpr_(op);
-      return;
-    }
-    if (op->op.same_as(tl::hexagon_hmx_store())) {
-      ICHECK_EQ(op->args.size(), 5U);
-      VisitExprWithAlignment(op->args[1], 2048); // output activation tile
-      VisitExprWithAlignment(op->args[4], 256);  // scale/bias config
-      StmtExprVisitor::VisitExpr_(op);
+    if (auto alignments = SharedOperandAlignments(op)) {
+      ICHECK_EQ(alignments->size(), op->args.size())
+          << op->op << " declares " << alignments->size()
+          << " operand alignments for " << op->args.size() << " arguments";
+      for (size_t i = 0; i < op->args.size(); ++i) {
+        int64_t alignment = (*alignments)[i]->value;
+        if (alignment > 0) {
+          VisitExprWithAlignment(op->args[i], static_cast<int>(alignment));
+        } else {
+          VisitExpr(op->args[i]);
+        }
+      }
       return;
     }
 
@@ -505,10 +519,12 @@ public:
   explicit SharedMemoryRewriter(
       const std::unordered_map<const VarNode *, const AllocBufferNode *>
           &shmem_allocs,
+      const std::unordered_map<const VarNode *, int> &alloc_order,
       bool is_dynamic = true, bool verbose = false, int align_bytes = 0,
       bool preserve_aliases = true)
-      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
-        align_bytes_{align_bytes}, preserve_aliases_{preserve_aliases} {
+      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs},
+        alloc_order_{alloc_order}, verbose_{verbose}, align_bytes_{align_bytes},
+        preserve_aliases_{preserve_aliases} {
     if (!is_dynamic) {
       merged_buf_var_ =
           Var("buf_shmem", PointerType(PrimType(DataType::UInt(8)), "shared"));
@@ -555,6 +571,13 @@ public:
   }
 
 private:
+  // Name order, then allocation order for equal names.
+  bool NameBefore(const VarNode *a, const VarNode *b) const {
+    if (a->name_hint != b->name_hint)
+      return a->name_hint < b->name_hint;
+    return alloc_order_.at(a) < alloc_order_.at(b);
+  }
+
   std::vector<Stmt> MakeAliasBindings() const {
     struct AliasInfo {
       const VarNode *var{nullptr};
@@ -571,14 +594,14 @@ private:
     }
 
     std::sort(aliases.begin(), aliases.end(),
-              [](const AliasInfo &lhs, const AliasInfo &rhs) {
+              [this](const AliasInfo &lhs, const AliasInfo &rhs) {
                 const auto *lhs_offset = lhs.byte_offset.as<IntImmNode>();
                 const auto *rhs_offset = rhs.byte_offset.as<IntImmNode>();
                 if (lhs_offset != nullptr && rhs_offset != nullptr &&
                     lhs_offset->value != rhs_offset->value) {
                   return lhs_offset->value < rhs_offset->value;
                 }
-                return lhs.var->name_hint < rhs.var->name_hint;
+                return NameBefore(lhs.var, rhs.var);
               });
 
     std::vector<Stmt> bindings;
@@ -612,8 +635,8 @@ private:
       sorted_vars.push_back(kv.first);
     }
     std::sort(sorted_vars.begin(), sorted_vars.end(),
-              [](const VarNode *a, const VarNode *b) {
-                return a->name_hint < b->name_hint;
+              [this](const VarNode *a, const VarNode *b) {
+                return NameBefore(a, b);
               });
 
     DataType offset_dtype = DataType::Int(32);
@@ -874,6 +897,7 @@ private:
   struct BufInfo {
     const VarNode *var{nullptr};
     std::string name;
+    int order{0}; // allocation order, which breaks ties between equal names.
     PrimExpr size_expr;
     std::optional<int64_t> const_size_bytes; // in bytes if compile-time known.
     int alignment{0};                        // required byte alignment.
@@ -889,6 +913,7 @@ private:
     size_t size_bytes{0};
     int alignment{0};
     const VarNode *var{nullptr};
+    int order{0};
   };
 
   // Result of a linear-scan arena packing.  Offsets contain the byte offset for
@@ -1044,7 +1069,10 @@ private:
                 if (lhs.size_bytes != rhs.size_bytes) {
                   return lhs.size_bytes > rhs.size_bytes;
                 }
-                return lhs.var->name_hint < rhs.var->name_hint;
+                if (lhs.var->name_hint != rhs.var->name_hint) {
+                  return lhs.var->name_hint < rhs.var->name_hint;
+                }
+                return lhs.order < rhs.order;
               });
 
     std::priority_queue<ActiveInterval, std::vector<ActiveInterval>,
@@ -1417,8 +1445,8 @@ private:
       sorted_vars.push_back(kv.first);
     }
     std::sort(sorted_vars.begin(), sorted_vars.end(),
-              [](const VarNode *a, const VarNode *b) {
-                return a->name_hint < b->name_hint;
+              [this](const VarNode *a, const VarNode *b) {
+                return NameBefore(a, b);
               });
 
     std::vector<BufInfo> buf_infos;
@@ -1433,6 +1461,7 @@ private:
       BufInfo info;
       info.var = var;
       info.name = var->name_hint;
+      info.order = alloc_order_.at(var);
       info.start = start_it->second;
       info.end = std::max(end_index[var], info.start + 1);
       info.alignment = align_bytes_;
@@ -1466,7 +1495,9 @@ private:
                   return a.start < b.start;
                 if (a.end != b.end)
                   return a.end < b.end;
-                return a.name < b.name;
+                if (a.name != b.name)
+                  return a.name < b.name;
+                return a.order < b.order;
               });
 
     std::vector<Interval> intervals;
@@ -1483,6 +1514,7 @@ private:
           std::max<int64_t>(0, info.const_size_bytes.value()));
       interval.alignment = info.alignment;
       interval.var = info.var;
+      interval.order = info.order;
       intervals.push_back(interval);
     }
 
@@ -1611,6 +1643,8 @@ private:
                       PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
   // The mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocBufferNode *> shmem_allocs_;
+  // The program order of every allocation (AllocateCollector::alloc_order_)
+  std::unordered_map<const VarNode *, int> alloc_order_;
   // The size of the merged buffer
   PrimExpr merged_alloc_size_{0};
   // The mapping from the original buffer var to its offset in the merged buffer
@@ -1658,7 +1692,8 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
         return resolved;
       };
   if (collector.dyn_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_,
+                                  collector.alloc_order_, true, verbose,
                                   align_bytes, preserve_aliases);
     rewriter.PlanReuse(stmt, true,
                        disable_reuse ? false : enable_aggressive_merge, false,
@@ -1666,8 +1701,9 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
     stmt = rewriter(std::move(stmt));
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
-                                  verbose, align_bytes, preserve_aliases);
+    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_,
+                                  collector.alloc_order_, false, verbose,
+                                  align_bytes, preserve_aliases);
     rewriter.PlanReuse(stmt, false,
                        disable_reuse ? false : enable_aggressive_merge, false,
                        disable_reuse, resolve(collector.static_shmem_allocs_));
@@ -1691,27 +1727,8 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
     bool preserve_aliases = true;
-    int eff_align = align_bytes;
     if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
       preserve_aliases = target.value()->kind->name != "webgpu";
-      // Hexagon: align merged VTCM tiles to the 128-byte HVX vector so the
-      // elementwise codegen vectorizer can emit aligned vmem (not vmemu), and
-      // so a small (e.g. fp32) tile between two fp16 tiles can't push the next
-      // off 128-byte alignment.
-      if (target.value()->kind->name == "hexagon" && eff_align < 128)
-        eff_align = 128;
-    }
-    // A DMA source/destination remains live beyond its submission statement.
-    // Until interval-aware async liveness is available, do not overlay VTCM
-    // allocations in managed async kernels. Explicit ping/pong is unaffected.
-    bool async_dma = false;
-    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
-      if (target.value()->kind->name == "hexagon") {
-        PostOrderVisit(f->body, [&](const ObjectRef &node) {
-          if (const auto *call = node.as<CallNode>())
-            async_dma |= call->op.same_as(tl::hexagon_dma_submit());
-        });
-      }
     }
     // Per-buffer alignment requirements recorded by op lowering
     // (swizzle-dependent TMA/MMA constraints), propagated onto the device
@@ -1725,8 +1742,8 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocations(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
-        eff_align, debug_merge_shared_memory_allocations, preserve_aliases,
-        disable_reuse || async_dma, explicit_alignments);
+        align_bytes, debug_merge_shared_memory_allocations, preserve_aliases,
+        disable_reuse, explicit_alignments);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",

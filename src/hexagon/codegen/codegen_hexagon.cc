@@ -5,6 +5,7 @@
 #include "hexagon/op/builtin.h"
 #include "support/check.h"
 #include "transform/common/attr.h"
+#include "transform/common/storage_size.h"
 
 #include <tvm/ir/op.h>
 #include <tvm/runtime/logging.h>
@@ -31,6 +32,9 @@ struct HexagonBuiltin {
   bool on_dma_queue = false;
   // Returns a kernel status, which the statement returns on failure.
   bool returns_status = false;
+  // Prints only the first `printed_args` arguments (-1: all). The others are
+  // dependency-only operands for compiler analyses.
+  int printed_args = -1;
 };
 
 const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
@@ -48,7 +52,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        true},
       {tl::hexagon_dma_commit(), "tl_hexagon_dma_async_commit", false, true,
        true},
-      {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", false, true, true},
+      {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", false, true, true,
+       1},
       {tl::hexagon_exp(), "tl_hvx_exp", false},
       {tl::hexagon_exp2(), "tl_hvx_exp2", false},
       {tl::hexagon_log(), "tl_hvx_log", false},
@@ -72,10 +77,6 @@ bool IsHexagonHMXIntrinsic(const CallNode *call) {
   return builtin != nullptr && builtin->uses_hmx;
 }
 
-// The VTCM region's first 2 KiB hold the HMX output scales; kernel arenas
-// start above them (TL_VTCM_ARENA_OFFSET in tl_templates/hexagon/vtcm.h).
-constexpr size_t kVtcmArenaOffset = 2048;
-
 // A parallel loop that MaterializeGrid made from a T.Kernel(num_workers=) grid.
 bool IsWorkerLoop(const ForNode *loop) {
   return loop->kind == ForKind::kParallel &&
@@ -97,20 +98,19 @@ size_t ConstantElements(const tirx::Buffer &buffer) {
   return elems;
 }
 
-// The bytes a shared buffer takes in a VTCM arena: whole 2 KiB tiles, one HMX
-// Crouton tile each, which keeps every buffer HVX (128 B) aligned too.
-size_t VtcmBytes(const tirx::Buffer &buffer) {
-  size_t bytes = ConstantElements(buffer) * buffer->dtype.bytes();
-  return (bytes + 2047) & ~size_t(2047);
+int64_t ConstantBytes(const tirx::Buffer &buffer) {
+  return tl::GetBufferStorageSizeBytes(
+      static_cast<int64_t>(ConstantElements(buffer)), buffer->dtype);
 }
 
-// The VTCM arena of one tile program in `body`.
-size_t VtcmArenaBytes(const Stmt &body) {
-  size_t bytes = 0;
+// The bytes of the VTCM arena of the tile program in `body`: its one shared
+// allocation (VerifyVTCMArena), or 0.
+int64_t VtcmArenaBytes(const Stmt &body) {
+  int64_t bytes = 0;
   tirx::PostOrderVisit(body, [&bytes](const ffi::ObjectRef &node) {
     const auto *alloc = node.as<AllocBufferNode>();
     if (alloc && IsSharedScope(GetPtrStorageScope(alloc->buffer->data)))
-      bytes += VtcmBytes(alloc->buffer);
+      bytes += ConstantBytes(alloc->buffer);
   });
   return bytes;
 }
@@ -224,12 +224,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // Clear previous generated state and reserve keywords.
   this->InitFuncState(f);
   ReserveKeywordsAsUnique();
-  vtcm_offset_ = 0;
-  vtcm_capacity_ = 0;
-  if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
-    if (auto capacity = target.value()->GetAttr<Integer>("vtcm-capacity"))
-      vtcm_capacity_ = static_cast<size_t>(capacity.value()->value);
-  }
+  arena_bound_ = false;
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
@@ -298,7 +293,7 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
                            << "` must start at 0";
   int64_t num_workers =
       op->annotations.Get(tl::attr::kHexagonNumWorkers)->cast<Integer>()->value;
-  size_t arena_bytes = VtcmArenaBytes(op->body);
+  int64_t arena_bytes = VtcmArenaBytes(op->body);
 
   // tl_parallel_for runs the body once per tile program, on the worker pool.
   // Each worker gets a private VTCM arena; a worker that issues HMX enables
@@ -320,12 +315,9 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   stream << ") -> int32_t {\n";
   int scope = BeginScope();
   in_worker_ = true;
-  size_t outer_offset = vtcm_offset_;
-  vtcm_offset_ = 0;
   PrintStmt(op->body);
   PrintIndent();
   stream << "return TL_OK;\n";
-  vtcm_offset_ = outer_offset;
   in_worker_ = false;
   EndScope(scope);
   PrintIndent();
@@ -340,27 +332,21 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
   if (IsSharedScope(GetPtrStorageScope(op->buffer->data))) {
     // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and
     // HVX wants its scratch there, so a `shared` tile cannot live on the stack.
-    // It gets a compile-time byte offset into the tile program's VTCM arena:
-    // the kernel arena (tl_vtcm_arena()) or, in a worker, the worker's own
-    // arena (tl_arena). The offsets repeat for every program.
-    size_t offset = vtcm_offset_;
-    vtcm_offset_ += VtcmBytes(op->buffer);
-    ICHECK(vtcm_capacity_ == 0 ||
-           kVtcmArenaOffset + vtcm_offset_ <= vtcm_capacity_)
-        << "alloc_shared total (" << kVtcmArenaOffset + vtcm_offset_
-        << " bytes) exceeds the target's VTCM capacity (" << vtcm_capacity_
-        << " bytes)";
+    // MergeSharedMemoryAllocations laid out the tile program's shared buffers
+    // in this one arena, which starts at the kernel's VTCM base or, in a
+    // worker, at the worker's slice (tl_arena).
+    ICHECK(!arena_bound_) << "A Hexagon tile program has one VTCM arena";
+    arena_bound_ = true;
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
-    stream << "*)(" << (in_worker_ ? "tl_arena" : "tl_vtcm_arena()") << " + "
-           << offset << ");\n";
-    // Publish static VTCM usage, from the region base, for embedding/export
-    // capacity checks. Worker arenas are sized by tl_parallel_for instead.
+    stream << "*)" << (in_worker_ ? "tl_arena" : "tl_vtcm_arena()") << ";\n";
+    // Publish the kernel's VTCM usage for embedding/export capacity checks.
+    // Worker arenas are sized by tl_parallel_for instead.
     if (!in_worker_) {
       this->PrintIndent();
-      stream << "tl_vtcm_shared_high_water = "
-             << kVtcmArenaOffset + vtcm_offset_ << "u;\n";
+      stream << "tl_vtcm_shared_high_water = " << ConstantBytes(op->buffer)
+             << "u;\n";
     }
   } else {
     // Stack-local (fragments / small scratch).
@@ -392,8 +378,11 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
       os << "tl_dma_async";
       separator = ", ";
     }
-    for (const PrimExpr &arg : op->args) {
-      os << separator << PrintExpr(arg);
+    size_t printed = builtin->printed_args < 0
+                         ? op->args.size()
+                         : static_cast<size_t>(builtin->printed_args);
+    for (size_t i = 0; i < printed; ++i) {
+      os << separator << PrintExpr(op->args[i]);
       separator = ", ";
     }
     os << ")";
@@ -443,11 +432,14 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
 
 void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == tl::attr::kTileProgramScope) {
-    // A tile program declares its DMA queue in this scope, which is the C
-    // block of its loop body, lambda or function.
+    // A tile program declares its DMA queue and binds its VTCM arena in this
+    // scope, which is the C block of its loop body, lambda or function.
     bool outer_dma = dma_in_scope_;
+    bool outer_arena = arena_bound_;
+    arena_bound_ = false;
     CodeGenC::VisitStmt_(op);
     dma_in_scope_ = outer_dma;
+    arena_bound_ = outer_arena;
     return;
   }
   CodeGenC::VisitStmt_(op);

@@ -62,7 +62,7 @@ def test_workers_run_the_linearized_grid():
     (loop,) = _parallel_loops(_device_func(artifact))
     assert int(loop.extent) == 32
     assert int(loop.annotations["hexagon.num_workers"]) == 6
-    assert "tl_parallel_for(32, 6, tl_vtcm_worker_arenas(2048u), [&](int32_t bx_by_fused, uint8_t *tl_arena) -> int32_t {" in (
+    assert "tl_parallel_for(32, 6, tl_vtcm_worker_arenas(256u), [&](int32_t bx_by_fused, uint8_t *tl_arena) -> int32_t {" in (
         artifact.kernel_source
     )
 
