@@ -35,6 +35,9 @@ struct HexagonBuiltin {
   // Prints only the first `printed_args` arguments (-1: all). The others are
   // dependency-only operands for compiler analyses.
   int printed_args = -1;
+  // Prints the first `template_args` arguments as template arguments: a string
+  // as its text, a type annotation as its type.
+  int template_args = 0;
 };
 
 const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
@@ -64,12 +67,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_sigmoid(), "tl_hvx_sigmoid", false},
       {tl::hexagon_erf(), "tl_hvx_erf", false},
       {tl::hexagon_fabs(), "tl_hvx_fabs", false},
-      {tl::hexagon_lane_sum(), "tl_hvx_lane_sum", false},
-      {tl::hexagon_lane_max(), "tl_hvx_lane_max", false},
-      {tl::hexagon_lane_min(), "tl_hvx_lane_min", false},
-      {tl::hexagon_lane_and(), "tl_hvx_lane_and", false},
-      {tl::hexagon_lane_or(), "tl_hvx_lane_or", false},
-      {tl::hexagon_lane_xor(), "tl_hvx_lane_xor", false},
+      {tl::hexagon_reduce_rows(), "tl_hvx_reduce_rows", false, false, false,
+       -1, 2},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))
@@ -380,7 +379,23 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
   if (const HexagonBuiltin *builtin = FindHexagonBuiltin(op)) {
     ICHECK(!builtin->on_dma_queue || dma_in_scope_)
         << builtin->function << " needs the tile program's DMA queue";
-    os << builtin->function << "(";
+    os << builtin->function;
+    size_t first = static_cast<size_t>(builtin->template_args);
+    for (size_t i = 0; i < first; ++i) {
+      os << (i == 0 ? "<" : ", ");
+      if (const auto *text = op->args[i].as<StringImmNode>()) {
+        os << text->value;
+      } else {
+        static const Op &type_annotation = Op::Get("tirx.type_annotation");
+        const auto *type = op->args[i].as<CallNode>();
+        ICHECK(type && type->op.same_as(type_annotation))
+            << builtin->function << " takes a string or a type annotation as "
+            << "template argument " << i << ", got " << op->args[i];
+        PrintType(type->dtype, os);
+      }
+      os << (i + 1 == first ? ">" : "");
+    }
+    os << "(";
     const char *separator = "";
     if (builtin->on_dma_queue) {
       os << "tl_dma_async";
@@ -389,7 +404,7 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
     size_t printed = builtin->printed_args < 0
                          ? op->args.size()
                          : static_cast<size_t>(builtin->printed_args);
-    for (size_t i = 0; i < printed; ++i) {
+    for (size_t i = first; i < printed; ++i) {
       os << separator << PrintExpr(op->args[i]);
       separator = ", ";
     }

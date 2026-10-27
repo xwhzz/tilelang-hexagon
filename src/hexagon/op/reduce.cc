@@ -8,9 +8,9 @@
  * and min are exact, so an fp16 source keeps them in fp16 unless an fp32
  * destination value joins in.
  *
- * Reducing the innermost axis runs each output's row through a vector
- * accumulator of whole HVX registers, which a lane tree (tl_hvx_lane_*)
- * finishes, and a scalar loop takes the tail. Along any other axis the outputs
+ * Reducing the innermost axis is one tl_hvx_reduce_rows call (hvx_reduce.h)
+ * per position of the outer axes: it reduces blocks of rows with HVX transpose
+ * trees and stores whole blocks of results. Along any other axis the outputs
  * are contiguous instead: a block of them accumulates in registers while the
  * loop walks the reduced axis.
  */
@@ -18,12 +18,15 @@
 #include "op/reduce.h"
 
 #include "backend/common/op/reduce.h"
+#include "layout/layout.h"
 #include "backend/common/target_utils.h"
 #include "hexagon/op/builtin.h"
 #include "op/utils.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt.h>
 
 #include <algorithm>
 #include <string>
@@ -66,6 +69,39 @@ DataType AccType(const ReduceOpNode &op) {
   return DataType::Float(32);
 }
 
+// Whether the elements of `buffer` sit at their row-major positions: it has no
+// layout, or one that maps every index there (a fragment one thread holds
+// whole).
+bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
+  Optional<Layout> layout = layout_map.Get(buffer);
+  if (!layout)
+    return true;
+  if (const auto *fragment = layout.value().as<FragmentNode>()) {
+    if (!is_one(fragment->ThreadExtent()) ||
+        !is_one(fragment->ReplicateExtent()))
+      return false;
+  }
+  PrimExpr row_major = make_zero(DataType::Int(32));
+  Array<PrimExpr> shape = layout.value()->InputShape();
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    row_major = row_major * shape[i] + InputPlaceholder(i);
+    analyzer.Bind(InputPlaceholder(i), Range(0, shape[i]));
+  }
+  return analyzer.CanProveEqual(
+      layout.value()->GetLinearizedForwardIndex(), row_major);
+}
+
+// The stride of `axis` in a compact row-major buffer, in elements.
+PrimExpr Stride(const Buffer &buffer, int axis) {
+  if (!buffer->strides.empty())
+    return buffer->strides[axis];
+  PrimExpr stride = make_const(DataType::Int(32), 1);
+  for (size_t d = axis + 1; d < buffer->shape.size(); ++d)
+    stride = stride * buffer->shape[d];
+  return stride;
+}
+
 Stmt Loop(const Var &var, PrimExpr extent, ForKind kind, Stmt body) {
   return For(var, make_zero(DataType::Int(32)), cast(DataType::Int(32), extent),
              kind, std::move(body));
@@ -73,8 +109,9 @@ Stmt Loop(const Var &var, PrimExpr extent, ForKind kind, Stmt body) {
 
 class ReduceLowering {
 public:
-  explicit ReduceLowering(const ReduceOpNode &op)
-      : op_(op), ndim_(static_cast<int>(op.srcRegion_->region.size())),
+  ReduceLowering(const ReduceOpNode &op, const LayoutMap &layout_map)
+      : op_(op), layout_map_(layout_map),
+        ndim_(static_cast<int>(op.srcRegion_->region.size())),
         src_t_(op.src->dtype), dst_t_(op.dst->dtype), acc_t_(AccType(op)) {
     // The vectorized loops fill whole registers with their narrowest type.
     int bits = std::min(src_t_.bits(), acc_t_.bits());
@@ -88,13 +125,16 @@ public:
   Stmt Lower() {
     for (int d = 0; d < ndim_; ++d)
       vars_.emplace_back("i" + std::to_string(d), DataType::Int(32));
-    Stmt body = Innermost() ? RowReduce() : ColumnReduce();
-    // Loops over the outputs: every axis but the reduced one, and in a column
-    // reduction the innermost axis too, which ColumnReduce walks itself.
-    for (int d = ndim_ - 1; d >= 0; --d) {
-      if (d == op_.dim || (!Innermost() && d == ndim_ - 1))
-        continue;
-      body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
+    if (Innermost())
+      return RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_)
+                 ? RowReduce()
+                 : ScalarRowReduce();
+    // Loops over the outputs: every axis but the reduced one and the innermost
+    // one, which ColumnReduce walks itself.
+    Stmt body = ColumnReduce();
+    for (int d = ndim_ - 2; d >= 0; --d) {
+      if (d != op_.dim)
+        body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
     }
     return SeqStmt({AllocBuffer(acc_), AllocBuffer(res_), body});
   }
@@ -103,36 +143,49 @@ private:
   bool Innermost() const { return op_.dim == ndim_ - 1; }
   PrimExpr Extent(int d) const { return op_.srcRegion_->region[d]->extent; }
 
-  // Reduces the innermost axis of one output's row.
+  // Reduces the innermost axis with one tl_hvx_reduce_rows call per position
+  // of the axes before the rows, the next-to-innermost axis.
   Stmt RowReduce() {
-    PrimExpr extent = Extent(op_.dim);
-    PrimExpr blocks = floordiv(extent, lanes_);
-    PrimExpr full = blocks * lanes_;
-    Var k0("k0", DataType::Int(32)), k("k", DataType::Int(32));
-    Array<Stmt> seq;
-    if (is_zero(blocks)) {
-      // Shorter than a register: the scalar loop below does it all.
-      seq.push_back(BufferStore(res_, Init(), {0}));
-    } else {
-      seq.push_back(Lanes([&](const Var &) { return Init(); }, acc_));
-      seq.push_back(Loop(k0, blocks, ForKind::kSerial,
-                         Lanes(
-                             [&](const Var &v) {
-                               return Accumulate(BufferLoad(acc_, {v}),
-                                                 Source(k0 * lanes_ + v));
-                             },
-                             acc_)));
-      seq.push_back(BufferStore(
-          res_,
-          Call(acc_t_, LaneOp(), {BufferLoad(acc_, {Ramp(0, 1, lanes_)})}),
-          {0}));
-    }
-    seq.push_back(Loop(
-        k, extent - full, ForKind::kSerial,
-        BufferStore(res_, Accumulate(BufferLoad(res_, {0}), Source(full + k)),
-                    {0})));
-    seq.push_back(Store({}, BufferLoad(res_, {0})));
-    return SeqStmt::Flatten(seq);
+    int rows_axis = ndim_ - 2;
+    std::vector<std::pair<int, PrimExpr>> first_row;
+    if (rows_axis >= 0)
+      first_row.emplace_back(rows_axis, make_zero(DataType::Int(32)));
+    Array<PrimExpr> dst_indices = Output(first_row);
+    PrimExpr one = make_const(DataType::Int(32), 1);
+    PrimExpr rows = rows_axis >= 0 ? Extent(rows_axis) : one;
+    PrimExpr cols = Extent(op_.dim);
+    // The rows axis keeps its position in the destination, with or without
+    // keepdim, since the reduced axis is the innermost one.
+    PrimExpr src_stride = rows_axis >= 0 ? Stride(op_.src, rows_axis) : cols;
+    PrimExpr dst_stride = rows_axis >= 0 ? Stride(op_.dst, rows_axis) : one;
+    Stmt body = Evaluate(Call(
+        DataType::Void(), hexagon_reduce_rows(),
+        {StringImm(KindName()), TypeAnnotation(acc_t_),
+         Call(DataType::Handle(), builtin::address_of(),
+              {BufferLoad(op_.dst, dst_indices)}),
+         Call(DataType::Handle(), builtin::address_of(),
+              {Source(make_zero(DataType::Int(32)), first_row)}),
+         cast(DataType::Int(32), rows), cast(DataType::Int(32), cols),
+         cast(DataType::Int(32), src_stride),
+         cast(DataType::Int(32), dst_stride), Bool(op_.clear)}));
+    for (int d = rows_axis - 1; d >= 0; --d)
+      body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
+    return body;
+  }
+
+  // An innermost-axis reduction over buffers in other layouts: one element at
+  // a time, through the layouts.
+  Stmt ScalarRowReduce() {
+    Var k("k", DataType::Int(32));
+    Stmt body = SeqStmt(
+        {BufferStore(res_, Init(), {0}),
+         Loop(k, Extent(op_.dim), ForKind::kSerial,
+              BufferStore(res_, Accumulate(BufferLoad(res_, {0}), Source(k)),
+                          {0})),
+         Store({}, BufferLoad(res_, {0}))});
+    for (int d = ndim_ - 2; d >= 0; --d)
+      body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
+    return SeqStmt({AllocBuffer(res_), body});
   }
 
   // Reduces an outer axis for one row of outputs along the innermost axis.
@@ -274,23 +327,29 @@ private:
     return a ^ b;
   }
 
-  // The lane tree that finishes a vector accumulator.
-  const Op &LaneOp() const {
+  // The TL_REDUCE_* constant of hvx_reduce.h.
+  std::string KindName() const {
     const ReduceType &type = op_.type;
-    if (type->IsSum() || type->IsAbsSum())
-      return hexagon_lane_sum();
-    if (type->IsMax() || type->IsAbsMax())
-      return hexagon_lane_max();
+    if (type->IsSum())
+      return "TL_REDUCE_SUM";
+    if (type->IsMax())
+      return "TL_REDUCE_MAX";
     if (type->IsMin())
-      return hexagon_lane_min();
+      return "TL_REDUCE_MIN";
+    if (type->IsAbsSum())
+      return "TL_REDUCE_ABSSUM";
+    if (type->IsAbsMax())
+      return "TL_REDUCE_ABSMAX";
     if (type->IsBitAnd())
-      return hexagon_lane_and();
+      return "TL_REDUCE_AND";
     if (type->IsBitOr())
-      return hexagon_lane_or();
-    return hexagon_lane_xor();
+      return "TL_REDUCE_OR";
+    ICHECK(type->IsBitXor());
+    return "TL_REDUCE_XOR";
   }
 
   const ReduceOpNode &op_;
+  const LayoutMap &layout_map_;
   int ndim_;
   DataType src_t_, dst_t_, acc_t_;
   int lanes_ = 1;
@@ -301,7 +360,6 @@ private:
 struct Reduce {
   static Stmt Lower(const ReduceOpNode &op, const LowerArgs &lower_args,
                     arith::Analyzer *analyzer) {
-    (void)lower_args;
     (void)analyzer;
     if (!InPlace(op.src) || !InPlace(op.dst)) {
       LOG(FATAL) << "Hexagon reduce reads and writes shared, fragment or "
@@ -317,7 +375,7 @@ struct Reduce {
       LOG(FATAL) << "Hexagon reduce does not propagate NaN: HVX max and min "
                     "return the other operand";
     }
-    return ReduceLowering(op).Lower();
+    return ReduceLowering(op, lower_args.layout_map).Lower();
   }
 };
 

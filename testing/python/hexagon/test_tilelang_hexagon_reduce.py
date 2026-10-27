@@ -50,27 +50,70 @@ def _source(func):
 
 @pytest.mark.parametrize("scope", ["shared", "fragment"])
 @pytest.mark.parametrize("op", _FLOAT_OPS)
-def test_innermost_axis_runs_vector_accumulators_and_a_lane_tree(op, scope):
+def test_innermost_axis_is_one_call_over_the_rows(op, scope):
     source = _source(_make(op, (64, 256), 1, "float32", "float32", scope=scope))
-    lane = {"sum": "sum", "abssum": "sum", "max": "max", "absmax": "max", "min": "min"}[op]
-    assert f"tl_hvx_lane_{lane}(*(float32*)(acc + 0))" in source
-    assert "*(float32*)(acc + 0) = " in source
+    kind = f"TL_REDUCE_{op.upper()}"
+    assert f"tl_hvx_reduce_rows<{kind}, float>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 256, 256, 1, (bool)1);" in source
     # The source stays in the arena: no fragment copy of it.
     assert source.count("buf_dyn_shmem +") == 2
 
 
-def test_rows_shorter_than_a_register_stay_scalar():
-    source = _source(_make("sum", (64, 20), 1, "float32", "float32"))
-    assert "tl_hvx_lane" not in source
-    assert "float acc[" not in source
+def test_rows_of_any_length_use_the_same_call():
+    # Rows shorter than a register, and rows that do not start on a register
+    # boundary (200 floats), take the call's tail and unaligned paths.
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 20, 20, 1, (bool)1);" in _source(
+        _make("sum", (64, 20), 1, "float32", "float32")
+    )
+    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 200, 200, 1, (bool)1);" in _source(
+        _make("max", (64, 200), 1, "float32", "float32")
+    )
 
 
-def test_stack_scratch_is_register_aligned():
-    # Rows of 200 do not start on a register boundary, so the vectorizer leaves
-    # the accumulation scalar; the lane tree then reads `acc` with an aligned
-    # vmem, which drops the low address bits.
-    source = _source(_make("max", (64, 200), 1, "float32", "float32"))
-    assert "float acc[32] __attribute__((aligned(128)));" in source
+def test_outer_axes_loop_around_the_call():
+    source = _source(_make("sum", (4, 24, 96), 2, "float32", "float32"))
+    assert "for (int32_t i0 = 0; i0 < 4; ++i0) {" in source
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float>((&(((float*)dst)[(i0 * 24)])), (&(((float*)src)[(i0 * 2304)])), 24, 96, 96, 1, (bool)1);" in source
+
+
+def _make_regions(op, clear=True):
+    """Reduces columns [8, 200) of a 64x256 tile into column 1 of a 64x4 one."""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 256), "float32"), Init: T.Tensor((64, 4), "float32"), B: T.Tensor((64, 4), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((64, 256), "float32")
+            dst = T.alloc_shared((64, 4), "float32")
+            T.copy(A, src)
+            T.copy(Init, dst)
+            getattr(T, f"reduce_{op}")(src[:, 8:200], dst[:, 1:2], dim=1, clear=clear)
+            T.copy(dst, B)
+
+    return kernel
+
+
+def test_regions_pass_their_origin_and_strides():
+    source = _source(_make_regions("max"))
+    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float>((&(((float*)dst)[1])), (&(((float*)src)[8])), 64, 192, 256, 4, (bool)1);" in source
+
+
+def test_other_layouts_reduce_through_them():
+    # A Crouton tile is not row-major; its rows reduce one element at a time
+    # until HVX works on Crouton tiles directly.
+    from tilelang.hexagon.intrinsics.crouton import make_hmx_output_layout
+
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((64, 64), "float16")
+            dst = T.alloc_shared((64,), "float32")
+            T.annotate_layout({src: make_hmx_output_layout(src)})
+            T.copy(A, src)
+            T.reduce_max(src, dst, dim=1)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "tl_hvx_reduce_rows" not in source
+    assert "for (int32_t k = 0; k < 64; ++k) {" in source
 
 
 def test_outer_axis_accumulates_whole_registers():
@@ -80,11 +123,11 @@ def test_outer_axis_accumulates_whole_registers():
 
 
 def test_fp16_max_stays_in_fp16():
-    source = _source(_make("max", (64, 256), 1, "float16", "float32"))
-    # Max is exact, so fp16 lanes need no widening; a sum widens to fp32.
-    assert "tl_hvx_lane_max(*(half64*)(acc + 0))" in source
-    assert "float64" not in source
-    assert "tl_hvx_lane_sum(*(float64*)(acc + 0))" in _source(_make("sum", (64, 256), 1, "float16", "float32"))
+    # Max is exact, so fp16 lanes need no widening; a sum accumulates in fp32.
+    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, half>(" in _source(_make("max", (64, 256), 1, "float16", "float32"))
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float>(" in _source(_make("sum", (64, 256), 1, "float16", "float32"))
+    # The fp32 values already in the destination join an accumulating max.
+    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float>(" in _source(_make("max", (64, 256), 1, "float16", "float32", clear=False))
 
 
 def test_accumulating_fp16_max_into_fp32_widens():
@@ -212,9 +255,117 @@ def test_int8_sums_into_int32():
 
 
 @DEVICE
+@pytest.mark.parametrize("op", ["sum", "bitxor"])
+def test_int32_reduces_into_int8(op):
+    # Four source registers fill one int8 accumulator register.
+    _check(op, (16, 300), 1, "int32", "int8")
+
+
+def _make_unaligned_output(op):
+    """Reduces 64 rows into elements [3, 67) of a 70-element buffer."""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 96), "float32"), Init: T.Tensor((70,), "float32"), B: T.Tensor((70,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((64, 96), "float32")
+            dst = T.alloc_shared((70,), "float32")
+            T.copy(A, src)
+            T.copy(Init, dst)
+            getattr(T, f"reduce_{op}")(src, dst[3:67], dim=1, clear=False)
+            T.copy(dst, B)
+
+    return kernel
+
+
+@DEVICE
+@pytest.mark.parametrize("op", ["sum", "max"])
+def test_unaligned_outputs_keep_their_neighbours(op):
+    import torch
+
+    kernel = tilelang.compile(_make_unaligned_output(op), out_idx=[2], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(13)
+        A = torch.randn(64, 96, generator=gen)
+        init = torch.randn(70, generator=gen)
+        out = kernel(A, init)
+        value = A.double().sum(dim=1) if op == "sum" else A.double().amax(dim=1)
+        expected = init.double().clone()
+        expected[3:67] = expected[3:67] + value if op == "sum" else torch.maximum(expected[3:67], value)
+        torch.testing.assert_close(out.double(), expected, rtol=1e-5, atol=1e-4)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
 @pytest.mark.parametrize("op", ["sum", "absmax"])
 def test_short_rows_match_torch(op):
     _check(op, (8, 20), 1, "float32", "float32")
+
+
+@DEVICE
+@pytest.mark.parametrize("op", ["sum", "max", "min", "absmax"])
+@pytest.mark.parametrize("rows", [1, 7, 70])
+def test_partial_row_blocks_match_torch(op, rows):
+    # A block is 32 fp32 rows; 70 = 2 blocks + 6 rows, and a 1-row block folds
+    # within one register.
+    _check(op, (rows, 96), 1, "float32", "float32")
+    _check(op, (rows, 96), 1, "float16", "float16", scope="fragment")
+
+
+@DEVICE
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("clear", [True, False])
+def test_regions_match_torch(op, clear):
+    import torch
+
+    kernel = tilelang.compile(_make_regions(op, clear), out_idx=[2], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(11)
+        A = torch.randn(64, 256, generator=gen)
+        init = torch.randn(64, 4, generator=gen)
+        out = kernel(A, init)
+        part = A[:, 8:200].double()
+        value = part.sum(dim=1) if op == "sum" else part.amax(dim=1)
+        expected = init.double().clone()
+        expected[:, 1] = value if clear else (expected[:, 1] + value if op == "sum" else torch.maximum(expected[:, 1], value))
+        torch.testing.assert_close(out.double(), expected, rtol=1e-5, atol=1e-4)
+    finally:
+        kernel.adapter.close()
+
+
+def _make_vector(op, n, src_dtype, dst_dtype):
+    """Reduces a vector of n elements into a one-element buffer."""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((n,), src_dtype), B: T.Tensor((1,), dst_dtype)):
+        with T.Kernel(1):
+            src = T.alloc_shared((n,), src_dtype)
+            dst = T.alloc_shared((1,), dst_dtype)
+            T.copy(A, src)
+            getattr(T, f"reduce_{op}")(src, dst, dim=0)
+            T.copy(dst, B)
+
+    return kernel
+
+
+def test_a_vector_is_one_row():
+    source = _source(_make_vector("sum", 300, "float32", "float32"))
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float>((&(((float*)dst)[0])), (&(((float*)src)[0])), 1, 300, 300, 1, (bool)1);" in source
+
+
+@DEVICE
+@pytest.mark.parametrize("op,src_dtype", [("sum", "float32"), ("max", "float16")])
+def test_vector_reductions_match_torch(op, src_dtype):
+    import torch
+
+    kernel = tilelang.compile(_make_vector(op, 300, src_dtype, "float32"), out_idx=[1], target="hexagon")
+    try:
+        A = torch.randn(300, generator=torch.Generator().manual_seed(5)).to(getattr(torch, src_dtype))
+        out = kernel(A)
+        expected = A.double().sum() if op == "sum" else A.double().max()
+        torch.testing.assert_close(out.double(), expected.reshape(1), rtol=1e-5, atol=1e-4)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE

@@ -5,14 +5,14 @@
 // tl_hvx_<fn> functions here, for scalars and for the codegen's vectors
 // (vec_type, common.h), and a float vector division as tl_hvx_div. Each
 // transcendental is one 32-lane fp32 register kernel (tl_hvx_<fn>_vsf) built
-// from exp2, recip and rsqrt; fp16 computes in fp32 and rounds once. The reduce
-// tile op lowers to the row reductions at the end (max, sum).
+// from exp2, recip and rsqrt; fp16 computes in fp32 and rounds once. The row
+// reductions of the reduce tile op are in hvx_reduce.h.
 //
 // Pulled in on demand by runtime/fastrpc.py when a kernel references `tl_hvx`.
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h> // vec_type, the codegen's vectors
-#include <type_traits>
+#include <tl_templates/hexagon/hvx_reduce.h>
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))
@@ -413,68 +413,6 @@ TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
     __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
   }
   return out;
-}
-
-// ---------------------------------------------------------------------------
-// Lane reductions of the codegen's vectors (vec_type<T, N>, N whole registers),
-// which finish the reduce lowering's vector accumulators. The registers combine
-// first; then rotating by half the remaining width (Q6_V_vror_VR, in bytes)
-// and combining leaves the whole reduction in lane 0. An fp16 result returns
-// as float, since __fp16 is not a valid return type.
-// ---------------------------------------------------------------------------
-template <typename T>
-using tl_hvx_lane_t = std::conditional_t<std::is_same_v<T, half>, float, T>;
-
-template <typename T, int N, typename Op>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_reduce(const vec_type<T, N> &x, Op op) {
-  constexpr int kLanes = 128 / static_cast<int>(sizeof(T));
-  static_assert(N % kLanes == 0, "lane reductions need whole registers");
-  typedef T reg_t __attribute__((ext_vector_type(kLanes)));
-  reg_t acc;
-  __builtin_memcpy(&acc, &x.v, 128);
-#pragma clang loop unroll(full)
-  for (int i = 1; i < N / kLanes; ++i) {
-    reg_t r;
-    __builtin_memcpy(&r, (const char *)&x.v + 128 * i, 128);
-    acc = op(acc, r);
-  }
-#pragma clang loop unroll(full)
-  for (int bytes = 64; bytes >= static_cast<int>(sizeof(T)); bytes /= 2) {
-    HVX_Vector v;
-    __builtin_memcpy(&v, &acc, 128);
-    HVX_Vector rotated = Q6_V_vror_VR(v, bytes);
-    reg_t r;
-    __builtin_memcpy(&r, &rotated, 128);
-    acc = op(acc, r);
-  }
-  return acc[0];
-}
-
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_sum(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a + b; });
-}
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_max(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(
-      x, [](auto a, auto b) { return __builtin_elementwise_max(a, b); });
-}
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_min(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(
-      x, [](auto a, auto b) { return __builtin_elementwise_min(a, b); });
-}
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_and(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a & b; });
-}
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_or(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a | b; });
-}
-template <typename T, int N>
-TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_xor(const vec_type<T, N> &x) {
-  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a ^ b; });
 }
 
 // ---------------------------------------------------------------------------
