@@ -149,8 +149,9 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # explicit HMX qmatmul schedule.
     uses_qmatmul = "tl_hexagon_hmx_pack_a_f32_pair_k32" in kernel_source or "tl_hexagon_q4_0_" in kernel_source
     qmatmul_include = "#include <tl_templates/hexagon/qmatmul.h>\n" if uses_qmatmul else ""
-    # Acquire/release the HMX session at _open/_close (the matmul also inits
-    # lazily, but _close MUST deinit or VTCM/HMX/power leak for the agent's life).
+    # Every session votes for clocks at _open and removes the vote at _close
+    # (power.h). Acquire/release the HMX session at _open/_close too: _close
+    # MUST deinit or VTCM/HMX leak for the agent's life.
     # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
     # vtcm_check only apply to non-HMX shared kernels (avoids a double release).
     hmx_open = "tl_hmx_session_init(); " if hmx else ""
@@ -166,6 +167,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         "#include <AEEStdErr.h>\n"
         "#include <type_traits>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
+        "#include <tl_templates/hexagon/power.h>\n"
         f"{vtcm_include}"
         f"{worker_include}"
         f"{hmx_include}"
@@ -187,8 +189,8 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         "  }\n"
         "}\n\n"
         '#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
-        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {hmx_open}{hmx_check}{vtcm_check}return AEE_SUCCESS; }}\n"
-        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}{vtcm_close}return AEE_SUCCESS; }}\n\n"
+        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; tl_power_vote(); {hmx_open}{hmx_check}{vtcm_check}return AEE_SUCCESS; }}\n"
+        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}{vtcm_close}tl_power_unvote(); return AEE_SUCCESS; }}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
         f"  return tl_hexagon_forward_kernel_status([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
         "}\n\n"

@@ -13,51 +13,17 @@
 // use HMX.
 #include <HAP_compute_res.h>
 #include <HAP_perf.h> // Generated DSP timing wrappers also use the qtimer API.
-#include <HAP_power.h>
 #include <hexagon_types.h> // HVX_Vector + Q6_* intrinsics (needs -mhvx)
 #include <hmx_hexagon_protos.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <tl_templates/hexagon/power.h>   // the session's power requests
 #include <tl_templates/hexagon/qmatmul.h> // reusable FP32/Crouton row-pair atoms
 #include <tl_templates/hexagon/vtcm.h> // unified VTCM arena (shared with alloc_shared)
 #include <tl_templates/hexagon/worker.h> // HW-thread worker pool (multithreaded HMX/HVX)
 
 #define TL_HMX_INLINE static inline __attribute__((unused, always_inline))
-
-// ------------------------------ power -------------------------------------
-static int tl_hmx_power_ctx;
-TL_HMX_INLINE void tl_hmx_power_setup(void) {
-  HAP_power_request_t req;
-  memset(&req, 0, sizeof(req));
-  req.type = HAP_power_set_DCVS_v3;
-  req.dcvs_v3.dcvs_enable = TRUE;
-  req.dcvs_v3.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
-  req.dcvs_v3.set_latency = TRUE;
-  req.dcvs_v3.latency = 100;
-  req.dcvs_v3.set_core_params = TRUE;
-  req.dcvs_v3.core_params.min_corner = HAP_DCVS_VCORNER_NOM;
-  req.dcvs_v3.core_params.max_corner = HAP_DCVS_VCORNER_TURBO_L3;
-  req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_TURBO_L3;
-  req.dcvs_v3.set_bus_params = TRUE;
-  req.dcvs_v3.bus_params.min_corner = HAP_DCVS_VCORNER_NOM;
-  req.dcvs_v3.bus_params.max_corner = HAP_DCVS_VCORNER_TURBO_L3;
-  req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_TURBO_L3;
-  HAP_power_set(&tl_hmx_power_ctx, &req);
-  memset(&req, 0, sizeof(req));
-  req.type = HAP_power_set_HMX;
-  req.hmx.power_up = TRUE;
-  HAP_power_set(&tl_hmx_power_ctx, &req);
-}
-TL_HMX_INLINE void tl_hmx_power_reset(void) {
-  HAP_power_request_t req;
-  memset(&req, 0, sizeof(req));
-  req.type = HAP_power_set_HMX;
-  req.hmx.power_up = FALSE;
-  HAP_power_set(&tl_hmx_power_ctx, &req);
-  HAP_power_set_dcvs_v3_init(&req);
-  HAP_power_set(&tl_hmx_power_ctx, &req);
-}
 
 // ------------------------------ VTCM --------------------------------------
 // Delegated to the shared tl_vtcm arena (vtcm.h) so HMX scratch and
@@ -159,7 +125,7 @@ static qurt_thread_t
 static void tl_hmx_session_init(void) {
   if (tl_hmx_inited)
     return;
-  tl_hmx_power_setup();
+  tl_power_hmx(true);
   tl_hmx_vtcm_setup();
   tl_hmx_setup();
   // Require BOTH the VTCM grant AND a successful per-thread HMX enable (which
@@ -172,11 +138,11 @@ static void tl_hmx_session_init(void) {
         qurt_thread_get_id(); // this enable is bound to this thread
     tl_hmx_inited = 1;
   } else {
-    // VTCM acquire failed: release the HMX ctx and drop the rail off TURBO so a
-    // failed init doesn't leak the unit + pin power for the agent's lifetime.
+    // VTCM acquire failed: release the HMX ctx and power HMX down so a failed
+    // init doesn't leak the unit for the agent's lifetime.
     tl_hmx_reset();
     tl_hmx_vtcm_reset();
-    tl_hmx_power_reset();
+    tl_power_hmx(false);
   }
 }
 static void tl_hmx_session_deinit(void) {
@@ -185,7 +151,7 @@ static void tl_hmx_session_deinit(void) {
   tl_hmx_disable();
   tl_hmx_reset();
   tl_hmx_vtcm_reset();
-  tl_hmx_power_reset();
+  tl_power_hmx(false);
   tl_hmx_inited = 0;
 }
 
