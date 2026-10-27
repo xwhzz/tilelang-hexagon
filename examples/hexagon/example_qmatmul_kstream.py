@@ -260,7 +260,7 @@ def make_staged_hmx(M, N, K):
                         A_hmx,
                         B_hmx,
                         inst_m_idx=mt,
-                        b_prefix=(nt,),
+                        b_origin=(nt, 0, 0),
                     )
                     E.convert(cvt, acc, bias, bias_vtcm)
                     E.store(

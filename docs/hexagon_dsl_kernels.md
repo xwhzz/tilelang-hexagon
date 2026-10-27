@@ -89,8 +89,37 @@ template** (~1.4 ms/512K weights) — so the template is not needed; the DSL gen
 ## 3. The fused matmul, and the DSL-driven HMX K-loop
 
 `example_qmatmul.py` fuses dequant + `T.gemm` in one kernel: the dequantized weight lands in
-VTCM (`alloc_shared`) and never hits DDR. `T.gemm` needs `clear_accum=True` on Hexagon (the
-HMX accumulator must be `mxclracc`'d, else NaN).
+VTCM (`alloc_shared`) and never hits DDR.
+
+`T.gemm(A, B, C)` runs on HMX when A and B are fp16 and C is fp16 or fp32, all three in VTCM
+(shared buffers or fragments), M, N and K are multiples of 32, and each operand is a matrix
+of whole 32x32 tiles that starts on a tile: a whole buffer, a sub-matrix of a larger one, or
+one matrix of a stack. Transposes and `clear_accum`, also as an expression such as `k == 0`,
+combine freely. Any other GEMM runs as a scalar loop that hexagon-clang vectorizes, and the
+compiler logs why HMX does not apply (`tl.hexagon.GemmHMXRejection`).
+
+Each 32x32 output tile reduces the call's K in the HMX accumulator and converts to fp16: HMX
+accumulates within a call, and HVX across calls. An fp16 C keeps the HMX output layout, and a
+call that overwrites it takes the tiles directly. Every other C takes each tile through a
+staging tile in VTCM, which `tl_crouton_tile_store` (`crouton.h`) writes or adds into C:
+
+- an fp32 C stays row-major, where widening a row-pair register by 1.0 gives the pair's two
+  rows as fp32 registers;
+- an fp16 C adds in its own Crouton tiles;
+- a C of another layout is written element by element.
+
+Two staging tiles alternate, so each tile's epilogue runs on HVX while HMX multiplies the
+next tile; the call holds the HMX accumulator throughout, so worker threads that issue gemms
+take turns call by call. A loop of calls therefore costs one HVX pass over C per call, which
+the K inside a call does not. On v79, one call over K = 1024 runs at 8.1 cycles per
+32x32x32 multiply, the HMX rate. A loop of calls into an fp32 C (`example_gemm.py`) runs at:
+
+| K per call (BK) | 64 | 256 | 512 |
+|---|---|---|---|
+| cycles per 32x32x32 multiply | 114 | 27 | 12.7 |
+
+So give each call as much K as VTCM holds. Each call's product is rounded to fp16 before HVX
+adds it, so an fp32 C carries the error of a sum of K / BK fp16 numbers.
 
 For explicit scheduling, HMX is driven at **instruction-atom granularity** via
 `tilelang/hexagon/intrinsics/hmx.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
@@ -119,13 +148,15 @@ accumulator-read setup stay with the embedding runtime.
 
 The shared-memory planner propagates each native VTCM requirement from its HMX operand:
 activation/output 2 KB, weight 128 B, and scale/bias config 256 B. Because every 32x32 FP16
-Crouton output tile is exactly 2 KB, the emitter stores repeated tiles directly at their native
-C addresses without an internal staging atom or HVX commit.
+Crouton output tile is exactly 2 KB, `store` writes an output tile at its native address in
+C, and `store_at` at any other 2 KB boundary, such as a staging tile. Operand origins
+(`a_origin`, `b_origin`, `output_origin`) are the logical indices of each operand's first
+element, so the atoms address sub-matrices and stacked matrices.
 
 `GemmHMX.lower` takes only `T.gemm(A, B, C)`. Layout inference assigns native Crouton layouts
-to those VTCM buffers, while lowering owns the dependency-only HMX states, internal scale/bias
-block, and outer M/N loops. It emits the same explicit atoms and no longer calls the legacy
-monolithic `tl_hexagon_hmx_gemm` template. Kernels may use one logical `T.copy` to move any
+to A and B (and to an fp16 C without a layout), and lowering checks that they have them,
+while it owns the dependency-only HMX states, the internal scale/bias block, the staging
+tiles and the loop over output tiles. It emits the same explicit atoms. Kernels may use one logical `T.copy` to move any
 region of a strided matrix, in DDR or VTCM, fp16 or fp32, to or from a Crouton buffer: the
 lowering passes the region's origin and the matrix strides to one `tl_crouton_copy`, which
 converts fp32 on the way. Row pairs of a row-contiguous matrix move as HVX registers

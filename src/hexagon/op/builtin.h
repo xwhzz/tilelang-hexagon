@@ -135,6 +135,14 @@ TVM_DLL const Op &hexagon_load_repeat();
 // `column_tiles` ("true" or "false") print as template arguments.
 TVM_DLL const Op &hexagon_crouton_copy();
 
+// tl_crouton_tile_store<accumulate, rows, aligned>(dst, ldc, tile)
+// (crouton.h): writes the fp16 Crouton tile `tile`, an HMX output, into a
+// 32 x 32 block of a matrix, or adds it to the block (accumulate): a row-major
+// block whose element (i, j) is dst[i * ldc + j] (rows), fp16 or fp32, or the
+// Crouton tile dst. `aligned`: the rows start on register boundaries (fp32) or
+// half-register ones (fp16). The three print as template arguments.
+TVM_DLL const Op &hexagon_crouton_tile_store();
+
 // tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();

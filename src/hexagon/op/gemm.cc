@@ -2,15 +2,22 @@
  * \file tl/hexagon/op/gemm.cc
  * \brief Hexagon implementation for tl.gemm instruction selection.
  *
- * Select the explicit HMX instruction path for its validated native-Crouton
- * surface and retain the scalar implementation as the general fallback.
+ * A GEMM runs on HMX (GemmHMX, tilelang/hexagon/op/gemm/gemm_hmx.py) when its
+ * operands fit the matrix unit, and as the scalar loop otherwise, which
+ * hexagon-clang vectorizes onto HVX.
  */
 
 #include "op/gemm.h"
-#include "op/utils.h" // IsSharedBuffer
+#include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
 
 #include "backend/common/target_utils.h"
+
+#include <tvm/arith/analyzer.h>
+#include <tvm/ffi/reflection/registry.h>
+
+#include <sstream>
+#include <string>
 
 namespace tvm {
 namespace tl {
@@ -23,28 +30,72 @@ namespace hexagon {
 namespace {
 constexpr const char *kHexagonScalar = "cpu.scalar";
 constexpr const char *kHexagonHMX = "hexagon.hmx";
+constexpr int kTile = 32;
+
+bool OnTiles(const PrimExpr &value, arith::Analyzer *analyzer) {
+  return analyzer->CanProveEqual(floormod(value, kTile), 0);
+}
+
+std::string TypeName(DataType dtype) {
+  std::ostringstream os;
+  os << dtype;
+  return os.str();
+}
+
+// Why HMX cannot run `op`, or an empty string when it can: A and B fp16 and C
+// fp16 or fp32, all in VTCM (shared buffers or fragments, which are VTCM on
+// Hexagon); M, N and K multiples of 32; and each operand a matrix of whole
+// 32 x 32 tiles: its region starts on a tile, its leading dimensions are
+// single indices, and A's and B's matrices, which take Crouton layouts, are
+// whole tiles too.
+std::string HMXRejection(const GemmNode &op) {
+  const DataType fp16 = DataType::Float(16);
+  if (op.a_->dtype != fp16 || op.b_->dtype != fp16)
+    return "HMX multiplies fp16 operands, not " + TypeName(op.a_->dtype) +
+           " x " + TypeName(op.b_->dtype);
+  if (op.c_->dtype != fp16 && op.c_->dtype != DataType::Float(32))
+    return "HMX writes an fp16 or fp32 C, not " + TypeName(op.c_->dtype);
+  if (op.m_ % kTile || op.n_ % kTile || op.k_ % kTile)
+    return "HMX needs M, N and K multiples of 32, not " +
+           std::to_string(op.m_) + " x " + std::to_string(op.n_) + " x " +
+           std::to_string(op.k_);
+  arith::Analyzer analyzer;
+  const std::pair<const char *, const BufferRegion *> operands[] = {
+      {"A", &op.aRegion_}, {"B", &op.bRegion_}, {"C", &op.cRegion_}};
+  for (const auto &[name, region] : operands) {
+    const Buffer &buffer = (*region)->buffer;
+    std::string operand = std::string(name) + " (" + buffer->name + ")";
+    if (!IsSharedBuffer(buffer) && !IsFragmentBuffer(buffer))
+      return operand + " is not in VTCM: HMX operands are shared buffers or "
+                       "fragments";
+    const Array<Range> &ranges = (*region)->region;
+    size_t rank = ranges.size();
+    if (rank < 2)
+      return operand + " is not a matrix";
+    for (size_t i = 0; i + 2 < rank; ++i) {
+      if (!is_one(ranges[i]->extent))
+        return operand + " spans more than one matrix of its leading "
+                         "dimensions";
+    }
+    for (size_t i = rank - 2; i < rank; ++i) {
+      if (!OnTiles(ranges[i]->min, &analyzer))
+        return operand + "'s region does not start on a 32 x 32 tile";
+      if (buffer.same_as(op.c_) && buffer->dtype != fp16)
+        continue; // An fp32 C stays row-major.
+      if (!OnTiles(buffer->shape[i], &analyzer))
+        return operand + " is not whole 32 x 32 tiles";
+    }
+  }
+  return "";
+}
 } // namespace
 
 struct Gemm {
   static String SelectInst(const GemmNode &op, int block_size, Target target) {
     (void)block_size;
     (void)target;
-    // Route to HMX only for the validated GemmHMX surface: fp16, 32-multiple,
-    // 2D, shared-shared (SS), overwrite (clear_accum is true). Logical operand
-    // transposes are represented by composing the corresponding Crouton layout.
-    // Everything else falls back to the scalar loop hexagon-clang
-    // auto-vectorizes onto HVX — crucially the DEFAULT clear_accum=false (the
-    // accumulate K-loop pattern) and fragment/sub-rank operands, which GemmHMX
-    // can't lower yet.
-    bool hmx_ok = op.a_->dtype == DataType::Float(16) &&
-                  op.b_->dtype == DataType::Float(16) &&
-                  op.c_->dtype == DataType::Float(16) && op.m_ % 32 == 0 &&
-                  op.n_ % 32 == 0 && op.k_ % 32 == 0 &&
-                  op.a_->shape.size() == 2 && op.b_->shape.size() == 2 &&
-                  op.c_->shape.size() == 2 && IsSharedBuffer(op.a_) &&
-                  IsSharedBuffer(op.b_) && IsSharedBuffer(op.c_) &&
-                  is_one(op.clearAccum_);
-    return hmx_ok ? String(kHexagonHMX) : String(kHexagonScalar);
+    return HMXRejection(op).empty() ? String(kHexagonHMX)
+                                    : String(kHexagonScalar);
   }
 
   static std::pair<int, int>
@@ -60,9 +111,11 @@ struct Gemm {
     return {1, 1};
   }
 
+  // A layout a shared buffer already has stays: C may have any layout, and
+  // GemmHMX checks that A and B have the HMX operand layouts.
   static bool ReuseExistingSharedLayout(String gemm_inst) {
     (void)gemm_inst;
-    return false;
+    return true;
   }
 };
 
@@ -86,6 +139,16 @@ bool RegisterHexagonGemm() {
 const bool hexagon_gemm_registered = RegisterHexagonGemm();
 
 } // namespace
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  // The scalar fallback reports why a GEMM is not on HMX.
+  refl::GlobalDef().def("tl.hexagon.GemmHMXRejection", [](ObjectRef gemm) {
+    const auto *node = gemm.as<GemmNode>();
+    ICHECK(node) << "expected a tl.Gemm, got " << gemm->GetTypeKey();
+    return String(hexagon::HMXRejection(*node));
+  });
+}
 
 } // namespace tl
 } // namespace tvm

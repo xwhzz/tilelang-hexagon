@@ -1,6 +1,7 @@
 #pragma once
-// Copies between Crouton matrices in VTCM and strided matrices (T.copy), and
-// reductions of Crouton matrices along rows or columns (T.reduce_*).
+// Copies between Crouton matrices in VTCM and strided matrices (T.copy),
+// reductions of Crouton matrices along rows or columns (T.reduce_*), and the
+// stores of HMX output tiles into a gemm's C (T.gemm).
 //
 // A Crouton tile is 32x32 fp16 stored as interleaved row pairs: element (r, c)
 // of a tile sits at (r / 2) * 64 + c * 2 + r % 2, so one HVX register holds a
@@ -426,5 +427,88 @@ TL_DEVICE void tl_crouton_reduce(D *dst, const half *crouton, int row_tiles,
                             tl_crouton_columns<K, A, ColumnTiles>(
                                 crouton, row_tiles, col_tiles, c),
                             32, clear);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HMX output tiles (T.gemm): an HMX tile, stored fp16 to a Crouton staging
+// tile, written or added into the gemm's C.
+// ---------------------------------------------------------------------------
+
+// Writes, or adds (Accumulate), a 64-byte fp16 row at `row` from a register
+// that holds the row in both halves. Aligned: the row starts on a
+// half-register boundary, so it is the masked half of one aligned block.
+template <bool Accumulate, bool Aligned>
+TL_DEVICE void tl_crouton_half_row(half *row, HVX_Vector v) {
+  if constexpr (Aligned) {
+    int off = tl_hvx_block_offset(row);
+    HVX_Vector *block = const_cast<HVX_Vector *>(tl_hvx_block_of(row));
+    if constexpr (Accumulate)
+      v = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(*block, v));
+    HVX_VectorPred half_at =
+        Q6_Q_and_QQn(Q6_Q_vsetq2_R(off + 64), Q6_Q_vsetq_R(off));
+    Q6_vmem_QRIV(half_at, block, v);
+  } else {
+    if constexpr (Accumulate)
+      v = Q6_Vhf_equals_Vqf16(
+          Q6_Vqf16_vadd_VhfVhf(tl_hvx_load_bytes(row, 64), v));
+    tl_hvx_store_bytes(row, v, 64);
+  }
+}
+
+// Writes the fp16 Crouton tile `tile` into the 32 x 32 block at `dst`, or adds
+// it (Accumulate). Rows: the block is row-major, element (i, j) at
+// dst[i * ldc + j], fp16 or fp32; Aligned when its rows start on register
+// boundaries (fp32) or half-register ones (fp16). Otherwise dst is a Crouton
+// tile, fp16.
+template <bool Accumulate, bool Rows, bool Aligned, typename D>
+TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
+                                     const half *__restrict__ tile) {
+  const HVX_Vector *t = reinterpret_cast<const HVX_Vector *>(tile);
+  if constexpr (!Rows) {
+    static_assert(std::is_same_v<D, half>, "Crouton tiles are fp16");
+    HVX_Vector *d = reinterpret_cast<HVX_Vector *>(dst);
+#pragma clang loop unroll(full)
+    for (int q = 0; q < 16; ++q)
+      d[q] = Accumulate ? Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(d[q], t[q]))
+                        : t[q];
+  } else if constexpr (std::is_same_v<D, float>) {
+    // Widening by 1.0 splits row pair q into its even lanes, row 2q, and its
+    // odd ones, row 2q + 1: one fp32 register each. Two row pairs per
+    // iteration, their rows loaded first: on v79 the fastest of the
+    // schedules measured, a full unroll and software pipelining included.
+    const HVX_Vector one = Q6_Vh_vsplat_R(0x3c00);
+#pragma clang loop unroll(disable)
+    for (int q = 0; q < 16; q += 2) {
+      float *r = dst + 2 * q * ldc;
+      HVX_Vector x[4];
+      if constexpr (Accumulate) {
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i)
+          x[i] = tl_hvx_load<Aligned>(r + i * ldc);
+      }
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 2; ++i) {
+        HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(t[q + i], one);
+        HVX_Vector even = Q6_V_lo_W(w), odd = Q6_V_hi_W(w);
+        if constexpr (Accumulate) {
+          even = Q6_Vqf32_vadd_Vqf32Vsf(even, x[2 * i]);
+          odd = Q6_Vqf32_vadd_Vqf32Vsf(odd, x[2 * i + 1]);
+        }
+        tl_hvx_store<Aligned>(r + 2 * i * ldc, Q6_Vsf_equals_Vqf32(even));
+        tl_hvx_store<Aligned>(r + (2 * i + 1) * ldc, Q6_Vsf_equals_Vqf32(odd));
+      }
+    }
+  } else {
+    static_assert(std::is_same_v<D, half>, "fp16 or fp32 matrices");
+#pragma clang loop unroll(full)
+    for (int q = 0; q < 16; ++q) {
+      // Dealing a row pair with itself puts row 2q in both halves of the low
+      // register and row 2q + 1 in both halves of the high one.
+      HVX_VectorPair d = Q6_W_vdeal_VVR(t[q], t[q], -2);
+      half *r0 = dst + 2 * q * ldc;
+      tl_crouton_half_row<Accumulate, Aligned>(r0, Q6_V_lo_W(d));
+      tl_crouton_half_row<Accumulate, Aligned>(r0 + ldc, Q6_V_hi_W(d));
+    }
   }
 }

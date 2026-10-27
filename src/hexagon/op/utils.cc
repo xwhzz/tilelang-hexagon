@@ -6,6 +6,7 @@
 #include "utils.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
@@ -73,5 +74,11 @@ bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
 }
 
 } // namespace hexagon
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.hexagon.RowMajor", hexagon::RowMajor);
+}
+
 } // namespace tl
 } // namespace tvm

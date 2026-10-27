@@ -29,13 +29,26 @@ from .crouton import (
 BIAS_WORDS = 64
 
 
-def _buffer_prefix(buffer, prefix, name: str) -> tuple:
-    prefix = () if prefix is None else tuple(prefix)
+def _origin(buffer, origin, name: str) -> tuple:
+    """The logical index of an operand's first element: its leading indices
+    and the top-left corner of its matrix, zeros by default."""
+
     rank = len(getattr(buffer, "shape", ()))
-    expected = max(rank - 2, 0)
-    if len(prefix) != expected:
-        raise ValueError(f"HMX {name} expects {expected} prefix indices for a rank-{rank} buffer; got {len(prefix)}")
-    return prefix
+    if rank < 2:
+        raise ValueError(f"HMX {name} must have at least two dimensions; got rank {rank}")
+    origin = (0,) * rank if origin is None else tuple(origin)
+    if len(origin) != rank:
+        raise ValueError(f"HMX {name} origin needs {rank} indices for a rank-{rank} buffer; got {len(origin)}")
+    return origin
+
+
+def _at(origin: tuple, rows, cols) -> tuple:
+    """`origin` moved down `rows` and right `cols` in its matrix."""
+
+    def plus(base, offset):
+        return offset if isinstance(base, int) and base == 0 else base + offset
+
+    return origin[:-2] + (plus(origin[-2], rows), plus(origin[-1], cols))
 
 
 def _validate_atom_index(index, extent: int, name: str):
@@ -147,16 +160,18 @@ class HMXIntrinEmitter:
         inst_m_idx=0,
         inst_n_idx=0,
         k_inner=0,
-        a_prefix=(),
-        b_prefix=(),
+        a_origin=None,
+        b_origin=None,
         num_tiles=1,
     ):
         """Emit one HMX packet reducing 1..32 contiguous K tiles for an output tile.
 
-        ``a_prefix`` and ``b_prefix`` address independent staged matrices.  The
-        final dimensions follow the operand's logical storage shape
-        (``[M,K]``/``[K,N]`` or their transposes) and are rewritten by
-        ``T.Layout`` to the same native mathematical Crouton tiles.
+        ``a_origin`` and ``b_origin`` are the logical indices of each operand's
+        first element: leading indices select one of several matrices, and
+        the last two the top-left corner of a sub-matrix on a tile boundary.
+        Tile indices count from there, along the operand's logical storage
+        shape (``[M,K]``/``[K,N]`` or their transposes), which ``T.Layout``
+        rewrites to the same native mathematical Crouton tiles.
         """
 
         _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
@@ -167,16 +182,16 @@ class HMXIntrinEmitter:
                 raise ValueError("HMX deep num_tiles must be in [1, 32]")
             if isinstance(k_inner, int) and k_inner + num_tiles > self.KT:
                 raise ValueError("HMX deep packet exceeds operand K tiles")
-        a_prefix = _buffer_prefix(activation, a_prefix, "activation")
-        b_prefix = _buffer_prefix(weight, b_prefix, "weight")
+        a_origin = _origin(activation, a_origin, "activation")
+        b_origin = _origin(weight, b_origin, "weight")
         if self.a_transposed:
-            a_index = a_prefix + (k_inner * TILE, inst_m_idx * TILE)
+            a_index = _at(a_origin, k_inner * TILE, inst_m_idx * TILE)
         else:
-            a_index = a_prefix + (inst_m_idx * TILE, k_inner * TILE)
+            a_index = _at(a_origin, inst_m_idx * TILE, k_inner * TILE)
         if self.b_transposed:
-            b_index = b_prefix + (inst_n_idx * TILE, k_inner * TILE)
+            b_index = _at(b_origin, inst_n_idx * TILE, k_inner * TILE)
         else:
-            b_index = b_prefix + (k_inner * TILE, inst_n_idx * TILE)
+            b_index = _at(b_origin, k_inner * TILE, inst_n_idx * TILE)
 
         @T.macro
         def _mma(acc_state, activation, weight):
@@ -196,8 +211,8 @@ class HMXIntrinEmitter:
         weight,
         inst_m_idx=0,
         inst_n_idx=0,
-        a_prefix=(),
-        b_prefix=(),
+        a_origin=None,
+        b_origin=None,
     ):
         """Reduce one output tile with caller-side chunks of at most 32 K tiles.
 
@@ -207,8 +222,8 @@ class HMXIntrinEmitter:
 
         _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
         _validate_atom_index(inst_n_idx, self.NT, "inst_n_idx")
-        a_prefix = _buffer_prefix(activation, a_prefix, "activation")
-        b_prefix = _buffer_prefix(weight, b_prefix, "weight")
+        a_origin = _origin(activation, a_origin, "activation")
+        b_origin = _origin(weight, b_origin, "weight")
 
         @T.macro
         def _mma(acc_state, activation, weight):
@@ -220,8 +235,8 @@ class HMXIntrinEmitter:
                     inst_m_idx,
                     inst_n_idx,
                     k_chunk * 32,
-                    a_prefix,
-                    b_prefix,
+                    a_origin,
+                    b_origin,
                     T.min(self.KT - k_chunk * 32, 32),
                 )
 
@@ -249,36 +264,33 @@ class HMXIntrinEmitter:
         bias_vtcm,
         inst_m_idx=0,
         inst_n_idx=0,
-        output_prefix=(),
+        output_origin=None,
     ):
+        """Store the converted tile to output tile ``(inst_m_idx, inst_n_idx)``,
+        counted from ``output_origin`` as in ``mma_atom``."""
+
         _validate_atom_index(inst_m_idx, self.MT, "inst_m_idx")
         _validate_atom_index(inst_n_idx, self.NT, "inst_n_idx")
-        output_prefix = _buffer_prefix(output, output_prefix, "output")
-        output_index = output_prefix + (inst_m_idx * TILE, inst_n_idx * TILE)
+        output_origin = _origin(output, output_origin, "output")
+        tile = output[_at(output_origin, inst_m_idx * TILE, inst_n_idx * TILE)]
+        return self.store_at(cvt_state, acc_state, tile, bias_state, bias_vtcm)
+
+    @staticmethod
+    def store_at(cvt_state, acc_state, tile, bias_state, bias_vtcm):
+        """Store the converted tile to the Crouton tile whose first element is
+        ``tile`` (a buffer element in VTCM, on a 2 KiB boundary)."""
 
         @T.macro
-        def _store(
-            cvt_state,
-            acc_state,
-            output,
-            bias_state,
-            bias_vtcm,
-        ):
+        def _store(cvt_state, acc_state, bias_state, bias_vtcm):
             T.hmx.store(
                 T.access_ptr(cvt_state[0], "r"),
-                T.access_ptr(output[output_index], "w", TILE_ELEMS),
+                T.access_ptr(tile, "w", TILE_ELEMS),
                 T.access_ptr(acc_state[0], "rw"),
                 T.access_ptr(bias_state[0], "r"),
                 T.access_ptr(bias_vtcm[0], "r", BIAS_WORDS),
             )
 
-        return _store(
-            cvt_state,
-            acc_state,
-            output,
-            bias_state,
-            bias_vtcm,
-        )
+        return _store(cvt_state, acc_state, bias_state, bias_vtcm)
 
 
 __all__ = [

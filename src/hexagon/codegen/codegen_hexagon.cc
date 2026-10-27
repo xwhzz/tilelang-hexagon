@@ -81,6 +81,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        3},
       {tl::hexagon_crouton_copy(), "tl_crouton_copy", false, false, false, -1,
        2},
+      {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", false, false,
+       false, -1, 3},
       {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
   };
   for (const auto &builtin : builtins) {

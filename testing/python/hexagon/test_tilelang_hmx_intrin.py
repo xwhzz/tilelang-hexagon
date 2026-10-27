@@ -187,19 +187,19 @@ def _make_hmx_operand_alignment_probe():
     return hmx_operand_alignment_probe
 
 
-def _make_t_gemm_probe(*, transpose_a=False, transpose_b=False, output_dtype="float16"):
+def _make_t_gemm_probe(*, transpose_a=False, transpose_b=False):
     """Exercise instruction selection, layout inference, and GemmHMX lowering."""
 
     @T.prim_func
     def t_gemm_probe(
         A: T.Tensor((64, 64), "float16"),
         B: T.Tensor((64, 64), "float16"),
-        C: T.Tensor((64, 64), output_dtype),
+        C: T.Tensor((64, 64), "float16"),
     ):
         with T.Kernel(1) as _:
             A_hmx = T.alloc_shared((64, 64), "float16")
             B_hmx = T.alloc_shared((64, 64), "float16")
-            C_hmx = T.alloc_shared((64, 64), output_dtype)
+            C_hmx = T.alloc_shared((64, 64), "float16")
             T.copy(A, A_hmx)
             T.copy(B, B_hmx)
             T.gemm(
@@ -392,9 +392,12 @@ def test_t_gemm_lowers_to_native_hmx_layout_and_atoms():
     ):
         assert call in source
     assert "tl_hexagon_hmx_gemm" not in source
-    assert "A_hmx)[(inst_m_idx * 2048)]" in source
-    assert "B_hmx)[(inst_n_idx * 2048)]" in source
-    assert "C_hmx)[((inst_m_idx * 2048) + (inst_n_idx * 1024))]" in source
+    # Output tile t is row tile t / 2 and column tile t % 2 of the 2 x 2.
+    assert "A_hmx)[((t >> 1) * 2048)]" in source
+    assert "B_hmx)[((t & 1) * 2048)]" in source
+    # An fp16 C that the call overwrites takes the HMX tiles directly.
+    assert "C_hmx)[(t * 1024)]" in source
+    assert "tl_crouton_tile_store" not in source
     assert "output_atom" not in source
     assert "tl_hexagon_hmx_commit_output_atom" not in source
 
@@ -416,20 +419,14 @@ def test_t_gemm_transposed_operands_use_composed_native_layouts():
     transposed_a = _lower_source(_make_t_gemm_probe(transpose_a=True))
     transposed_b = _lower_source(_make_t_gemm_probe(transpose_b=True))
 
-    assert "A_hmx)[(inst_m_idx * 2048)]" in transposed_a
-    assert "B_hmx)[(inst_n_idx * 2048)]" in transposed_b
+    assert "A_hmx)[((t >> 1) * 2048)]" in transposed_a
+    assert "B_hmx)[((t & 1) * 2048)]" in transposed_b
     # A transposed operand's matrix runs down its storage columns.
     assert "tl_crouton_copy<true, false>((&(((half*)A_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(A[0])), 1, 64);" in transposed_a
     assert "tl_crouton_copy<true, true>((&(((half*)B_hmx)[0])), 2, 2, 0, 0, 64, 64, (&(B[0])), 1, 64);" in transposed_b
     for source in (transposed_a, transposed_b):
         assert "tl_hexagon_hmx_mma_atom" in source
         assert "tl_hexagon_hmx_gemm" not in source
-
-
-def test_t_gemm_unsupported_output_dtype_stays_on_scalar_fallback():
-    source = _lower_source(_make_t_gemm_probe(output_dtype="float32"))
-    assert "tl_hexagon_hmx_" not in source
-    assert "tl_hexagon_hmx_gemm" not in source
 
 
 def test_flash_attention_softmax_works_on_crouton_tiles():
