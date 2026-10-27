@@ -1,17 +1,21 @@
 /*!
  * \file tl/hexagon/op/dma.cc
- * \brief Explicit Hexagon DMA copy (T.dma_copy, T.dma_wait).
+ * \brief Explicit Hexagon DMA copy (T.dma_copy).
  *
- * Each T.dma_copy is one asynchronous User-DMA submission and one FIFO
- * completion unit; T.dma_wait(n) completes all but the newest n. An explicit
- * async request either becomes DMA or fails: it never silently falls back to
- * a synchronous copy.
+ * Each T.dma_copy lowers to the descriptors of one asynchronous User-DMA
+ * transfer and one commit, so it is one group of the tile program's queue;
+ * T.dma_wait(n) waits until at most n groups are pending. An explicit async
+ * request either becomes DMA or fails: it never silently falls back to a
+ * synchronous copy.
  */
 
 #include "dma.h"
 
 #include <tvm/tirx/builtin.h>
 
+#include <algorithm>
+
+#include "hexagon/op/builtin.h"
 #include "hexagon/target_utils.h"
 #include "op/utils.h"
 #include "support/check.h"
@@ -79,32 +83,58 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   int64_t rows = constant(src.rows), cols = constant(src.cols);
   int64_t ss = constant(src.stride), ds = constant(dst.stride);
   int64_t bytes = op.src->dtype.bytes();
-  constexpr int64_t max24 = 0x00ffffff;
-  ICHECK(rows <= 65535 && cols <= max24 / bytes && ss >= cols && ds >= cols &&
-         ss <= max24 / bytes && ds <= max24 / bytes)
-      << "Hexagon T.dma_copy region exceeds DMA descriptor limits";
-  PrimExpr sp =
-      MakeAccessPtrAtRegion(op.src, op.src_range, src.strides, 1, src.span);
-  PrimExpr dp =
-      MakeAccessPtrAtRegion(op.dst, op.dst_range, dst.strides, 2, dst.span);
+  ICHECK(ss >= cols && ds >= cols)
+      << "Hexagon T.dma_copy requires rows that do not overlap";
   auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
-  if ((rows == 1 || (ss == cols && ds == cols)) &&
-      rows * cols * bytes <= max24) {
-    return Evaluate(Call(DataType::Int(32), builtin::call_extern(),
-                         {StringImm("tl_hexagon_dma_async_copy_1d"), dp, sp,
-                          u32(rows * cols * bytes), direction}));
+  // One descriptor of `count` rows starting `src_offset`/`dst_offset` elements
+  // into the regions. Strides and row sizes are in bytes.
+  auto submit = [&](int64_t src_offset, int64_t dst_offset, int64_t count,
+                    int64_t row_bytes, int64_t src_stride, int64_t dst_stride) {
+    int64_t src_span = (count - 1) * src_stride + row_bytes;
+    int64_t dst_span = (count - 1) * dst_stride + row_bytes;
+    PrimExpr sp = MakeAccessPtrAtRegion(
+        op.src, op.src_range, src.strides, 1,
+        IntImm(DataType::Int(32), src_span / bytes), src_offset);
+    PrimExpr dp = MakeAccessPtrAtRegion(
+        op.dst, op.dst_range, dst.strides, 2,
+        IntImm(DataType::Int(32), dst_span / bytes), dst_offset);
+    return Evaluate(Call(DataType::Int(32), hexagon_dma_submit(),
+                         {dp, sp, u32(dst_stride), u32(src_stride),
+                          u32(row_bytes), u32(count), direction}));
+  };
+
+  // Descriptor fields are 24 bits wide, and a 2D descriptor has at most
+  // 65535 rows; larger transfers take several descriptors of one group.
+  constexpr int64_t kField = 0x00ffffff;
+  constexpr int64_t kRows = 0xffff;
+  // 1D chunks stay aligned for every element size.
+  constexpr int64_t kChunk = int64_t(1) << 23;
+  Array<Stmt> seq;
+  if (rows == 1 || (ss == cols && ds == cols)) {
+    int64_t total = rows * cols * bytes;
+    for (int64_t done = 0; done < total; done += kChunk) {
+      int64_t n = std::min(kChunk, total - done);
+      seq.push_back(submit(done / bytes, done / bytes, 1, n, n, n));
+    }
+  } else {
+    ICHECK(cols * bytes <= kField && ss * bytes <= kField &&
+           ds * bytes <= kField)
+        << "Hexagon T.dma_copy rows and strides must fit the 24-bit DMA "
+           "descriptor fields (16 MiB)";
+    // The runtime builds the v75+ type-9 2D descriptor; older architectures
+    // would need another descriptor format.
+    const int arch = HexagonArchVersion(T.target);
+    ICHECK(arch == 0 || arch >= 75)
+        << "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv"
+        << arch << ". Copy contiguous rows with 1D transfers instead.";
+    for (int64_t row = 0; row < rows; row += kRows) {
+      seq.push_back(submit(row * ss, row * ds, std::min(kRows, rows - row),
+                           cols * bytes, ss * bytes, ds * bytes));
+    }
   }
-  // The runtime builds the v75+ type-9 2D descriptor; older architectures
-  // would need another descriptor format.
-  const int arch = HexagonArchVersion(T.target);
-  ICHECK(arch == 0 || arch >= 75)
-      << "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv"
-      << arch << ". Copy contiguous rows with 1D transfers instead.";
-  return Evaluate(
-      Call(DataType::Int(32), builtin::call_extern(),
-           {StringImm("tl_hexagon_dma_async_copy_2d"), dp, sp, u32(ds * bytes),
-            u32(ss * bytes), u32(cols * bytes), u32(rows), direction}));
+  seq.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {})));
+  return SeqStmt(seq);
 }
 
 void CheckHexagonTarget(const Target &target) {
@@ -155,12 +185,6 @@ Stmt HexagonDmaCopyNode::Lower(const LowerArgs &lower_args,
 
 TIR_REGISTER_TL_TILE_OP(HexagonDmaCopy, dma_copy)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
-TVM_REGISTER_OP("tl.dma_wait")
-    .set_attr<TScriptPrinterName>("TScriptPrinterName", "dma_wait")
-    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

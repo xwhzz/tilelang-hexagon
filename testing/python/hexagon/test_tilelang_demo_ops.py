@@ -90,8 +90,8 @@ def test_gemm_preserves_interface_and_dma_completion(shape):
     assert "tl_hexagon_hmx_mma_atom(" in source
     assert "tl_hexagon_hmx_pack_crouton(" in source
     assert "tl_hexagon_hmx_unpack_crouton(" in source
-    assert "tl_hexagon_dma_async_context<3>" in source
-    assert "tl_dma_async.wait(0)" in source
+    assert "tl_hexagon_dma_async_context<" in source
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
     assert "demo_parallel_pack" not in source
     assert "worker_pool_run_func" not in source
     assert "tl_bridge_enter" not in source
@@ -161,7 +161,7 @@ def test_wide_gemm_keeps_single_raw_slot_within_vtcm_budget():
     source = lower(make_gemm_f16_io(256, 2048, 2048, 512, copy_workers=6, fused_copy=True))
     high = max(map(int, re.findall(r"tl_vtcm_shared_high_water = (\d+)u", source)))
     assert high <= 8 * 1024 * 1024
-    assert "tl_dma_async.wait(0)" in source
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
     assert "tl_hexagon_hmx_mma_atom(" in source
 
 

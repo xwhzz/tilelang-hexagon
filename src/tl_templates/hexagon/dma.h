@@ -3,14 +3,16 @@
 // helpers.
 //
 // Queues are thread-confined: submit, poll and drain from the same QuRT thread.
-// The managed codegen gives every worker its own descriptors and VTCM region
-// (validated on v79). This is not a claim of one physical DMA engine per
-// worker. A thread must not interleave raw/foreign DMA with its managed queue.
-// This header never resets DMA during initialization or borrows another
-// runtime's queue; callers of the raw layer supply descriptor/metadata storage.
+// The managed codegen gives every tile program its own queue, and every worker
+// its own VTCM arena (validated on v79). This is not a claim of one physical
+// DMA engine per worker. A thread must not interleave raw/foreign DMA with its
+// managed queue. This header never resets DMA during initialization or borrows
+// another runtime's queue; callers of the raw layer supply descriptor/metadata
+// storage.
 
 #include <hexagon_protos.h>
 #include <qurt_memory.h>
+#include <tl_templates/hexagon/common.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -726,19 +728,34 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_reset(tl_hexagon_dma_queue *queue) {
                                    queue->capacity);
 }
 
-// Per-callback queue used by explicit T.dma_copy/T.dma_wait. The calling thread
-// owns the DMA instruction context for its lifetime. Initialization never
-// resets another queue's outstanding work on this thread.
+// The queue of one tile program, used by explicit T.dma_copy/T.dma_wait. The
+// calling thread owns the DMA instruction context for its lifetime.
+// Initialization never resets another queue's outstanding work on this thread.
+//
+// Descriptors complete in commit groups: T.dma_copy submits the descriptors of
+// one transfer and commits them as a group, and T.dma_wait(n) completes the
+// oldest groups until at most n are pending. The compiler sizes both rings for
+// the most descriptors and groups the program keeps in flight.
+//
 // Compile managed async kernels with -fno-exceptions (the DSP has no C++
-// unwinder). Stack storage survives until the kernel drains its queue,
+// unwinder). Stack storage survives until the program drains its queue,
 // including returns caused by another helper's error. No dynamic allocation or
 // global queue state.
-template <uint32_t Capacity> struct tl_hexagon_dma_async_context {
-  static_assert(Capacity > 0 && Capacity <= 256,
+template <uint32_t Descriptors, uint32_t Groups>
+struct tl_hexagon_dma_async_context {
+  static_assert(Descriptors > 0 && Descriptors <= 256,
                 "DMA queue capacity out of range");
-  tl_hexagon_dma_descriptor descriptors[Capacity];
-  tl_hexagon_dma_transfer transfers[Capacity];
+  static_assert(Groups > 0 && Groups <= 256, "DMA group capacity out of range");
+  tl_hexagon_dma_descriptor descriptors[Descriptors];
+  tl_hexagon_dma_transfer transfers[Descriptors];
   tl_hexagon_dma_queue queue{};
+  // The end of every committed, pending group as a count of submitted
+  // descriptors, oldest first, in a ring.
+  uint32_t group_end[Groups];
+  uint32_t group_head = 0;
+  uint32_t group_count = 0;
+  uint32_t submitted = 0;
+  uint32_t retired = 0;
   int status;
   // Releases the HMX unit lock on an early DMA error return. A function
   // pointer keeps this header independent of the HMX runtime.
@@ -747,7 +764,7 @@ template <uint32_t Capacity> struct tl_hexagon_dma_async_context {
   tl_hexagon_dma_async_context() {
     status = tl_hexagon_dma_engine_idle()
                  ? tl_hexagon_dma_queue_init(&queue, descriptors, transfers,
-                                             Capacity)
+                                             Descriptors)
                  : TL_HEXAGON_DMA_ERR_BUSY;
   }
   ~tl_hexagon_dma_async_context() {
@@ -762,28 +779,61 @@ template <uint32_t Capacity> struct tl_hexagon_dma_async_context {
   tl_hexagon_dma_async_context &
   operator=(const tl_hexagon_dma_async_context &) = delete;
 
-  int copy_1d(void *dst, const void *src, uint32_t bytes, int direction) {
-    return tl_hexagon_dma_queue_push_1d(&queue, dst, src, bytes, direction);
+  int submit(void *dst, const void *src, uint32_t dst_stride,
+             uint32_t src_stride, uint32_t row_bytes, uint32_t rows,
+             int direction) {
+    int result = tl_hexagon_dma_queue_push(
+        &queue, dst, src, dst_stride, src_stride, row_bytes, rows, direction);
+    if (result == TL_HEXAGON_DMA_OK)
+      ++submitted;
+    return result;
   }
-  int copy_2d(void *dst, const void *src, uint32_t dst_stride,
-              uint32_t src_stride, uint32_t row_bytes, uint32_t rows,
-              int direction) {
-    return tl_hexagon_dma_queue_push_2d(&queue, dst, src, dst_stride,
-                                        src_stride, row_bytes, rows, direction);
+  int commit() {
+    if (group_count == Groups)
+      return TL_HEXAGON_DMA_ERR_QUEUE_FULL;
+    group_end[(group_head + group_count) % Groups] = submitted;
+    ++group_count;
+    return TL_HEXAGON_DMA_OK;
   }
-  int wait(uint32_t pending) {
-    // Count FIFO submissions, not hardware in-flight descriptors: later copies
-    // can complete early, but the newest pending calls still retain their
-    // slots.
-    if (pending > Capacity)
-      return TL_HEXAGON_DMA_ERR_ARGUMENT;
-    while (queue.count > pending) {
-      int result = tl_hexagon_dma_queue_pop(&queue);
-      if (result != TL_HEXAGON_DMA_OK)
-        return result;
+  int wait(uint32_t groups) {
+    while (group_count > groups) {
+      // Unsigned differences stay correct when the counters wrap.
+      while (group_end[group_head] - retired != 0) {
+        int result = tl_hexagon_dma_queue_pop(&queue);
+        if (result != TL_HEXAGON_DMA_OK)
+          return result;
+        ++retired;
+      }
+      group_head = (group_head + 1) % Groups;
+      --group_count;
     }
     // Prevent the compiler from hoisting consumers before DMA completion.
     asm volatile("" : : : "memory");
     return TL_HEXAGON_DMA_OK;
   }
 };
+
+// The kernel-facing calls: a failure becomes the kernel status TL_ERR_DMA.
+template <uint32_t Descriptors, uint32_t Groups>
+TL_DMA_INLINE int tl_hexagon_dma_async_submit(
+    tl_hexagon_dma_async_context<Descriptors, Groups> &context, void *dst,
+    const void *src, uint32_t dst_stride, uint32_t src_stride,
+    uint32_t row_bytes, uint32_t rows, int direction) {
+  return context.submit(dst, src, dst_stride, src_stride, row_bytes, rows,
+                        direction) == TL_HEXAGON_DMA_OK
+             ? TL_OK
+             : TL_ERR_DMA;
+}
+
+template <uint32_t Descriptors, uint32_t Groups>
+TL_DMA_INLINE int tl_hexagon_dma_async_commit(
+    tl_hexagon_dma_async_context<Descriptors, Groups> &context) {
+  return context.commit() == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
+}
+
+template <uint32_t Descriptors, uint32_t Groups>
+TL_DMA_INLINE int tl_hexagon_dma_async_wait(
+    tl_hexagon_dma_async_context<Descriptors, Groups> &context,
+    uint32_t groups) {
+  return context.wait(groups) == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
+}

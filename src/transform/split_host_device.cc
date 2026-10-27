@@ -69,7 +69,6 @@ public:
     }
   }
 
-  void SetDmaCapacity(Integer n) { dma_capacity_ = std::move(n); }
   void SetClusterDims(Array<Integer> cluster_dims) {
     cluster_dims_ = std::move(cluster_dims);
   }
@@ -245,7 +244,6 @@ private:
   Array<tirx::Var> host_params_;
   Array<tirx::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
-  Optional<Integer> dma_capacity_{std::nullopt};
   // Per-buffer shared-memory alignment requirements (kSmemAlignmentMap)
   // propagated from the host PrimFunc onto each split device kernel.
   Map<String, IntImm> smem_alignment_map_;
@@ -571,8 +569,6 @@ private:
     if (cluster_dims_.defined()) {
       device_attrs.Set("cluster_dims", cluster_dims_.value());
     }
-    if (dma_capacity_.defined())
-      device_attrs.Set("hexagon.dma_queue_capacity", dma_capacity_.value());
     if (!smem_alignment_map_.empty()) {
       device_attrs.Set(tl::kSmemAlignmentMap, smem_alignment_map_);
     }
@@ -637,12 +633,6 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
   if (auto opt = func->GetAttr<Array<Integer>>("cluster_dims")) {
     splitter.SetClusterDims(opt.value());
     func = tvm::WithoutAttr(std::move(func), "cluster_dims");
-  }
-  // Propagate the Hexagon DMA queue capacity from the host func to the device
-  // kernel, whose codegen sizes the managed DMA queue with it.
-  if (auto opt = func->GetAttr<Integer>("hexagon.dma_queue_capacity")) {
-    splitter.SetDmaCapacity(opt.value());
-    func = tvm::WithoutAttr(std::move(func), "hexagon.dma_queue_capacity");
   }
   // Propagate per-buffer shared-memory alignment requirements collected by
   // LowerTileOp onto the device kernel, where MergeSharedMemoryAllocations

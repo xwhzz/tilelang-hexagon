@@ -36,15 +36,17 @@ Array<PrimExpr> GetBufferStrides(const Buffer &buffer) {
 
 PrimExpr MakeAccessPtrAtRegion(const Buffer &buffer, const Array<Range> &region,
                                const Array<PrimExpr> &strides, int rw_mask,
-                               const PrimExpr &extent) {
+                               const PrimExpr &extent, int64_t offset) {
   ICHECK_EQ(region.size(), buffer->shape.size());
   ICHECK_EQ(strides.size(), buffer->shape.size());
-  PrimExpr offset = buffer->elem_offset;
+  PrimExpr first = buffer->elem_offset;
   for (size_t i = 0; i < region.size(); ++i)
-    offset = offset + region[i]->min * strides[i];
+    first = first + region[i]->min * strides[i];
+  if (offset != 0)
+    first = first + IntImm(first.dtype(), offset);
 
   PrimExpr ptype = tirx::TypeAnnotation(buffer->dtype);
-  Array<PrimExpr> args{ptype, buffer->data, offset, extent,
+  Array<PrimExpr> args{ptype, buffer->data, first, extent,
                        IntImm(DataType::Int(32), rw_mask)};
   return Call(DataType::Handle(), builtin::tvm_access_ptr(), args);
 }

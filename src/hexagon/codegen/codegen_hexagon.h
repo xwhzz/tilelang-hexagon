@@ -40,8 +40,10 @@ public:
   void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
-  // Propagate synchronous DMA copy failures through the kernel status ABI.
+  // Declare the DMA queue, and return the status of failing runtime calls.
   void VisitStmt_(const EvaluateNode *op) final; // NOLINT(*)
+  // Scope the DMA queue to its tile program.
+  void VisitStmt_(const AttrStmtNode *op) final; // NOLINT(*)
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
   void VisitExpr_(const MinNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
@@ -67,19 +69,12 @@ private:
   /*! \brief the target's vtcm-capacity in bytes; 0 when the target has none
    *  and only the runtime checks the grant. */
   size_t vtcm_capacity_ = 0;
-  /*! \brief whether the current function uses the managed DMA queue */
-  bool dma_async_ = false;
-  /*! \brief whether a managed DMA queue (tl_dma_async) is in scope */
+  /*! \brief whether a tile program's DMA queue (tl_dma_async) is in scope */
   bool dma_in_scope_ = false;
   /*! \brief whether any emitted kernel uses the managed DMA queue */
   bool uses_dma_async_ = false;
-  int dma_capacity_ = 16;
   /*! \brief whether the emitter is inside a worker loop body */
   bool in_worker_ = false;
-
-  // Declare the managed DMA queue of the current scope, and drain it.
-  void EmitDMAContext();
-  void EmitDMADrain();
   // Print a T.Kernel(num_workers=) grid loop as a tl_parallel_for call whose
   // lambda runs one tile program.
   void PrintWorkerLoop(const ForNode *op);

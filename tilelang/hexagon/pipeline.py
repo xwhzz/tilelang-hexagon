@@ -114,6 +114,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.RemoveNoOp()(mod)
     mod = s_tir.transform.HoistIfThenElse()(mod)
     mod = tilelang.hexagon.transform.MaterializeGrid()(mod)
+    mod = tilelang.hexagon.transform.PlanDMAQueue()(mod)
 
     mod = tirx.transform.VerifyMemory()(mod)
     mod = tirx.transform.AnnotateEntryFunc()(mod)

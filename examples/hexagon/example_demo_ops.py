@@ -124,7 +124,6 @@ def make_map_tiled(M, N, kind="add", tile_rows=4, group_tiles=4, num_workers=6, 
 
     @T.prim_func
     def map_tiled(X: T.Tensor((M, N), "float32"), Y: T.Tensor((M, N), "float32"), O: T.Tensor((M, N), "float32")):
-        T.func_attr({"hexagon.dma_queue_capacity": 6})
         with T.Kernel(groups, num_workers=num_workers) as group:
             sx = T.alloc_shared((2, tile_rows, N), "float32")
             sy = T.alloc_shared((2, tile_rows, N), "float32")
@@ -196,7 +195,6 @@ def make_gemm_f16_io(M, N, K, BN=128, copy_workers=1, fused_copy=False):
 
     @T.prim_func
     def gemm(A: T.Tensor((M, K), "float32"), W: T.Tensor((N, K), "float16"), C: T.Tensor((M, N), "float32")):
-        T.func_attr({"hexagon.dma_queue_capacity": 3})
         with T.Kernel(1):
             a_dma = T.alloc_shared((M, K), "float32", align=2048)
             a_row = T.alloc_shared((M, K), "float16", align=2048)

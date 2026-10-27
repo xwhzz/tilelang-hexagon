@@ -22,3 +22,14 @@ def MaterializeGrid():
     index, and marks the function body as device code.
     """
     return _ffi_api.MaterializeGrid()  # type: ignore
+
+
+def PlanDMAQueue():
+    """Size and place the DMA queue of every tile program.
+
+    Bounds the descriptors and commit groups in flight at any point of a tile
+    program, declares the program's queue with those capacities
+    (``hexagon_dma_queue``) at the start of its ``tl.tile_program_scope``, and
+    drains it at the end.
+    """
+    return _ffi_api.PlanDMAQueue()  # type: ignore

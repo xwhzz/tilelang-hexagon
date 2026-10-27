@@ -25,7 +25,6 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
 
     @T.prim_func
     def dma_hmx_matmul(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"), C: T.Tensor((M, N), "float16")):
-        T.func_attr({"hexagon.dma_queue_capacity": 4})
         with T.Kernel(1):
             ar = T.alloc_shared((2, BM, K), "float16", align=2048)
             br = T.alloc_shared((2, K, BN), "float16", align=2048)

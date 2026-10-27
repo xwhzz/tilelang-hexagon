@@ -17,8 +17,8 @@ namespace hexagon {
 ffi::Array<PrimExpr> GetBufferStrides(const tirx::Buffer &buffer);
 
 /*!
- * \brief A tvm_access_ptr to the first element of `region`, covering `extent`
- * elements.
+ * \brief A tvm_access_ptr to the first element of `region`, plus `offset`
+ * elements, covering `extent` elements.
  *
  * `strides` are the buffer's strides (GetBufferStrides). The offset includes
  * the region minimum of every dimension, so a sub-matrix of a larger tensor
@@ -27,7 +27,7 @@ ffi::Array<PrimExpr> GetBufferStrides(const tirx::Buffer &buffer);
 PrimExpr MakeAccessPtrAtRegion(const tirx::Buffer &buffer,
                                const ffi::Array<Range> &region,
                                const ffi::Array<PrimExpr> &strides, int rw_mask,
-                               const PrimExpr &extent);
+                               const PrimExpr &extent, int64_t offset = 0);
 
 } // namespace hexagon
 } // namespace tl

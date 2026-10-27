@@ -1708,14 +1708,8 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
     if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
       if (target.value()->kind->name == "hexagon") {
         PostOrderVisit(f->body, [&](const ObjectRef &node) {
-          if (const auto *call = node.as<CallNode>()) {
-            if (call->op.same_as(builtin::call_extern()) &&
-                !call->args.empty()) {
-              if (const auto *name = call->args[0].as<StringImmNode>())
-                async_dma |=
-                    name->value.find("tl_hexagon_dma_async_copy_") == 0;
-            }
-          }
+          if (const auto *call = node.as<CallNode>())
+            async_dma |= call->op.same_as(tl::hexagon_dma_submit());
         });
       }
     }

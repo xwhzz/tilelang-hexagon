@@ -155,11 +155,11 @@ void CheckWorkerBody(const Stmt &body) {
           << "`" << callee
           << "` is not worker-safe: inside T.Kernel(num_workers=...) only the "
              "Crouton pack/unpack helpers and the T.hmx atoms may use HMX";
-    } else if (callee.rfind("tl_hexagon_dma_", 0) == 0) {
-      ICHECK(callee.rfind("tl_hexagon_dma_async_copy_", 0) == 0)
+    } else {
+      ICHECK(callee.rfind("tl_hexagon_dma_", 0) != 0)
           << "`" << callee
           << "` is not worker-safe: inside T.Kernel(num_workers=...) use "
-             "T.dma_copy and T.dma_wait, whose queue belongs to the worker";
+             "T.dma_copy and T.dma_wait, whose queue belongs to the program";
     }
   });
 }

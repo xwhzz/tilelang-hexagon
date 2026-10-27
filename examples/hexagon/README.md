@@ -94,12 +94,12 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   by the one matrix engine (the spinlock serializes the MACs). The compute-heavy demo
   is HVX-bound, so its speedup is visible end-to-end.
 - **Explicit async DMA is available as `T.dma_copy(src, dst)` and
-  `T.dma_wait(pending=0)`.** One copy submits one FIFO entry; wait completes and
-  reclaims all but the newest `pending` entries. No separate commit is required.
-  Wait before reading a destination or modifying a source. The kernel also drains
-  the queue at exit (each tile program, in a `num_workers` kernel). Capacity defaults to 16; set
-  `T.func_attr({"hexagon.dma_queue_capacity": 4})` to configure it (1..256).
-  Submitting to a full queue reports an error instead of silently waiting.
+  `T.dma_wait(pending=0)`.** Each copy is one group of the tile program's queue;
+  wait completes the older copies until at most the newest `pending` are in flight.
+  No separate commit is required. Wait before reading a destination or modifying a
+  source. Every tile program drains its queue before it ends. The compiler sizes the
+  queue for the most copies the program keeps in flight and rejects a loop that
+  submits without waiting.
   Static, in-bounds 1D/2D row-major DDR ↔ VTCM regions are supported. Crouton
   conversion remains a separate `T.copy`; unsupported async regions fail lowering.
   Use a manual `T.serial` schedule. Under `num_workers` each tile program owns its

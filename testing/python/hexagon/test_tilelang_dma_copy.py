@@ -79,7 +79,6 @@ def example(name):
 def test_async_manual_ping_pong():
     @T.prim_func
     def probe(A: T.Tensor((768,), "float16")):
-        T.func_attr({"hexagon.dma_queue_capacity": 2})
         with T.Kernel(1):
             s = T.alloc_shared((2, 256), "float16")
             T.dma_copy(A[0:256], s[0, 0:256])
@@ -89,10 +88,14 @@ def test_async_manual_ping_pong():
             T.dma_wait()
 
     source = lower(probe)
-    assert "tl_hexagon_dma_async_context<2>" in source
-    assert source.count("tl_dma_async.copy_1d(") == 3
-    assert "tl_dma_async.wait(1)" in source
-    assert source.rindex("tl_dma_async.wait(0)") > source.rindex("tl_dma_async.copy_1d(")
+    # At most two copies are in flight; each is one descriptor and one group.
+    assert "tl_hexagon_dma_async_context<2, 2> tl_dma_async;" in source
+    assert source.count("tl_hexagon_dma_async_submit(tl_dma_async, ") == 3
+    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 3
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in source
+    # The program already drains the queue, so no second drain follows.
+    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
+    assert source.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > source.rindex("tl_hexagon_dma_async_submit(")
     assert "ptx_" not in source
 
 
@@ -106,47 +109,38 @@ def test_async_strided_load_store():
             T.dma_copy(s, B[0:32, 32:96])
 
     source = lower(probe)
-    calls = [line for line in source.splitlines() if "tl_dma_async.copy_2d(" in line]
+    calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     assert len(calls) == 2
-    assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 0" in calls[0]
-    assert "(uint32_t)256, (uint32_t)128, (uint32_t)128, (uint32_t)32, 1" in calls[1]
+    # dst stride, src stride, row bytes, rows, direction
+    assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 0)" in calls[0]
+    assert "(uint32_t)256, (uint32_t)128, (uint32_t)128, (uint32_t)32, 1)" in calls[1]
     assert "A[32]" in calls[0] and "B[32]" in calls[1]
-    assert source.count("tl_dma_async.wait(0)") == 2
+    # The store is still in flight at the end, so the program drains it.
+    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 2
 
 
 def test_async_hmx_dsl_schedule():
     source = lower(example("example_dma_hmx_matmul").make_dma_hmx_matmul())
-    assert "tl_hexagon_dma_async_context<4>" in source
-    assert "tl_dma_async.wait(2)" in source
+    # Double buffering: two output blocks of two copies each are in flight.
+    assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async;" in source
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in source
     assert "tl_hexagon_hmx_pack_crouton" in source
     assert "tl_hexagon_hmx_mma_atom" in source
     assert "tl_hexagon_dma_copy_hmx_matmul_double_buffer" not in source
 
 
-def make_capacity_probe(capacity, pending=0, workers=None):
+def make_queue_probe(workers=None):
     grid = workers or 1
 
     @T.prim_func
     def probe(A: T.Tensor((grid * 256,), "float16"), B: T.Tensor((grid * 256,), "float16")):
-        T.func_attr({"hexagon.dma_queue_capacity": capacity})
         with T.Kernel(grid, num_workers=workers) as bx:
             s = T.alloc_shared((256,), "float16")
             T.dma_copy(A[bx * 256 : (bx + 1) * 256], s)
-            T.dma_wait(pending)
+            T.dma_wait()
             T.copy(s, B[bx * 256 : (bx + 1) * 256])
 
     return probe
-
-
-@pytest.mark.parametrize("capacity", [0, -1, 257])
-def test_reject_invalid_capacity(capacity):
-    with pytest.raises(Exception, match="dma_queue_capacity"):
-        lower(make_capacity_probe(capacity))
-
-
-def test_reject_wait_above_capacity():
-    with pytest.raises(Exception, match="within queue capacity"):
-        lower(make_capacity_probe(2, pending=3))
 
 
 @pytest.mark.parametrize("pending", [-1, True, 1.5])
@@ -156,14 +150,14 @@ def test_reject_invalid_wait_argument(pending):
 
 
 def test_managed_worker_queue_is_local_and_drained():
-    source = lower(make_capacity_probe(2, workers=2))
+    source = lower(make_queue_probe(workers=2))
     entry, program = source.split(" -> int32_t {", 1)
     assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(2048u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
     # Each tile program owns its queue and its buffers in the worker's arena.
-    assert "tl_hexagon_dma_async_context<2> tl_dma_async;" in program
+    assert "tl_hexagon_dma_async_context<1, 1> tl_dma_async;" in program
     assert "(tl_arena + 0)" in program
-    assert program.rindex("tl_dma_async.wait(0)") > program.rindex("tl_dma_async.copy_1d(")
+    assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")
 
 
 def test_reject_crouton_async():
@@ -260,7 +254,6 @@ def make_hmx_probe():
         Fail: T.Tensor((1,), "int32"),
         C: T.Tensor((13 * 32, 32), "float16"),
     ):
-        T.func_attr({"hexagon.dma_queue_capacity": 2})
         with T.Kernel(13, num_workers=6) as group:
             ar = T.alloc_shared((32, 64), "float16")
             br = T.alloc_shared((64, 32), "float16")
@@ -319,8 +312,8 @@ def test_async_scalar_access_is_not_silently_synchronous():
             T.copy(s[0], B[0])
 
     source = lower(probe)
-    assert "tl_dma_async.copy_1d(" in source
-    assert "(uint32_t)2, 0)" in source
+    (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 0)" in call
 
 
 @pytest.mark.parametrize("shape,dtype", [((2, 8, 8), "float16"), ((256,), "float32")])
@@ -364,4 +357,4 @@ def test_async_copy_is_separate_from_dma_copy():
 def test_dma_copy_rejects_cpu_target():
     target = determine_target("llvm", return_object=True)
     with tvm.target.Target(target), pytest.raises(Exception, match="T.dma_copy is supported only on Hexagon"):
-        tilelang.lower(make_capacity_probe(2), target=target, enable_host_codegen=False, enable_device_compile=False)
+        tilelang.lower(make_queue_probe(), target=target, enable_host_codegen=False, enable_device_compile=False)

@@ -185,11 +185,15 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   and a caller-owned descriptor ring with start/link/poll/wait/pop/flush operations.
   The queue allocates nothing and does not acquire or reset DMA0; its caller must
   own and serialize the engine. Synchronous 1D/2D copy helpers remain available
-  through explicit extern calls. `T.dma_copy` submits to a per-kernel FIFO and
-  `T.dma_wait(n)` completes/reclaims all but its newest n entries (one copy per
-  entry). The kernel drains outstanding transfers before returning. Capacity is
-  configured with `hexagon.dma_queue_capacity` (default 16, range 1..256); a full
-  queue fails without a hidden wait. Regions must have equal scalar dtypes, static
+  through explicit extern calls. `T.dma_copy` lowers to IR builtins: the
+  descriptors of one transfer (`hexagon_dma_submit`; a transfer over the
+  descriptor limits takes several) and one `hexagon_dma_commit`, so every copy is
+  one group of the tile program's queue. `T.dma_wait(n)` (`hexagon_dma_wait`)
+  completes the oldest groups until at most n are pending. `PlanDMAQueue` bounds
+  the descriptors and groups each tile program keeps in flight, declares the
+  program's queue with those capacities (`hexagon_dma_queue`), and drains it at
+  the end. The bound is conservative across branches; a loop that never waits is
+  rejected, as are more than 256 transfers in flight. Regions must have equal scalar dtypes, static
   positive extents/strides, unit innermost stride, and provable bounds. Unsupported
   async copies fail lowering. Managed async kernels disable automatic VTCM
   allocation reuse and require a manual serial schedule and exclusive DMA0

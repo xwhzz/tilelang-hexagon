@@ -90,7 +90,9 @@ def _dma_2d_kernel():
 
 
 def test_2d_dma_needs_v75():
-    assert "tl_dma_async.copy_2d(" in str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": "hexagonv75"}).kernel_source)
+    source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": "hexagonv75"}).kernel_source)
+    # A 32-row descriptor: the v75+ 2D form.
+    assert "(uint32_t)32, 0)) return tl_status;" in source
     with pytest.raises(Exception, match="2D T.dma_copy needs Hexagon v75"):
         _lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": "hexagonv73"})
 

@@ -4,6 +4,7 @@
 #include "codegen_hexagon.h"
 #include "hexagon/op/builtin.h"
 #include "support/check.h"
+#include "transform/common/attr.h"
 
 #include <tvm/ir/op.h> // Op::Get (exp intrinsic match)
 #include <tvm/runtime/logging.h>
@@ -27,6 +28,10 @@ struct HexagonBuiltin {
   Op op;
   const char *function;
   bool uses_hmx;
+  // Takes the tile program's DMA queue (tl_dma_async) as the first argument.
+  bool on_dma_queue = false;
+  // Returns a kernel status, which the statement returns on failure.
+  bool returns_status = false;
 };
 
 const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
@@ -40,6 +45,11 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_hmx_mma(), "tl_hexagon_hmx_mma_atom", true},
       {tl::hexagon_hmx_convert(), "tl_hexagon_hmx_convert_acc", true},
       {tl::hexagon_hmx_store(), "tl_hexagon_hmx_store_cvt_state", true},
+      {tl::hexagon_dma_submit(), "tl_hexagon_dma_async_submit", false, true,
+       true},
+      {tl::hexagon_dma_commit(), "tl_hexagon_dma_async_commit", false, true,
+       true},
+      {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", false, true, true},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))
@@ -51,25 +61,6 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
 bool IsHexagonHMXIntrinsic(const CallNode *call) {
   const HexagonBuiltin *builtin = FindHexagonBuiltin(call);
   return builtin != nullptr && builtin->uses_hmx;
-}
-
-bool IsHexagonDMAExtern(const CallNode *call) {
-  if (!call->op.same_as(tirx::builtin::call_extern()) || call->args.empty())
-    return false;
-  const auto *name = call->args[0].as<StringImmNode>();
-  return name && name->value.find("tl_hexagon_dma_") == 0;
-}
-
-bool IsHexagonAsyncCopy(const CallNode *call) {
-  if (!IsHexagonDMAExtern(call))
-    return false;
-  const auto *name = call->args[0].as<StringImmNode>();
-  return name->value == "tl_hexagon_dma_async_copy_1d" ||
-         name->value == "tl_hexagon_dma_async_copy_2d";
-}
-
-bool IsDMAWait(const CallNode *call) {
-  return call->op.same_as(Op::Get("tl.dma_wait"));
 }
 
 // The VTCM region's first 2 KiB hold the HMX output scales; kernel arenas
@@ -122,24 +113,6 @@ bool UsesHMX(const Stmt &body) {
       found |= IsHexagonHMXIntrinsic(call);
   });
   return found;
-}
-
-// Whether `body` uses the managed DMA queue outside worker loops, which own
-// their queues.
-bool UsesManagedDMA(const Stmt &body) {
-  struct Finder : public tirx::StmtExprVisitor {
-    bool found = false;
-    void VisitStmt_(const ForNode *op) final {
-      if (!IsWorkerLoop(op))
-        tirx::StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const CallNode *op) final {
-      found |= IsHexagonAsyncCopy(op) || IsDMAWait(op);
-      tirx::StmtExprVisitor::VisitExpr_(op);
-    }
-  } finder;
-  finder(body);
-  return finder.found;
 }
 
 } // namespace
@@ -257,27 +230,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
 
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
-  dma_async_ = false;
-  bool raw_dma = false;
-  tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &node) {
-    if (const auto *call = node.as<CallNode>()) {
-      if (IsHexagonAsyncCopy(call) || IsDMAWait(call))
-        dma_async_ = true;
-      else if (IsHexagonDMAExtern(call))
-        raw_dma = true;
-    }
-  });
-  dma_capacity_ = 16;
-  if (auto capacity = f->GetAttr<Integer>("hexagon.dma_queue_capacity")) {
-    ICHECK(capacity.value()->value > 0 && capacity.value()->value <= 256)
-        << "hexagon.dma_queue_capacity must be in [1, 256]";
-    dma_capacity_ = static_cast<int>(capacity.value()->value);
-  }
-  if (dma_async_) {
-    ICHECK(!raw_dma)
-        << "Hexagon async DMA cannot share a kernel with raw DMA calls";
-    uses_dma_async_ = true;
-  }
+  dma_in_scope_ = false;
   // Names the runtime calls bind; reserve them before the parameters so no
   // parameter can take them.
   for (const char *name : {"tl_dma_async", "tl_status", "tl_arena"})
@@ -298,7 +251,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // The kernel entry returns an int32 status (TL_OK = 0); the skel maps a
   // nonzero status to AEE_EFAILED. LowerDeviceKernelLaunch leaves the device
   // function void, so the codegen declares the status type and emits the
-  // returns itself, after the DMA drain.
+  // returns itself.
   this->PrintFuncPrefix(stream);
   stream << "int32_t";
   this->PrintExtraAttrs(f, stream);
@@ -322,32 +275,12 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
-  dma_in_scope_ = dma_async_ && UsesManagedDMA(f->body);
-  if (dma_in_scope_)
-    EmitDMAContext();
   this->PrintStmt(f->body);
-  if (dma_in_scope_)
-    EmitDMADrain();
   this->PrintIndent();
   this->stream << "return TL_OK;\n";
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
-}
-
-void CodeGenTileLangHexagon::EmitDMAContext() {
-  // The descriptors and FIFO belong to this scope: the kernel, or one tile
-  // program of a worker. Never share a queue between threads.
-  PrintIndent();
-  stream << "tl_hexagon_dma_async_context<" << dma_capacity_
-         << "> tl_dma_async;\n";
-  PrintIndent();
-  stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
-}
-
-void CodeGenTileLangHexagon::EmitDMADrain() {
-  PrintIndent();
-  stream << "if (tl_dma_async.wait(0) != TL_OK) return TL_ERR_DMA;\n";
 }
 
 void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
@@ -357,12 +290,11 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   int64_t num_workers =
       op->annotations.Get(tl::attr::kHexagonNumWorkers)->cast<Integer>()->value;
   size_t arena_bytes = VtcmArenaBytes(op->body);
-  bool outer_dma = dma_in_scope_;
-  dma_in_scope_ = dma_async_ && UsesManagedDMA(op->body);
 
   // tl_parallel_for runs the body once per tile program, on the worker pool.
   // Each worker gets a private VTCM arena; a worker that issues HMX enables
-  // it for its thread (tl_hmx_worker_scope).
+  // it for its thread (tl_hmx_worker_scope). Each program declares its own
+  // DMA queue.
   std::string extent = PrintExpr(op->extent);
   PrintIndent();
   stream << "if (int32_t tl_status = tl_parallel_for";
@@ -381,16 +313,11 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   in_worker_ = true;
   size_t outer_offset = vtcm_offset_;
   vtcm_offset_ = 0;
-  if (dma_in_scope_)
-    EmitDMAContext();
   PrintStmt(op->body);
-  if (dma_in_scope_)
-    EmitDMADrain();
   PrintIndent();
   stream << "return TL_OK;\n";
   vtcm_offset_ = outer_offset;
   in_worker_ = false;
-  dma_in_scope_ = outer_dma;
   EndScope(scope);
   PrintIndent();
   stream << "})) return tl_status;\n";
@@ -448,11 +375,17 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
 void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
   if (const HexagonBuiltin *builtin = FindHexagonBuiltin(op)) {
+    ICHECK(!builtin->on_dma_queue || dma_in_scope_)
+        << builtin->function << " needs the tile program's DMA queue";
     os << builtin->function << "(";
-    for (size_t i = 0; i < op->args.size(); ++i) {
-      if (i != 0)
-        os << ", ";
-      os << PrintExpr(op->args[i]);
+    const char *separator = "";
+    if (builtin->on_dma_queue) {
+      os << "tl_dma_async";
+      separator = ", ";
+    }
+    for (const PrimExpr &arg : op->args) {
+      os << separator << PrintExpr(arg);
+      separator = ", ";
     }
     os << ")";
     return;
@@ -462,6 +395,21 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
 
 void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
   const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tl::hexagon_dma_queue())) {
+    // The queue lives as long as the tile program; its destructor drains it on
+    // early returns too.
+    const auto *descriptors = call->args[0].as<IntImmNode>();
+    const auto *groups = call->args[1].as<IntImmNode>();
+    ICHECK(descriptors && groups) << "hexagon_dma_queue needs constant sizes";
+    PrintIndent();
+    stream << "tl_hexagon_dma_async_context<" << descriptors->value << ", "
+           << groups->value << "> tl_dma_async;\n";
+    PrintIndent();
+    stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
+    dma_in_scope_ = true;
+    uses_dma_async_ = true;
+    return;
+  }
   if (dma_in_scope_ && call &&
       (call->op.same_as(tl::hexagon_hmx_acquire()) ||
        call->op.same_as(tl::hexagon_hmx_release()))) {
@@ -474,26 +422,23 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
            << ";\n";
     return;
   }
-  if (call && (IsHexagonAsyncCopy(call) || IsDMAWait(call))) {
-    ICHECK(dma_in_scope_);
+  const HexagonBuiltin *builtin = call ? FindHexagonBuiltin(call) : nullptr;
+  if (builtin && builtin->returns_status) {
+    std::string value = PrintExpr(op->value);
     PrintIndent();
-    stream << "if (tl_dma_async.";
-    if (IsDMAWait(call)) {
-      const auto *pending = call->args[0].as<IntImmNode>();
-      ICHECK(pending && pending->value >= 0 && pending->value <= dma_capacity_)
-          << "T.dma_wait pending must be static and within queue capacity";
-      stream << "wait(" << pending->value;
-    } else {
-      const auto *name = call->args[0].as<StringImmNode>();
-      stream << (name->value == "tl_hexagon_dma_async_copy_1d" ? "copy_1d("
-                                                               : "copy_2d(");
-      for (size_t i = 1; i < call->args.size(); ++i) {
-        if (i != 1)
-          stream << ", ";
-        stream << PrintExpr(call->args[i]);
-      }
-    }
-    stream << ") != TL_OK) return TL_ERR_DMA;\n";
+    stream << "if (int32_t tl_status = " << value << ") return tl_status;\n";
+    return;
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == tl::attr::kTileProgramScope) {
+    // A tile program declares its DMA queue in this scope, which is the C
+    // block of its loop body, lambda or function.
+    bool outer_dma = dma_in_scope_;
+    CodeGenC::VisitStmt_(op);
+    dma_in_scope_ = outer_dma;
     return;
   }
   CodeGenC::VisitStmt_(op);

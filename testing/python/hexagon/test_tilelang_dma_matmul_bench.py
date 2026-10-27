@@ -27,13 +27,15 @@ def test_dma_benchmark_dsl_schedule(dims, filename, factory, timers):
         )
     assert "bench_run(" not in src
     assert "bench_once(" not in src
-    assert "tl_hexagon_dma_async_context<4>" in src
+    # The bound joins the prefetch and the synchronous schedule, which a
+    # runtime flag selects, so it is conservative.
+    assert "tl_hexagon_dma_async_context<" in src
     assert src.count("HAP_perf_get_time_us()") == timers
     assert "tl_hexagon_hmx_mma_atom(" in src
     assert "tl_hexagon_hmx_unpack_crouton(" in src
     if dims[0] > dims[3]:
-        assert "tl_dma_async.wait(2)" in src
+        assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in src
         # A refill follows packing and precedes the current output block's MMA.
         pack = src.index("tl_hexagon_hmx_pack_crouton(")
-        refill = src.index("tl_dma_async.copy_1d(", pack)
+        refill = src.index("tl_hexagon_dma_async_submit(", pack)
         assert pack < refill < src.index("tl_hexagon_hmx_mma_atom(")
