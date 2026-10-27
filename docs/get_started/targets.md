@@ -18,6 +18,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
 | `ascend` | Huawei Ascend NPUs. Use `execution_backend="pto"` to select PTO code generation. |
+| `hexagon` | Qualcomm Hexagon NPUs (cDSP). Name the DSP architecture with `{"kind": "hexagon", "mcpu": "hexagonv79"}`; a bare `hexagon` uses `HEXAGON_DSP_ARCH`, else v79. Kernels run on the device through the `hexagon` execution backend. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |

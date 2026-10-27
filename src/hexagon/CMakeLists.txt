@@ -9,6 +9,7 @@ file(GLOB TILE_LANG_HEXAGON_SRCS
   src/hexagon/codegen/codegen_hexagon.cc
   src/hexagon/codegen/rt_mod_hexagon.cc
   src/hexagon/op/*.cc
+  src/hexagon/target.cc
   src/hexagon/target_utils.cc
 )
 list(APPEND TILE_LANG_SRCS ${TILE_LANG_HEXAGON_SRCS})

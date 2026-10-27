@@ -13,6 +13,12 @@ namespace tl {
 
 bool TargetIsHexagon(Target target);
 
+/*!
+ * \brief The DSP architecture version in the target's mcpu (79 for
+ * "hexagonv79"), or 0 when the target names none.
+ */
+int HexagonArchVersion(Target target);
+
 } // namespace tl
 } // namespace tvm
 

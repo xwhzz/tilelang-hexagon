@@ -62,6 +62,9 @@ private:
   /*! \brief compile-time bump offset (bytes) for placing alloc_shared buffers
    *  in the VTCM arena; reset per function in AddFunction. */
   size_t vtcm_offset_ = 0;
+  /*! \brief the target's vtcm-capacity in bytes; 0 when the target has none
+   *  and only the runtime checks the grant. */
+  size_t vtcm_capacity_ = 0;
   bool dma_async_ = false;
   int dma_capacity_ = 16;
 

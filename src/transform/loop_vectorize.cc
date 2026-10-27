@@ -257,19 +257,9 @@ public:
     Target target = Target::Current(false);
     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
 
-    if (TargetIsHexagon(target)) {
-      // HVX is a 1024-bit vector unit (64 fp16 / 128 int8 lanes) — far wider
-      // than the 128/256-bit vectorized-load width this planner assumes for
-      // GPUs.  Without this, elementwise DSL kernels (e.g. a q4_0 dequant) cap
-      // at 128/dtype_bits lanes (4 for an int32 intermediate) and leave the HVX
-      // unit ~16x underutilized.
-      vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
-          1024;
-    } else {
-      vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
-          MaxVectorLoadBits(
-              target, VectorizeFindMemoryAccess::MaySupportVectorize256(node));
-    }
+    vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
+        MaxVectorLoadBits(
+            target, VectorizeFindMemoryAccess::MaySupportVectorize256(node));
 
     // Check if For body contains SeqStmt (multiple statements).
     // When there's SeqStmt, we use conservative strategy - treating local

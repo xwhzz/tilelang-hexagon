@@ -15,6 +15,7 @@
 
 #include "backend/common/target_utils.h"
 
+#include <algorithm>
 #include <optional>
 #include <tvm/tirx/builtin.h>
 
@@ -189,8 +190,13 @@ std::optional<Stmt> LowerHMXLayoutCopy(const CopyNode &op, const LowerArgs &T,
                           IntImm(DataType::Int(32), kind)};
   if (auto workers = op.annotations.Get("hexagon.copy_workers")) {
     const auto *nw = workers.value().as<IntImmNode>();
-    ICHECK(nw && nw->value >= 1 && nw->value <= 6)
-        << "hexagon.copy_workers must be an integer in [1, 6]";
+    // The runtime worker pool has at most 6 threads (TL_MAX_WORKERS).
+    int64_t max_workers = 6;
+    if (auto cores = T.target->GetAttr<Integer>("num-cores"))
+      max_workers = std::min<int64_t>(max_workers, cores.value()->value);
+    ICHECK(nw && nw->value >= 1 && nw->value <= max_workers)
+        << "hexagon.copy_workers must be an integer in [1, " << max_workers
+        << "]";
     ICHECK(kind == static_cast<int>(HMXLayoutKind::kActivation) ||
            kind == static_cast<int>(HMXLayoutKind::kWeightTransposed))
         << "parallel Crouton copy requires row-tile-major physical storage";

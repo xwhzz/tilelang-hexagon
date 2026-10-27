@@ -97,6 +97,10 @@ The backend registers itself through upstream's backend plugin interface
 - `tilelang/hexagon/backend.py` — the `BackendModule` manifest: pipeline, device
   codegen (`target.build.tilelang_hexagon`) and the `hexagon` execution backend;
   imported from `tilelang/__init__.py`
+- `tilelang/hexagon/target.py` — target normalization: the DSP architecture in
+  `mcpu`, and the capabilities passes read (`max_vector_bits`, `vtcm-capacity`,
+  `num-cores`). `src/hexagon/target.cc` adds `max_vector_bits` (1024) to the TVM
+  `hexagon` kind, so the vectorizer needs no Hexagon special case
 - `tilelang/hexagon/pipeline.py` — the pass order
 - `tilelang/hexagon/op/` — tile-op implementations; `op/gemm/` registers the
   gemm dispatch (`register_gemm_impl(...)`)

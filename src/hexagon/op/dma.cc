@@ -95,6 +95,12 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                          {StringImm("tl_hexagon_dma_async_copy_1d"), dp, sp,
                           u32(rows * cols * bytes), direction}));
   }
+  // The runtime builds the v75+ type-9 2D descriptor; older architectures
+  // would need another descriptor format.
+  const int arch = HexagonArchVersion(T.target);
+  ICHECK(arch == 0 || arch >= 75)
+      << "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv"
+      << arch << ". Copy contiguous rows with 1D transfers instead.";
   return Evaluate(
       Call(DataType::Int(32), builtin::call_extern(),
            {StringImm("tl_hexagon_dma_async_copy_2d"), dp, sp, u32(ds * bytes),

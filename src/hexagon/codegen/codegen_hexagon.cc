@@ -151,6 +151,11 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // runtime VTCM size.  (Non-HMX shared kernels just leave the first tile
   // unused.)
   vtcm_offset_ = 2048;
+  vtcm_capacity_ = 0;
+  if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
+    if (auto capacity = target.value()->GetAttr<Integer>("vtcm-capacity"))
+      vtcm_capacity_ = static_cast<size_t>(capacity.value()->value);
+  }
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
@@ -435,8 +440,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     size_t offset = vtcm_offset_;
     // 2048-byte align == one HMX Crouton tile, also HVX(128B)-aligned.
     vtcm_offset_ += (nbytes + size_t(2047)) & ~size_t(2047);
-    ICHECK_LE(vtcm_offset_, size_t(8) << 20)
-        << "alloc_shared total exceeds 8MB VTCM (" << vtcm_offset_ << " bytes)";
+    ICHECK(vtcm_capacity_ == 0 || vtcm_offset_ <= vtcm_capacity_)
+        << "alloc_shared total (" << vtcm_offset_
+        << " bytes) exceeds the target's VTCM capacity (" << vtcm_capacity_
+        << " bytes)";
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);

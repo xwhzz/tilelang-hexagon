@@ -20,6 +20,7 @@ import tempfile
 import numpy as np
 import torch
 
+from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
 from . import fastrpc
@@ -67,6 +68,9 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self.kernel_name = kernel_name or _kernel_name(kernel_source)
         self.target = target
         self.verbose = verbose
+        # The target names the DSP architecture; HEXAGON_DSP_ARCH only seeds
+        # its default during target normalization.
+        dsp_arch = dsp_arch or hexagon_arch(target)
         self.sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self.dsp_arch = dsp_arch or self.sdk.dsp_arch
         self._param_list = list(params)
