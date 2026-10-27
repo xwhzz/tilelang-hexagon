@@ -5,9 +5,17 @@ visible without a multi-shape dispatch table. It produces three embeddable
 stages: activation pack, parallel-range Q4 dequant, and explicit HMX compute.
 """
 
+from pathlib import Path
+import sys
+
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
-from tilelang.hexagon.intrinsics.q4_0 import Q4HMXIntrinEmitter
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.hexagon.quantize.q4_0 import Q4HMXIntrinEmitter
 
 
 M = 32

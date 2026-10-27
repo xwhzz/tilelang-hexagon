@@ -12,6 +12,8 @@ when it runs, while the intrinsic fixes the v79 HVX instruction sequence.
 """
 
 import argparse
+from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -19,7 +21,12 @@ import torch
 import tilelang
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
-from tilelang.hexagon.intrinsics.q4_0 import Q4HMXIntrinEmitter
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.hexagon.quantize.q4_0 import Q4HMXIntrinEmitter
 
 
 Q4_TILE_BYTES = 576

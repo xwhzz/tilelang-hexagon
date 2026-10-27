@@ -24,7 +24,7 @@ The Q8 rationale and measured model A/B are in
 
 The reusable implementation is in:
 
-- `tilelang/hexagon/intrinsics/q8_0.py`: layout ABI + `Q8GemvIntrinEmitter`;
+- `examples/hexagon/quantize/q8_0.py`: layout ABI + `Q8GemvIntrinEmitter`;
 - `src/tl_templates/hexagon/qgemv.h`: v79 HVX signed-int8 dot atom;
 - `src/tl_templates/hexagon/tl_embed.h`: C-safe embedding context/registry.
 

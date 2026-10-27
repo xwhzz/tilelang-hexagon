@@ -100,8 +100,8 @@ The backend registers itself through upstream's backend plugin interface
 - `tilelang/hexagon/pipeline.py` — the pass order
 - `tilelang/hexagon/op/` — tile-op implementations; `op/gemm/` registers the
   gemm dispatch (`register_gemm_impl(...)`)
-- `tilelang/hexagon/intrinsics/` — Crouton layouts, the HMX emitter and the
-  Q4_0/Q8_0 atoms
+- `tilelang/hexagon/intrinsics/` — Crouton layouts and the HMX emitter. The ggml
+  Q4_0/Q8_0 format helpers live with the examples in `examples/hexagon/quantize/`
 - `tilelang/hexagon/language/` — the Hexagon dialect: `T.Kernel(num_workers=...)`,
   `T.dma_copy`/`T.dma_wait`, and the expert HMX atoms under `T.hmx`. Kernels import
   it as `from tilelang.hexagon import language as T`

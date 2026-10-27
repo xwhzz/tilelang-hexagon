@@ -158,7 +158,7 @@ return hmx_ok ? "hexagon.hmx" : "cpu.scalar";
 
 1. **薄 codegen、厚 runtime**：新指令族的正确姿势是先写 runtime atom（可脱离编译器单测），再加 TIR op + emitter + codegen 一行名字映射。不要把硬件序列拼在 codegen 的字符串流里。
 2. **拒绝优于静默**：每一层都有拒绝手段——SelectInst 回退 scalar、Python lower `raise NotImplementedError`、tileop `ICHECK` 带改法提示、runtime 返回 -1/-2/-3、kernel 状态码让 host `raise`。设备上最贵的 bug 是静默垃圾，本仓库的所有检查都是被真实事故换来的。
-3. **布局是 ABI**：Crouton 的 cpos 公式在 `hmx.h` 与 `intrinsics/crouton.py` 各有一份镜像，Q8 的 1152 B tile 在 `qgemv.h` 宏与 `intrinsics/q8_0.py` layout 各一份——改任何一侧必须同步另一侧并跑 layout 契约测试（`testing/python/hexagon/`）。
+3. **布局是 ABI**：Crouton 的 cpos 公式在 `hmx.h` 与 `intrinsics/crouton.py` 各有一份镜像，Q8 的 1152 B tile 在 `qgemv.h` 宏与 `examples/hexagon/quantize/q8_0.py` layout 各一份——改任何一侧必须同步另一侧并跑 layout 契约测试（`testing/python/hexagon/`）。
 4. **已固化的铁律**：emitter 方法必须 build+return 嵌套 `@T.macro`；HMX 用 dependency token 表达隐式状态与缓冲存活期；`T.gemm` 必须 `clear_accum=True`；elementwise 最窄 dtype 填满 128 B、bitwise 前加宽 int16。
 5. **注释记录"为什么"**：仓库风格是在坑位处写清约束成因（如 spinlock 为什么可以裸 store 释放、`aligned(1)` 为什么不损失向量化）。新代码照此办理——这些注释就是下一个人的走读文档。
 

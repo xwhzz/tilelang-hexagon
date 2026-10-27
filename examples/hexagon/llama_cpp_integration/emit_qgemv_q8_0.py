@@ -14,9 +14,15 @@ import argparse
 import json
 import re
 from pathlib import Path
+import sys
 
 import tilelang
-from tilelang.hexagon.intrinsics.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.hexagon.quantize.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
 
 
 def emit(k: int, output_dir: Path, *, with_bias: bool) -> None:

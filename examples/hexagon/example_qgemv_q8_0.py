@@ -12,12 +12,19 @@ scheduler intact.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import sys
 
 import numpy as np
 import torch
 
 import tilelang
-from tilelang.hexagon.intrinsics.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.hexagon.quantize.q8_0 import Q8_0_TILED_LAYOUT, make_q8_0_dot_prim_func
 
 
 def pack_weight_tile(q: np.ndarray, scales: np.ndarray) -> np.ndarray:
