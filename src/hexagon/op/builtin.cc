@@ -101,7 +101,7 @@ TL_HEXAGON_MATH_BUILTIN(hexagon_fabs);
 #undef TL_HEXAGON_MATH_BUILTIN
 
 TIR_DEFINE_TL_BUILTIN(hexagon_reduce_rows)
-    .set_num_inputs(9)
+    .set_num_inputs(10)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

@@ -94,11 +94,12 @@ TVM_DLL const Op &hexagon_sigmoid();
 TVM_DLL const Op &hexagon_erf();
 TVM_DLL const Op &hexagon_fabs();
 
-// tl_hvx_reduce_rows<kind, acc>(dst, src, rows, cols, src_stride, dst_stride,
-// clear) (hvx_reduce.h): reduces `rows` rows of `cols` elements into one
-// element each, accumulating in `acc`. The kind is the name of a TL_REDUCE_*
-// constant and `acc` a type annotation; the codegen prints both as template
-// arguments.
+// tl_hvx_reduce_rows<kind, acc, aligned>(dst, src, rows, cols, src_stride,
+// dst_stride, clear) (hvx_reduce.h): reduces `rows` rows of `cols` elements
+// into one element each, accumulating in `acc`. The kind names a TL_REDUCE_*
+// constant, `acc` is a type annotation and `aligned` ("true" or "false") says
+// whether every row starts on a 128-byte boundary; the codegen prints the three
+// as template arguments.
 TVM_DLL const Op &hexagon_reduce_rows();
 
 } // namespace tl

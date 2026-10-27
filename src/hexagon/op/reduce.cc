@@ -158,19 +158,38 @@ private:
     // keepdim, since the reduced axis is the innermost one.
     PrimExpr src_stride = rows_axis >= 0 ? Stride(op_.src, rows_axis) : cols;
     PrimExpr dst_stride = rows_axis >= 0 ? Stride(op_.dst, rows_axis) : one;
+    BufferLoad first = Downcast<BufferLoad>(
+        Source(make_zero(DataType::Int(32)), first_row));
     Stmt body = Evaluate(Call(
         DataType::Void(), hexagon_reduce_rows(),
         {StringImm(KindName()), TypeAnnotation(acc_t_),
+         StringImm(RowsAligned(first, src_stride) ? "true" : "false"),
          Call(DataType::Handle(), builtin::address_of(),
               {BufferLoad(op_.dst, dst_indices)}),
-         Call(DataType::Handle(), builtin::address_of(),
-              {Source(make_zero(DataType::Int(32)), first_row)}),
+         Call(DataType::Handle(), builtin::address_of(), {first}),
          cast(DataType::Int(32), rows), cast(DataType::Int(32), cols),
          cast(DataType::Int(32), src_stride),
          cast(DataType::Int(32), dst_stride), Bool(op_.clear)}));
     for (int d = rows_axis - 1; d >= 0; --d)
       body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
     return body;
+  }
+
+  // Whether every row from `first` on starts on a register boundary. The
+  // buffers start on one: VTCM arena buffers and stack arrays are 128-byte
+  // aligned.
+  bool RowsAligned(const BufferLoad &first, const PrimExpr &row_stride) const {
+    PrimExpr offset = make_zero(DataType::Int(64));
+    for (size_t d = 0; d < first->indices.size(); ++d)
+      offset = offset + cast(DataType::Int(64), first->indices[d]) *
+                            cast(DataType::Int(64), Stride(op_.src, d));
+    PrimExpr bytes = make_const(DataType::Int(64), src_t_.bytes());
+    PrimExpr line = make_const(DataType::Int(64), 128);
+    arith::Analyzer analyzer;
+    return analyzer.CanProve(floormod(offset * bytes, line) == 0) &&
+           analyzer.CanProve(
+               floormod(cast(DataType::Int(64), row_stride) * bytes, line) ==
+               0);
   }
 
   // An innermost-axis reduction over buffers in other layouts: one element at

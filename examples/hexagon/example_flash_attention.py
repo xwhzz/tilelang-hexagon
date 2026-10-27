@@ -6,7 +6,8 @@ entirely on **HVX** — no scalar fp16 libcalls.  The softmax is built from the 
 non-gemm primitives of the backend's {gemm, copy, map, reduce} basis:
 
   * **reduce** — `T.reduce_max(S, rmax, dim=1)` / `T.reduce_sum` reduce the rows of the
-    shared tile in place, with vector accumulators and an HVX lane tree.
+    shared tile in place: HVX transpose trees reduce blocks of rows into whole
+    registers of results.
   * **map** — the elementwise `T.Parallel` loops (`exp(S − m)`, the `acc_o` rescale,
     the `+ temp` accumulate, the final `/l`) vectorize onto whole HVX registers through
     the standard lowering; `T.exp` and the division become the HVX math functions.

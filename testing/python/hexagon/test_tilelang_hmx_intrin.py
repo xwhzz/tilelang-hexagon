@@ -447,11 +447,11 @@ def test_t_gemm_unsupported_output_dtype_stays_on_scalar_fallback():
 def test_flash_attention_keeps_row_reduce_outside_crouton_buffers():
     source = _lower_source(make_flash(64, 64, 64, 64))
     lines = source.splitlines()
-    # Each row reduction loads row-major S rows and finishes with a lane tree.
-    for lane in ("tl_hvx_lane_max(", "tl_hvx_lane_sum("):
-        at = next(i for i, line in enumerate(lines) if lane in line)
-        loads = [line for line in lines[at - 3 : at] if "*(half64*)(((half*)S" in line]
-        assert loads, lines[at - 3 : at + 1]
+    # Each row reduction reads the row-major staging tile S.
+    for kind, acc in (("MAX", "half"), ("SUM", "float")):
+        assert f"tl_hvx_reduce_rows<TL_REDUCE_{kind}, {acc}, true>(" in source
+        line = next(line for line in lines if f"TL_REDUCE_{kind}" in line)
+        assert "(&(((half*)S)[0]))" in line, line
 
     assert source.count("tl_hexagon_hmx_mma_atom") == 2
     assert source.count("tl_hexagon_hmx_pack_crouton") == 4

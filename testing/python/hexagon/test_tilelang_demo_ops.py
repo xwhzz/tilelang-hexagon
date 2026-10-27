@@ -63,15 +63,15 @@ def test_fp32_map_uses_native_vectors_and_own_workers(kind):
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 def test_reduce_keeps_source_precision(dtype):
     source = lower(make_reduce_probe(3, 65, dtype))
-    assert "tl_hvx_lane_sum(" in source
-    assert "tl_hvx_lane_max(" in source
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, " in source
+    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, " in source
     if dtype == "float32":
         assert "half" not in source
 
 
 def test_rmsnorm_stays_fp32_and_composes_reduction():
     source = lower(make_rmsnorm_fp32(32, 2048))
-    assert "tl_hvx_lane_sum(" in source
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>(" in source
     assert "float32*" in source
     # The scalar rsqrt runs the HVX kernel too, not libm.
     assert "tl_hvx_rsqrt(" in source
@@ -103,7 +103,7 @@ def test_tail_maps_do_not_require_full_vector_rows():
     for kind in ["add", "mul", "scale"]:
         source = lower(make_elementwise(3, 65, kind))
         assert "float32*" not in source
-    assert "tl_hvx_lane_sum(" in lower(make_rmsnorm_fp32(3, 65))
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>(" in lower(make_rmsnorm_fp32(3, 65))
 
 
 def test_gemm_bad_block_is_rejected_before_lowering():

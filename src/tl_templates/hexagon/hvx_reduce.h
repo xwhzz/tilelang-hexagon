@@ -314,6 +314,37 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_tree(const S *src, int src_stride, int cols,
   }
 }
 
+// A tree over the registers part[i0, i0 + M), M a power of two.
+template <int K, typename A, int M>
+TL_DEVICE tl_hvx_reg<A> tl_reduce_merge_all(const tl_hvx_reg<A> *part, int i0) {
+  if constexpr (M == 1)
+    return part[i0];
+  else
+    return tl_reduce_merge<K, A>(tl_reduce_merge_all<K, A, M / 2>(part, i0),
+                                 tl_reduce_merge_all<K, A, M / 2>(part, i0 + M / 2));
+}
+
+// Rows [0, N) of a block, N a power of two, rows from n on padding. Short
+// rows (up to two registers) all inline into one tree. Long rows run in a
+// loop over groups of four, whose trees meet in a tree of the groups, so the
+// code holds four row loops whatever N is.
+template <int K, typename A, typename S, bool Aligned, int N>
+TL_DEVICE tl_hvx_reg<A> tl_reduce_rows_of(const S *src, int src_stride,
+                                          int cols, int n) {
+  constexpr int G = 4;
+  if constexpr (N > G) {
+    if (cols * static_cast<int>(sizeof(S)) > 256) {
+      tl_hvx_reg<A> part[N / G];
+#pragma clang loop unroll(disable)
+      for (int g = 0; g < N / G; ++g)
+        part[g] = tl_reduce_tree<K, A, S, Aligned, G>(
+            src + g * G * src_stride, src_stride, cols, 0, n - g * G);
+      return tl_reduce_merge_all<K, A, N / G>(part, 0);
+    }
+  }
+  return tl_reduce_tree<K, A, S, Aligned, N>(src, src_stride, cols, 0, n);
+}
+
 // The results of rows [0, n), 0 < n <= N, in lanes [0, n): a tree over the
 // smallest power of two that holds n rows, then folds of each row's run.
 template <int K, typename A, typename S, bool Aligned, int N>
@@ -324,7 +355,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_block(const S *src, int src_stride, int cols,
       return tl_reduce_block<K, A, S, Aligned, N / 2>(src, src_stride, cols, n);
   }
   tl_hvx_reg<A> v =
-      tl_reduce_tree<K, A, S, Aligned, N>(src, src_stride, cols, 0, n);
+      tl_reduce_rows_of<K, A, S, Aligned, N>(src, src_stride, cols, n);
 #pragma clang loop unroll(full)
   for (int g = tl_hvx_lanes<A> / N; g > 1; g /= 2)
     v = tl_reduce_merge<K, A>(v, v);
@@ -381,15 +412,17 @@ TL_DEVICE void tl_reduce_store(D *dst, int dst_stride, tl_hvx_reg<A> v, int n,
   }
 }
 
-template <int K, typename A, typename D, typename S, bool Aligned>
-TL_DEVICE void tl_hvx_reduce_rows_impl(D *dst, const S *src, int rows,
-                                       int cols, int src_stride,
-                                       int dst_stride, bool clear) {
+// Reduces `rows` rows of `cols` elements, src[r * src_stride + c], into
+// dst[r * dst_stride], accumulating in A. Combines with dst unless `clear`.
+// Aligned: every row starts on a 128-byte boundary.
+template <int K, typename A, bool Aligned, typename D, typename S>
+TL_DEVICE void tl_hvx_reduce_rows(D *dst, const S *src, int rows, int cols,
+                                  int src_stride, int dst_stride, bool clear) {
   constexpr int L = tl_hvx_lanes<A>;
   int blocks = rows / L;
   for (int b = 0; b < blocks; ++b) {
-    tl_hvx_reg<A> v = tl_reduce_tree<K, A, S, Aligned, L>(
-        src + b * L * src_stride, src_stride, cols, 0, L);
+    tl_hvx_reg<A> v = tl_reduce_rows_of<K, A, S, Aligned, L>(
+        src + b * L * src_stride, src_stride, cols, L);
     tl_reduce_store<K, A>(dst + b * L * dst_stride, dst_stride, v, L, clear);
   }
   int n = rows - blocks * L;
@@ -399,19 +432,4 @@ TL_DEVICE void tl_hvx_reduce_rows_impl(D *dst, const S *src, int rows,
     tl_reduce_store<K, A>(dst + blocks * L * dst_stride, dst_stride, v, n,
                           clear);
   }
-}
-
-// Reduces `rows` rows of `cols` elements, src[r * src_stride + c], into
-// dst[r * dst_stride], accumulating in A. Combines with dst unless `clear`.
-template <int K, typename A, typename D, typename S>
-TL_DEVICE void tl_hvx_reduce_rows(D *dst, const S *src, int rows, int cols,
-                                  int src_stride, int dst_stride, bool clear) {
-  bool aligned = (reinterpret_cast<uintptr_t>(src) & 127) == 0 &&
-                 (src_stride * static_cast<int>(sizeof(S))) % 128 == 0;
-  if (aligned)
-    tl_hvx_reduce_rows_impl<K, A, D, S, true>(dst, src, rows, cols, src_stride,
-                                              dst_stride, clear);
-  else
-    tl_hvx_reduce_rows_impl<K, A, D, S, false>(dst, src, rows, cols,
-                                               src_stride, dst_stride, clear);
 }

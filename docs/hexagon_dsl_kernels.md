@@ -41,10 +41,12 @@ vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` pr
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
-reads and writes shared buffers and fragments in place. Reducing the innermost axis keeps
-a vector accumulator of whole registers per output and finishes it with a lane tree
-(`tl_hvx_lane_*`); other axes accumulate blocks of outputs in registers. Float sums
-accumulate in fp32; max and min stay in fp16 for an fp16 source when that is exact.
+reads and writes shared buffers and fragments in place. Reducing the innermost axis is
+one `tl_hvx_reduce_rows` call (`hvx_reduce.h`): each row accumulates into one register,
+and a transpose tree (`vdeal` + combine) merges the registers of a block of rows into one
+register whose lane i is row i, which HVX stores; no value passes through a scalar
+register. Other axes accumulate blocks of outputs in registers. Float sums accumulate in
+fp32; max and min stay in fp16 for an fp16 source when that is exact.
 
 Practical: **DSL guidance** — for a loop that touches uint8, use `T.vectorized(≥128)` (a
 multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 20 ms → 1.4 ms.

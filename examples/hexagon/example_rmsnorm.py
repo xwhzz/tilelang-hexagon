@@ -11,7 +11,8 @@ the backend isn't softmax-shaped.  Per row:
 Every elementwise `T.Parallel` loop vectorizes onto whole HVX registers through the
 standard lowering (fp16 loads, fp32 arithmetic, fp16 stores); `T.rsqrt` becomes the HVX
 `rsqrt`, so the per-row `inv[i]` map vectorizes too. `T.reduce_sum` reduces the rows of
-the shared tile in place, with vector accumulators and an HVX lane tree.
+the shared tile in place: HVX transpose trees reduce blocks of rows into whole
+registers of results.
 
 Requires a Hexagon device + SDK over adb (see README.md).
 
