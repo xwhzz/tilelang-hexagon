@@ -10,11 +10,8 @@ the backend isn't softmax-shaped.  Per row:
 
 Every elementwise `T.Parallel` loop vectorizes onto whole HVX registers through the
 standard lowering (fp16 loads, fp32 arithmetic, fp16 stores); `T.rsqrt` becomes the HVX
-`rsqrt`, so the per-row `inv[i]` map vectorizes too. The row reduction goes through the
-reduce tile op (`hexreduce`).
-
-`hexreduce` invokes the reduce tile op directly on shared VTCM tiles (the stock
-`T.reduce_sum` macro routes through register fragments Hexagon can't infer).
+`rsqrt`, so the per-row `inv[i]` map vectorizes too. `T.reduce_sum` reduces the rows of
+the shared tile in place, with vector accumulators and an HVX lane tree.
 
 Requires a Hexagon device + SDK over adb (see README.md).
 
@@ -25,17 +22,8 @@ import argparse
 import torch
 import tilelang
 from tilelang.hexagon import language as T
-from tvm import tirx
-from tilelang.hexagon.language import macro
-from tilelang.utils.language import to_tile_region
 
 EPS = 1e-5
-
-
-@macro
-def hexreduce(src, dst, rtype, dim):
-    """Hexagon row reduction on shared VTCM tiles (max/sum over the last axis)."""
-    tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.reduce"), to_tile_region(src, "r"), to_tile_region(dst, "w"), rtype, dim, True)
 
 
 def make_rmsnorm(M, N):
@@ -52,7 +40,7 @@ def make_rmsnorm(M, N):
             T.copy(G, G_sh)
             for i, j in T.Parallel(M, N):  # X²
                 Xsq[i, j] = T.cast(T.cast(X_sh[i, j], "float32") * T.cast(X_sh[i, j], "float32"), "float16")
-            hexreduce(Xsq, ssq, "sum", 1)  # Σ_j X² (HVX reduce, fp32 accum)
+            T.reduce_sum(Xsq, ssq, dim=1)  # Σ_j X² (HVX reduce, fp32 accum)
             for i in T.Parallel(M):  # per-row inverse RMS
                 inv[i] = T.rsqrt(ssq[i] / T.float32(N) + T.float32(EPS))
             for i, j in T.Parallel(M, N):  # O = X · inv · gamma

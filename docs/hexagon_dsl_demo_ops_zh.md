@@ -13,7 +13,8 @@ HMX 指令顺序都位于 `examples/hexagon/example_demo_ops.py`，没有手写 
   已测 1/2/6 worker、环形队列回绕、64 KiB 块、65 元素尾部、DSP 脏输入、保护区，
   以及持有 HMX 时 DMA 队列满后在同一 session 恢复执行。
 - **FP32 分块**：`make_map_tiled` 用显式双槽预取、连续分组、行内 HVX 计算组合。
-  RMSNorm 保留 FP32 平方和局部 `hexreduce` macro，把每行归一化系数留在寄存器。
+  RMSNorm 的 FP32 平方和先在向量寄存器里累加，再用 `T.reduce_sum` 归约每行的部分和，
+  每行归一化系数留在寄存器。
   优化路径要求完整 tile、N 为 32 倍数；非整齐形状保留基础实现。
 - **通用复制**：修复 `vec_type` 隐式结构体复制变为逐 128-byte `memcpy` 调用的问题，
   显式复制 native vector。`T.copy` 可以融合 FP32↔FP16 与 activation/output Crouton

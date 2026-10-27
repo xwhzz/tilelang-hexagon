@@ -40,14 +40,21 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
+// The storage scope fragments lower to: the target's `fragment_scope`, or
+// registers ("local").
+static String FragmentScope(const Target &target) {
+  return target->GetAttr<String>("fragment_scope").value_or("local");
+}
+
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
-                                   Map<Var, Var> &var_remap) {
+                                   Map<Var, Var> &var_remap,
+                                   const String &fragment_scope) {
   const auto *ptr_type =
       TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
   Type new_type;
-  // convert fragments to normal local buffer
+  // convert fragments to the target's fragment storage
   if (IsFragmentBuffer(buffer)) {
-    new_type = PointerType(ptr_type->element_type, "local");
+    new_type = PointerType(ptr_type->element_type, fragment_scope);
   } else {
     new_type = buffer->data->type_annotation;
   }
@@ -105,7 +112,8 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
 
 // The function `makeBufferWithLayout` creates a new Buffer object based on the
 // given buffer and layout. It handles remapping of buffer variables, adjusts
-// the storage scope if needed (e.g., from "local.fragment" to "local"), and
+// the storage scope if needed (e.g., from "local.fragment" to the target's
+// fragment scope), and
 // computes the output shape according to the layout. For shared memory buffers,
 // it also handles replication if the buffer's extent is larger than the
 // layout's extent.
@@ -223,6 +231,7 @@ public:
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
+    substituter.fragment_scope_ = FragmentScope(target.value());
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = substituter.VisitStmt(f->body);
     fptr->body =
@@ -338,8 +347,9 @@ private:
                             .as<Map<Buffer, Layout>>()
                             .value();
       for (auto [buffer, layout] : layout_map) {
-        buffer_remap_.Set(buffer,
-                          makeBufferWithLayout(buffer, layout, var_remap_));
+        buffer_remap_.Set(
+            buffer,
+            makeBufferWithLayout(buffer, layout, var_remap_, fragment_scope_));
         layout_map_.Set(buffer, layout);
       }
     }
@@ -365,7 +375,7 @@ private:
       } else if (IsFragmentBuffer(buffer)) {
         const auto *ptr_type =
             TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-        Type new_type = PointerType(ptr_type->element_type, "local");
+        Type new_type = PointerType(ptr_type->element_type, fragment_scope_);
         Var new_var;
         if (var_remap_.count(buffer->data)) {
           new_var = var_remap_[buffer->data];
@@ -1065,7 +1075,7 @@ private:
     if (IsFragmentBuffer(buffer)) {
       const auto *ptr_type =
           TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-      Type new_type = PointerType(ptr_type->element_type, "local");
+      Type new_type = PointerType(ptr_type->element_type, fragment_scope_);
       Var new_var;
       if (var_remap_.count(buffer->data)) {
         new_var = var_remap_[buffer->data];
@@ -1427,6 +1437,7 @@ private:
   }
 
   Target target_;
+  String fragment_scope_ = "local";
   Map<String, Any> block_annotations_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Var, PrimExpr> safe_value_map_;

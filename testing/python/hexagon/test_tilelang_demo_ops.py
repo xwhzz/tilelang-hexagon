@@ -4,7 +4,7 @@ import os
 import pytest
 import tilelang
 from tilelang.backend.target import determine_target
-from examples.hexagon.example_demo_ops import hexreduce, make_elementwise, make_gemm_f16_io, make_map_tiled, make_rmsnorm_fp32
+from examples.hexagon.example_demo_ops import make_elementwise, make_gemm_f16_io, make_map_tiled, make_rmsnorm_fp32
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 
@@ -17,8 +17,8 @@ def make_reduce_probe(rows, cols, dtype="float32"):
             sums = T.alloc_shared((rows,), "float32")
             maxima = T.alloc_shared((rows,), "float32")
             T.copy(X, shared)
-            hexreduce(shared, sums, "sum", 1)
-            hexreduce(shared, maxima, "max", 1)
+            T.reduce_sum(shared, sums, dim=1)
+            T.reduce_max(shared, maxima, dim=1)
             for i in T.serial(rows):
                 O[0, i] = sums[i]
                 O[1, i] = maxima[i]
@@ -60,18 +60,18 @@ def test_fp32_map_uses_native_vectors_and_own_workers(kind):
     assert "demo_" not in source
 
 
-@pytest.mark.parametrize("dtype,suffix", [("float16", "_f16"), ("float32", "_f32")])
-def test_reduce_keeps_source_precision(dtype, suffix):
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_reduce_keeps_source_precision(dtype):
     source = lower(make_reduce_probe(3, 65, dtype))
-    assert f"tl_hvx_rowsum_mat{suffix}(" in source
-    assert f"tl_hvx_rowmax_mat{suffix}(" in source
+    assert "tl_hvx_lane_sum(" in source
+    assert "tl_hvx_lane_max(" in source
     if dtype == "float32":
         assert "half" not in source
 
 
 def test_rmsnorm_stays_fp32_and_composes_reduction():
     source = lower(make_rmsnorm_fp32(32, 2048))
-    assert "tl_hvx_rowsum_mat_f32(" in source
+    assert "tl_hvx_lane_sum(" in source
     assert "float32*" in source
     # The scalar rsqrt runs the HVX kernel too, not libm.
     assert "tl_hvx_rsqrt(" in source
@@ -80,9 +80,9 @@ def test_rmsnorm_stays_fp32_and_composes_reduction():
     assert "tl_parallel_for(" in source
 
 
-def test_reduce_rejects_integer_sources():
-    with pytest.raises(Exception, match="fp16/fp32 source only"):
-        lower(make_reduce_probe(3, 65, "int32"))
+def test_reduce_rejects_unsupported_sources():
+    with pytest.raises(Exception, match="supports float16, float32 and 8 to 32-bit integers"):
+        lower(make_reduce_probe(3, 65, "float64"))
 
 
 @pytest.mark.parametrize("shape", [(64, 64, 64, 64), (128, 256, 256, 256), (256, 2048, 2048, 256)])
@@ -103,7 +103,7 @@ def test_tail_maps_do_not_require_full_vector_rows():
     for kind in ["add", "mul", "scale"]:
         source = lower(make_elementwise(3, 65, kind))
         assert "float32*" not in source
-    assert "tl_hvx_rowsum_mat_f32" in lower(make_rmsnorm_fp32(3, 65))
+    assert "tl_hvx_lane_sum(" in lower(make_rmsnorm_fp32(3, 65))
 
 
 def test_gemm_bad_block_is_rejected_before_lowering():

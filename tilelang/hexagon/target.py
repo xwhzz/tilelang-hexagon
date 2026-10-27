@@ -9,6 +9,9 @@ A normalized Hexagon target names its DSP architecture in ``mcpu``
   defaults (``src/hexagon/target.cc``), so every Hexagon target has them.
 * ``vtcm-capacity``: VTCM bytes available to a kernel.
 * ``num-cores``: hardware threads available to the worker pool.
+* ``fragment_scope``: ``shared.dyn``. A fragment is the tile of the one hardware
+  thread that runs a tile program, so it lives in VTCM, the HVX working memory,
+  in the tile program's arena with the shared buffers.
 
 ``vtcm-capacity`` and ``num-cores`` default only for architectures measured on
 hardware. Elsewhere they stay unset unless given, and only the runtime checks
@@ -90,6 +93,7 @@ def normalize_hexagon_target(target: TargetLike) -> Target | None:
     config["mcpu"] = f"hexagon{arch}"
     for key, value in _MEASURED_CAPABILITIES.get(arch, {}).items():
         config.setdefault(key, value)
+    config.setdefault("fragment_scope", "shared.dyn")
     return Target(config)
 
 

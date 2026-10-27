@@ -6,29 +6,7 @@ copy/reduce/HMX instruction primitives are selected by the backend.
 """
 
 from tilelang.hexagon import language as T
-from tvm import tirx
 from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
-from tilelang.hexagon.language import macro
-from tilelang.utils.language import to_tile_region
-
-
-@macro
-def hexreduce(src, dst, rtype, dim):
-    """Reduce shared FP16/FP32 rows into FP32, without fragment staging.
-
-    Like example_rmsnorm.py, keep this adapter local until T.reduce_sum/max
-    can lower shared tiles directly on Hexagon. Supports sum/max with clear=True;
-    NaN propagation is unsupported.
-    """
-    tirx.call_intrin(
-        "handle",
-        tirx.op.Op.get("tl.tileop.reduce"),
-        to_tile_region(src, "r"),
-        to_tile_region(dst, "w"),
-        rtype,
-        dim,
-        True,
-    )
 
 
 def make_elementwise(M, N, kind="add", num_workers=6, scale=0.75, bias=0.125):
@@ -75,7 +53,7 @@ def make_rmsnorm_fp32(M, N, eps=1e-5, num_workers=6):
             inv = T.alloc_local((1,), "float32")
             for j in T.Parallel(N):
                 squares[0, j] = X[row, j] * X[row, j]
-            hexreduce(squares, total, "sum", 1)
+            T.reduce_sum(squares, total, dim=1)
             inv[0] = T.rsqrt(total[0] / T.float32(N) + T.float32(eps))
             for j in T.Parallel(N):
                 O[row, j] = X[row, j] * inv[0]
@@ -149,8 +127,8 @@ def make_map_tiled(M, N, kind="add", tile_rows=4, group_tiles=4, num_workers=6, 
                         T.copy(Y[row : row + tile_rows, :], sy[i % 2, :, :])
                 if kind == "rmsnorm":
                     for r in T.serial(tile_rows):
-                        # Keep independent sums in vector locals. Only spill
-                        # the final partials for the existing row-reduce op.
+                        # Keep independent sums in vector locals; only the
+                        # final partials go through the row reduction.
                         for u in T.unroll(partial_lanes // 32):
                             vacc[u] = T.Broadcast(T.float32(0), 32)
                         for k in T.serial(N // partial_lanes):
@@ -159,7 +137,7 @@ def make_map_tiled(M, N, kind="add", tile_rows=4, group_tiles=4, num_workers=6, 
                                 vacc[u] = vacc[u] + x * x
                         for u in T.unroll(partial_lanes // 32):
                             partial[0, T.Ramp(u * 32, 1, 32)] = vacc[u]
-                        hexreduce(partial, row_sum, "sum", 1)
+                        T.reduce_sum(partial, row_sum, dim=1)
                         sums[r] = row_sum[0]
                 if dma_store:
                     compute(sx, sy, sums, inv, result, 0, i % 2)

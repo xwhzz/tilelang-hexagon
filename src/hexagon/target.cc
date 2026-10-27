@@ -18,11 +18,14 @@ namespace refl = tvm::ffi::reflection;
 
 // HVX registers are 1024 bits wide (64 fp16 or 128 int8 lanes), and every
 // HVX instruction works on whole registers. The vectorizer reads both limits
-// instead of its GPU-sized default.
+// instead of its GPU-sized default. LowerTileOp places fragments in the
+// storage scope `fragment_scope` names; the target normalizer sets it, since a
+// string default registered here does not survive static initialization.
 [[maybe_unused]] TargetKindRegEntry &hexagon_kind =
     TargetKindRegEntry::RegisterOrGet("hexagon")
         .add_attr_option<int64_t>("max_vector_bits", refl::DefaultValue(1024))
-        .add_attr_option<int64_t>("min_vector_bits", refl::DefaultValue(1024));
+        .add_attr_option<int64_t>("min_vector_bits", refl::DefaultValue(1024))
+        .add_attr_option<ffi::String>("fragment_scope");
 
 } // namespace
 } // namespace tvm

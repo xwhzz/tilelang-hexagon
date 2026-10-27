@@ -64,6 +64,12 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_sigmoid(), "tl_hvx_sigmoid", false},
       {tl::hexagon_erf(), "tl_hvx_erf", false},
       {tl::hexagon_fabs(), "tl_hvx_fabs", false},
+      {tl::hexagon_lane_sum(), "tl_hvx_lane_sum", false},
+      {tl::hexagon_lane_max(), "tl_hvx_lane_max", false},
+      {tl::hexagon_lane_min(), "tl_hvx_lane_min", false},
+      {tl::hexagon_lane_and(), "tl_hvx_lane_and", false},
+      {tl::hexagon_lane_or(), "tl_hvx_lane_or", false},
+      {tl::hexagon_lane_xor(), "tl_hvx_lane_xor", false},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))
@@ -349,9 +355,11 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
              << "u;\n";
     }
   } else {
-    // Stack-local (fragments / small scratch).
+    // Stack-local scratch. Whole-register vector accesses to it are aligned
+    // vmem, which drops the low address bits, so align it like a register.
     PrintType(op->buffer->dtype, stream);
-    stream << ' ' << vid << '[' << constant_size << "];\n";
+    stream << ' ' << vid << '[' << constant_size
+           << "] __attribute__((aligned(128)));\n";
   }
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
 }

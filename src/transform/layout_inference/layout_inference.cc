@@ -234,6 +234,18 @@ private:
   std::unordered_set<int> finalize_ops_;
 };
 
+// The layout of a fragment that one thread holds whole: row-major, all of it
+// in thread 0. It is what a T.Parallel loop infers for such a fragment.
+static Fragment SingleThreadFragment(const Buffer &buffer) {
+  PrimExpr index = make_zero(buffer->shape.empty() ? DataType::Int(32)
+                                                   : buffer->shape[0].dtype());
+  for (size_t i = 0; i < buffer->shape.size(); ++i)
+    index = index * buffer->shape[i] + InputPlaceholder(i);
+  return Fragment(buffer->shape, {index}, make_zero(DataType::Int(32)),
+                  make_const(DataType::Int(32), 1), std::nullopt)
+      ->BindThreadRange(Range(0, 1));
+}
+
 class BufferUseDefCollector : public IRVisitorWithAnalyzer {
 public:
   BufferUseDefCollector() = default;
@@ -618,6 +630,21 @@ public:
                      in_queue);
     // step 3: relax constraints to free and re-run
     InferInFreeMode(layout_map, strict_layout_map);
+    // step 3.5: a fragment that only single-thread code uses, and that no
+    // operator constrained, is plain storage of that thread: row-major.
+    for (const auto &[buffer, users] : use_list_) {
+      if (!IsFragmentBuffer(buffer) || layout_map.count(buffer) ||
+          users.empty()) {
+        continue;
+      }
+      bool single_thread = true;
+      for (int user : users) {
+        const int64_t *extent = as_const_int(thread_bounds_vec_[user]->extent);
+        single_thread &= extent != nullptr && *extent == 1;
+      }
+      if (single_thread)
+        layout_map.Set(buffer, SingleThreadFragment(buffer));
+    }
     // step 4: finalize alias layouts by Var
     // For each storage var, if any buffer in the group has a layout,
     // propagate (reshape if needed) to the rest to ensure completeness.

@@ -37,6 +37,15 @@ runs the same 32-lane kernel on a splat, so a result never depends on whether it
 vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` print as
 `tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type.
 
+`T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
+row-major in the same arena as its shared buffers (`fragment_scope` on the target).
+`T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
+(sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
+reads and writes shared buffers and fragments in place. Reducing the innermost axis keeps
+a vector accumulator of whole registers per output and finishes it with a lane tree
+(`tl_hvx_lane_*`); other axes accumulate blocks of outputs in registers. Float sums
+accumulate in fp32; max and min stay in fp16 for an fp16 source when that is exact.
+
 Practical: **DSL guidance** — for a loop that touches uint8, use `T.vectorized(≥128)` (a
 multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 20 ms → 1.4 ms.
 

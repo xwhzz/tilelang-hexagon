@@ -121,8 +121,8 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
   for the currently validated composition and cleanup rules.
 - The flash-attention softmax runs on **HVX**: the elementwise `T.Parallel` maps
   (`exp`, rescale, `/l`) vectorize onto whole HVX registers, with `T.exp` and division
-  lowered to the HVX math functions, and the row reductions go through the reduce tile
-  op (`hexreduce`) rather than `T.reduce_max` until #23 lands fragments.
+  lowered to the HVX math functions, and `T.reduce_max`/`T.reduce_sum` reduce the rows
+  of the shared tile in place.
 - If a run reports an agent/VTCM error, clear stale agents: `adb shell pkill -f _agent`.
 
 ## DMA matmul example and benchmark

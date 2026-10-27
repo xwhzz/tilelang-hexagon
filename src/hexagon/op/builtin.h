@@ -94,6 +94,16 @@ TVM_DLL const Op &hexagon_sigmoid();
 TVM_DLL const Op &hexagon_erf();
 TVM_DLL const Op &hexagon_fabs();
 
+// Lane reductions: the sum, max, min, and, or or xor of the lanes of a vector
+// of whole HVX registers, a scalar. The reduce lowering finishes a vector
+// accumulator with them; they print as the hvx_math.h tl_hvx_lane_* functions.
+TVM_DLL const Op &hexagon_lane_sum();
+TVM_DLL const Op &hexagon_lane_max();
+TVM_DLL const Op &hexagon_lane_min();
+TVM_DLL const Op &hexagon_lane_and();
+TVM_DLL const Op &hexagon_lane_or();
+TVM_DLL const Op &hexagon_lane_xor();
+
 } // namespace tl
 } // namespace tvm
 

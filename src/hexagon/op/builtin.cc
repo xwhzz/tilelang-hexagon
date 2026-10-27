@@ -100,5 +100,18 @@ TL_HEXAGON_MATH_BUILTIN(hexagon_fabs);
 
 #undef TL_HEXAGON_MATH_BUILTIN
 
+#define TL_HEXAGON_LANE_BUILTIN(Name)                                          \
+  TIR_DEFINE_TL_BUILTIN(Name).set_num_inputs(1).set_attr<TCallEffectKind>(     \
+      "TCallEffectKind", Integer(CallEffectKind::kPure))
+
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_sum);
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_max);
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_min);
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_and);
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_or);
+TL_HEXAGON_LANE_BUILTIN(hexagon_lane_xor);
+
+#undef TL_HEXAGON_LANE_BUILTIN
+
 } // namespace tl
 } // namespace tvm

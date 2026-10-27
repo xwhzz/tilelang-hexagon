@@ -2,8 +2,8 @@
  * \file tl/hexagon/op/fill.cc
  * \brief Hexagon implementation for tl.fill lowering (e.g. T.clear).
  *
- * Reuses the generic SIMT-loop fill for global, local, and VTCM shared buffers;
- * hexagon-clang auto-vectorizes eligible initialization loops onto HVX.
+ * Reuses the generic SIMT-loop fill for global, local, VTCM shared buffers and
+ * fragments, which one thread holds whole; the loop vectorizes onto HVX.
  */
 
 #include "op/fill.h"
@@ -23,7 +23,7 @@ struct Fill {
   static Stmt Lower(const FillNode &op, const LowerArgs &T,
                     arith::Analyzer *analyzer) {
     if (IsLocalBuffer(op.dst, true) || IsGlobalBuffer(op.dst) ||
-        IsSharedBuffer(op.dst)) {
+        IsSharedBuffer(op.dst) || IsFragmentBuffer(op.dst)) {
       auto init_loop = op.MakeSIMTLoop(analyzer);
       auto vectorized_loop = VectorizeLoop(init_loop, analyzer, T.layout_map);
       return PragmaUnrollLoop(vectorized_loop);

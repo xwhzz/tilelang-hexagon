@@ -446,14 +446,14 @@ def test_t_gemm_unsupported_output_dtype_stays_on_scalar_fallback():
 
 def test_flash_attention_keeps_row_reduce_outside_crouton_buffers():
     source = _lower_source(make_flash(64, 64, 64, 64))
-    rowmax = next(line for line in source.splitlines() if "tl_hvx_rowmax_mat_f16(" in line)
-    rowsum = next(line for line in source.splitlines() if "tl_hvx_rowsum_mat_f16(" in line)
+    lines = source.splitlines()
+    # Each row reduction loads row-major S rows and finishes with a lane tree.
+    for lane in ("tl_hvx_lane_max(", "tl_hvx_lane_sum("):
+        at = next(i for i, line in enumerate(lines) if lane in line)
+        loads = [line for line in lines[at - 3 : at] if "*(half64*)(((half*)S" in line]
+        assert loads, lines[at - 3 : at + 1]
 
     assert source.count("tl_hexagon_hmx_mma_atom") == 2
-    assert "((half*)S)[0]" in rowmax
-    assert "((half*)S)[0]" in rowsum
-    assert "S_hmx" not in rowmax
-    assert "S_hmx" not in rowsum
     assert source.count("tl_hexagon_hmx_pack_crouton") == 4
     assert source.count("tl_hexagon_hmx_unpack_crouton") == 2
     assert "tl_hexagon_hmx_gemm" not in source

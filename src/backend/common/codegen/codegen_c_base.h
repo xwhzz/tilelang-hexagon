@@ -6,6 +6,7 @@
 #ifndef TVM_TL_BACKEND_COMMON_CODEGEN_CODEGEN_C_BASE_H_
 #define TVM_TL_BACKEND_COMMON_CODEGEN_CODEGEN_C_BASE_H_
 
+#include <cmath>
 #include <sstream>
 #include <string>
 
@@ -63,6 +64,23 @@ public:
     // Qualified call: dispatch through StmtFunctor::VisitStmt to the matching
     // VisitStmt_ callback without re-entering this override.
     CodeGenC::VisitStmt(n);
+  }
+
+  // C has no inf or nan literal: CodeGenC appends the float suffix to the IEEE
+  // text ("-inff", "nanf"), which compilers reject. Print the C99 macros
+  // INFINITY and NAN instead; finite values keep CodeGenC's formatting.
+  void VisitExpr_(const FloatImmNode *op,
+                  std::ostream &os) override { // NOLINT(*)
+    if (std::isinf(op->value)) {
+      std::string text = op->value < 0 ? "-INFINITY" : "INFINITY";
+      MarkConst(text);
+      os << text;
+    } else if (std::isnan(op->value)) {
+      MarkConst("NAN");
+      os << "NAN";
+    } else {
+      CodeGenC::VisitExpr_(op, os);
+    }
   }
 
   // Called by AddFunction between the signature and the body; anchors the

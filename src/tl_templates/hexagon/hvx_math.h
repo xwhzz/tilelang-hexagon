@@ -12,6 +12,7 @@
 #include <hexagon_types.h> // HVX_Vector / HVX_VectorPair + Q6_* intrinsics (needs -mhvx)
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h> // vec_type, the codegen's vectors
+#include <type_traits>
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))
@@ -20,10 +21,6 @@
 // HVX vector geometry: 1024-bit register = 32 fp32 lanes = 64 fp16 lanes.
 #define TL_HVX_F32_LANES 32
 #define TL_HVX_F16_LANES 64
-
-TL_DEVICE int tl_hvx_aligned_128(const void *p) {
-  return (((uintptr_t)p) & 127u) == 0;
-}
 
 // ---------------------------------------------------------------------------
 // fp32 (IEEE "sf") arithmetic.  HVX accumulates in the internal "qf32" format;
@@ -419,136 +416,65 @@ TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
 }
 
 // ---------------------------------------------------------------------------
-// Row reductions over a contiguous fp16 row of length n -> fp32 scalar.
-// The _f16/_f32 suffix denotes the input dtype; both return fp32 results.
-// Accumulate across vectors, then a butterfly rotate-reduce within one vector
-// (Q6_V_vror_VR rotates by bytes).  Aligned rows use HVX; short or unaligned
-// rows fall back to scalar so arbitrary row widths are correct.
+// Lane reductions of the codegen's vectors (vec_type<T, N>, N whole registers),
+// which finish the reduce lowering's vector accumulators. The registers combine
+// first; then rotating by half the remaining width (Q6_V_vror_VR, in bytes)
+// and combining leaves the whole reduction in lane 0. An fp16 result returns
+// as float, since __fp16 is not a valid return type.
 // ---------------------------------------------------------------------------
-TL_DEVICE float tl_hvx_lane0_sf(HVX_Vector v) {
-  __attribute__((aligned(128))) float buf[TL_HVX_F32_LANES];
-  *(HVX_Vector *)buf = v;
-  return buf[0];
-}
-TL_DEVICE float tl_hvx_lane0_hf(HVX_Vector v) {
-  __attribute__((aligned(128))) __fp16 buf[TL_HVX_F16_LANES];
-  *(HVX_Vector *)buf = v;
-  return (float)buf[0];
-}
-TL_DEVICE float tl_hvx_row_max_f16(const __fp16 *in, int n) {
-  if (n <= 0)
-    return -3.4028234663852886e38f;
-  if (!tl_hvx_aligned_128(in) || n < TL_HVX_F16_LANES) {
-    float r = (float)in[0];
-    for (int j = 1; j < n; ++j) {
-      float x = (float)in[j];
-      if (x > r)
-        r = x;
-    }
-    return r;
+template <typename T>
+using tl_hvx_lane_t = std::conditional_t<std::is_same_v<T, half>, float, T>;
+
+template <typename T, int N, typename Op>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_reduce(const vec_type<T, N> &x, Op op) {
+  constexpr int kLanes = 128 / static_cast<int>(sizeof(T));
+  static_assert(N % kLanes == 0, "lane reductions need whole registers");
+  typedef T reg_t __attribute__((ext_vector_type(kLanes)));
+  reg_t acc;
+  __builtin_memcpy(&acc, &x.v, 128);
+#pragma clang loop unroll(full)
+  for (int i = 1; i < N / kLanes; ++i) {
+    reg_t r;
+    __builtin_memcpy(&r, (const char *)&x.v + 128 * i, 128);
+    acc = op(acc, r);
   }
-  const HVX_Vector *v = (const HVX_Vector *)in;
-  int nv = n / TL_HVX_F16_LANES;
-  HVX_Vector m = v[0];
-  for (int i = 1; i < nv; ++i)
-    m = Q6_Vhf_vmax_VhfVhf(m, v[i]);
-  for (int s = 64; s >= 2; s >>= 1)
-    m = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vror_VR(m, s));
-  float r = tl_hvx_lane0_hf(m);
-  for (int j = nv * TL_HVX_F16_LANES; j < n; ++j) {
-    float x = (float)in[j];
-    if (x > r)
-      r = x;
+#pragma clang loop unroll(full)
+  for (int bytes = 64; bytes >= static_cast<int>(sizeof(T)); bytes /= 2) {
+    HVX_Vector v;
+    __builtin_memcpy(&v, &acc, 128);
+    HVX_Vector rotated = Q6_V_vror_VR(v, bytes);
+    reg_t r;
+    __builtin_memcpy(&r, &rotated, 128);
+    acc = op(acc, r);
   }
-  return r;
-}
-TL_DEVICE float tl_hvx_row_sum_f16(const __fp16 *in, int n) {
-  if (n <= 0)
-    return 0.0f;
-  if (!tl_hvx_aligned_128(in) || n < TL_HVX_F16_LANES) {
-    float r = 0.0f;
-    for (int j = 0; j < n; ++j)
-      r += (float)in[j];
-    return r;
-  }
-  const HVX_Vector *v = (const HVX_Vector *)in;
-  int nv = n / TL_HVX_F16_LANES;
-  HVX_Vector acc = Q6_V_vzero();
-  for (int i = 0; i < nv; ++i) {
-    HVX_Vector lo, hi;
-    tl_hvx_widen_hf(v[i], &lo, &hi);
-    acc = tl_hvx_add_sf(acc, tl_hvx_add_sf(lo, hi));
-  }
-  for (int s = 64; s >= 4; s >>= 1)
-    acc = tl_hvx_add_sf(acc, Q6_V_vror_VR(acc, s));
-  float r = tl_hvx_lane0_sf(acc);
-  for (int j = nv * TL_HVX_F16_LANES; j < n; ++j)
-    r += (float)in[j];
-  return r;
-}
-// Whole-tile reductions: out[i] = reduce(in[i, :]) for i in [0, rows).  Output
-// is fp32 (the reduce result feeds the fp32 running-max/sum scalar logic in
-// softmax/layernorm).  Rows with 128-byte alignment use HVX; other rows are
-// handled by the scalar path in tl_hvx_row_{max,sum}_f16.
-TL_DEVICE void tl_hvx_rowmax_mat_f16(float *out, const __fp16 *in, int rows,
-                                     int n) {
-  for (int i = 0; i < rows; ++i)
-    out[i] = tl_hvx_row_max_f16(in + (size_t)i * n, n);
-}
-TL_DEVICE void tl_hvx_rowsum_mat_f16(float *out, const __fp16 *in, int rows,
-                                     int n) {
-  for (int i = 0; i < rows; ++i)
-    out[i] = tl_hvx_row_sum_f16(in + (size_t)i * n, n);
+  return acc[0];
 }
 
-// FP32 reductions are separate from the FP16 entry points: narrowing first
-// changes the semantics of FP32 normalization and attention. Full aligned
-// vectors stay in FP32; short/unaligned rows and the final tail use scalar
-// accesses, with no vector read beyond the logical row.
-TL_DEVICE float tl_hvx_row_sum_f32(const float *in, int n) {
-  float result = 0.0f;
-  int j = 0;
-  if (tl_hvx_aligned_128(in) && n >= TL_HVX_F32_LANES) {
-    HVX_Vector acc = Q6_V_vzero();
-    for (; j + TL_HVX_F32_LANES <= n; j += TL_HVX_F32_LANES)
-      acc = tl_hvx_add_sf(acc, *(const HVX_Vector *)(in + j));
-    for (int shift = 64; shift >= 4; shift >>= 1)
-      acc = tl_hvx_add_sf(acc, Q6_V_vror_VR(acc, shift));
-    result = tl_hvx_lane0_sf(acc);
-  }
-  for (; j < n; ++j)
-    result += in[j];
-  return result;
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_sum(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a + b; });
 }
-
-TL_DEVICE float tl_hvx_row_max_f32(const float *in, int n) {
-  if (n <= 0)
-    return -3.4028234663852886e38f;
-  float result = in[0];
-  int j = 1;
-  if (tl_hvx_aligned_128(in) && n >= TL_HVX_F32_LANES) {
-    HVX_Vector acc = *(const HVX_Vector *)in;
-    for (j = TL_HVX_F32_LANES; j + TL_HVX_F32_LANES <= n; j += TL_HVX_F32_LANES)
-      acc = Q6_Vsf_vmax_VsfVsf(acc, *(const HVX_Vector *)(in + j));
-    for (int shift = 64; shift >= 4; shift >>= 1)
-      acc = Q6_Vsf_vmax_VsfVsf(acc, Q6_V_vror_VR(acc, shift));
-    result = tl_hvx_lane0_sf(acc);
-  }
-  for (; j < n; ++j)
-    if (in[j] > result)
-      result = in[j];
-  return result;
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_max(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(
+      x, [](auto a, auto b) { return __builtin_elementwise_max(a, b); });
 }
-
-TL_DEVICE void tl_hvx_rowsum_mat_f32(float *out, const float *in, int rows,
-                                     int n) {
-  for (int i = 0; i < rows; ++i)
-    out[i] = tl_hvx_row_sum_f32(in + (size_t)i * n, n);
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_min(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(
+      x, [](auto a, auto b) { return __builtin_elementwise_min(a, b); });
 }
-TL_DEVICE void tl_hvx_rowmax_mat_f32(float *out, const float *in, int rows,
-                                     int n) {
-  for (int i = 0; i < rows; ++i)
-    out[i] = tl_hvx_row_max_f32(in + (size_t)i * n, n);
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_and(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a & b; });
+}
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_or(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a | b; });
+}
+template <typename T, int N>
+TL_DEVICE tl_hvx_lane_t<T> tl_hvx_lane_xor(const vec_type<T, N> &x) {
+  return tl_hvx_lane_reduce(x, [](auto a, auto b) { return a ^ b; });
 }
 
 // ---------------------------------------------------------------------------

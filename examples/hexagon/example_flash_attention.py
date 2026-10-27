@@ -5,24 +5,20 @@ lower to the HMX matrix engine (`T.gemm`), and the online softmax between them r
 entirely on **HVX** — no scalar fp16 libcalls.  The softmax is built from the two
 non-gemm primitives of the backend's {gemm, copy, map, reduce} basis:
 
-  * **reduce** — `hexreduce(S, rmax, "max", 1)` / `"sum"` lower the structured reduce
-    tile op straight to the HVX row-reduction primitives.
+  * **reduce** — `T.reduce_max(S, rmax, dim=1)` / `T.reduce_sum` reduce the rows of the
+    shared tile in place, with vector accumulators and an HVX lane tree.
   * **map** — the elementwise `T.Parallel` loops (`exp(S − m)`, the `acc_o` rescale,
     the `+ temp` accumulate, the final `/l`) vectorize onto whole HVX registers through
     the standard lowering; `T.exp` and the division become the HVX math functions.
 
 The running max/denominator (`m`, `l`, `scale`) are per-row (M-length) maps of the
-same kind. HMX GEMM buffers use native Crouton layout, while the HVX row-reduce
-extern requires contiguous row-major input. `S_hmx -> S -> S_hmx` and
+same kind. HMX GEMM buffers use native Crouton layout, while the softmax works on
+row-major tiles. `S_hmx -> S -> S_hmx` and
 `temp_hmx -> temp` make those layout boundaries explicit; Hexagon `T.copy` recognizes
 the exact HMX layout and lowers these VTCM-to-VTCM transforms to Crouton pack/unpack.
 DDR inputs likewise pass through row-major VTCM staging before that transform.
 The HMX accumulator can't be preloaded, so the `clear_accum=False` accumulation of `O`
 is decomposed into an overwrite gemm to `temp` plus the HVX rescale-and-add into `acc_o`.
-
-`hexreduce` invokes the reduce tile op directly on shared VTCM buffers — the stock
-`T.reduce_max` macro routes through register fragments, which Hexagon has no layout
-inference for; a cleaner `T.reduce`-shaped wrapper is a tracked follow-up.
 
 Requires a Hexagon device + SDK over adb (see README.md).
 
@@ -33,18 +29,8 @@ import argparse
 import torch
 import tilelang
 from tilelang.hexagon import language as T
-from tvm import tirx
-from tilelang.hexagon.language import macro
-from tilelang.utils.language import to_tile_region
 
 NEG = -3.0e38
-
-
-@macro
-def hexreduce(src, dst, rtype, dim):
-    """Hexagon row reduction: invoke the reduce tile op directly on shared VTCM
-    tiles (max/sum over the last axis), bypassing the fragment-based macro."""
-    tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.reduce"), to_tile_region(src, "r"), to_tile_region(dst, "w"), rtype, dim, True)
 
 
 def make_flash(M, SEQ, BN, D):
@@ -83,13 +69,13 @@ def make_flash(M, SEQ, BN, D):
                 T.copy(V_row, V_sh)
                 T.gemm(Q_sh, K_sh, S_hmx, transpose_B=True, clear_accum=True)  # S = Q@Kᵀ (HMX)
                 T.copy(S_hmx, S)  # Crouton -> row-major
-                hexreduce(S, rmax, "max", 1)  # rmax = rowmax(S) (HVX)
+                T.reduce_max(S, rmax, dim=1)  # rmax = rowmax(S) (HVX)
                 for i in T.Parallel(M):  # running max + rescale
                     rmax[i] = T.max(m[i], rmax[i])
                     scale[i] = T.exp(m[i] - rmax[i])
                 for i, j in T.Parallel(M, BN):  # P = exp(S − m)
                     S[i, j] = T.cast(T.exp(T.cast(S[i, j], "float32") - rmax[i]), "float16")
-                hexreduce(S, rsum, "sum", 1)  # rsum = rowsum(P) (HVX)
+                T.reduce_sum(S, rsum, dim=1)  # rsum = rowsum(P) (HVX)
                 for i in T.Parallel(M):  # denominator update
                     l[i] = l[i] * scale[i] + rsum[i]
                     m[i] = rmax[i]

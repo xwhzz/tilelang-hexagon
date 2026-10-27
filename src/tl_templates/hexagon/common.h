@@ -37,14 +37,20 @@ using half = __fp16;
 // Backed by a NATIVE clang ext_vector so element-wise ARITHMETIC lowers to real
 // HVX ops (vand/vlsr/vmpy/…) instead of scalar loops — a DSL dequant like
 // `(int16)(q & 0xF) - 8) * s` becomes native vector `&`/`-`/`*` that
-// hexagon-clang++ maps onto HVX.  `aligned(1)` keeps the codegen's reinterpret
-// loads/stores (`*(halfN*)(ptr + off)`) unaligned-safe — the VTCM shared-memory
-// merge pass packs tiles at element, not 128-byte, offsets; the value ops
-// themselves are alignment-independent, so this costs only the load/store form
-// (vmemu vs vmem), never vectorization.
-template <typename T, int N> struct vec_type {
+// hexagon-clang++ maps onto HVX.
+//
+// A vec_type keeps the ext_vector's natural alignment, 128 bytes for a whole
+// HVX register, so the codegen's reinterpret loads and stores
+// (`*(halfN*)(ptr + off)`) compile to aligned vmem, which ignores the low
+// address bits. They are aligned: the vectorizer accesses whole registers at
+// multiples of the vector width from 128-byte-aligned bases, which are the
+// VTCM arena's buffers, DDR tensors and the stack arrays the codegen aligns.
+// `may_alias` makes those accesses legal next to scalar ones on the same array:
+// a loop the vectorizer leaves scalar writes `a[i]`, and the next statement may
+// read `*(half64*)a`, which strict aliasing would let the compiler reorder.
+template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   typedef T nat_t __attribute__((ext_vector_type(N)));
-  nat_t v __attribute__((aligned(1)));
+  nat_t v;
   vec_type() = default;
   // Express copies as native vector loads/stores. The implicit aggregate copy
   // becomes llvm.memcpy (and an out-of-line 128-byte memcpy on Hexagon), even
