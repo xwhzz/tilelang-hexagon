@@ -443,11 +443,11 @@ else()
     if(TL_HEXAGON_LEGACY_COMPUTE_RES)
         target_compile_definitions({iface}_skel PRIVATE TL_HEXAGON_LEGACY_COMPUTE_RES=1)
     endif()
-    # Every supported architecture (v73+) has IEEE fp16/fp32 HVX arithmetic:
-    # vector ops on half/float lower to single .hf/.sf instructions instead of
-    # a qfloat op plus a conversion.
-    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -mhvx-ieee-fp -Wno-error")
-    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -mhvx-ieee-fp -Wno-error -fno-exceptions")
+    # No -mhvx-ieee-fp: the SM8750 (v79) cDSP returns zeros for the IEEE .sf/.hf
+    # HVX arithmetic it selects, although hexagon-sim computes it. Vector float
+    # ops stay a qfloat op plus a conversion.
+    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error")
+    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions")
     copy_binaries({iface}_skel)
 endif()
 """

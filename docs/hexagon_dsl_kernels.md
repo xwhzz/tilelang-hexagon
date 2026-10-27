@@ -25,8 +25,9 @@ final vector size to be a multiple of `1024 / min_dtype_bits`
 buffer accesses allow, else **scalarizes (safe)**. Backing this,
 `src/tl_templates/hexagon/common.h`'s `vec_type` is a native clang `ext_vector` (so
 `a * b`, `a & mask` become real HVX ops, not scalar struct loops), and `PrintType` emits
-vector spellings up to 128 lanes. Kernels build with `-mhvx-ieee-fp`, so fp16/fp32 vector
-arithmetic is one IEEE `.hf`/`.sf` instruction rather than a qfloat op and a conversion.
+vector spellings up to 128 lanes. fp16/fp32 vector arithmetic compiles to a qfloat op
+plus a conversion: `-mhvx-ieee-fp` would select single IEEE `.hf`/`.sf` instructions, but
+the SM8750 (v79) cDSP returns zeros for them, although hexagon-sim computes them correctly.
 HVX has no divide, and clang scalarizes a vector `/`, so the codegen prints float vector
 division as `tl_hvx_div` (`hvx_math.h`): a times the Newton-Raphson reciprocal of b, in fp32.
 
