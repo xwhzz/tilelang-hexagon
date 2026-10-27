@@ -57,8 +57,7 @@ TL_DEVICE To tl_hvx_bitcast(const From &x) {
 // ---------------------------------------------------------------------------
 typedef HVX_Vector tl_hvx_reduce_uvector __attribute__((aligned(1)));
 
-template <bool Aligned>
-TL_DEVICE HVX_Vector tl_hvx_reduce_load(const void *p) {
+template <bool Aligned> TL_DEVICE HVX_Vector tl_hvx_reduce_load(const void *p) {
   if constexpr (Aligned)
     return *(const HVX_Vector *)p;
   else
@@ -87,8 +86,8 @@ TL_DEVICE void tl_hvx_store_bytes(void *p, HVX_Vector v, int nbytes) {
   // Byte i of v goes to byte off + i of the two blocks.
   HVX_Vector rotated = Q6_V_vror_VR(v, (128 - off) & 127);
   int end = off + nbytes;
-  HVX_VectorPred first = Q6_Q_and_QQn(Q6_Q_vsetq2_R(end < 128 ? end : 128),
-                                      Q6_Q_vsetq_R(off));
+  HVX_VectorPred first =
+      Q6_Q_and_QQn(Q6_Q_vsetq2_R(end < 128 ? end : 128), Q6_Q_vsetq_R(off));
   Q6_vmem_QRIV(first, block, rotated);
   if (end > 128)
     Q6_vmem_QRIV(Q6_Q_vsetq_R(end - 128), block + 1, rotated);
@@ -98,7 +97,8 @@ TL_DEVICE void tl_hvx_store_bytes(void *p, HVX_Vector v, int nbytes) {
 // The reduce operations.
 // ---------------------------------------------------------------------------
 template <int K>
-constexpr bool tl_reduce_is_abs = K == TL_REDUCE_ABSSUM || K == TL_REDUCE_ABSMAX;
+constexpr bool tl_reduce_is_abs =
+    K == TL_REDUCE_ABSSUM || K == TL_REDUCE_ABSMAX;
 
 template <typename T>
 constexpr bool tl_reduce_is_float =
@@ -166,13 +166,14 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_operand(tl_hvx_reg<A> x) {
 // Source elements per step: one register of S, or as many as fill one
 // register of A when S is wider.
 template <typename A, typename S>
-constexpr int tl_reduce_step = tl_hvx_lanes<S> > tl_hvx_lanes<A>
-                                   ? tl_hvx_lanes<S>
-                                   : tl_hvx_lanes<A>;
+constexpr int tl_reduce_step =
+    tl_hvx_lanes<S> > tl_hvx_lanes<A> ? tl_hvx_lanes<S> : tl_hvx_lanes<A>;
 // Source registers per step.
 template <typename A, typename S>
-constexpr int tl_reduce_step_regs =
-    sizeof(S) > sizeof(A) ? static_cast<int>(sizeof(S) / sizeof(A)) : 1;
+constexpr int tl_reduce_step_regs = sizeof(S) > sizeof(A)
+                                        ? static_cast<int>(sizeof(S) /
+                                                           sizeof(A))
+                                        : 1;
 
 // One step of source registers combined into one register of A. A step
 // converts to tl_reduce_step<A, S> lanes of A, one or more registers; the
@@ -291,9 +292,9 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_row(const S *row, int cols) {
 // into one register holding rows [0, 2n) in runs of g / 2 lanes.
 template <int K, typename A>
 TL_DEVICE tl_hvx_reg<A> tl_reduce_merge(tl_hvx_reg<A> lo, tl_hvx_reg<A> hi) {
-  HVX_VectorPair d =
-      Q6_W_vdeal_VVR(tl_hvx_bitcast<HVX_Vector>(hi),
-                     tl_hvx_bitcast<HVX_Vector>(lo), -static_cast<int>(sizeof(A)));
+  HVX_VectorPair d = Q6_W_vdeal_VVR(tl_hvx_bitcast<HVX_Vector>(hi),
+                                    tl_hvx_bitcast<HVX_Vector>(lo),
+                                    -static_cast<int>(sizeof(A)));
   return tl_reduce_combine<K>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_lo_W(d)),
                               tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_hi_W(d)));
 }
@@ -320,8 +321,9 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_merge_all(const tl_hvx_reg<A> *part, int i0) {
   if constexpr (M == 1)
     return part[i0];
   else
-    return tl_reduce_merge<K, A>(tl_reduce_merge_all<K, A, M / 2>(part, i0),
-                                 tl_reduce_merge_all<K, A, M / 2>(part, i0 + M / 2));
+    return tl_reduce_merge<K, A>(
+        tl_reduce_merge_all<K, A, M / 2>(part, i0),
+        tl_reduce_merge_all<K, A, M / 2>(part, i0 + M / 2));
 }
 
 // Rows [0, N) of a block, N a power of two, rows from n on padding. Rows of

@@ -18,9 +18,9 @@
 #include "op/reduce.h"
 
 #include "backend/common/op/reduce.h"
-#include "layout/layout.h"
 #include "backend/common/target_utils.h"
 #include "hexagon/op/builtin.h"
+#include "layout/layout.h"
 #include "op/utils.h"
 
 #include <tvm/arith/analyzer.h>
@@ -88,8 +88,8 @@ bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
     row_major = row_major * shape[i] + InputPlaceholder(i);
     analyzer.Bind(InputPlaceholder(i), Range(0, shape[i]));
   }
-  return analyzer.CanProveEqual(
-      layout.value()->GetLinearizedForwardIndex(), row_major);
+  return analyzer.CanProveEqual(layout.value()->GetLinearizedForwardIndex(),
+                                row_major);
 }
 
 // The stride of `axis` in a compact row-major buffer, in elements.
@@ -158,18 +158,18 @@ private:
     // keepdim, since the reduced axis is the innermost one.
     PrimExpr src_stride = rows_axis >= 0 ? Stride(op_.src, rows_axis) : cols;
     PrimExpr dst_stride = rows_axis >= 0 ? Stride(op_.dst, rows_axis) : one;
-    BufferLoad first = Downcast<BufferLoad>(
-        Source(make_zero(DataType::Int(32)), first_row));
-    Stmt body = Evaluate(Call(
-        DataType::Void(), hexagon_reduce_rows(),
-        {StringImm(KindName()), TypeAnnotation(acc_t_),
-         StringImm(RowsAligned(first, src_stride) ? "true" : "false"),
-         Call(DataType::Handle(), builtin::address_of(),
-              {BufferLoad(op_.dst, dst_indices)}),
-         Call(DataType::Handle(), builtin::address_of(), {first}),
-         cast(DataType::Int(32), rows), cast(DataType::Int(32), cols),
-         cast(DataType::Int(32), src_stride),
-         cast(DataType::Int(32), dst_stride), Bool(op_.clear)}));
+    BufferLoad first =
+        Downcast<BufferLoad>(Source(make_zero(DataType::Int(32)), first_row));
+    Stmt body = Evaluate(
+        Call(DataType::Void(), hexagon_reduce_rows(),
+             {StringImm(KindName()), TypeAnnotation(acc_t_),
+              StringImm(RowsAligned(first, src_stride) ? "true" : "false"),
+              Call(DataType::Handle(), builtin::address_of(),
+                   {BufferLoad(op_.dst, dst_indices)}),
+              Call(DataType::Handle(), builtin::address_of(), {first}),
+              cast(DataType::Int(32), rows), cast(DataType::Int(32), cols),
+              cast(DataType::Int(32), src_stride),
+              cast(DataType::Int(32), dst_stride), Bool(op_.clear)}));
     for (int d = rows_axis - 1; d >= 0; --d)
       body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
     return body;

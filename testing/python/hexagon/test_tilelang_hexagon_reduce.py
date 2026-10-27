@@ -61,18 +61,23 @@ def test_innermost_axis_is_one_call_over_the_rows(op, scope):
 def test_rows_of_any_length_use_the_same_call():
     # Rows shorter than a register, and rows that do not start on a register
     # boundary (200 floats), take the call's tail and unaligned paths.
-    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 20, 20, 1, (bool)1);" in _source(
-        _make("sum", (64, 20), 1, "float32", "float32")
+    assert (
+        "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 20, 20, 1, (bool)1);"
+        in _source(_make("sum", (64, 20), 1, "float32", "float32"))
     )
-    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 200, 200, 1, (bool)1);" in _source(
-        _make("max", (64, 200), 1, "float32", "float32")
+    assert (
+        "tl_hvx_reduce_rows<TL_REDUCE_MAX, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 64, 200, 200, 1, (bool)1);"
+        in _source(_make("max", (64, 200), 1, "float32", "float32"))
     )
 
 
 def test_outer_axes_loop_around_the_call():
     source = _source(_make("sum", (4, 24, 96), 2, "float32", "float32"))
     assert "for (int32_t i0 = 0; i0 < 4; ++i0) {" in source
-    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[(i0 * 24)])), (&(((float*)src)[(i0 * 2304)])), 24, 96, 96, 1, (bool)1);" in source
+    assert (
+        "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[(i0 * 24)])), (&(((float*)src)[(i0 * 2304)])), 24, 96, 96, 1, (bool)1);"
+        in source
+    )
 
 
 def _make_regions(op, clear=True):
@@ -93,7 +98,9 @@ def _make_regions(op, clear=True):
 
 def test_regions_pass_their_origin_and_strides():
     source = _source(_make_regions("max"))
-    assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float, false>((&(((float*)dst)[1])), (&(((float*)src)[8])), 64, 192, 256, 4, (bool)1);" in source
+    assert (
+        "tl_hvx_reduce_rows<TL_REDUCE_MAX, float, false>((&(((float*)dst)[1])), (&(((float*)src)[8])), 64, 192, 256, 4, (bool)1);" in source
+    )
 
 
 def test_other_layouts_reduce_through_them():
@@ -350,7 +357,9 @@ def _make_vector(op, n, src_dtype, dst_dtype):
 
 def test_a_vector_is_one_row():
     source = _source(_make_vector("sum", 300, "float32", "float32"))
-    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 1, 300, 300, 1, (bool)1);" in source
+    assert (
+        "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>((&(((float*)dst)[0])), (&(((float*)src)[0])), 1, 300, 300, 1, (bool)1);" in source
+    )
 
 
 @DEVICE
