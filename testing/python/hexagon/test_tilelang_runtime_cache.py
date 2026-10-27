@@ -85,3 +85,113 @@ def test_cached_does_not_return_linux_adapter_after_switch_to_android(cache, mon
     monkeypatch.setenv("HEXAGON_DSP_ARCH", "v73")
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "board")
     assert compile_kernel() is linux
+
+
+# ---------------------------------------------------------------------------
+# Build products persist across processes, keyed by their inputs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def builds(monkeypatch, tmp_path):
+    """build_cmake_fastrpc over a fake build that counts its runs."""
+    from tilelang.hexagon.runtime import build
+
+    tl_env = importlib.import_module("tilelang.env")
+
+    templates = tmp_path / "templates"
+    (templates / "tl_templates" / "hexagon").mkdir(parents=True)
+    (templates / "tl_templates" / "hexagon" / "common.h").write_text("// v1\n")
+    monkeypatch.setattr(tl_env, "TILELANG_TEMPLATE_PATH", str(templates))
+    monkeypatch.setattr(tl_env.env, "TILELANG_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(tl_env.env, "is_cache_enabled", lambda: True)
+    runs = []
+
+    def fake_build(project_dir, name, sdk, dsp_arch, hlos, build_host, verbose):
+        runs.append(project_dir)
+        paths = {}
+        for field, fn in (("dsp_skel", f"lib{name}_skel.so"), ("host_exe", f"{name}_test"), ("agent_exe", f"{name}_agent")):
+            paths[field] = os.path.join(project_dir, fn)
+            with open(paths[field], "w") as f:
+                f.write(f"{field} of {project_dir}")
+        return build.FastRPCArtifacts(**paths)
+
+    monkeypatch.setattr(build, "_build", fake_build)
+    sdk = SimpleNamespace(sdk_root="/sdk", ndk_root="/ndk", cmake_root="/cmake", dsp_arch="v79", validate=lambda: sdk)
+    counter = iter(range(1000))
+
+    def run(source="kernel v1"):
+        project = tmp_path / f"project{next(counter)}"
+        project.mkdir()
+        (project / "tl_k_dsp.cc").write_text(source)
+        return build.build_cmake_fastrpc(str(project), "tl_k", sdk=sdk)
+
+    return SimpleNamespace(run=run, runs=runs, templates=templates, tl_env=tl_env)
+
+
+def test_an_unchanged_project_reuses_its_build(builds):
+    first = builds.run()
+    second = builds.run()
+    assert len(builds.runs) == 1
+    assert second == first
+    assert "hexagon_builds" in first.dsp_skel
+    with open(second.agent_exe) as f:
+        assert f.read() == f"agent_exe of {builds.runs[0]}"
+
+
+def test_sources_and_headers_are_part_of_the_key(builds):
+    builds.run()
+    builds.run("kernel v2")
+    assert len(builds.runs) == 2
+    (builds.templates / "tl_templates" / "hexagon" / "common.h").write_text("// v2\n")
+    builds.run()
+    assert len(builds.runs) == 3
+
+
+def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):
+    builds.run()
+    monkeypatch.setenv("TILELANG_HEXAGON_LINUX_CC", "/other/gcc")
+    builds.run()
+    assert len(builds.runs) == 2
+    # The device lock does not change what a build produces.
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", "/tmp/lock")
+    builds.run()
+    assert len(builds.runs) == 2
+
+
+def test_a_disabled_cache_always_builds(builds, monkeypatch):
+    monkeypatch.setattr(builds.tl_env.env, "is_cache_enabled", lambda: False)
+    builds.run()
+    builds.run()
+    assert len(builds.runs) == 2
+
+
+# ---------------------------------------------------------------------------
+# The device lock: one session at a time across processes.
+# ---------------------------------------------------------------------------
+
+
+def _locked_elsewhere(path):
+    """Whether another process finds the lock file taken."""
+    import subprocess
+    import sys
+
+    probe = "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR)\ntry:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError:\n    sys.exit(1)\n"
+    return subprocess.run([sys.executable, "-c", probe, path]).returncode == 1
+
+
+def test_the_device_lock_is_off_without_its_variable(monkeypatch):
+    monkeypatch.delenv("TILELANG_HEXAGON_DEVICE_LOCK", raising=False)
+    assert device.DeviceLock().acquire() is False
+
+
+def test_device_lock_holds_nest_within_a_process(monkeypatch, tmp_path):
+    path = str(tmp_path / "device.lock")
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", path)
+    lock = device.DeviceLock()
+    assert lock.acquire() and lock.acquire()
+    assert _locked_elsewhere(path)
+    lock.release()
+    assert _locked_elsewhere(path)
+    lock.release()
+    assert not _locked_elsewhere(path)

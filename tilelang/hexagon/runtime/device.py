@@ -15,14 +15,59 @@ Dependency-free (stdlib only).
 from __future__ import annotations
 
 import abc
+import fcntl
 import os
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 
 
 class HexagonConnectionError(RuntimeError):
     pass
+
+
+class DeviceLock:
+    """Runs one device session at a time across processes, when asked to.
+
+    With ``TILELANG_HEXAGON_DEVICE_LOCK`` naming a file, an adapter holds an
+    exclusive lock on it from deployment to ``close()``, so parallel test
+    workers (``pytest -n``) build kernels concurrently but use the device one
+    after another. Holds nest within a process.
+    """
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._depth = 0
+        self._fd: int | None = None
+
+    def acquire(self) -> bool:
+        """Takes a hold; returns whether one was taken (the variable is set)."""
+        path = os.environ.get("TILELANG_HEXAGON_DEVICE_LOCK")
+        if not path:
+            return False
+        with self._mutex:
+            if self._depth == 0:
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                self._fd = fd
+            self._depth += 1
+        return True
+
+    def release(self) -> None:
+        with self._mutex:
+            self._depth -= 1
+            if self._depth == 0:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+                self._fd = None
+
+
+DEVICE_LOCK = DeviceLock()
 
 
 class HexagonConnection(abc.ABC):

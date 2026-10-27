@@ -25,7 +25,7 @@ from tilelang.jit.adapter.base import BaseKernelAdapter
 
 from . import fastrpc
 from .build import build_cmake_fastrpc
-from .device import AdbConnection, HexagonConnection
+from .device import DEVICE_LOCK, AdbConnection, HexagonConnection
 from .env import HexagonSDK
 from .config import device_serial
 
@@ -105,6 +105,15 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         if self.verbose:
             print(f"[hexagon] FastRPC project: {proj} (iface={iface})")
         artifacts = build_cmake_fastrpc(proj, iface, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
+        # The device part: one session at a time with a device lock (device.py).
+        self._holds_device = DEVICE_LOCK.acquire()
+        try:
+            self._start_on_device(artifacts)
+        except BaseException:
+            self.close()
+            raise
+
+    def _start_on_device(self, artifacts) -> None:
         conn = self._connection()
         conn.push(artifacts.dsp_skel)
         self._exe_remote = conn.push(artifacts.host_exe)
@@ -135,6 +144,9 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         if getattr(self, "_agent", None) is not None:
             self._agent.close()
             self._agent = None
+        if getattr(self, "_holds_device", False):
+            self._holds_device = False
+            DEVICE_LOCK.release()
 
     def __del__(self):
         with contextlib.suppress(Exception):

@@ -1,15 +1,14 @@
 """Build orchestration for Hexagon FastRPC projects.
 
-For M0 this drives the Hexagon SDK's ``build_cmake`` over a project that already
-has a ``CMakeLists.txt`` (e.g. ``mini-htp``), producing the two FastRPC
-artifacts:
+This drives the Hexagon SDK's ``build_cmake`` over a generated project
+(``fastrpc.write_project``), producing the FastRPC artifacts:
 
   * the **DSP skel** ``lib<name>_skel.so`` (Hexagon ELF, runs on the cDSP), and
-  * the **HLOS host** binary (aarch64 Android, opens the FastRPC session).
+  * the **HLOS host** binaries (aarch64 Android, open the FastRPC session).
 
-For generated kernels (M1+) a separate code path will invoke ``qaic`` +
-``hexagon-clang`` directly instead of cmake; this module is the orchestration
-seam where that will plug in.
+Build products are cached by content under the TileLang cache directory: the
+project files, the Hexagon template headers they include and the toolchain
+identify a build, so an unchanged kernel skips both CMake builds.
 
 Dependency-free (stdlib only).
 """
@@ -17,9 +16,13 @@ Dependency-free (stdlib only).
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
+import shutil
 import subprocess
-from dataclasses import dataclass
+import tempfile
+from dataclasses import asdict, dataclass
 
 from .env import HexagonSDK
 
@@ -64,6 +67,81 @@ def _find_one(patterns: list[str]) -> str | None:
     return None
 
 
+def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, build_host: bool) -> str | None:
+    """The build cache directory of this project, or None when caching is off."""
+    from tilelang.env import TILELANG_TEMPLATE_PATH, env
+
+    if not env.is_cache_enabled() or not TILELANG_TEMPLATE_PATH:
+        return None
+    digest = hashlib.sha256()
+
+    def add(label: str, path: str) -> None:
+        digest.update(label.encode() + b"\0")
+        with open(path, "rb") as f:
+            digest.update(f.read())
+        digest.update(b"\0")
+
+    for fn in sorted(os.listdir(project_dir)):
+        path = os.path.join(project_dir, fn)
+        if os.path.isfile(path):
+            add(fn, path)
+    templates = os.path.join(TILELANG_TEMPLATE_PATH, "tl_templates", "hexagon")
+    for root, dirs, files in os.walk(templates):
+        dirs.sort()
+        for fn in sorted(files):
+            path = os.path.join(root, fn)
+            add(os.path.relpath(path, templates), path)
+    toolchain = {
+        "name": name,
+        "dsp_arch": dsp_arch,
+        "hlos": hlos,
+        "build_host": build_host,
+        "sdk_root": sdk.sdk_root,
+        "ndk_root": sdk.ndk_root,
+        "cmake_root": sdk.cmake_root,
+        # Build switches and the Linux HLOS toolchain (linux_build.py). Like
+        # the paths above, they identify tools; replacing a tool in place
+        # needs a cleared cache.
+        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k != "TILELANG_HEXAGON_DEVICE_LOCK"},
+    }
+    digest.update(json.dumps(toolchain, sort_keys=True).encode())
+    return os.path.join(env.TILELANG_CACHE_DIR, "hexagon_builds", digest.hexdigest())
+
+
+def _load_cached(entry: str) -> FastRPCArtifacts | None:
+    try:
+        with open(os.path.join(entry, "artifacts.json")) as f:
+            names = json.load(f)
+    except (OSError, ValueError):
+        return None
+    paths = {key: os.path.join(entry, fn) if fn else "" for key, fn in names.items()}
+    if not all(os.path.isfile(p) for p in paths.values() if p):
+        return None
+    return FastRPCArtifacts(**paths)
+
+
+def _store_cached(entry: str, artifacts: FastRPCArtifacts) -> FastRPCArtifacts:
+    """Copies the build products into the cache; another process may race us."""
+    parent = os.path.dirname(entry)
+    os.makedirs(parent, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".staging-", dir=parent)
+    try:
+        names = {}
+        for key, path in asdict(artifacts).items():
+            names[key] = os.path.basename(path) if path else ""
+            if path:
+                shutil.copy2(path, os.path.join(staging, names[key]))
+        with open(os.path.join(staging, "artifacts.json"), "w") as f:
+            json.dump(names, f)
+        os.rename(staging, entry)
+    except OSError:
+        # The entry exists (a concurrent build stored it first) or the cache
+        # is not writable; the fresh products serve this build either way.
+        shutil.rmtree(staging, ignore_errors=True)
+        return artifacts
+    return _load_cached(entry) or artifacts
+
+
 def build_cmake_fastrpc(
     project_dir: str,
     name: str,
@@ -74,6 +152,8 @@ def build_cmake_fastrpc(
 ) -> FastRPCArtifacts:
     """Build a CMake-based FastRPC project for both the DSP and (optionally) the
     aarch64 host, returning the resolved artifact paths.
+
+    A build whose inputs match a cached one returns the cached products.
 
     Parameters
     ----------
@@ -88,6 +168,18 @@ def build_cmake_fastrpc(
     hlos = os.environ.get("TILELANG_HEXAGON_HLOS", "android")
     if hlos not in {"android", "linux"}:
         raise HexagonBuildError(f"Unsupported HLOS: {hlos}")
+    entry = _cache_entry(project_dir, name, sdk, dsp_arch, hlos, build_host)
+    if entry:
+        cached = _load_cached(entry)
+        if cached:
+            if verbose:
+                print(f"[hexagon-build] cached: {entry}")
+            return cached
+    artifacts = _build(project_dir, name, sdk, dsp_arch, hlos, build_host, verbose)
+    return _store_cached(entry, artifacts) if entry else artifacts
+
+
+def _build(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, build_host: bool, verbose: bool) -> FastRPCArtifacts:
     if hlos == "linux":
         from .linux_runtime import build_linux_fastrpc
 

@@ -31,7 +31,10 @@ These examples run on **real hardware** (not an emulator), so they need:
   setup), and `torch` for the reference check.
 
 The first run of each kernel builds + deploys a FastRPC skel and starts a small
-persistent on-device agent (kept warm across calls); rebuilds are cached in-process.
+persistent on-device agent (kept warm across calls). Build products are cached on
+disk under `$TILELANG_CACHE_DIR/hexagon_builds`, keyed by the generated sources,
+the Hexagon template headers and the toolchain, so a rerun of an unchanged kernel
+only deploys it.
 
 ## Running
 
@@ -45,6 +48,18 @@ python example_worker_pool.py
 python example_rmsnorm.py --m 64 --n 256
 python example_qgemv_q8_0.py --k 2048
 python example_qmatmul_kstream.py --n 128 --k 512 --io-dtype float32
+```
+
+## Device tests
+
+`TL_HEXAGON_DEVICE_TEST=1` enables the device tests in `testing/python/hexagon`.
+Building kernels takes most of their time, so they can run in parallel workers
+(pytest-xdist) that share a device lock: an adapter holds the lock from deployment
+to `close()`, so one session at a time uses the device while the other workers build.
+
+```bash
+TL_HEXAGON_DEVICE_TEST=1 TILELANG_HEXAGON_DEVICE_LOCK=/tmp/tl_hexagon_device.lock \
+    python -m pytest testing/python/hexagon -n 4
 ```
 
 ## Expected output
