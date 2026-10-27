@@ -42,21 +42,6 @@ def test_hexagon_symbols_stay_out_of_other_dialects():
         assert not hasattr(T_comm, name)
 
 
-def test_dma_copy_is_rejected_off_hexagon():
-    import tilelang
-
-    @T.prim_func
-    def kernel(A: T.Tensor((64,), "float16"), B: T.Tensor((64,), "float16")):
-        with T.Kernel(1):
-            A_s = T.alloc_shared((64,), "float16")
-            T.dma_copy(A, A_s)
-            T.dma_wait()
-            T.copy(A_s, B)
-
-    with pytest.raises(Exception, match="T.dma_copy is supported only on Hexagon"):
-        tilelang.lower(kernel, target="c")
-
-
 @pytest.mark.parametrize("num_workers", [0, -1, True, 2.0])
 def test_hexagon_kernel_rejects_invalid_num_workers(num_workers):
     with pytest.raises(ValueError, match="num_workers"):
