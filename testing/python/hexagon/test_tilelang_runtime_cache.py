@@ -197,26 +197,27 @@ def test_device_lock_holds_nest_within_a_process(monkeypatch, tmp_path):
     assert not _locked_elsewhere(path)
 
 
-def test_closed_kernels_reopen_and_hold_the_lock_only_while_open(monkeypatch, tmp_path):
+class _FakeConnection:
+    workdir = "/remote"
+
+    def __init__(self):
+        self.pushes = []
+
+    def push(self, local, remote_name=None):
+        self.pushes.append(os.path.basename(local))
+        return f"/remote/{os.path.basename(local)}"
+
+    def run_host_binary(self, exe, argv, timeout=None):
+        return 0, ""
+
+
+def _fake_kernel(monkeypatch, conn, **kwargs):
+    """A kernel whose build and device are fakes."""
     from pathlib import Path
 
     from tilelang.hexagon.runtime import adapter, build
 
-    lock = str(tmp_path / "device.lock")
-    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", lock)
-    pushes = []
-
-    class FakeConnection:
-        workdir = "/remote"
-
-        def push(self, local, remote_name=None):
-            pushes.append(os.path.basename(local))
-            return f"/remote/{os.path.basename(local)}"
-
-        def run_host_binary(self, exe, argv, timeout=None):
-            return 0, ""
-
-    def compile_project(project, iface, **kwargs):
+    def compile_project(project, iface, **_):
         skel, host = Path(project) / f"lib{iface}_skel.so", Path(project) / f"{iface}_test"
         skel.write_text("skel")
         host.write_text("host")
@@ -224,16 +225,42 @@ def test_closed_kernels_reopen_and_hold_the_lock_only_while_open(monkeypatch, tm
 
     monkeypatch.setattr(adapter, "build_cmake_fastrpc", compile_project)
     sdk = SimpleNamespace(sdk_root="/sdk", ndk_root="/ndk", cmake_root="/cmake", dsp_arch="v79", validate=lambda: sdk)
-    kernel = adapter.HexagonKernelAdapter(
-        [], [], None, "int32_t k() { return 0; }", sdk=sdk, connection=FakeConnection(), workdir=str(tmp_path / "k"), use_agent=False
-    )
-    assert pushes == ["libtl_k_skel.so", "tl_k_test"]
+    return adapter.HexagonKernelAdapter([], [], None, "int32_t k() { return 0; }", sdk=sdk, connection=conn, use_agent=False, **kwargs)
+
+
+def test_closed_kernels_reopen_and_hold_the_lock_only_while_open(monkeypatch, tmp_path):
+    from tilelang.hexagon.runtime import adapter
+
+    lock = str(tmp_path / "device.lock")
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", lock)
+    conn = _FakeConnection()
+    kernel = _fake_kernel(monkeypatch, conn, workdir=str(tmp_path / "k"))
+    assert conn.pushes == ["libtl_k_skel.so", "tl_k_test"]
     assert _locked_elsewhere(lock)
     adapter.HexagonKernelAdapter.close_all()
     assert not _locked_elsewhere(lock)
     # A call after close() deploys again and takes the lock again.
     kernel.func()
-    assert pushes == ["libtl_k_skel.so", "tl_k_test"] * 2
+    assert conn.pushes == ["libtl_k_skel.so", "tl_k_test"] * 2
     assert _locked_elsewhere(lock)
     kernel.close()
     assert not _locked_elsewhere(lock)
+
+
+def test_kernels_remove_the_work_directories_they_make(monkeypatch, tmp_path):
+    import gc
+    import tempfile
+
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", str(tmp_path / "device.lock"))
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    made = _fake_kernel(monkeypatch, _FakeConnection())
+    given = _fake_kernel(monkeypatch, _FakeConnection(), workdir=str(tmp_path / "given"))
+    assert [d.name.startswith("tl_hexagon_") for d in temp.iterdir()] == [True]
+    made.close()
+    given.close()
+    del made, given
+    gc.collect()
+    assert list(temp.iterdir()) == []
+    assert (tmp_path / "given").is_dir()

@@ -15,6 +15,7 @@ import contextlib
 import itertools
 import os
 import re
+import shutil
 import tempfile
 import weakref
 
@@ -83,7 +84,12 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         n = len(self._param_list)
         ri = list(result_idx) if isinstance(result_idx, (list, tuple)) else ([] if result_idx is None else [result_idx])
         self._result_idx = [i if i >= 0 else n + i for i in ri]
-        self._workdir = workdir or tempfile.mkdtemp(prefix="tl_hexagon_")
+        if workdir is None:
+            # The adapter's own directory, removed with the adapter: its
+            # FastRPC project, build tree and argument files.
+            workdir = tempfile.mkdtemp(prefix="tl_hexagon_")
+            weakref.finalize(self, shutil.rmtree, workdir, True)
+        self._workdir = workdir
         self._conn = connection
         self._use_agent = use_agent
         self._agent = None

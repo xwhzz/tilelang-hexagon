@@ -67,7 +67,8 @@ class HexagonAgentSession:
             subprocess.run(self._base + ["forward", f"tcp:{self.host_port}", f"tcp:{self.device_port}"], check=True, capture_output=True)
 
         adsp = os.pathsep.join([workdir, *_DEFAULT_ADSP_DIRS])
-        cmd = f"cd {workdir} && LD_LIBRARY_PATH={workdir} ADSP_LIBRARY_PATH={adsp} ./{self._exe_name} {self.device_port}"
+        # The directory is the session's own: it goes when the agent exits.
+        cmd = f"cd {workdir} && LD_LIBRARY_PATH={workdir} ADSP_LIBRARY_PATH={adsp} ./{self._exe_name} {self.device_port}; rm -rf {workdir}"
         self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self._wait_ready(ready_timeout)
         self._sock = self._connect()
