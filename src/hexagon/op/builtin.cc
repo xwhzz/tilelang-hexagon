@@ -105,15 +105,30 @@ TIR_DEFINE_TL_BUILTIN(hexagon_reduce_rows)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(hexagon_crouton_reduce)
+    .set_num_inputs(10)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(hexagon_load_lanes)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kReadState));
 
 TIR_DEFINE_TL_BUILTIN(hexagon_broadcast_lane)
-    .set_num_inputs(3)
+    .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TL_BUILTIN(hexagon_load_replicate)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kReadState));
+
+TIR_DEFINE_TL_BUILTIN(hexagon_load_repeat)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kReadState));
 
 TIR_DEFINE_TL_BUILTIN(hexagon_crouton_copy)
     .set_num_inputs(12)

@@ -17,6 +17,11 @@
  * register is one loop over the vectors of all rows, whose scalar sits at
  * i // K for K vectors per row; it splits into rows of K vectors first.
  *
+ * A Crouton tile register holds a row pair, whose values a map reads as a
+ * window of two elements, replicated (LowerWindowLoads). The loop over a
+ * tile's row pairs then steps the window by its size: such a window is a
+ * source of a group of lanes, which each row pair broadcasts the same way.
+ *
  * Runs after VectorizeLoop, on flattened buffers.
  */
 
@@ -47,31 +52,68 @@ namespace {
 
 constexpr int kRegisterBytes = 128;
 
-// A buffer that a loop reads one scalar of per iteration, at loop_var + base,
-// and broadcasts into vectors.
+// A buffer that a loop reads `group` elements of per iteration, at
+// loop_var * group + base, and repeats over vectors: a broadcast scalar
+// (group 1) or a replicated window.
 struct Source {
   Buffer buffer;
   PrimExpr base;
+  int64_t group = 1;
 };
 
+// The source a vector expression reads, if it is one: a broadcast of a scalar
+// load, or a replicated window (hexagon_load_replicate). Sets the load, the
+// group size and the vector's lane count.
+bool AsSourceRead(const PrimExpr &expr, const BufferLoadNode **load,
+                  int64_t *group) {
+  if (const auto *broadcast = expr.as<BroadcastNode>()) {
+    *load = broadcast->value.as<BufferLoadNode>();
+    *group = 1;
+    return *load && (*load)->dtype.lanes() == 1;
+  }
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(hexagon_load_replicate()))
+    return false;
+  const auto *addr = call->args[3].as<CallNode>();
+  if (!addr || !addr->op.same_as(builtin::address_of()))
+    return false;
+  *load = addr->args[0].as<BufferLoadNode>();
+  *group = std::stoll(Downcast<StringImm>(call->args[0])->value);
+  return *load != nullptr;
+}
+
 // The buffers a statement may write: stores, and the buffers of any pointer a
-// call takes (builtins write through them).
-std::unordered_set<const VarNode *> WrittenBuffers(const Stmt &body) {
+// call takes (builtins write through them), except the loads of windows and
+// lanes, which only read.
+class WrittenBufferCollector : public StmtExprVisitor {
+public:
   std::unordered_set<const VarNode *> written;
-  PostOrderVisit(body, [&](const ObjectRef &node) {
-    if (const auto *store = node.as<BufferStoreNode>()) {
-      written.insert(store->buffer->data.get());
-    } else if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(builtin::address_of())) {
-        if (const auto *load = call->args[0].as<BufferLoadNode>())
-          written.insert(load->buffer->data.get());
-      } else if (call->op.same_as(builtin::tvm_access_ptr())) {
-        if (const auto *data = call->args[1].as<VarNode>())
-          written.insert(data);
-      }
+
+private:
+  void VisitStmt_(const BufferStoreNode *op) final {
+    written.insert(op->buffer->data.get());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(hexagon_load_replicate()) ||
+        op->op.same_as(hexagon_load_repeat()) ||
+        op->op.same_as(hexagon_load_lanes()))
+      return;
+    if (op->op.same_as(builtin::address_of())) {
+      if (const auto *load = op->args[0].as<BufferLoadNode>())
+        written.insert(load->buffer->data.get());
+    } else if (op->op.same_as(builtin::tvm_access_ptr())) {
+      if (const auto *data = op->args[1].as<VarNode>())
+        written.insert(data);
     }
-  });
-  return written;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+};
+
+std::unordered_set<const VarNode *> WrittenBuffers(const Stmt &body) {
+  WrittenBufferCollector collector;
+  collector(body);
+  return collector.written;
 }
 
 // The variables a statement defines: its loop and bound variables.
@@ -88,22 +130,23 @@ std::unordered_set<const VarNode *> DefinedVars(const Stmt &body) {
   return defined;
 }
 
-// The broadcast scalars of `body` that step through a buffer with `row`, at
-// row + base, from buffers the body does not write.
+// The broadcast scalars and replicated windows of `body` that step through a
+// buffer with `row`, at row * group + base, from buffers the body does not
+// write.
 std::vector<Source> CollectSources(const Stmt &body, const Var &row) {
   std::unordered_set<const VarNode *> written = WrittenBuffers(body);
   std::unordered_set<const VarNode *> defined = DefinedVars(body);
   std::vector<Source> sources;
   PostOrderVisit(body, [&](const ObjectRef &node) {
-    const auto *broadcast = node.as<BroadcastNode>();
-    if (!broadcast)
-      return;
-    const auto *load = broadcast->value.as<BufferLoadNode>();
-    if (!load || load->indices.size() != 1 || load->dtype.lanes() != 1 ||
-        written.count(load->buffer->data.get()))
+    const BufferLoadNode *load = nullptr;
+    int64_t group = 1;
+    if (!node.as<PrimExprNode>() ||
+        !AsSourceRead(Downcast<PrimExpr>(node), &load, &group) ||
+        load->indices.size() != 1 || written.count(load->buffer->data.get()))
       return;
     Array<PrimExpr> coef = arith::DetectLinearEquation(load->indices[0], {row});
-    if (coef.size() != 2 || !is_one(coef[0]))
+    const auto *step = coef.size() == 2 ? coef[0].as<IntImmNode>() : nullptr;
+    if (!step || step->value != group)
       return;
     PrimExpr base = coef[1];
     bool invariant =
@@ -111,10 +154,11 @@ std::vector<Source> CollectSources(const Stmt &body, const Var &row) {
     if (!invariant)
       return;
     for (const Source &s : sources) {
-      if (s.buffer.same_as(load->buffer) && StructuralEqual()(s.base, base))
+      if (s.buffer.same_as(load->buffer) && s.group == group &&
+          StructuralEqual()(s.base, base))
         return;
     }
-    sources.push_back({load->buffer, base});
+    sources.push_back({load->buffer, base, group});
   });
   return sources;
 }
@@ -165,7 +209,7 @@ private:
   arith::Analyzer *analyzer_;
 };
 
-// Replaces the broadcasts of the sources with lane broadcasts from their
+// Replaces the reads of the sources with lane broadcasts from their
 // registers.
 class BroadcastRewriter : public StmtExprMutator {
 public:
@@ -176,21 +220,36 @@ public:
 
 private:
   PrimExpr VisitExpr_(const BroadcastNode *op) final {
-    if (const auto *load = op->value.as<BufferLoadNode>()) {
-      for (size_t k = 0; k < sources_.size(); ++k) {
-        if (!load->buffer.same_as(sources_[k].buffer))
-          continue;
-        Array<PrimExpr> coef =
-            arith::DetectLinearEquation(load->indices[0], {loop_var_});
-        if (coef.size() == 2 && is_one(coef[0]) &&
-            StructuralEqual()(coef[1], sources_[k].base)) {
-          int lanes = op->dtype.lanes();
-          return Call(op->dtype, hexagon_broadcast_lane(),
-                      {StringImm(std::to_string(lanes)), registers_[k], lane_});
-        }
+    if (auto lanes = Rewrite(GetRef<PrimExpr>(op)))
+      return lanes.value();
+    return StmtExprMutator::VisitExpr_(op);
+  }
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (auto lanes = Rewrite(GetRef<PrimExpr>(op)))
+      return lanes.value();
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Optional<PrimExpr> Rewrite(const PrimExpr &expr) {
+    const BufferLoadNode *load = nullptr;
+    int64_t group = 1;
+    if (!AsSourceRead(expr, &load, &group))
+      return std::nullopt;
+    for (size_t k = 0; k < sources_.size(); ++k) {
+      const Source &s = sources_[k];
+      if (!load->buffer.same_as(s.buffer) || group != s.group)
+        continue;
+      Array<PrimExpr> coef =
+          arith::DetectLinearEquation(load->indices[0], {loop_var_});
+      const auto *step = coef.size() == 2 ? coef[0].as<IntImmNode>() : nullptr;
+      if (step && step->value == group && StructuralEqual()(coef[1], s.base)) {
+        int lanes = expr.dtype().lanes();
+        return Call(expr.dtype(), hexagon_broadcast_lane(),
+                    {StringImm(std::to_string(lanes)),
+                     StringImm(std::to_string(group)), registers_[k], lane_});
       }
     }
-    return StmtExprMutator::VisitExpr_(op);
+    return std::nullopt;
   }
 
   const Var &loop_var_;
@@ -236,11 +295,15 @@ private:
     if (sources.empty())
       return loop;
 
-    // A strip is one register of the widest source type.
-    int lanes = kRegisterBytes;
-    for (const Source &s : sources)
-      lanes = std::min(lanes, kRegisterBytes / s.buffer->dtype.bytes());
-    PrimExpr width = make_const(index_t, lanes);
+    // A strip is the rows whose groups fill one register of the source with
+    // the fewest groups per register.
+    int rows_per_strip = kRegisterBytes;
+    for (const Source &s : sources) {
+      int source_lanes = kRegisterBytes / s.buffer->dtype.bytes();
+      rows_per_strip =
+          std::min(rows_per_strip, source_lanes / static_cast<int>(s.group));
+    }
+    PrimExpr width = make_const(index_t, rows_per_strip);
     Var strip(loop->loop_var->name_hint + "_strip", index_t);
     Var lane(loop->loop_var->name_hint + "_lane", index_t);
     PrimExpr first = strip * width;
@@ -250,21 +313,24 @@ private:
 
     std::vector<Var> registers;
     for (const Source &s : sources) {
+      int source_lanes = kRegisterBytes / s.buffer->dtype.bytes();
       registers.emplace_back(s.buffer->name + "_lanes",
-                             s.buffer->dtype.with_lanes(lanes));
+                             s.buffer->dtype.with_lanes(source_lanes));
     }
     Stmt body = BroadcastRewriter(row, sources, registers, lane)(row_body);
     body = Substitute(body, {{row, row_min + first + lane}});
     Array<Stmt> strip_body;
     for (size_t k = 0; k < sources.size(); ++k) {
       const Source &s = sources[k];
-      PrimExpr at = s.base + row_min + first;
-      strip_body.push_back(Bind(
-          registers[k], Call(registers[k].dtype(), hexagon_load_lanes(),
-                             {StringImm(std::to_string(lanes)),
-                              Call(DataType::Handle(), builtin::address_of(),
-                                   {BufferLoad(s.buffer, {at})}),
-                              count})));
+      PrimExpr group = make_const(index_t, s.group);
+      PrimExpr at = s.base + (row_min + first) * group;
+      strip_body.push_back(
+          Bind(registers[k],
+               Call(registers[k].dtype(), hexagon_load_lanes(),
+                    {StringImm(std::to_string(registers[k].dtype().lanes())),
+                     Call(DataType::Handle(), builtin::address_of(),
+                          {BufferLoad(s.buffer, {at})}),
+                     analyzer.Simplify(count * group)})));
     }
     // Serial, as a whole strip unrolled would leave nothing to pipeline.
     strip_body.push_back(For(lane, make_zero(index_t), count, ForKind::kSerial,

@@ -5,21 +5,25 @@ lower to the HMX matrix engine (`T.gemm`), and the online softmax between them r
 entirely on **HVX** — no scalar fp16 libcalls.  The softmax is built from the two
 non-gemm primitives of the backend's {gemm, copy, map, reduce} basis:
 
-  * **reduce** — `T.reduce_max(S, rmax, dim=1)` / `T.reduce_sum` reduce the rows of the
-    shared tile in place: HVX transpose trees reduce blocks of rows into whole
-    registers of results.
+  * **reduce** — `T.reduce_max(S, rmax, dim=1)` / `T.reduce_sum` reduce the rows of
+    `S` register by register: HVX transpose trees reduce each tile's row pairs into
+    whole registers of results.
   * **map** — the elementwise `T.Parallel` loops (`exp(S − m)`, the `acc_o` rescale,
-    the `+ temp` accumulate, the final `/l`) vectorize onto whole HVX registers through
-    the standard lowering; `T.exp` and the division become the HVX math functions.
+    the `+ temp` accumulate, the final `/l`) vectorize onto whole HVX registers;
+    `T.exp` and the division become the HVX math functions.
 
-The running max/denominator (`m`, `l`, `scale`) are per-row (M-length) maps of the
-same kind. HMX GEMM buffers use native Crouton layout, while the softmax works on
-row-major tiles. `S_hmx -> S -> S_hmx` and
-`temp_hmx -> temp` make those layout boundaries explicit; Hexagon `T.copy` recognizes
-the exact HMX layout and lowers these VTCM-to-VTCM transforms to Crouton pack/unpack.
-DDR inputs likewise pass through row-major VTCM staging before that transform.
-The HMX accumulator can't be preloaded, so the `clear_accum=False` accumulation of `O`
-is decomposed into an overwrite gemm to `temp` plus the HVX rescale-and-add into `acc_o`.
+Every buffer an HMX gemm touches keeps the gemm's native Crouton layout, and the
+softmax works on those tiles directly: a map over a Crouton buffer runs in its
+physical order, a register (a row pair of a tile) at a time, and reads the per-row
+`m`, `l` and `scale` as two-lane windows of registers loaded once per tile. `S` is
+the first gemm's output and the second gemm's input; `temp` and `acc_o` share the
+output layout. So nothing converts layouts between the gemms. K and V stage through
+row-major VTCM before their Crouton packs.
+
+The running max/denominator (`m`, `l`, `scale`) are per-row (M-length) maps. The
+HMX accumulator can't be preloaded, so the `clear_accum=False` accumulation of `O`
+is decomposed into an overwrite gemm to `temp` plus the HVX rescale-and-add into
+`acc_o`.
 
 Requires a Hexagon device + SDK over adb (see README.md).
 
@@ -30,6 +34,7 @@ import argparse
 import torch
 import tilelang
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_output_layout
 
 NEG = -3.0e38
 
@@ -40,24 +45,22 @@ def make_flash(M, SEQ, BN, D):
         Q: T.Tensor((M, D), "float16"), K: T.Tensor((SEQ, D), "float16"), V: T.Tensor((SEQ, D), "float16"), O: T.Tensor((M, D), "float16")
     ):
         with T.Kernel(1) as _:
-            Q_row = T.alloc_shared((M, D), "float16")
             K_row = T.alloc_shared((BN, D), "float16")
             V_row = T.alloc_shared((BN, D), "float16")
             Q_sh = T.alloc_shared((M, D), "float16")
             K_sh = T.alloc_shared((BN, D), "float16")
             V_sh = T.alloc_shared((BN, D), "float16")
-            S_hmx = T.alloc_shared((M, BN), "float16")
-            S = T.alloc_shared((M, BN), "float16")
-            temp_hmx = T.alloc_shared((M, D), "float16")
-            temp = T.alloc_shared((M, D), "float16")
+            S = T.alloc_shared((M, BN), "float16")  # Crouton: gemm output, then input
+            temp = T.alloc_shared((M, D), "float16")  # Crouton: gemm output
             acc_o = T.alloc_shared((M, D), "float16")
             m = T.alloc_shared((M,), "float32")  # running max
             l = T.alloc_shared((M,), "float32")  # running denominator
             rmax = T.alloc_shared((M,), "float32")  # reduce dst (also the new max)
             rsum = T.alloc_shared((M,), "float32")  # reduce dst
             scale = T.alloc_shared((M,), "float32")
-            T.copy(Q, Q_row)
-            T.copy(Q_row, Q_sh)
+            # acc_o meets temp in maps, so it takes temp's layout.
+            T.annotate_layout({acc_o: make_hmx_output_layout(acc_o)})
+            T.copy(Q, Q_sh)
             for i, j in T.Parallel(M, D):
                 acc_o[i, j] = T.float16(0)
             for i in T.Parallel(M):
@@ -68,8 +71,7 @@ def make_flash(M, SEQ, BN, D):
                 T.copy(V[kv * BN, 0], V_row)
                 T.copy(K_row, K_sh)
                 T.copy(V_row, V_sh)
-                T.gemm(Q_sh, K_sh, S_hmx, transpose_B=True, clear_accum=True)  # S = Q@Kᵀ (HMX)
-                T.copy(S_hmx, S)  # Crouton -> row-major
+                T.gemm(Q_sh, K_sh, S, transpose_B=True, clear_accum=True)  # S = Q@Kᵀ (HMX)
                 T.reduce_max(S, rmax, dim=1)  # rmax = rowmax(S) (HVX)
                 for i in T.Parallel(M):  # running max + rescale
                     rmax[i] = T.max(m[i], rmax[i])
@@ -82,9 +84,7 @@ def make_flash(M, SEQ, BN, D):
                     m[i] = rmax[i]
                 for i, j in T.Parallel(M, D):  # rescale acc_o
                     acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") * scale[i], "float16")
-                T.copy(S, S_hmx)  # row-major -> Crouton
-                T.gemm(S_hmx, V_sh, temp_hmx, clear_accum=True)  # temp = P@V (HMX)
-                T.copy(temp_hmx, temp)  # Crouton -> row-major
+                T.gemm(S, V_sh, temp, clear_accum=True)  # temp = P@V (HMX)
                 for i, j in T.Parallel(M, D):  # acc_o += temp
                     acc_o[i, j] = T.cast(T.cast(acc_o[i, j], "float32") + T.cast(temp[i, j], "float32"), "float16")
             for i, j in T.Parallel(M, D):  # O = acc_o / l

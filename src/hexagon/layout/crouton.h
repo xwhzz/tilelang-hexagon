@@ -9,8 +9,10 @@
  * leading dimensions stack whole matrices.
  *
  * The matrix is the buffer's last two dimensions, swapped when `transposed`
- * (a transposed GEMM operand keeps its storage shape). Lowerings recognize the
- * layout by its type and read the tile order from it.
+ * (a transposed GEMM operand keeps its storage shape). The physical shape is
+ * [tiles, 16 row pairs, 64 lanes], tiles of all matrices in order, so that a
+ * loop in physical order nests by tile and by register. Lowerings recognize
+ * the layout by its type and read the tile order from it.
  */
 #ifndef TVM_TL_HEXAGON_LAYOUT_CROUTON_H_
 #define TVM_TL_HEXAGON_LAYOUT_CROUTON_H_

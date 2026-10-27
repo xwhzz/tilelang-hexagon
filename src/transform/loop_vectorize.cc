@@ -256,6 +256,9 @@ public:
   int Plan(const For &node) {
     Target target = Target::Current(false);
     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
+    window_loads_ =
+        target.defined() &&
+        target->GetAttr<Bool>("vector_window_loads").value_or(Bool(false));
 
     vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
         MaxVectorLoadBits(
@@ -337,7 +340,8 @@ public:
             elem_offset += info.indices[i] * strides[i];
           if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
                                    inner_for_->extent, reg_lanes, analyzer_,
-                                   /*allow_broadcast=*/true, inner_for_->min))
+                                   /*allow_broadcast=*/true, inner_for_->min,
+                                   window_loads_ && !info.is_store))
             ok = false;
         }
         vector_size_ = ok ? reg_lanes : 1;
@@ -1114,7 +1118,8 @@ private:
     while (buffer_vec_size > 1 &&
            !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
                                 inner_for_->extent, buffer_vec_size, analyzer_,
-                                /*allow_broadcast=*/true, inner_for_->min)) {
+                                /*allow_broadcast=*/true, inner_for_->min,
+                                window_loads_ && !is_store)) {
       buffer_vec_size /= 2;
     }
     return {buffer_vec_size, /*requires_scalarization=*/false};
@@ -1153,6 +1158,8 @@ private:
 
   int vector_load_bits_max_;
   int initial_vector_size_ = 128;
+  // The target lowers window loads (see DetectVectorWindow).
+  bool window_loads_ = false;
   int loop_extent_vector_size_ = 128;
 
   For inner_for_;
@@ -1332,10 +1339,48 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, const Var &var,
   return analyzer->CanProveEqual(analysis_expr, expr_aligned);
 }
 
+std::optional<VectorWindow>
+DetectVectorWindow(const PrimExpr &expr, const Var &var, const PrimExpr &extent,
+                   int width, arith::Analyzer *analyzer, const PrimExpr &min) {
+  // At width 2 a window is a ramp or a broadcast.
+  if (width < 4 || !analyzer->CanProveEqual(
+                       FloorMod(extent, make_const(extent.dtype(), width)), 0))
+    return std::nullopt;
+  Var ordinal("ordinal", var.dtype());
+  PrimExpr analysis_expr = PrepareExprForAnalyzer(expr, width, analyzer);
+  analysis_expr =
+      Substitute(analysis_expr, {{var, cast(var.dtype(), min) + ordinal}});
+  Var group("group", ordinal.dtype()), lane("lane", ordinal.dtype());
+  PrimExpr w = make_const(ordinal.dtype(), width);
+  analyzer->Bind(lane, Range(make_zero(ordinal.dtype()), w));
+  analyzer->Bind(group, Range(make_zero(ordinal.dtype()),
+                              analyzer->Simplify(
+                                  FloorDiv(cast(ordinal.dtype(), extent), w))));
+  // The group's first lane from the simplified lane expression, so that the
+  // two sides share their form (the simplifier may prove (i * 64 + l) // 2048
+  // == i // 32 for lanes l < 64 but not (i * 64 + g * 32) // 2048 alone).
+  PrimExpr at = analyzer->Simplify(
+      Substitute(analysis_expr, {{ordinal, group * w + lane}}));
+  PrimExpr first =
+      analyzer->Simplify(Substitute(at, {{lane, make_zero(ordinal.dtype())}}));
+  PrimExpr offset = analyzer->Simplify(at - first);
+  if (UsesVar(offset, [&](const VarNode *v) { return v == group.get(); }))
+    return std::nullopt;
+  PrimExpr lane_offset = cast(offset.dtype(), lane);
+  for (int period = 2; period < width; period *= 2) {
+    PrimExpr p = make_const(offset.dtype(), period);
+    if (analyzer->CanProveEqual(offset, FloorMod(lane_offset, p)))
+      return VectorWindow{VectorWindowKind::kReplicate, period};
+    if (analyzer->CanProveEqual(offset, FloorDiv(lane_offset, p)))
+      return VectorWindow{VectorWindowKind::kRepeat, period};
+  }
+  return std::nullopt;
+}
+
 bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
                          const PrimExpr &extent, int target_vectorized_size,
                          arith::Analyzer *analyzer, bool allow_broadcast,
-                         const PrimExpr &min) {
+                         const PrimExpr &min, bool allow_window) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1) {
     return true;
@@ -1351,6 +1396,10 @@ bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
                                       analyzer, min)) {
     return true;
   }
+  // A window starts anywhere: it needs no aligned base.
+  if (allow_window && DetectVectorWindow(expr, var, extent,
+                                         target_vectorized_size, analyzer, min))
+    return true;
 
   Var ordinal("ordinal", var.dtype());
   PrimExpr analysis_expr =

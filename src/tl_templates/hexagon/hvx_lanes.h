@@ -36,14 +36,24 @@ template <bool Aligned> TL_DEVICE void tl_hvx_store(void *p, HVX_Vector v) {
     tl_hvx_storeu(p, v);
 }
 
+// The register-aligned block that holds `p`, and p's offset in it. The block
+// address is `p` minus the offset, not `p` with its low bits masked: LLVM then
+// keeps the pointer's provenance, so it can tell the block from the stores of
+// other buffers, reorder around them and hoist invariant loads.
+TL_DEVICE int tl_hvx_block_offset(const void *p) {
+  return static_cast<int>(reinterpret_cast<uintptr_t>(p) & 127);
+}
+TL_DEVICE const HVX_Vector *tl_hvx_block_of(const void *p) {
+  return reinterpret_cast<const HVX_Vector *>(static_cast<const char *>(p) -
+                                              tl_hvx_block_offset(p));
+}
+
 // The `nbytes` (1..128) bytes at `p` in the low bytes of a register; the other
 // bytes are undefined. Reads only the aligned blocks that hold those bytes, so
 // it never touches memory past them.
 TL_DEVICE HVX_Vector tl_hvx_load_bytes(const void *p, int nbytes) {
-  uintptr_t a = reinterpret_cast<uintptr_t>(p);
-  int off = static_cast<int>(a & 127);
-  const HVX_Vector *block =
-      reinterpret_cast<const HVX_Vector *>(a & ~uintptr_t(127));
+  int off = tl_hvx_block_offset(p);
+  const HVX_Vector *block = tl_hvx_block_of(p);
   HVX_Vector lo = block[0];
   HVX_Vector hi = off + nbytes > 128 ? block[1] : lo;
   return Q6_V_valign_VVR(hi, lo, off);
@@ -52,9 +62,8 @@ TL_DEVICE HVX_Vector tl_hvx_load_bytes(const void *p, int nbytes) {
 // Stores the low `nbytes` (1..128) bytes of `v` at `p`, leaving the bytes
 // around them unchanged.
 TL_DEVICE void tl_hvx_store_bytes(void *p, HVX_Vector v, int nbytes) {
-  uintptr_t a = reinterpret_cast<uintptr_t>(p);
-  int off = static_cast<int>(a & 127);
-  HVX_Vector *block = reinterpret_cast<HVX_Vector *>(a & ~uintptr_t(127));
+  int off = tl_hvx_block_offset(p);
+  HVX_Vector *block = const_cast<HVX_Vector *>(tl_hvx_block_of(p));
   // Byte i of v goes to byte off + i of the two blocks.
   HVX_Vector rotated = Q6_V_vror_VR(v, (128 - off) & 127);
   int end = off + nbytes;
@@ -97,13 +106,13 @@ template <int B> TL_DEVICE HVX_Vector tl_hvx_replicate_control() {
   return *reinterpret_cast<const HVX_Vector *>(control);
 }
 
-// Lane i of `x` (at most one register), in every lane of an N-lane vector: a
-// rotate brings lane i to lane 0, and the delta network copies it over the
-// register.
-template <int N, typename T, int M>
+// Lane group i of `x` (at most one register), the G lanes from lane i * G,
+// repeated over an N-lane vector: a rotate brings the group to lane 0, and the
+// delta network copies it over the register. G = 1 broadcasts lane i.
+template <int N, int G, typename T, int M>
 TL_DEVICE vec_type<T, N> tl_hvx_broadcast_lane(const vec_type<T, M> &x, int i) {
   static_assert(M * sizeof(T) <= 128, "one register at most");
-  constexpr int B = static_cast<int>(sizeof(T));
+  constexpr int B = G * static_cast<int>(sizeof(T));
   HVX_Vector v;
   __builtin_memcpy(&v, &x, sizeof(x));
   v = Q6_V_vdelta_VV(Q6_V_vror_VR(v, i * B), tl_hvx_replicate_control<B>());
@@ -112,5 +121,59 @@ TL_DEVICE vec_type<T, N> tl_hvx_broadcast_lane(const vec_type<T, M> &x, int i) {
   for (int b = 0; b < N * B; b += 128)
     __builtin_memcpy(reinterpret_cast<char *>(&out) + b, &v,
                      N * B - b < 128 ? N * B - b : 128);
+  return out;
+}
+
+// The B bytes at p (a power of two of at most one register) in the low bytes
+// of a register. Aligned: p is a multiple of B, so the window lies in one
+// aligned block, which one load and a rotate bring down without a branch.
+template <int B, bool Aligned>
+TL_DEVICE HVX_Vector tl_hvx_load_window(const void *p) {
+  static_assert((B & (B - 1)) == 0 && B <= 128, "at most one register");
+  if constexpr (Aligned) {
+    return Q6_V_vror_VR(*tl_hvx_block_of(p), tl_hvx_block_offset(p));
+  } else {
+    return tl_hvx_load_bytes(p, B);
+  }
+}
+
+// An N-lane vector (at most two registers) of the P elements at p, repeated:
+// lane l is p[l % P]. The window, P * sizeof(T) bytes, is a power of two of at
+// most one register.
+template <int P, int N, bool Aligned, typename T>
+TL_DEVICE vec_type<T, N> tl_hvx_load_replicate(const T *p) {
+  constexpr int B = P * static_cast<int>(sizeof(T));
+  constexpr int bytes = N * static_cast<int>(sizeof(T));
+  static_assert(bytes <= 256, "two registers at most");
+  // Not inside the intrinsic: it is a macro, and the template arguments'
+  // comma would split its arguments.
+  HVX_Vector window = tl_hvx_load_window<B, Aligned>(p);
+  HVX_Vector v = Q6_V_vdelta_VV(window, tl_hvx_replicate_control<B>());
+  vec_type<T, N> out;
+#pragma clang loop unroll(full)
+  for (int b = 0; b < bytes; b += 128)
+    __builtin_memcpy(reinterpret_cast<char *>(&out) + b, &v,
+                     bytes - b < 128 ? bytes - b : 128);
+  return out;
+}
+
+// An N-lane vector (at most two registers) of the N / K elements at p, each
+// repeated K times: lane l is p[l / K]. Shuffling a register with itself
+// repeats each of its chunks twice, so log2(K) shuffles repeat each element
+// K times.
+template <int K, int N, bool Aligned, typename T>
+TL_DEVICE vec_type<T, N> tl_hvx_load_repeat(const T *p) {
+  constexpr int B = static_cast<int>(sizeof(T));
+  static_assert(K >= 2 && (K & (K - 1)) == 0 && N % K == 0 && N * B <= 256,
+                "K a power of two, two registers at most");
+  HVX_Vector v = tl_hvx_load_window<N / K * B, Aligned>(p);
+  HVX_VectorPair w;
+#pragma clang loop unroll(full)
+  for (int chunk = B; chunk < K * B; chunk *= 2) {
+    w = Q6_W_vshuff_VVR(v, v, -chunk);
+    v = Q6_V_lo_W(w);
+  }
+  vec_type<T, N> out;
+  __builtin_memcpy(&out, &w, N * B);
   return out;
 }

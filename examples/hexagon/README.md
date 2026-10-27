@@ -12,7 +12,8 @@ for how the adaptation works.
 | `benchmark_dma_matmul.py` | DSP-timed serial vs output-block prefetch, entirely DSL DMA/copy/HMX scheduling |
 | `example_dma_hmx_matmul.py` | DSL output-block DMA prefetch + Crouton packing + HMX matmul |
 | `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
-| `example_flash_attention.py` | two HMX gemms + an HVX online softmax, composed on-chip |
+| `example_flash_attention.py` | two HMX gemms + an HVX online softmax on their Crouton tiles, composed on-chip |
+| `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
 | `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) — the basis beyond softmax |
 | `example_qgemv_q8_0.py` | Q8_0 staged layout + `Q8GemvIntrinEmitter` → HVX signed-int8 decode dot |
@@ -44,6 +45,7 @@ cd examples/hexagon
 python example_matmul.py --m 256 --n 256 --k 256 --block 64
 python example_dma_hmx_matmul.py
 python example_flash_attention.py --seq 256
+python example_ffn.py
 python example_worker_pool.py
 python example_rmsnorm.py --m 64 --n 256
 python example_qgemv_q8_0.py --k 2048

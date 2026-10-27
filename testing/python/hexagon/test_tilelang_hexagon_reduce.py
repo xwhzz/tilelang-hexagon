@@ -103,9 +103,7 @@ def test_regions_pass_their_origin_and_strides():
     )
 
 
-def test_other_layouts_reduce_through_them():
-    # A Crouton tile is not row-major; its rows reduce one element at a time
-    # until HVX works on Crouton tiles directly.
+def test_crouton_tiles_reduce_register_by_register():
     from tilelang.hexagon.intrinsics.crouton import make_hmx_output_layout
 
     @T.prim_func
@@ -114,6 +112,23 @@ def test_other_layouts_reduce_through_them():
             src = T.alloc_shared((64, 64), "float16")
             dst = T.alloc_shared((64,), "float32")
             T.annotate_layout({src: make_hmx_output_layout(src)})
+            T.copy(A, src)
+            T.reduce_max(src, dst, dim=1)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "tl_crouton_reduce<TL_REDUCE_MAX, half, true, false>(" in source
+    assert "tl_hvx_reduce_rows" not in source
+
+
+def test_other_layouts_reduce_through_them():
+    # A layout without a lowering of its own reduces one element at a time.
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((64, 64), "float16")
+            dst = T.alloc_shared((64,), "float32")
+            T.annotate_layout({src: T.Layout((64, 64), lambda i, j: [j, i])})
             T.copy(A, src)
             T.reduce_max(src, dst, dim=1)
             T.copy(dst, B)

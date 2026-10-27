@@ -55,6 +55,9 @@ def test_buffers_start_on_whole_hvx_vectors():
             T.copy(B, b)
             for i in T.Parallel(64):
                 c[i] = a[i] * T.cast(b[i % 8], "float16")
+            # a and b stay live next to c.
+            for i in T.Parallel(64):
+                c[i] = c[i] + a[i] * T.cast(b[i % 8], "float16")
             T.copy(c, C)
 
     offsets = _offsets(_source(kernel), "a", "b", "c")

@@ -102,14 +102,31 @@ TVM_DLL const Op &hexagon_fabs();
 // as template arguments.
 TVM_DLL const Op &hexagon_reduce_rows();
 
+// tl_crouton_reduce<kind, acc, rows, column_tiles>(dst, crouton, row_tiles,
+// col_tiles, dst_stride, clear) (crouton.h): reduces a Crouton matrix along
+// its rows (rows "true": one result per row) or its columns into
+// dst[i * dst_stride], accumulating in `acc`. The kind, acc, rows and
+// column_tiles print as template arguments, as in hexagon_reduce_rows.
+TVM_DLL const Op &hexagon_crouton_reduce();
+
 // Lanes of HVX registers (hvx_math.h); the first argument, the vector's lane
 // count, prints as a template argument.
 // tl_hvx_load_lanes<lanes>(ptr, count): the `count` elements at `ptr` in the
 // low lanes of a vector of `lanes`; reads no memory past them.
 TVM_DLL const Op &hexagon_load_lanes();
-// tl_hvx_broadcast_lane<lanes>(vector, i): lane i of a register, in every lane
-// of a vector of `lanes`.
+// tl_hvx_broadcast_lane<lanes, group>(vector, i): lane group i of a register,
+// the `group` lanes from lane i * group, repeated over a vector of `lanes`; the
+// group size prints as a second template argument.
 TVM_DLL const Op &hexagon_broadcast_lane();
+
+// Vector loads of small windows (hvx_lanes.h); the first three arguments, the
+// period, the vector's lane count and whether the window starts on a multiple
+// of its size ("true" or "false"), print as template arguments.
+// tl_hvx_load_replicate<period, lanes, aligned>(ptr): lane l is
+// ptr[l % period].
+TVM_DLL const Op &hexagon_load_replicate();
+// tl_hvx_load_repeat<period, lanes, aligned>(ptr): lane l is ptr[l / period].
+TVM_DLL const Op &hexagon_load_repeat();
 
 // tl_crouton_copy<pack, column_tiles>(crouton, row_tiles, col_tiles, r0, c0,
 // rows, cols, matrix, rs, cs) (crouton.h): copies the region [r0, r0 + rows) x

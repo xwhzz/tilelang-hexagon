@@ -12,13 +12,16 @@
  * per position of the outer axes: it reduces blocks of rows with HVX transpose
  * trees and stores whole blocks of results. Along any other axis the outputs
  * are contiguous instead: a block of them accumulates in registers while the
- * loop walks the reduced axis.
+ * loop walks the reduced axis. A whole Crouton matrix reduces along its rows
+ * or its columns in one tl_crouton_reduce call (crouton.h), register by
+ * register.
  */
 
 #include "op/reduce.h"
 
 #include "backend/common/op/reduce.h"
 #include "backend/common/target_utils.h"
+#include "hexagon/layout/crouton.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/op/utils.h"
 #include "layout/layout.h"
@@ -30,6 +33,7 @@
 #include <tvm/tirx/stmt.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -103,6 +107,8 @@ public:
   Stmt Lower() {
     for (int d = 0; d < ndim_; ++d)
       vars_.emplace_back("i" + std::to_string(d), DataType::Int(32));
+    if (auto crouton = CroutonReduce())
+      return *crouton;
     if (Innermost())
       return RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_)
                  ? RowReduce()
@@ -151,6 +157,41 @@ private:
     for (int d = rows_axis - 1; d >= 0; --d)
       body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
     return body;
+  }
+
+  // A whole Crouton matrix reduced along its rows or its columns into a
+  // row-major vector: one tl_crouton_reduce call.
+  std::optional<Stmt> CroutonReduce() const {
+    Optional<Layout> layout = layout_map_.Get(op_.src);
+    const auto *crouton =
+        layout ? layout.value().as<CroutonLayoutNode>() : nullptr;
+    if (!crouton || ndim_ != 2 || !RowMajor(op_.dst, layout_map_))
+      return std::nullopt;
+    arith::Analyzer analyzer;
+    for (int d = 0; d < ndim_; ++d) {
+      const Range &r = op_.srcRegion_->region[d];
+      if (!is_zero(r->min) ||
+          !analyzer.CanProveEqual(r->extent, op_.src->shape[d]))
+        return std::nullopt;
+    }
+    // Reducing the matrix's columns leaves one result per row.
+    bool rows = op_.dim == crouton->ColAxis();
+    int keep = 1 - op_.dim;
+    bool keepdim = static_cast<int>(op_.dstRegion_->region.size()) == ndim_;
+    int dst_axis = keepdim || keep < op_.dim ? keep : keep - 1;
+    PrimExpr zero = make_zero(DataType::Int(32));
+    PrimExpr dst = Call(DataType::Handle(), builtin::address_of(),
+                        {BufferLoad(op_.dst, Output({{keep, zero}}))});
+    PrimExpr tiles = Call(DataType::Handle(), builtin::address_of(),
+                          {BufferLoad(op_.src, {zero, zero})});
+    auto i32 = [](int64_t v) { return make_const(DataType::Int(32), v); };
+    return Evaluate(Call(
+        DataType::Void(), hexagon_crouton_reduce(),
+        {StringImm(KindName()), TypeAnnotation(acc_t_),
+         StringImm(rows ? "true" : "false"),
+         StringImm(crouton->column_tiles ? "true" : "false"), dst, tiles,
+         i32(crouton->RowTiles()), i32(crouton->ColTiles()),
+         cast(DataType::Int(32), Stride(op_.dst, dst_axis)), Bool(op_.clear)}));
   }
 
   // Whether every row from `first` on starts on a register boundary. The

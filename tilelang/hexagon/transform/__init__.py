@@ -65,6 +65,18 @@ def BroadcastFromRegisters():
     return _ffi_api.BroadcastFromRegisters()  # type: ignore
 
 
+def LowerWindowLoads():
+    """Lower vector loads of small windows to a load and a lane shuffle.
+
+    In the physical order of a Crouton tile, a vector of the rows' values reads
+    ``[r0, r1, r0, r1, ...]`` and one of the columns' values ``[c0, c0, c1, c1,
+    ...]``. The vectorizer leaves these as per-lane gathers; this pass loads
+    the window once and replicates it, or repeats its elements, in registers.
+    Runs after ``VectorizeLoop``.
+    """
+    return _ffi_api.LowerWindowLoads()  # type: ignore
+
+
 def MarkExclusiveBuffers():
     """Give the VTCM buffers that share no memory pointers of their own.
 

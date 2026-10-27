@@ -20,12 +20,16 @@ namespace refl = tvm::ffi::reflection;
 // HVX instruction works on whole registers. The vectorizer reads both limits
 // instead of its GPU-sized default. LowerTileOp places fragments in the
 // storage scope `fragment_scope` names; the target normalizer sets it, since a
-// string default registered here does not survive static initialization.
+// string default registered here does not survive static initialization. With
+// `vector_window_loads` the vectorizer accepts loads of small windows (a
+// Crouton tile's row and column operands), which LowerWindowLoads lowers to a
+// window load and a lane shuffle.
 [[maybe_unused]] TargetKindRegEntry &hexagon_kind =
     TargetKindRegEntry::RegisterOrGet("hexagon")
         .add_attr_option<int64_t>("max_vector_bits", refl::DefaultValue(1024))
         .add_attr_option<int64_t>("min_vector_bits", refl::DefaultValue(1024))
-        .add_attr_option<ffi::String>("fragment_scope");
+        .add_attr_option<ffi::String>("fragment_scope")
+        .add_attr_option<bool>("vector_window_loads", refl::DefaultValue(true));
 
 } // namespace
 } // namespace tvm

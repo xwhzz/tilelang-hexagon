@@ -246,13 +246,13 @@ def _make_fused_copy_probe():
 
 def test_hmx_crouton_layout_contract():
     atom = make_hmx_crouton_layout()
-    assert _output_shape(atom) == (1024,)
+    assert _output_shape(atom) == (1, 16, 64)
     assert _offset(atom, 0, 0) == 0
     assert _offset(atom, 1, 0) == 1
     assert _offset(atom, 0, 1) == 2
 
     activation = make_hmx_activation_layout((64, 64))
-    assert _output_shape(activation) == (4096,)
+    assert _output_shape(activation) == (4, 16, 64)
     assert _offset(activation, 0, 0) == 0
     assert _offset(activation, 1, 0) == 1
     assert _offset(activation, 0, 1) == 2
@@ -260,7 +260,7 @@ def test_hmx_crouton_layout_contract():
     assert _offset(activation, 32, 0) == 2048
 
     weight = make_hmx_weight_layout((64, 64))
-    assert _output_shape(weight) == (4096,)
+    assert _output_shape(weight) == (4, 16, 64)
     assert _offset(weight, 0, 0) == 0
     assert _offset(weight, 1, 0) == 1
     assert _offset(weight, 0, 1) == 2
@@ -272,12 +272,12 @@ def test_hmx_crouton_layout_contract():
             assert _offset(weight, 2 * kpair + 1, n) == kpair * 64 + 2 * n + 1
 
     output = make_hmx_output_layout((64, 64))
-    assert _output_shape(output) == (4096,)
+    assert _output_shape(output) == (4, 16, 64)
     assert _offset(output, 0, 32) == 1024
     assert _offset(output, 32, 0) == 2048
 
     staged = make_hmx_weight_layout((2, 32, 32))
-    assert _output_shape(staged) == (2048,)
+    assert _output_shape(staged) == (2, 16, 64)
     assert _offset(staged, 1, 0, 0) == 1024
 
     assert len({_offset(weight, k, n) for k in range(64) for n in range(64)}) == 4096
@@ -307,9 +307,9 @@ def test_hmx_emitter_native_interface_contract():
     assert emitter.num_m_tiles == 2
     assert emitter.num_n_tiles == 3
     assert emitter.num_k_atoms == 4
-    assert _output_shape(emitter.activation_layout((64, 128))) == (8192,)
-    assert _output_shape(emitter.weight_layout((128, 96))) == (12288,)
-    assert _output_shape(emitter.output_layout((64, 96))) == (6144,)
+    assert _output_shape(emitter.activation_layout((64, 128))) == (8, 16, 64)
+    assert _output_shape(emitter.weight_layout((128, 96))) == (12, 16, 64)
+    assert _output_shape(emitter.output_layout((64, 96))) == (6, 16, 64)
     assert not hasattr(emitter, "make_mma_load_layout")
     assert not hasattr(emitter, "make_mma_store_layout")
     assert not hasattr(emitter, "mma_num_inst_m")
@@ -432,18 +432,19 @@ def test_t_gemm_unsupported_output_dtype_stays_on_scalar_fallback():
     assert "tl_hexagon_hmx_gemm" not in source
 
 
-def test_flash_attention_keeps_row_reduce_outside_crouton_buffers():
+def test_flash_attention_softmax_works_on_crouton_tiles():
     source = _lower_source(make_flash(64, 64, 64, 64))
     lines = source.splitlines()
-    # Each row reduction reads the row-major staging tile S.
+    # The row reductions read S's Crouton tiles; nothing converts S or temp.
     for kind, acc in (("MAX", "half"), ("SUM", "float")):
-        assert f"tl_hvx_reduce_rows<TL_REDUCE_{kind}, {acc}, true>(" in source
-        line = next(line for line in lines if f"TL_REDUCE_{kind}" in line)
+        line = next(line for line in lines if f"tl_crouton_reduce<TL_REDUCE_{kind}, {acc}, true, false>(" in line)
         assert "(&(((half*)S)[0]))" in line, line
+    assert "tl_hvx_reduce_rows" not in source
 
     assert source.count("tl_hexagon_hmx_mma_atom") == 2
-    assert source.count("tl_crouton_copy<true,") == 4
-    assert source.count("tl_crouton_copy<false,") == 2
+    # Q, K and V pack into Crouton tiles; only the output unpacks.
+    assert source.count("tl_crouton_copy<true,") == 3
+    assert source.count("tl_crouton_copy<false,") == 1
     assert "tl_hexagon_hmx_gemm" not in source
 
 

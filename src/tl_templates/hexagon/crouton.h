@@ -1,5 +1,6 @@
 #pragma once
-// Copies between Crouton matrices in VTCM and strided matrices (T.copy).
+// Copies between Crouton matrices in VTCM and strided matrices (T.copy), and
+// reductions of Crouton matrices along rows or columns (T.reduce_*).
 //
 // A Crouton tile is 32x32 fp16 stored as interleaved row pairs: element (r, c)
 // of a tile sits at (r / 2) * 64 + c * 2 + r % 2, so one HVX register holds a
@@ -12,6 +13,7 @@
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h>
 #include <tl_templates/hexagon/hvx_lanes.h>
+#include <tl_templates/hexagon/hvx_reduce.h>
 
 #include <type_traits>
 
@@ -299,4 +301,130 @@ TL_DEVICE void tl_crouton_copy(half *crouton, int row_tiles, int col_tiles,
   }
   tl_crouton_copy_elements<Pack, ColumnTiles>(crouton, row_tiles, col_tiles, r0,
                                               c0, 0, rows, cols, m, rs, cs);
+}
+
+// ---------------------------------------------------------------------------
+// Reductions (hvx_reduce.h's kinds and transpose tree).
+// ---------------------------------------------------------------------------
+
+// Row pair q of tile (r, c), one register.
+template <bool ColumnTiles>
+TL_DEVICE HVX_Vector tl_crouton_pair(const half *crouton, int row_tiles,
+                                     int col_tiles, int r, int c, int q) {
+  int tile = ColumnTiles ? c * row_tiles + r : r * col_tiles + c;
+  return *reinterpret_cast<const HVX_Vector *>(crouton + tile * 1024 + q * 64);
+}
+
+// The two rows of a row pair register as registers of A: fp32 widening splits
+// the even lanes (row 2q) from the odd ones (row 2q + 1).
+template <int K, typename A>
+TL_DEVICE void tl_crouton_rows_of(HVX_Vector pair, tl_hvx_reg<A> *even,
+                                  tl_hvx_reg<A> *odd) {
+  static_assert(std::is_same_v<A, float>, "fp32 rows");
+  HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pair, Q6_Vh_vsplat_R(0x3c00));
+  *even = tl_reduce_operand<K, A>(
+      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w))));
+  *odd = tl_reduce_operand<K, A>(
+      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w))));
+}
+
+// Rows [2 q0, 2 q0 + 2N) of row tile r, every column tile combined, as one
+// register of A in the transpose tree's form: rows in runs of lanes, in order.
+template <int K, typename A, bool ColumnTiles, int N>
+TL_DEVICE tl_hvx_reg<A> tl_crouton_row_tree(const half *crouton, int row_tiles,
+                                            int col_tiles, int r, int q0) {
+  if constexpr (N == 1) {
+    if constexpr (std::is_same_v<A, half>) {
+      // Lane 2c + e holds row 2 q0 + e, column c; dealing the halfwords puts
+      // the two rows in runs of 32 lanes.
+      tl_hvx_reg<A> acc = tl_reduce_identity<K, A>();
+      for (int c = 0; c < col_tiles; ++c)
+        acc = tl_reduce_combine<K>(
+            acc, tl_reduce_operand<K, A>(
+                     tl_hvx_bitcast<tl_hvx_reg<A>>(tl_crouton_pair<ColumnTiles>(
+                         crouton, row_tiles, col_tiles, r, c, q0))));
+      return tl_hvx_bitcast<tl_hvx_reg<A>>(
+          Q6_Vh_vdeal_Vh(tl_hvx_bitcast<HVX_Vector>(acc)));
+    } else {
+      tl_hvx_reg<A> even = tl_reduce_identity<K, A>(), odd = even;
+      for (int c = 0; c < col_tiles; ++c) {
+        tl_hvx_reg<A> e, o;
+        tl_crouton_rows_of<K, A>(tl_crouton_pair<ColumnTiles>(
+                                     crouton, row_tiles, col_tiles, r, c, q0),
+                                 &e, &o);
+        even = tl_reduce_combine<K>(even, e);
+        odd = tl_reduce_combine<K>(odd, o);
+      }
+      return tl_reduce_merge<K, A>(even, odd);
+    }
+  } else {
+    return tl_reduce_merge<K, A>(
+        tl_crouton_row_tree<K, A, ColumnTiles, N / 2>(crouton, row_tiles,
+                                                      col_tiles, r, q0),
+        tl_crouton_row_tree<K, A, ColumnTiles, N / 2>(
+            crouton, row_tiles, col_tiles, r, q0 + N / 2));
+  }
+}
+
+// The columns of column tile c, every row combined: lanes [0, 32) of a
+// register of A.
+template <int K, typename A, bool ColumnTiles>
+TL_DEVICE tl_hvx_reg<A> tl_crouton_columns(const half *crouton, int row_tiles,
+                                           int col_tiles, int c) {
+  // Two accumulators: even and odd rows, or two chains of row pairs.
+  tl_hvx_reg<A> a0 = tl_reduce_identity<K, A>(), a1 = a0;
+  for (int r = 0; r < row_tiles; ++r) {
+#pragma clang loop unroll_count(2)
+    for (int q = 0; q < 16; ++q) {
+      HVX_Vector pair =
+          tl_crouton_pair<ColumnTiles>(crouton, row_tiles, col_tiles, r, c, q);
+      if constexpr (std::is_same_v<A, half>) {
+        tl_hvx_reg<A> x =
+            tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(pair));
+        if (q & 1)
+          a1 = tl_reduce_combine<K>(a1, x);
+        else
+          a0 = tl_reduce_combine<K>(a0, x);
+      } else {
+        tl_hvx_reg<A> e, o;
+        tl_crouton_rows_of<K, A>(pair, &e, &o);
+        a0 = tl_reduce_combine<K>(a0, e);
+        a1 = tl_reduce_combine<K>(a1, o);
+      }
+    }
+  }
+  tl_hvx_reg<A> v = tl_reduce_combine<K>(a0, a1);
+  if constexpr (std::is_same_v<A, half>) {
+    // Lane 2c + e: the two rows of each column, dealt apart and combined.
+    HVX_Vector d = Q6_Vh_vdeal_Vh(tl_hvx_bitcast<HVX_Vector>(v));
+    v = tl_reduce_combine<K>(
+        tl_hvx_bitcast<tl_hvx_reg<A>>(d),
+        tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_vror_VR(d, 64)));
+  }
+  return v;
+}
+
+// Reduces a Crouton matrix with row_tiles x col_tiles tiles along its rows
+// (Rows: one result per row, the columns combined) or its columns, into
+// dst[i * dst_stride], accumulating in A. Combines with dst unless `clear`.
+template <int K, typename A, bool Rows, bool ColumnTiles, typename D>
+TL_DEVICE void tl_crouton_reduce(D *dst, const half *crouton, int row_tiles,
+                                 int col_tiles, int dst_stride, bool clear) {
+  if constexpr (Rows) {
+    for (int r = 0; r < row_tiles; ++r) {
+      tl_hvx_reg<A> v = tl_crouton_row_tree<K, A, ColumnTiles, 16>(
+          crouton, row_tiles, col_tiles, r, 0);
+      // fp16 rows end in runs of two lanes.
+      if constexpr (std::is_same_v<A, half>)
+        v = tl_reduce_merge<K, A>(v, v);
+      tl_reduce_store<K, A>(dst + r * 32 * dst_stride, dst_stride, v, 32,
+                            clear);
+    }
+  } else {
+    for (int c = 0; c < col_tiles; ++c)
+      tl_reduce_store<K, A>(dst + c * 32 * dst_stride, dst_stride,
+                            tl_crouton_columns<K, A, ColumnTiles>(
+                                crouton, row_tiles, col_tiles, c),
+                            32, clear);
+  }
 }

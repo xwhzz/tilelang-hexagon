@@ -64,9 +64,17 @@ template <typename T>
 constexpr bool tl_reduce_is_float =
     std::is_floating_point_v<T> || std::is_same_v<T, half>;
 
-// The combine of two registers, or of two scalars.
+// The combine of two registers, or of two scalars. An fp32 register sum is
+// spelled out as sf + sf through qf32 and back, as hvx_math.h's adds are:
+// hexagon-clang 19 miscompiled long chains of generic fp32 vector adds (a
+// Crouton row lost one tile's sum), and of qf32 values kept across permutes
+// and spills.
 template <int K, typename V> TL_DEVICE V tl_reduce_combine(V a, V b) {
-  if constexpr (K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM)
+  if constexpr ((K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM) &&
+                std::is_same_v<V, tl_hvx_reg<float>>)
+    return tl_hvx_bitcast<V>(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(
+        tl_hvx_bitcast<HVX_Vector>(a), tl_hvx_bitcast<HVX_Vector>(b))));
+  else if constexpr (K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM)
     return a + b;
   else if constexpr (K == TL_REDUCE_MAX || K == TL_REDUCE_ABSMAX)
     return __builtin_elementwise_max(a, b);
@@ -201,6 +209,66 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_load_tail(const S *p, int rem) {
   return tl_reduce_step_value<K, A, S>(x);
 }
 
+// An fp32 sum of a long row keeps its accumulators in qf32, one qf32 + sf add
+// per step, and converts once: the spelled-out sf + sf of tl_reduce_combine
+// is two instructions. The qf32 values live in the row's loop only, across
+// no permutes or spills.
+template <int K, typename A, typename S>
+constexpr bool tl_reduce_qf32_row =
+    std::is_same_v<A, float> &&
+    (std::is_same_v<S, float> || std::is_same_v<S, half>) &&
+    (K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM);
+
+template <int K, typename A, typename S, bool Aligned>
+TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
+  static_assert(std::is_same_v<S, float> || std::is_same_v<S, half>,
+                "fp32 sums of fp16 or fp32 rows");
+  constexpr int E = tl_reduce_step<A, S>;
+  // Out of the intrinsic macros: a template argument's comma splits theirs.
+  constexpr int sign_off = std::is_same_v<S, half> ? 0x7fff7fff : 0x7fffffff;
+  auto load = [&](int s) {
+    HVX_Vector x = tl_hvx_load<Aligned>(row + s * E);
+    if constexpr (tl_reduce_is_abs<K>)
+      x = Q6_V_vand_VV(x, Q6_V_vsplat_R(sign_off));
+    return x;
+  };
+  // An accumulator's first step as qf32, then each next step added to it: an
+  // fp32 register, or the two fp32 halves of a widened fp16 register.
+  auto first = [&](int s) {
+    HVX_Vector x = load(s);
+    if constexpr (std::is_same_v<S, float>) {
+      return Q6_Vqf32_vadd_VsfVsf(x, Q6_V_vzero());
+    } else {
+      HVX_VectorPair w = Q6_Wsf_vcvt_Vhf(x);
+      return Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w));
+    }
+  };
+  auto next = [&](HVX_Vector acc, int s) {
+    HVX_Vector x = load(s);
+    if constexpr (std::is_same_v<S, float>) {
+      return Q6_Vqf32_vadd_Vqf32Vsf(acc, x);
+    } else {
+      // The halves first, off the accumulator's chain of adds.
+      HVX_VectorPair w = Q6_Wsf_vcvt_Vhf(x);
+      return Q6_Vqf32_vadd_Vqf32Vqf32(
+          acc, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w)));
+    }
+  };
+  HVX_Vector a0 = first(0), a1 = first(1), a2 = first(2), a3 = first(3);
+  int s = 4;
+  for (; s + 4 <= steps; s += 4) {
+    a0 = next(a0, s);
+    a1 = next(a1, s + 1);
+    a2 = next(a2, s + 2);
+    a3 = next(a3, s + 3);
+  }
+  for (; s < steps; ++s)
+    a0 = next(a0, s);
+  return tl_hvx_bitcast<tl_hvx_reg<A>>(
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(
+          Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1), Q6_Vqf32_vadd_Vqf32Vqf32(a2, a3))));
+}
+
 // Reduces the `cols` elements at `row` into one register of A. Long rows keep
 // four accumulators, so four combine chains overlap.
 template <int K, typename A, typename S, bool Aligned>
@@ -210,26 +278,30 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_row(const S *row, int cols) {
   int rem = cols - steps * E;
   tl_hvx_reg<A> acc;
   if (steps >= 4) {
-    tl_hvx_reg<A> a0 = tl_reduce_load_step<K, A, S, Aligned>(row);
-    tl_hvx_reg<A> a1 = tl_reduce_load_step<K, A, S, Aligned>(row + E);
-    tl_hvx_reg<A> a2 = tl_reduce_load_step<K, A, S, Aligned>(row + 2 * E);
-    tl_hvx_reg<A> a3 = tl_reduce_load_step<K, A, S, Aligned>(row + 3 * E);
-    int s = 4;
-    for (; s + 4 <= steps; s += 4) {
-      a0 = tl_reduce_combine<K>(
-          a0, tl_reduce_load_step<K, A, S, Aligned>(row + s * E));
-      a1 = tl_reduce_combine<K>(
-          a1, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 1) * E));
-      a2 = tl_reduce_combine<K>(
-          a2, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 2) * E));
-      a3 = tl_reduce_combine<K>(
-          a3, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 3) * E));
+    if constexpr (tl_reduce_qf32_row<K, A, S>) {
+      acc = tl_reduce_qf32_sum<K, A, S, Aligned>(row, steps);
+    } else {
+      tl_hvx_reg<A> a0 = tl_reduce_load_step<K, A, S, Aligned>(row);
+      tl_hvx_reg<A> a1 = tl_reduce_load_step<K, A, S, Aligned>(row + E);
+      tl_hvx_reg<A> a2 = tl_reduce_load_step<K, A, S, Aligned>(row + 2 * E);
+      tl_hvx_reg<A> a3 = tl_reduce_load_step<K, A, S, Aligned>(row + 3 * E);
+      int s = 4;
+      for (; s + 4 <= steps; s += 4) {
+        a0 = tl_reduce_combine<K>(
+            a0, tl_reduce_load_step<K, A, S, Aligned>(row + s * E));
+        a1 = tl_reduce_combine<K>(
+            a1, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 1) * E));
+        a2 = tl_reduce_combine<K>(
+            a2, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 2) * E));
+        a3 = tl_reduce_combine<K>(
+            a3, tl_reduce_load_step<K, A, S, Aligned>(row + (s + 3) * E));
+      }
+      for (; s < steps; ++s)
+        a0 = tl_reduce_combine<K>(
+            a0, tl_reduce_load_step<K, A, S, Aligned>(row + s * E));
+      acc = tl_reduce_combine<K>(tl_reduce_combine<K>(a0, a1),
+                                 tl_reduce_combine<K>(a2, a3));
     }
-    for (; s < steps; ++s)
-      a0 = tl_reduce_combine<K>(
-          a0, tl_reduce_load_step<K, A, S, Aligned>(row + s * E));
-    acc = tl_reduce_combine<K>(tl_reduce_combine<K>(a0, a1),
-                               tl_reduce_combine<K>(a2, a3));
   } else if (steps > 0) {
     acc = tl_reduce_load_step<K, A, S, Aligned>(row);
     for (int s = 1; s < steps; ++s)

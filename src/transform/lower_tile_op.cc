@@ -9,12 +9,14 @@
 #include <tvm/relax/analysis.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/utils.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../layout/layout.h"
@@ -39,6 +41,59 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+/*!
+ * \brief The loop layout that iterates a parallel loop nest in the physical
+ * order of a buffer it writes.
+ *
+ * When a single thread runs every iteration, any order is legal. A nest that
+ * writes every element of a buffer with a (non-fragment) layout once, indexed
+ * by its loop variables only, then walks that buffer contiguously, and its
+ * other operands follow the layout's index pattern. Example: the Crouton tiles
+ * of HMX operands on Hexagon, whose maps then vectorize.
+ */
+static Optional<Fragment> PhysicalOrderLoopLayout(const For &root,
+                                                  const LayoutMap &layout_map,
+                                                  const Range &thread_bounds,
+                                                  arith::Analyzer *analyzer) {
+  Array<IterVar> vars;
+  std::unordered_set<const VarNode *> var_set;
+  PrimExpr iterations = make_const(DataType::Int(32), 1);
+  Stmt body = root;
+  while (const auto *loop = body.as<ForNode>()) {
+    if (loop->kind != ForKind::kParallel || !is_zero(loop->min))
+      break;
+    vars.push_back(IterVar(Range::FromMinExtent(loop->min, loop->extent),
+                           loop->loop_var, IterVarType::kDataPar));
+    var_set.insert(loop->loop_var.get());
+    iterations = iterations * loop->extent;
+    body = loop->body;
+  }
+  Optional<Fragment> result;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    const auto *store = node.as<BufferStoreNode>();
+    if (result || store == nullptr || !layout_map.count(store->buffer))
+      return;
+    Layout layout = layout_map[store->buffer];
+    if (layout.as<Fragment>())
+      return;
+    PrimExpr elements = make_const(DataType::Int(32), 1);
+    for (const PrimExpr &extent : layout->InputShape())
+      elements = elements * extent;
+    if (!analyzer->CanProveEqual(elements, iterations))
+      return;
+    for (const PrimExpr &index : store->indices) {
+      if (UsesVar(index, [&](const VarNode *v) { return !var_set.count(v); }))
+        return;
+    }
+    Fragment candidate = Fragment(vars, layout->Forward(store->indices),
+                                  make_zero(DataType::Int(32)), IterVar())
+                             ->BindThreadRange(thread_bounds);
+    if (candidate->DetectInjective(false)->errors.empty())
+      result = candidate;
+  });
+  return result;
+}
 
 // The storage scope fragments lower to: the target's `fragment_scope`, or
 // registers ("local").
@@ -1257,6 +1312,13 @@ private:
 
     auto loop_layout = Downcast<Fragment>(
         op->annotations.Get(attr::kParallelLoopLayout).value());
+    Range thread_bounds = CurrentThreadBounds();
+    if (is_one(thread_bounds->extent)) {
+      if (auto physical = PhysicalOrderLoopLayout(GetRef<For>(op), layout_map_,
+                                                  thread_bounds, analyzer_)) {
+        loop_layout = physical.value();
+      }
+    }
     // Get predicate if it exists
     Optional<PrimExpr> predicate;
     if (op->annotations.count(attr::kParallelLoopPredicate)) {

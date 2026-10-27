@@ -139,7 +139,7 @@ def test_row_scalars_come_from_one_register_per_strip():
     assert "for (int32_t i_strip = 0; i_strip < 2; ++i_strip) {" in source
     assert "float32 r_lanes = tl_hvx_load_lanes<32>((&(((float*)r)[(i_strip * 32)])), 32);" in source
     assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
-    assert "tl_hvx_broadcast_lane<32>(r_lanes, i_lane)" in source
+    assert "tl_hvx_broadcast_lane<32, 1>(r_lanes, i_lane)" in source
     # The row loop reads no scalar of r.
     assert "((float*)r)[" not in source.split("i_strip")[1].split("tl_hvx_load_lanes")[0]
 
@@ -163,7 +163,7 @@ def test_rows_of_several_registers_split_into_rows_and_columns():
     assert "for (int32_t i_strip = 0; i_strip < 2; ++i_strip) {" in source
     assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
     assert "for (int32_t i_col = 0; i_col < 4; ++i_col) {" in source
-    assert "tl_hvx_broadcast_lane<32>(r_lanes, i_lane)" in source
+    assert "tl_hvx_broadcast_lane<32, 1>(r_lanes, i_lane)" in source
 
 
 def test_scalars_that_do_not_step_with_the_row_stay_loads():

@@ -133,6 +133,27 @@ converts fp32 on the way. Row pairs of a row-contiguous matrix move as HVX regis
 column-contiguous fp16 matrix (a transposed weight in row-major storage) goes through a
 32x32 word transpose in registers; other strides go element by element.
 
+HVX code works on Crouton buffers directly, so chained gemms and the maps between them
+(the flash attention softmax on `S`, an FFN gate `silu(h1) * h3`) convert no layouts.
+A Crouton layout's physical shape is `[tiles, 16 row pairs, 64 lanes]`, and a
+single-thread `T.Parallel` that writes every element of a buffer with a layout iterates
+in that buffer's physical order (`LowerTileOp`): a loop over tiles and their row pairs,
+vectorized over the 64 lanes of one register, so Crouton operands of the same layout are
+whole-register loads and stores. A row operand `r[i]` then reads a window of two
+elements per register, `[r0, r1, r0, r1, ...]`, and a column operand `c[j]` 32 elements
+each repeated twice; the vectorizer accepts such window loads on Hexagon
+(`vector_window_loads`), `LowerWindowLoads` lowers them to `tl_hvx_load_replicate` and
+`tl_hvx_load_repeat`, and `BroadcastFromRegisters` loads a tile's 32 row values once and
+broadcasts each row pair's group of two lanes. `T.reduce_*` of a whole Crouton matrix
+along its rows or columns is one `tl_crouton_reduce` call (`crouton.h`), with the
+transpose trees of the row-major reductions: fp32 widening splits a row pair register
+into its two rows, and an fp16 max or min deals the pair's halfwords apart.
+
+fp32 register sums in these trees are spelled out as `sf + sf` through qf32 and back
+(`tl_reduce_combine`), as the `hvx_math.h` adds are. hexagon-clang 19 miscompiled long
+chains of generic fp32 vector adds, and of qf32 values kept across permutes and spills,
+in the Crouton row sums: a row lost one tile's sum, or turned to inf.
+
 DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
 permutation. `dma.h` exposes raw instructions, descriptor builders, synchronous
 copy helpers, and a caller-owned linked queue through explicit extern calls;

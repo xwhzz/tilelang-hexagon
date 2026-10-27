@@ -20,10 +20,11 @@ int64_t StaticExtent(const PrimExpr &extent, const char *what) {
   return n->value;
 }
 
-// The flat element offset of every buffer index: leading dimensions pick a
-// matrix, the matrix picks a tile, the tile a row pair and a lane.
-PrimExpr CroutonOffset(const Array<PrimExpr> &shape, bool column_tiles,
-                       bool transposed) {
+// The physical position of every buffer index: [tile, row pair, lane], one
+// HVX register per row pair. Leading dimensions pick a matrix, whose tiles
+// follow it.
+Array<PrimExpr> CroutonPosition(const Array<PrimExpr> &shape, bool column_tiles,
+                                bool transposed) {
   size_t n = shape.size();
   ICHECK_GE(n, 2) << "a Crouton layout needs at least two dimensions";
   int row_axis = static_cast<int>(transposed ? n - 1 : n - 2);
@@ -44,17 +45,16 @@ PrimExpr CroutonOffset(const Array<PrimExpr> &shape, bool column_tiles,
                             floordiv(r, t)
                       : floordiv(r, t) * static_cast<int>(cols / kCroutonTile) +
                             floordiv(c, t);
-  PrimExpr pos =
-      floordiv(floormod(r, t), 2) * 64 + floormod(c, t) * 2 + floormod(r, 2);
-  return batch * static_cast<int>(rows * cols) +
-         tile * static_cast<int>(kCroutonTileElems) + pos;
+  int64_t tiles = (rows / kCroutonTile) * (cols / kCroutonTile);
+  return {batch * static_cast<int>(tiles) + tile, floordiv(floormod(r, t), 2),
+          floormod(c, t) * 2 + floormod(r, 2)};
 }
 
 } // namespace
 
 CroutonLayoutNode::CroutonLayoutNode(Array<PrimExpr> shape, bool column_tiles,
                                      bool transposed)
-    : LayoutNode(shape, {CroutonOffset(shape, column_tiles, transposed)}),
+    : LayoutNode(shape, CroutonPosition(shape, column_tiles, transposed)),
       column_tiles(column_tiles), transposed(transposed) {}
 
 int CroutonLayoutNode::RowAxis() const {

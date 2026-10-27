@@ -1,6 +1,7 @@
 """Crouton layouts and T.copy between Crouton and row-major buffers on Hexagon."""
 
 import os
+import re
 
 import pytest
 
@@ -164,5 +165,131 @@ def test_hmx_gemm_operands_match_torch(transpose_a, transpose_b, a_dtype):
         b_in = b.T.contiguous() if transpose_b else b
         c = kernel(a_in, b_in)
         torch.testing.assert_close(c, (a.float() @ b.float()).half().float(), rtol=2e-3, atol=2e-3)
+    finally:
+        kernel.adapter.close()
+
+
+# Maps over Crouton buffers run in the tiles' physical order, a register (a
+# row pair of a tile) at a time. Row operands then read [r0, r1, r0, r1, ...]
+# and column operands [c0, c0, c1, c1, ...].
+
+
+def _map(kind, dtype):
+    """Y = X * u[i] + v[j] on Crouton tiles of layout `kind`, computed in `dtype`."""
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor((R, C), "float16"),
+        U: T.Tensor((R,), dtype),
+        V: T.Tensor((C,), dtype),
+        Y: T.Tensor((R, C), "float16"),
+    ):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((R, C), "float16")
+            u = T.alloc_shared((R,), dtype)
+            v = T.alloc_shared((C,), dtype)
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.copy(X, tiles)
+            T.copy(U, u)
+            T.copy(V, v)
+            for i, j in T.Parallel(R, C):
+                tiles[i, j] = T.cast(T.cast(tiles[i, j], dtype) * u[i] + v[j], "float16")
+            T.copy(tiles, Y)
+
+    return kernel
+
+
+# A scalar store to the tiles, which a vectorized map has none of.
+SCALAR_TILE_STORE = re.compile(r"\(\(half\*\)tiles\)\[[^\]]*\] =")
+
+
+def test_maps_over_crouton_tiles_use_whole_registers():
+    source = _source(_map("activation", "float16"))
+    # One register per row pair, in loops over tiles and their row pairs.
+    assert re.search(r"\*\(half64\*\)\(\(\(half\*\)tiles\) \+ \(\(i\w* \* 1024\) \+ \(j\w* \* 64\)\)\) = ", source)
+    # The rows' values: a tile's 32 rows in one register, two of them per row
+    # pair. The columns' values: 32 elements, each repeated twice.
+    assert "half64 u_lanes = tl_hvx_load_lanes<64>((&(((half*)u)[" in source
+    assert "tl_hvx_broadcast_lane<64, 2>(u_lanes, j_lane)" in source
+    assert "tl_hvx_load_repeat<2, 64, true>((&(((half*)v)[" in source
+    assert not SCALAR_TILE_STORE.search(source)
+
+
+def test_fp32_maps_over_crouton_tiles_widen_the_windows():
+    source = _source(_map("weight", "float32"))
+    assert "float32 u_lanes = tl_hvx_load_lanes<32>((&(((float*)u)[" in source
+    assert "tl_hvx_broadcast_lane<32, 2>(u_lanes, j_lane)" in source
+    assert "tl_hvx_load_repeat<2, 32, true>((&(((float*)v)[" in source
+    assert not SCALAR_TILE_STORE.search(source)
+
+
+@DEVICE
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_maps_over_crouton_tiles_match_torch(kind, dtype):
+    import torch
+
+    kernel = tilelang.compile(_map(kind, dtype), out_idx=[3], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(29)
+        x = torch.randn(R, C, generator=gen).half()
+        u = torch.randn(R, generator=gen).to(getattr(torch, dtype))
+        v = torch.randn(C, generator=gen).to(getattr(torch, dtype))
+        y = kernel(x, u, v)
+        expected = (x.to(u.dtype) * u[:, None] + v[None, :]).half()
+        torch.testing.assert_close(y, expected, rtol=1e-2, atol=1e-2)
+    finally:
+        kernel.adapter.close()
+
+
+def _reduce(kind, op, dim, dtype, shape=(R, C)):
+    """Y = op of X along `dim`, from Crouton tiles of layout `kind`."""
+    rows, cols = shape
+    n = rows if dim == 1 else cols
+
+    @T.prim_func
+    def kernel(X: T.Tensor((rows, cols), "float16"), Y: T.Tensor((n,), dtype)):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((rows, cols), "float16")
+            out = T.alloc_shared((n,), dtype)
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.copy(X, tiles)
+            getattr(T, "reduce_" + op)(tiles, out, dim=dim)
+            T.copy(out, Y)
+
+    return kernel
+
+
+def test_reductions_of_crouton_tiles_are_one_call():
+    source = _source(_reduce("activation", "max", 1, "float16"))
+    assert "tl_crouton_reduce<TL_REDUCE_MAX, half, true, false>((&(((half*)out)[0])), (&(((half*)tiles)[0])), 2, 3, 1, (bool)1);" in source
+    # Columns of a weight layout, in fp32.
+    source = _source(_reduce("weight", "sum", 0, "float32"))
+    assert "tl_crouton_reduce<TL_REDUCE_SUM, float, false, true>(" in source
+    # The rows of a transposed layout's buffer are the matrix's columns.
+    source = _source(_reduce("activation_t", "max", 1, "float16"))
+    assert "tl_crouton_reduce<TL_REDUCE_MAX, half, false, false>(" in source
+
+
+@DEVICE
+@pytest.mark.parametrize("shape", [(R, C), (64, 64)])
+@pytest.mark.parametrize("dim", [0, 1])
+@pytest.mark.parametrize("op,dtype", [("max", "float16"), ("sum", "float32"), ("absmax", "float16"), ("min", "float32")])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_reductions_of_crouton_tiles_match_torch(kind, op, dtype, dim, shape):
+    import torch
+
+    kernel = tilelang.compile(_reduce(kind, op, dim, dtype, shape), out_idx=[1], target="hexagon")
+    try:
+        x = torch.randn(*shape, generator=torch.Generator().manual_seed(31)).half()
+        y = kernel(x)
+        xf = x.float()
+        expected = {
+            "max": lambda: xf.amax(dim),
+            "min": lambda: xf.amin(dim),
+            "sum": lambda: xf.sum(dim),
+            "absmax": lambda: xf.abs().amax(dim),
+        }[op]().to(getattr(torch, dtype))
+        torch.testing.assert_close(y, expected, rtol=1e-3, atol=1e-2)
     finally:
         kernel.adapter.close()

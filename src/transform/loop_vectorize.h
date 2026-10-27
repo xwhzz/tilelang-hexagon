@@ -26,6 +26,8 @@
 #define TVM_TL_LOOP_VECTORIZE_H_
 
 #include "../op/operator.h"
+#include <optional>
+
 #include <tvm/arith/analyzer.h>
 #include <tvm/target/target.h>
 #include <tvm/tirx/op.h>
@@ -105,7 +107,28 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, const Var &var,
 bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
                          const PrimExpr &extent, int target_vectorized_size,
                          arith::Analyzer *analyzer, bool allow_broadcast = true,
-                         const PrimExpr &min = 0);
+                         const PrimExpr &min = 0, bool allow_window = false);
+
+/*!
+ * \brief A vector load whose lanes read a small window of elements.
+ *
+ * Every aligned group of the vector's lanes reads from the element its first
+ * lane reads: lane l reads the element l % period after it (kReplicate, e.g.
+ * the rows [r0, r1, r0, r1, ...] of a Crouton tile register) or l / period
+ * after it (kRepeat, e.g. its columns [c0, c0, c1, c1, ...]). Targets that load
+ * the window and shuffle its lanes declare the `vector_window_loads`
+ * attribute; for them, IndicesCanVectorize accepts such loads with
+ * allow_window.
+ */
+enum class VectorWindowKind { kReplicate, kRepeat };
+struct VectorWindow {
+  VectorWindowKind kind;
+  int period;
+};
+std::optional<VectorWindow>
+DetectVectorWindow(const PrimExpr &expr, const Var &var, const PrimExpr &extent,
+                   int width, arith::Analyzer *analyzer,
+                   const PrimExpr &min = 0);
 
 } // namespace tl
 } // namespace tvm
