@@ -144,7 +144,7 @@ def make_dequant_q4_0(N, K, BLK=32):
         S: T.Tensor((N, KB), "float16"),  # 每 32-block 一个 fp16 尺度
         W: T.Tensor((N, K), "float16"),  # 反量化输出
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             Q_sh = T.alloc_shared((N, K // 2), "uint8")
             S_sh = T.alloc_shared((N, KB), "float16")
             W_sh = T.alloc_shared((N, K), "float16")

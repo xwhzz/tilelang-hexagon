@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "common/attr.h"
 #include "common/storage_size.h"
 #include "cuda/op/builtin.h"
 #include "hexagon/op/builtin.h"
@@ -40,6 +41,14 @@ using namespace ffi;
 
 using runtime::StorageRank;
 using runtime::StorageScope;
+
+// A scope that owns one tile program's shared memory: the outermost
+// thread_extent, or the tile program scope of a target that lowers the launch
+// grid to loops. The merged allocation is placed at its start.
+static bool IsSharedMemoryOwnerScope(const AttrStmtNode *op) {
+  return op->attr_key == tirx::attr::thread_extent ||
+         op->attr_key == attr::kTileProgramScope;
+}
 
 static bool IsDynamicSharedMemory(Var buffer_var) {
   StorageScope storage_scope =
@@ -277,8 +286,8 @@ public:
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
-    // Only record the outer most thread extent.
-    if (op->attr_key == tirx::attr::thread_extent && !in_thread_env_) {
+    // Only record the outermost owner scope.
+    if (IsSharedMemoryOwnerScope(op) && !in_thread_env_) {
       in_thread_env_ = true;
       VisitNewScope(op);
       in_thread_env_ = false;
@@ -638,9 +647,9 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tirx::attr::thread_extent && !allocated_) {
+    if (IsSharedMemoryOwnerScope(op) && !allocated_) {
       // Allocate one dynamic shared memory allocation at the beginning of
-      // thread scope
+      // the owner scope
 
       if (verbose_) {
 

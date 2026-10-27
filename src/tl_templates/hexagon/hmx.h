@@ -618,6 +618,29 @@ static void tl_hmx_session_deinit(void) {
 // Let the FastRPC runtime reject execution if VTCM/HMX acquisition failed.
 static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 
+// tl_parallel_for worker scope for tile programs that issue HMX: a pool thread
+// enables HMX for itself around its programs. The session thread already holds
+// the enable that tl_hmx_session_init took.
+struct tl_hmx_worker_scope {
+  int status = TL_OK;
+  bool enabled = false;
+
+  tl_hmx_worker_scope() {
+    if (qurt_thread_get_id() == tl_hmx_session_tid)
+      return;
+    if (tl_hmx_enable() != 0)
+      status = TL_ERR_HMX; // refuse rather than run MACs with HMX unlocked
+    else
+      enabled = true;
+  }
+  ~tl_hmx_worker_scope() {
+    if (enabled)
+      tl_hmx_disable();
+  }
+  tl_hmx_worker_scope(const tl_hmx_worker_scope &) = delete;
+  tl_hmx_worker_scope &operator=(const tl_hmx_worker_scope &) = delete;
+};
+
 // ---- explicit HMX atoms: the DSL owns the K-loop and Crouton storage
 // --------- These thin wrappers expose the accumulator protocol one instruction
 // at a time. A DSL kernel decides where dequantization sits relative to

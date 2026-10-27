@@ -11,6 +11,18 @@
 namespace tvm {
 namespace tl {
 
+namespace attr {
+
+// Grid axis of a launch loop, in outer-to-inner order. Set by
+// LowerKernelLaunch and consumed by MaterializeGrid.
+constexpr const char *kHexagonGridDim = "hexagon.grid_dim";
+
+// Worker count of a launch: on the launch block (T.Kernel(num_workers=)), then
+// on the outermost grid loop, and finally on the parallel grid loop.
+constexpr const char *kHexagonNumWorkers = "hexagon.num_workers";
+
+} // namespace attr
+
 /*! \brief Acquire exclusive use of the implicit HMX accumulator state. */
 TVM_DLL const Op &hexagon_hmx_acquire();
 

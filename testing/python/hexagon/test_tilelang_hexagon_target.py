@@ -80,7 +80,7 @@ def _lower(func, spec):
 def _dma_2d_kernel():
     @T.prim_func
     def kernel(A: T.Tensor((64, 128), "float16"), B: T.Tensor((32, 64), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             A_s = T.alloc_shared((32, 64), "float16")
             T.dma_copy(A[0:32, 0:64], A_s)  # strided rows: a 2D descriptor
             T.dma_wait()
@@ -98,7 +98,7 @@ def test_2d_dma_needs_v75():
 def test_vtcm_capacity_is_checked_at_compile_time():
     @T.prim_func
     def kernel(A: T.Tensor((1024, 1024), "float16"), B: T.Tensor((1024, 1024), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             A_s = T.alloc_shared((1024, 1024), "float16")  # 2 MiB
             T.copy(A, A_s)
             T.copy(A_s, B)

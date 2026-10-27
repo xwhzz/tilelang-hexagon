@@ -40,17 +40,16 @@ public:
   void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
-  // Serialize the GPU-style grid: bind each thread_extent IterVar to a loop.
-  void VisitStmt_(const AttrStmtNode *op) final; // NOLINT(*)
   // Propagate synchronous DMA copy failures through the kernel status ABI.
   void VisitStmt_(const EvaluateNode *op) final; // NOLINT(*)
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
   void VisitExpr_(const MinNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
-  // Apply worker-pool restrictions to target runtime calls.
+  // Print Hexagon builtins as calls to their runtime template functions.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
-  // HVX-vectorize an innermost elementwise loop (the `map` half of the
-  // backend's primitive basis); fall back to CodeGenC's scalar loop otherwise.
+  // Print a worker loop as a tl_parallel_for call. HVX-vectorize an innermost
+  // elementwise loop (the `map` half of the backend's primitive basis); fall
+  // back to CodeGenC's scalar loop otherwise.
   void VisitStmt_(const ForNode *op) final; // NOLINT(*)
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
@@ -63,29 +62,27 @@ private:
   ffi::Array<ffi::String> function_names_;
 
   /*! \brief compile-time bump offset (bytes) for placing alloc_shared buffers
-   *  in the VTCM arena; reset per function in AddFunction. */
+   *  in the current VTCM arena: the kernel's, or a worker's. */
   size_t vtcm_offset_ = 0;
   /*! \brief the target's vtcm-capacity in bytes; 0 when the target has none
    *  and only the runtime checks the grant. */
   size_t vtcm_capacity_ = 0;
+  /*! \brief whether the current function uses the managed DMA queue */
   bool dma_async_ = false;
+  /*! \brief whether a managed DMA queue (tl_dma_async) is in scope */
+  bool dma_in_scope_ = false;
   /*! \brief whether any emitted kernel uses the managed DMA queue */
   bool uses_dma_async_ = false;
   int dma_capacity_ = 16;
+  /*! \brief whether the emitter is inside a worker loop body */
+  bool in_worker_ = false;
 
-  /*! \brief worker-pool (multithreaded grid) state, set per function.  When the
-   *  device func carries `hexagon.num_workers` > 0, the outermost block loop is
-   *  distributed across HW threads via tl_parallel rather than a serial loop.
-   */
-  int wp_num_workers_ = 0; // requested worker count (0 = serial / off)
-  bool wp_emit_ = false;   // currently emitting inside the worker callback
-  bool wp_outermost_pending_ =
-      false;             // next thread_extent is the (strided) block loop
-  size_t wp_stride_ = 0; // per-worker VTCM region size
-  size_t wp_operand_bytes_ =
-      0; // per-worker alloc_shared bytes (operand high-water)
-  bool wp_uses_hmx_ =
-      false; // HMX intrinsics appear in the body (workers enable HMX)
+  // Declare the managed DMA queue of the current scope, and drain it.
+  void EmitDMAContext();
+  void EmitDMADrain();
+  // Print a T.Kernel(num_workers=) grid loop as a tl_parallel_for call whose
+  // lambda runs one tile program.
+  void PrintWorkerLoop(const ForNode *op);
 
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,

@@ -22,7 +22,7 @@ def _source(func, **config) -> str:
 def _copy_kernel(prelude=None, imported=None, dma=False):
     @T.prim_func
     def kernel(A: T.Tensor((N,), "float16"), B: T.Tensor((N,), "float16")):
-        with T.Kernel(1, threads=1, prelude=prelude):
+        with T.Kernel(1, prelude=prelude):
             if imported is not None:
                 T.import_source(imported)
             A_s = T.alloc_shared((N,), "float16")

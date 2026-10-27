@@ -36,7 +36,7 @@ These are the decisions that keep the adaptation small and the code navigable.
 1. **Don't touch the DSL.** A Hexagon matmul is written with the *same* `T.Kernel` /
    `T.copy` / `T.gemm` a CUDA user writes. The user declares intent; the backend
    decides hardware. (The one Hexagon-specific knob is `T.Kernel(num_workers=N)`,
-   propagated like `cluster_dims`.)
+   which runs the grid's tile programs on the worker pool.)
 
 2. **The codegen is a thin C emitter; instruction details live in C templates.**
    `CodeGenTileLangHexagon` emits plain C and maps HMX TIR intrinsics to wrappers in
@@ -73,12 +73,15 @@ These are the decisions that keep the adaptation small and the code navigable.
 - **Layer 2** — `tilelang/hexagon/pipeline.py` owns the full Hexagon pass order (the
   CPU-style sequence plus VTCM arena planning) and registers the Hexagon `T.gemm`
   impls (`GemmHMX` for fp16 ×32 shapes, `GemmScalar` fallback). Op lowering for `T.copy`/`T.gemm`/`T.fill` lives in `src/hexagon/op/*.cc`,
-  each gated on `TargetIsHexagon` and reusing the CPU op where possible.
+  each gated on `TargetIsHexagon` and reusing the CPU op where possible. The launch
+  grid becomes loops in TIR, as on CPU: `src/hexagon/transform/` marks the grid
+  loops (`LowerKernelLaunch`) and, after the loop transformations, sinks each tile
+  program's buffers back into its body and turns a `num_workers` grid into one
+  parallel loop (`MaterializeGrid`).
 - **Layer 3** — `src/hexagon/codegen/codegen_hexagon.{cc,h}`. The key overrides:
-  serialize the GPU grid (`VisitStmt_(AttrStmtNode)` — `thread_extent` → nested `for`
-  loops); place `alloc_shared` in VTCM (`VisitStmt_(AllocBufferNode)`); emit the
-  worker-pool dispatch + per-worker VTCM (`AddFunction`); rewrite a worker-pool
-  `T.gemm` to the per-worker variant (`VisitExpr_(CallNode)`).
+  print a worker loop as a `tl_parallel_for` call whose lambda runs one tile program
+  (`VisitStmt_(ForNode)`); place `alloc_shared` in the tile program's VTCM arena
+  (`VisitStmt_(AllocBufferNode)`).
 - **Layer 4** — the recipe headers (Section 6/7). `common.h` (types), `vtcm.h` (the
   arena), `hmx.h` (the HMX matmul + HVX Crouton pack/unpack + session), `worker.h`
   (the HW-thread pool).
@@ -152,8 +155,8 @@ attention, worker pool) live in [`examples/hexagon/`](../examples/hexagon/).
 | DSL | Generated C | Recipe (Layer 4) |
 |---|---|---|
 | `T.Kernel(grid)` | nested `for` loops (grid serialized on one HW thread) | — |
-| `T.Kernel(..., num_workers=N)` | outermost `blockIdx.x` loop **strided across HW threads** via `tl_parallel` | `worker.h` |
-| `T.alloc_shared` | a byte offset into the VTCM arena `tl_vtcm_base()+off` | `vtcm.h` |
+| `T.Kernel(..., num_workers=N)` | one `tl_parallel_for` over the linearized grid: up to N HW threads run its tile programs, each worker with a private VTCM arena | `worker.h` |
+| `T.alloc_shared` | a byte offset into the tile program's VTCM arena (`tl_vtcm_arena()+off`, or the worker's `tl_arena+off`) | `vtcm.h` |
 | `T.copy(global, hmx_shared)` | strided DDR -> native Crouton pack (`vshuff` on the common path) | Hexagon copy/layout lowering |
 | `T.copy(hmx_shared, global)` | native Crouton -> strided DDR unpack (`vdeal` on the common path) | Hexagon copy/layout lowering |
 | `T.copy(row_shared, hmx_shared)` | native Crouton pack/unpack | Hexagon copy/layout lowering |
@@ -194,8 +197,8 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   cleanup drains DMA and releases an acquired HMX atom lock on errors; these DSP
   projects compile with `-fno-exceptions` to avoid unsupported unwinder symbols.
   `T.copy` has no DMA-specific lowering; native
-  Crouton endpoints retain HMX pack/unpack. DMA calls inside `num_workers` are
-  rejected until engine ownership and queue state are worker-local.
+  Crouton endpoints retain HMX pack/unpack. In a `num_workers` kernel every tile
+  program owns its DMA queue; raw DMA calls are rejected there.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
   pipeline axis** — you reduce the whole inner-K for an output tile in one `mxclracc`
@@ -216,7 +219,8 @@ native Crouton VTCM offsets, and explicit HMX atoms.
 
 - **VTCM is one arena; partition it carefully.** Codegen bump-allocates `alloc_shared`
   bottom-up and publishes `tl_vtcm_shared_high_water` for embedding/export capacity
-  checks. Under the worker pool, VTCM is partitioned per worker (`base + wid*stride`).
+  checks. Under the worker pool, `tl_parallel_for` gives every worker its own arena
+  and runs no more workers than arenas fit in the grant.
   HMX atoms and Crouton copies use explicit shared buffers; there is no hidden
   top-down GEMM scratch allocation.
 
@@ -232,9 +236,10 @@ native Crouton VTCM offsets, and explicit HMX atoms.
 - **fp16 `T.exp` is unresolved** (`FloatSuffix` returns "" for fp16) — compute softmax
   in fp32 (cast → exp → back).
 
-- **Don't import CPU thread-var passes.** Hexagon serializes `thread_extent` into
-  loops *at codegen*, keeping the thread var alive; the CPU `ThreadVarCanonicalizer`
-  zeroes a (assumed-dead) thread var — applying it to Hexagon corrupts indexing.
+- **The grid is a loop, so allocations escape it.** `StorageRewrite` hoists buffers
+  out of the grid loops to function scope. `MaterializeGrid` sinks every buffer that
+  only the tile program uses back into it; without that, the workers of a
+  `num_workers` kernel would share one copy.
 
 ---
 
@@ -252,8 +257,8 @@ native Crouton VTCM offsets, and explicit HMX atoms.
   to it directly.
 - **Surface a device-side failure** (VTCM/HMX unavailable, an unmet precondition):
   the generated kernel entry returns an `int32` status — `TL_OK` / `TL_ERR_VTCM` /
-  `TL_ERR_HMX` / `TL_ERR_DMA` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel the worker
-  callback returns the code and `tl_parallel` OR-reduces them into the entry. The
+  `TL_ERR_HMX` / `TL_ERR_DMA` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel each tile
+  program returns its code, and `tl_parallel_for` returns the lowest failing worker's. The
   FastRPC skel maps any nonzero to `AEE_EFAILED`, so the host's `run()` *raises* rather
   than returning unwritten/partial output (the silent-wrong-output trap). The codegen
   emits the `return`s; a new recipe that can fail should return a nonzero code rather

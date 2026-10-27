@@ -30,7 +30,7 @@ def _make_worker_dma_probe():
         A: T.Tensor((2, 2048), "float16"),
         B: T.Tensor((2, 2048), "float16"),
     ):
-        with T.Kernel(2, threads=1, num_workers=2) as _bx:
+        with T.Kernel(2, num_workers=2) as _bx:
             T.call_extern("uint32", "tl_hexagon_dma_poll")
 
     return worker_dma_probe
@@ -39,14 +39,14 @@ def _make_worker_dma_probe():
 def _make_dma_raw_poll_probe():
     @T.prim_func
     def dma_raw_poll_probe():
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             T.call_extern("uint32", "tl_hexagon_dma_poll")
 
     return dma_raw_poll_probe
 
 
-def test_hexagon_dma_rejects_worker_pool_until_channels_are_worker_local():
-    with pytest.raises(Exception, match="DMA calls inside a"):
+def test_hexagon_raw_dma_is_rejected_in_workers():
+    with pytest.raises(Exception, match="not worker-safe"):
         _lower_source(_make_worker_dma_probe())
 
 

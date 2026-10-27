@@ -7,8 +7,9 @@ HMX 指令顺序都位于 `examples/hexagon/example_demo_ops.py`，没有手写 
 
 ## 实现边界
 
-- **DMA＋worker**：每个 worker callback 创建自己的描述符、FIFO 和 VTCM 区域；
-  正常退出排空，错误退出先收尾 DMA，再释放已持有的 HMX 单元和线程资源。
+- **DMA＋worker**：每个 tile program 创建自己的描述符和 FIFO，buffer 位于所在 worker
+  的私有 VTCM arena；正常结束时排空，错误退出先收尾 DMA，再释放已持有的 HMX 单元，
+  worker 的 HMX 线程使能由 runtime 在该 worker 结束时释放。
   已测 1/2/6 worker、环形队列回绕、64 KiB 块、65 元素尾部、DSP 脏输入、保护区，
   以及持有 HMX 时 DMA 队列满后在同一 session 恢复执行。
 - **FP32 分块**：`make_map_tiled` 用显式双槽预取、连续分组、行内 HVX 计算组合。

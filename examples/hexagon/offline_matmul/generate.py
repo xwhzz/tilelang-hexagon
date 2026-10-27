@@ -32,7 +32,7 @@ REL_SRC = "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src"
 def make_matmul():
     @T.prim_func
     def matmul(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"), C: T.Tensor((M, N), "float16")):
-        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=1) as (bx, by):
+        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM)) as (bx, by):
             A_hmx = T.alloc_shared((BM, K), "float16")
             B_hmx = T.alloc_shared((K, BN), "float16")
             C_hmx = T.alloc_shared((BM, BN), "float16")

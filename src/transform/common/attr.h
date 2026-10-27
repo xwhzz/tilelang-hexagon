@@ -45,6 +45,12 @@ constexpr const char *kAssumeRequiresRuntimeCheck =
 // Compiler-internal physical buffer version count.
 constexpr const char *kBufferVersion = "tl.buffer_version";
 
+// Marks the body of one tile program when the target lowers the launch grid
+// to loops rather than thread_extent scopes. Shared memory belongs to a tile
+// program, so MergeSharedMemoryAllocations treats this scope like the
+// outermost thread_extent.
+constexpr const char *kTileProgramScope = "tl.tile_program_scope";
+
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";
 constexpr const char *kCodeBlockEntryName = "code_block_entry_name";

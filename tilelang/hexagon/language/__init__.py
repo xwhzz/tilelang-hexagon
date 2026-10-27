@@ -14,7 +14,7 @@ from .dma import *  # noqa: F401,F403
 from .dma import __all__ as _DMA_ALL
 
 # The Hexagon dialect shadows T.Kernel with a version that accepts
-# num_workers (and keeps threads= for serialized tile programs).
+# num_workers.
 from .kernel import *  # noqa: F401,F403
 from .kernel import __all__ as _KERNEL_ALL
 

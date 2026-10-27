@@ -30,7 +30,7 @@ NW = 6  # workers (== the device's HW-thread count)
 def make_batched_matmul(NB, M, N, K, num_workers):
     @T.prim_func
     def batched(A: T.Tensor((NB, M, K), "float16"), B: T.Tensor((NB, K, N), "float16"), C: T.Tensor((NB, M, N), "float16")):
-        with T.Kernel(NB, threads=1, num_workers=num_workers) as bx:
+        with T.Kernel(NB, num_workers=num_workers) as bx:
             A_hmx = T.alloc_shared((M, K), "float16")  # per-worker Crouton tiles
             B_hmx = T.alloc_shared((K, N), "float16")
             C_hmx = T.alloc_shared((M, N), "float16")
@@ -46,7 +46,7 @@ def make_batched_matmul(NB, M, N, K, num_workers):
 def make_heavy(NB, BS, ITERS, num_workers):
     @T.prim_func
     def heavy(A: T.Tensor((NB * BS,), "float16"), C: T.Tensor((NB * BS,), "float16")):
-        with T.Kernel(NB, threads=1, num_workers=num_workers) as bx:
+        with T.Kernel(NB, num_workers=num_workers) as bx:
             for i in T.serial(BS):
                 acc = T.alloc_local((1,), "float16")
                 acc[0] = A[bx * BS + i]

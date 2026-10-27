@@ -34,7 +34,7 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
         Readback: T.Tensor((size + 64,), "float32"),
         Copied: T.Tensor((size,), "float32"),
     ):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             staged = T.alloc_shared((size,), "float32", align=128)
             for j in T.Parallel(size + 64):
                 Scratch[j] = A[j] * T.float32(2) + T.float32(1)
@@ -80,7 +80,7 @@ def test_async_manual_ping_pong():
     @T.prim_func
     def probe(A: T.Tensor((768,), "float16")):
         T.func_attr({"hexagon.dma_queue_capacity": 2})
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((2, 256), "float16")
             T.dma_copy(A[0:256], s[0, 0:256])
             T.dma_copy(A[256:512], s[1, 0:256])
@@ -99,7 +99,7 @@ def test_async_manual_ping_pong():
 def test_async_strided_load_store():
     @T.prim_func
     def probe(A: T.Tensor((32, 128), "float16"), B: T.Tensor((32, 128), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((32, 64), "float16")
             T.dma_copy(A[0:32, 32:96], s)
             T.dma_wait()
@@ -124,14 +124,16 @@ def test_async_hmx_dsl_schedule():
 
 
 def make_capacity_probe(capacity, pending=0, workers=None):
+    grid = workers or 1
+
     @T.prim_func
-    def probe(A: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16")):
+    def probe(A: T.Tensor((grid * 256,), "float16"), B: T.Tensor((grid * 256,), "float16")):
         T.func_attr({"hexagon.dma_queue_capacity": capacity})
-        with T.Kernel(1, threads=1, num_workers=workers) as _:
+        with T.Kernel(grid, num_workers=workers) as bx:
             s = T.alloc_shared((256,), "float16")
-            T.dma_copy(A, s)
+            T.dma_copy(A[bx * 256 : (bx + 1) * 256], s)
             T.dma_wait(pending)
-            T.copy(s, B)
+            T.copy(s, B[bx * 256 : (bx + 1) * 256])
 
     return probe
 
@@ -155,12 +157,13 @@ def test_reject_invalid_wait_argument(pending):
 
 def test_managed_worker_queue_is_local_and_drained():
     source = lower(make_capacity_probe(2, workers=2))
-    callback, entry = source.split("int32_t probe_kernel(")
-    assert "static int probe_kernel_worker" in callback
-    assert "tl_hexagon_dma_async_context<2> tl_dma_async;" in callback
+    entry, program = source.split(" -> int32_t {", 1)
+    assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(2048u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
-    assert "tl_wid *" in callback or "* tl_wid" in callback
-    assert callback.rindex("tl_dma_async.wait(0)") > callback.rindex("tl_dma_async.copy_1d(")
+    # Each tile program owns its queue and its buffers in the worker's arena.
+    assert "tl_hexagon_dma_async_context<2> tl_dma_async;" in program
+    assert "(tl_arena + 0)" in program
+    assert program.rindex("tl_dma_async.wait(0)") > program.rindex("tl_dma_async.copy_1d(")
 
 
 def test_reject_crouton_async():
@@ -168,7 +171,7 @@ def test_reject_crouton_async():
 
     @T.prim_func
     def probe(A: T.Tensor((32, 32), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((32, 32), "float16")
             T.annotate_layout({s: e.activation_layout(s)})
             T.dma_copy(A, s)
@@ -181,7 +184,7 @@ def test_reject_crouton_async():
 def test_reject_out_of_bounds():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             T.dma_copy(A[128:384], s)
             T.dma_wait()
@@ -193,7 +196,7 @@ def test_reject_out_of_bounds():
 def test_reject_software_pipeline():
     @T.prim_func
     def probe(A: T.Tensor((4, 256), "float16"), B: T.Tensor((4, 256), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             for i in T.Pipelined(4, num_stages=2):
                 T.dma_copy(A[i, 0:256], s)
@@ -207,7 +210,7 @@ def test_reject_software_pipeline():
 def test_async_store_source_is_not_recycled_before_wait():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16"), C: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             t = T.alloc_shared((256,), "float16")
             T.copy(A, s)
@@ -225,7 +228,7 @@ def test_async_store_source_is_not_recycled_before_wait():
 def test_normal_copy_does_not_create_dma_queue():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             T.copy(A, s)
             T.copy(s, B)
@@ -258,7 +261,7 @@ def make_hmx_probe():
         C: T.Tensor((13 * 32, 32), "float16"),
     ):
         T.func_attr({"hexagon.dma_queue_capacity": 2})
-        with T.Kernel(13, threads=1, num_workers=6) as group:
+        with T.Kernel(13, num_workers=6) as group:
             ar = T.alloc_shared((32, 64), "float16")
             br = T.alloc_shared((64, 32), "float16")
             an = T.alloc_shared((32, 64), "float16")
@@ -298,15 +301,18 @@ def make_hmx_probe():
 
 def test_worker_hmx_thread_cleanup_survives_dma_errors():
     source = lower(make_hmx_probe())
-    assert "if (tl_en) tl_dma_async.disable_hmx = tl_hmx_disable;" in source
+    # The worker scope holds the thread's HMX enable for all of its programs
+    # and drops it on any return; the DMA queue releases the HMX unit lock.
+    assert "tl_parallel_for<tl_hmx_worker_scope>(13, 6, " in source
     assert "tl_dma_async.release_hmx = tl_hmx_unit_release;" in source
-    assert "if (tl_en) tl_hmx_disable();" not in source
+    assert "tl_hmx_enable" not in source
+    assert "tl_hmx_disable" not in source
 
 
 def test_async_scalar_access_is_not_silently_synchronous():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             T.dma_copy(A[0], s[0])
             T.dma_wait()
@@ -321,7 +327,7 @@ def test_async_scalar_access_is_not_silently_synchronous():
 def test_reject_unsupported_region_or_dtype(shape, dtype):
     @T.prim_func
     def probe(A: T.Tensor(shape, dtype)):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared(shape, "float16")
             T.dma_copy(A, s)
             T.dma_wait()
@@ -333,7 +339,7 @@ def test_reject_unsupported_region_or_dtype(shape, dtype):
 def test_reject_mixed_raw_dma_ownership():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             T.dma_copy(A, s)
             T.call_extern("uint32", "tl_hexagon_dma_poll")
@@ -346,7 +352,7 @@ def test_reject_mixed_raw_dma_ownership():
 def test_async_copy_is_separate_from_dma_copy():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             s = T.alloc_shared((256,), "float16")
             T.async_copy(A, s)
 

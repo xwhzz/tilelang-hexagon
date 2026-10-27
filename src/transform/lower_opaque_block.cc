@@ -64,10 +64,6 @@ public:
     if (lower.cluster_dims_.has_value()) {
       f = WithAttr(std::move(f), "cluster_dims", lower.cluster_dims_.value());
     }
-    if (lower.num_workers_.has_value()) {
-      f = WithAttr(std::move(f), "hexagon.num_workers",
-                   lower.num_workers_.value());
-    }
     return f;
   }
 
@@ -328,14 +324,6 @@ private:
                      << "` to be an Array<Integer>, but got "
                      << kv.second.GetTypeKey();
         }
-      } else if (key == "hexagon.num_workers") {
-        if (auto n = kv.second.try_cast<Integer>()) {
-          num_workers_ = n.value();
-        } else {
-          LOG(FATAL)
-              << "Expected `hexagon.num_workers` to be an Integer, but got "
-              << kv.second.GetTypeKey();
-        }
       } else if (!is_block) {
         // the loop annotation is preserved
         preserved_annotations.Set(key, kv.second);
@@ -381,10 +369,6 @@ private:
   /*! \brief Cluster dims collected from tilelang.cluster_dims block annotation.
    */
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
-
-  /*! \brief Hexagon worker count collected from the hexagon.num_workers block
-   * annotation (set by T.Kernel(num_workers=...)). */
-  Optional<Integer> num_workers_{std::nullopt};
 
   /*! \brief True while we are visiting the inner Block of a BlockRealize.
    * Used so that the SBlockNode handler does not double-lower alloc_buffers

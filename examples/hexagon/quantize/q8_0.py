@@ -133,7 +133,7 @@ def make_q8_0_dot_prim_func(k: int, symbol: str | None = None, *, with_bias: boo
             bias: T.Tensor((layout.block_n,), "float32"),
             dst: T.Tensor((layout.block_n,), "float32"),
         ):
-            with T.Kernel(1, threads=1) as _:
+            with T.Kernel(1) as _:
                 emitter.dot_32x1(dst, weight, activation, bias=bias)
 
     else:
@@ -144,7 +144,7 @@ def make_q8_0_dot_prim_func(k: int, symbol: str | None = None, *, with_bias: boo
             activation: T.Tensor((activation_bytes,), "uint8"),
             dst: T.Tensor((layout.block_n,), "float32"),
         ):
-            with T.Kernel(1, threads=1) as _:
+            with T.Kernel(1) as _:
                 emitter.dot_32x1(dst, weight, activation)
 
     if symbol is not None:

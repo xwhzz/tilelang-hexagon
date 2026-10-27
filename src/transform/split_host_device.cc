@@ -70,7 +70,6 @@ public:
   }
 
   void SetDmaCapacity(Integer n) { dma_capacity_ = std::move(n); }
-  void SetNumWorkers(Integer n) { num_workers_ = std::move(n); }
   void SetClusterDims(Array<Integer> cluster_dims) {
     cluster_dims_ = std::move(cluster_dims);
   }
@@ -246,7 +245,6 @@ private:
   Array<tirx::Var> host_params_;
   Array<tirx::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
-  Optional<Integer> num_workers_{std::nullopt};
   Optional<Integer> dma_capacity_{std::nullopt};
   // Per-buffer shared-memory alignment requirements (kSmemAlignmentMap)
   // propagated from the host PrimFunc onto each split device kernel.
@@ -575,9 +573,6 @@ private:
     }
     if (dma_capacity_.defined())
       device_attrs.Set("hexagon.dma_queue_capacity", dma_capacity_.value());
-    if (num_workers_.defined()) {
-      device_attrs.Set("hexagon.num_workers", num_workers_.value());
-    }
     if (!smem_alignment_map_.empty()) {
       device_attrs.Set(tl::kSmemAlignmentMap, smem_alignment_map_);
     }
@@ -643,16 +638,11 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
     splitter.SetClusterDims(opt.value());
     func = tvm::WithoutAttr(std::move(func), "cluster_dims");
   }
-  // Propagate the Hexagon worker-pool hint (number of HW threads to fan the
-  // grid across) from the host func to the device kernel so the codegen can
-  // emit the tl_parallel dispatch instead of a serial block loop.
+  // Propagate the Hexagon DMA queue capacity from the host func to the device
+  // kernel, whose codegen sizes the managed DMA queue with it.
   if (auto opt = func->GetAttr<Integer>("hexagon.dma_queue_capacity")) {
     splitter.SetDmaCapacity(opt.value());
     func = tvm::WithoutAttr(std::move(func), "hexagon.dma_queue_capacity");
-  }
-  if (auto opt = func->GetAttr<Integer>("hexagon.num_workers")) {
-    splitter.SetNumWorkers(opt.value());
-    func = tvm::WithoutAttr(std::move(func), "hexagon.num_workers");
   }
   // Propagate per-buffer shared-memory alignment requirements collected by
   // LowerTileOp onto the device kernel, where MergeSharedMemoryAllocations

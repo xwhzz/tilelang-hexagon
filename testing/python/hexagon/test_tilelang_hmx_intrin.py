@@ -66,7 +66,7 @@ def _make_hmx_coordinate_probe():
         C_hmx: T.Tensor((64, 64), "float16"),
         bias_vtcm: T.Tensor((64,), "uint32"),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             acc = T.hmx.alloc_accumulator()
             cvt = T.hmx.alloc_convert_state()
             bias = T.hmx.alloc_bias_state()
@@ -107,7 +107,7 @@ def _make_hmx_vtcm_gemm_probe():
         B_hmx: T.Tensor((64, 64), "float16"),
         C_hmx: T.Tensor((64, 64), "float16"),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             bias_vtcm = T.alloc_shared((64,), "uint32", align=256)
             acc = T.hmx.alloc_accumulator()
             cvt = T.hmx.alloc_convert_state()
@@ -158,7 +158,7 @@ def _make_hmx_operand_alignment_probe():
 
     @T.prim_func
     def hmx_operand_alignment_probe():
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             aa_padding = T.alloc_shared((64,), "float16")  # 128 bytes
             bb_weight = T.alloc_shared((32, 32), "float16")
             cc_config = T.alloc_shared((64,), "uint32")  # 256 bytes
@@ -196,7 +196,7 @@ def _make_t_gemm_probe(*, transpose_a=False, transpose_b=False, output_dtype="fl
         B: T.Tensor((64, 64), "float16"),
         C: T.Tensor((64, 64), output_dtype),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             A_hmx = T.alloc_shared((64, 64), "float16")
             B_hmx = T.alloc_shared((64, 64), "float16")
             C_hmx = T.alloc_shared((64, 64), output_dtype)
@@ -226,7 +226,7 @@ def _make_fused_copy_probe():
         B: T.Tensor((64, 128), "float16"),
         C: T.Tensor((128, 128), "float16"),
     ):
-        with T.Kernel(2, 2, threads=1) as (bx, by):
+        with T.Kernel(2, 2) as (bx, by):
             A_hmx = T.alloc_shared((64, 64), "float16")
             B_hmx = T.alloc_shared((64, 64), "float16")
             C_hmx = T.alloc_shared((64, 64), "float16")
@@ -670,7 +670,7 @@ def test_hmx_deep_chunk_bounds_and_native_offsets(tiles):
 
     @T.prim_func
     def probe(A: T.Tensor((32, tiles * 32), "float16"), B: T.Tensor((32, tiles * 32), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             acc = T.hmx.alloc_accumulator()
             T.annotate_layout({A: emitter.activation_layout(A), B: emitter.weight_layout(B)})
             emitter.acquire(acc)

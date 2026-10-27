@@ -53,7 +53,7 @@ def make_flash(M, SEQ, BN, D):
     def flash(
         Q: T.Tensor((M, D), "float16"), K: T.Tensor((SEQ, D), "float16"), V: T.Tensor((SEQ, D), "float16"), O: T.Tensor((M, D), "float16")
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             Q_row = T.alloc_shared((M, D), "float16")
             K_row = T.alloc_shared((BN, D), "float16")
             V_row = T.alloc_shared((BN, D), "float16")

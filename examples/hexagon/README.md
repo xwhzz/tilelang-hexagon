@@ -88,21 +88,23 @@ worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
 
 ## Notes
 
-- **`num_workers`** distributes the grid's outermost block loop across HW threads. It
-  helps HVX-heavy and batched/multi-block work; a single HMX-bound matmul is limited
+- **`num_workers`** runs the grid's tile programs on up to that many HW threads, each
+  worker with its own buffers and VTCM arena. It helps HVX-heavy and
+  batched/multi-block work; a single HMX-bound matmul is limited
   by the one matrix engine (the spinlock serializes the MACs). The compute-heavy demo
   is HVX-bound, so its speedup is visible end-to-end.
 - **Explicit async DMA is available as `T.dma_copy(src, dst)` and
   `T.dma_wait(pending=0)`.** One copy submits one FIFO entry; wait completes and
   reclaims all but the newest `pending` entries. No separate commit is required.
   Wait before reading a destination or modifying a source. The kernel also drains
-  the queue at exit. Capacity defaults to 16; set
+  the queue at exit (each tile program, in a `num_workers` kernel). Capacity defaults to 16; set
   `T.func_attr({"hexagon.dma_queue_capacity": 4})` to configure it (1..256).
   Submitting to a full queue reports an error instead of silently waiting.
   Static, in-bounds 1D/2D row-major DDR ↔ VTCM regions are supported. Crouton
   conversion remains a separate `T.copy`; unsupported async regions fail lowering.
-  Use a manual `T.serial` schedule. `num_workers` uses worker-local queue and VTCM
-  state, with submission and completion on the same QuRT thread; automatic
+  Use a manual `T.serial` schedule. Under `num_workers` each tile program owns its
+  queue and its worker's VTCM arena, with submission and completion on the same
+  QuRT thread; automatic
   `T.Pipelined` and mixing managed queues with raw/external DMA remain unsupported.
   This does not imply a separate physical DMA engine per worker. Managed async
   kernels conservatively disable automatic VTCM allocation

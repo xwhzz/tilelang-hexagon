@@ -36,7 +36,7 @@ def make_qmatmul(M, N, K, W=128):
         scb: T.Tensor((K, N), "float16"),  # per-(k,n) scale
         C: T.Tensor((M, N), "float16"),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             B_row = T.alloc_shared((K, N), "float16")  # dequantized row-major VTCM
             A_hmx = T.alloc_shared((M, K), "float16")
             B_hmx = T.alloc_shared((K, N), "float16")

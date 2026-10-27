@@ -117,15 +117,16 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
             call_args.append(f"({pl.ctype}*){pl.name}")
     # Pull in the HMX matmul runtime only when the kernel calls into it (it
     # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
-    # alloc_shared buffers lower to `tl_vtcm_base()` offsets — pull in the VTCM
-    # arena header when the kernel uses shared memory (same lazy-include scheme).
+    # alloc_shared buffers lower to `tl_vtcm_arena()` offsets, or to the per-worker
+    # arenas of `tl_vtcm_worker_arenas` — pull in the VTCM arena header when the
+    # kernel uses shared memory (same lazy-include scheme).
     uses_vtcm = "tl_vtcm" in kernel_source
     vtcm_include = "#include <tl_templates/hexagon/vtcm.h>\n" if uses_vtcm else ""
     hmx = "tl_hexagon_hmx" in kernel_source
     hmx_include = "#include <tl_templates/hexagon/hmx.h>\n" if hmx else ""
     # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
     # the multithreaded HMX path; include it directly for a non-HMX worker kernel
-    # (keyed on the public symbol prefix or a direct tl_parallel call).
+    # (keyed on the public symbol prefix or a tl_parallel / tl_parallel_for call).
     uses_worker = ("tl_hexagon_worker" in kernel_source or "tl_parallel" in kernel_source) and not hmx
     worker_include = "#include <tl_templates/hexagon/worker.h>\n" if uses_worker else ""
     # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in when a

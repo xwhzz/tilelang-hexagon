@@ -1,13 +1,13 @@
 """Lowering pipeline for the Hexagon backend.
 
-A Hexagon device kernel is sequential C with HVX/HMX intrinsics. The launch
-stays GPU-shaped until codegen: ``MaterializeKernelLaunch`` keeps the grid as
-``blockIdx`` thread_extent scopes (one thread unless ``threads=`` says
-otherwise), and the Hexagon codegen serializes them into loops or fans the
-outer loop across the worker pool. The sequence below is the CPU pass order
-this backend was validated against, plus Hexagon's VTCM arena planning
-(``MergeSharedMemoryAllocations``). Target copy/GEMM hooks lower Crouton
-operations and explicit async-copy submissions.
+A Hexagon device kernel is sequential C with HVX/HMX intrinsics, run by one
+DSP hardware thread or by the worker pool. As on CPU there are no SIMT
+threads, and the launch grid becomes a loop nest in TIR: ``LowerKernelLaunch``
+marks the grid loops, and after the loop transformations ``MaterializeGrid``
+turns them into the program loop nest, or into one parallel loop for
+``T.Kernel(num_workers=...)``. The sequence below is the CPU pass order, plus
+Hexagon's VTCM arena planning (``MergeSharedMemoryAllocations``). Target
+copy/GEMM hooks lower Crouton operations and explicit async-copy submissions.
 """
 
 from __future__ import annotations
@@ -64,11 +64,8 @@ def _check_dma_schedule(mod: IRModule) -> None:
 def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     _check_dma_schedule(mod)
     mod = tirx.transform.BindTarget(target)(mod)
-    mod = tilelang.transform.MaterializeKernelLaunch(
-        lower_thread_binding=True,
-        default_threads=1,
-        unsupported_annotations=["cluster_dims"],
-    )(mod)
+    mod = tilelang.hexagon.transform.LowerKernelLaunch()(mod)
+    mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=False, unsupported_annotations=["cluster_dims"])(mod)
     pass_ctx = tilelang.transform.get_pass_context()
 
     if should_force_let_inline():
@@ -116,24 +113,23 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
     mod = s_tir.transform.HoistIfThenElse()(mod)
+    mod = tilelang.hexagon.transform.MaterializeGrid()(mod)
 
     mod = tirx.transform.VerifyMemory()(mod)
     mod = tirx.transform.AnnotateEntryFunc()(mod)
     mod = s_tir.transform.InferFragment()(mod)
-    mod = tilelang.transform.LowerThreadAllreduce()(mod)
 
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 
-    # Shared buffers live in one VTCM arena; this pass also applies the HMX
-    # operand alignments and keeps managed-DMA buffers from overlapping.
+    # Shared buffers live in one VTCM arena per tile program; this pass also
+    # applies the HMX operand alignments and keeps managed-DMA buffers from
+    # overlapping.
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, disable_reuse=disable_reuse)(mod)
 
-    mod = tilelang.transform.ThreadSync("shared")(mod)
-    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)

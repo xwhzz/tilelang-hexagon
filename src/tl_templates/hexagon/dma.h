@@ -740,10 +740,9 @@ template <uint32_t Capacity> struct tl_hexagon_dma_async_context {
   tl_hexagon_dma_transfer transfers[Capacity];
   tl_hexagon_dma_queue queue{};
   int status;
+  // Releases the HMX unit lock on an early DMA error return. A function
+  // pointer keeps this header independent of the HMX runtime.
   void (*release_hmx)() = nullptr;
-  // Worker HMX thread enablement must also be undone on early DMA errors.
-  // Function pointers keep this header independent of the HMX runtime.
-  void (*disable_hmx)() = nullptr;
 
   tl_hexagon_dma_async_context() {
     status = tl_hexagon_dma_engine_idle()
@@ -758,8 +757,6 @@ template <uint32_t Capacity> struct tl_hexagon_dma_async_context {
       tl_hexagon_dma_engine_reset();
     if (release_hmx)
       release_hmx();
-    if (disable_hmx)
-      disable_hmx();
   }
   tl_hexagon_dma_async_context(const tl_hexagon_dma_async_context &) = delete;
   tl_hexagon_dma_async_context &

@@ -15,18 +15,24 @@
 // VTCM, so the per-worker stack stays small.  The pool lives for the FastRPC
 // session and is reclaimed when the PD unloads.
 //
+// Generated kernels reach the pool through tl_parallel_for, the form of a
+// parallel grid loop: one call runs every tile program of the grid.
+//
 // Compiled into the FastRPC skel with qurt.h on the include path.
 #include <qurt.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/vtcm.h>
+#include <type_traits>
 
 #define TL_MAX_WORKERS 6
 #define TL_WORKER_STACK_SZ (2 * 16384) // 32 KiB/worker (htp-ops-lib default)
 
 // Worker callback: (ctx, worker id in [0,nw), total worker count nw).  Returns
-// a status code (0 = ok); tl_parallel OR-reduces the workers' codes so a
-// per-worker device failure (e.g. HMX enable) propagates to the kernel entry
-// and the host.
+// a status code (0 = ok); tl_parallel returns the code of the lowest-numbered
+// failing worker, so a per-worker device failure (e.g. HMX enable) propagates
+// to the kernel entry and the host.
 typedef int (*tl_worker_fn)(void *ctx, int wid, int nw);
 
 // Number of HW threads available, clamped to [1, TL_MAX_WORKERS].  This is the
@@ -135,15 +141,93 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
   tl_pool.nw = nw;
   for (int w = 1; w <= pooled; ++w)
     qurt_sem_up(&tl_pool.go[w]); // release the pooled workers
-  int rc = fn(ctx, 0, nw);       // worker 0 on the calling thread
+  int status[TL_MAX_WORKERS];
+  status[0] = fn(ctx, 0, nw); // worker 0 on the calling thread
   for (int w = pooled + 1; w < nw; ++w)
-    rc |= fn(ctx, w, nw); // overflow (fewer spawned than requested) runs inline
+    status[w] = fn(ctx, w, nw); // overflow (fewer spawned than requested)
   for (int w = 1; w <= pooled; ++w)
     qurt_sem_down(&tl_pool.done); // wait for the pooled workers
   for (int w = 1; w <= pooled; ++w)
-    rc |= tl_pool.status[w]; // join established happens-before; OR-reduce their
-                             // codes
-  return rc;
+    status[w] = tl_pool.status[w]; // the join established happens-before
+  for (int w = 0; w < nw; ++w) {
+    if (status[w] != 0)
+      return status[w];
+  }
+  return 0;
+}
+
+// --- parallel grid loops ---------------------------------------------------
+// tl_parallel_for(extent, max_workers, body) runs body(i) for every tile
+// program i in [0, extent) on up to min(max_workers, tl_num_workers(), extent)
+// workers. Worker w runs i = w, w + nw, ... in order and stops at its first
+// nonzero status. Given per-worker arenas, body(i, arena) also receives its
+// worker's private VTCM arena, and no more workers run than arenas fit.
+//
+// `Scope` holds per-worker resources: every worker constructs one on its own
+// thread before its first program and destroys it after its last. A scope
+// whose status is nonzero after construction fails the worker.
+struct tl_worker_scope {
+  int status = TL_OK;
+};
+
+// The kernel arena split into `count` per-worker arenas of `bytes` each.
+struct tl_worker_arenas {
+  uint8_t *base;
+  unsigned int bytes;
+  unsigned int count;
+};
+
+static inline tl_worker_arenas tl_vtcm_worker_arenas(unsigned int bytes) {
+  uint8_t *base = tl_vtcm_arena();
+  unsigned int count = base && bytes ? tl_vtcm_arena_bytes() / bytes : 0u;
+  return {base, bytes, count};
+}
+
+template <typename Scope, typename Body> struct tl_parallel_for_job {
+  Body *body;
+  int32_t extent;
+  tl_worker_arenas arenas;
+
+  static int run(void *ctx, int wid, int nw) {
+    tl_parallel_for_job *job = static_cast<tl_parallel_for_job *>(ctx);
+    Scope scope;
+    if (scope.status != TL_OK)
+      return scope.status;
+    uint8_t *arena = job->arenas.base + (size_t)wid * job->arenas.bytes;
+    for (int32_t i = wid; i < job->extent; i += nw) {
+      if (int status = (*job->body)(i, arena))
+        return status;
+    }
+    return TL_OK;
+  }
+};
+
+template <typename Scope = tl_worker_scope, typename Body>
+static inline int tl_parallel_for(int32_t extent, int max_workers,
+                                  tl_worker_arenas arenas, Body &&body) {
+  if (extent <= 0)
+    return TL_OK;
+  if (arenas.count < 1)
+    return TL_ERR_VTCM; // not even one worker's arena fits the VTCM grant
+  int nw = tl_num_workers();
+  if (nw > max_workers)
+    nw = max_workers;
+  if ((unsigned int)nw > arenas.count)
+    nw = (int)arenas.count;
+  if (nw > extent)
+    nw = (int)extent;
+  tl_parallel_for_job<Scope, typename std::remove_reference<Body>::type> job{
+      &body, extent, arenas};
+  return tl_parallel(job.run, &job, nw);
+}
+
+template <typename Scope = tl_worker_scope, typename Body>
+static inline int tl_parallel_for(int32_t extent, int max_workers,
+                                  Body &&body) {
+  auto program = [&body](int32_t i, uint8_t *) { return body(i); };
+  return tl_parallel_for<Scope>(extent, max_workers,
+                                tl_worker_arenas{nullptr, 0u, TL_MAX_WORKERS},
+                                program);
 }
 
 // --- threading selftest: proves dispatch + worker count run on-device, in

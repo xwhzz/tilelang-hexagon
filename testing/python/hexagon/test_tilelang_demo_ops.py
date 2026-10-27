@@ -12,7 +12,7 @@ from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
 def make_reduce_probe(rows, cols, dtype="float32"):
     @T.prim_func
     def reduce_probe(X: T.Tensor((rows, cols), dtype), O: T.Tensor((2, rows), "float32")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             shared = T.alloc_shared((rows, cols), dtype)
             sums = T.alloc_shared((rows,), "float32")
             maxima = T.alloc_shared((rows,), "float32")
@@ -34,7 +34,7 @@ def make_weight_copy_probe(cols, start=64, workers=1):
 
     @T.prim_func
     def weight_copy(X: T.Tensor((64, cols + 64), "float16"), O: T.Tensor((64, cols + 4), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             native = T.alloc_shared((64, cols), "float16", align=2048)
             T.annotate_layout({native: emitter.weight_layout(native)})
             for i, j in T.Parallel(64, cols + 4):
@@ -55,7 +55,7 @@ def lower(func):
 def test_fp32_map_uses_native_vectors_and_own_workers(kind):
     source = lower(make_elementwise(32, 2048, kind))
     assert "float32*" in source  # 32 FP32 lanes, not a dtype string.
-    assert "tl_parallel(" in source
+    assert "tl_parallel_for(" in source
     assert "own_row_f32" not in source
     assert "demo_" not in source
 
@@ -75,7 +75,7 @@ def test_rmsnorm_stays_fp32_and_composes_reduction():
     assert "float32*" in source
     assert "sqrtf" in source
     assert "half" not in source
-    assert "tl_parallel(" in source
+    assert "tl_parallel_for(" in source
 
 
 def test_reduce_rejects_integer_sources():
@@ -171,7 +171,7 @@ def test_parallel_copy_rejects_bad_worker_count(workers):
 
     @T.prim_func
     def probe(A: T.Tensor((32, 64), "float16")):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             native = T.alloc_shared((32, 64), "float16")
             T.annotate_layout({native: e.activation_layout(native)})
             T.copy(A, native, annotations={"hexagon.copy_workers": workers})
@@ -185,7 +185,7 @@ def test_parallel_copy_cannot_nest_worker_dispatch():
 
     @T.prim_func
     def probe(A: T.Tensor((32, 64), "float16")):
-        with T.Kernel(1, threads=1, num_workers=2):
+        with T.Kernel(1, num_workers=2):
             native = T.alloc_shared((32, 64), "float16")
             T.annotate_layout({native: e.activation_layout(native)})
             T.copy(A, native, annotations={"hexagon.copy_workers": 2})

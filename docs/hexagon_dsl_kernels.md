@@ -113,9 +113,9 @@ DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouto
 permutation. `dma.h` exposes raw instructions, descriptor builders, synchronous
 copy helpers, and a caller-owned linked queue through explicit extern calls;
 `T.dma_copy` / `T.dma_wait` expose a managed per-callback FIFO for explicit
-manual DMA schedules. With `T.Kernel(num_workers=...)`, every worker owns its
-descriptors and private VTCM slice and drains the FIFO before returning,
-including error cleanup. A worker must issue and complete its own queue on the
+manual DMA schedules. With `T.Kernel(num_workers=...)`, every tile program owns
+its descriptors and FIFO in its worker's private VTCM arena and drains the FIFO
+before it ends, including error cleanup. A worker must issue and complete its own queue on the
 same QuRT thread; managed and raw/foreign DMA may not be mixed. Concurrent DDR
 stores must own disjoint cache lines, including the lines around partial rows.
 Scalar/vector producers are published before DMA reads, and DMA stores finish

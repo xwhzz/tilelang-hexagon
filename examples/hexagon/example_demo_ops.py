@@ -42,7 +42,7 @@ def make_elementwise(M, N, kind="add", num_workers=6, scale=0.75, bias=0.125):
 
         @T.prim_func
         def scale_bias(X: T.Tensor((M, N), "float32"), O: T.Tensor((M, N), "float32")):
-            with T.Kernel(M, threads=1, num_workers=min(M, num_workers)) as row:
+            with T.Kernel(M, num_workers=min(M, num_workers)) as row:
                 for j in T.Parallel(N):
                     O[row, j] = X[row, j] * T.float32(scale) + T.float32(bias)
 
@@ -50,7 +50,7 @@ def make_elementwise(M, N, kind="add", num_workers=6, scale=0.75, bias=0.125):
 
     @T.prim_func
     def elementwise(X: T.Tensor((M, N), "float32"), Y: T.Tensor((M, N), "float32"), O: T.Tensor((M, N), "float32")):
-        with T.Kernel(M, threads=1, num_workers=min(M, num_workers)) as row:
+        with T.Kernel(M, num_workers=min(M, num_workers)) as row:
             for j in T.Parallel(N):
                 if kind == "add":
                     O[row, j] = X[row, j] + Y[row, j]
@@ -69,7 +69,7 @@ def make_rmsnorm_fp32(M, N, eps=1e-5, num_workers=6):
 
     @T.prim_func
     def rmsnorm(X: T.Tensor((M, N), "float32"), O: T.Tensor((M, N), "float32")):
-        with T.Kernel(M, threads=1, num_workers=min(M, num_workers)) as row:
+        with T.Kernel(M, num_workers=min(M, num_workers)) as row:
             squares = T.alloc_shared((1, N), "float32", align=128)
             total = T.alloc_shared((1,), "float32")
             inv = T.alloc_local((1,), "float32")
@@ -125,7 +125,7 @@ def make_map_tiled(M, N, kind="add", tile_rows=4, group_tiles=4, num_workers=6, 
     @T.prim_func
     def map_tiled(X: T.Tensor((M, N), "float32"), Y: T.Tensor((M, N), "float32"), O: T.Tensor((M, N), "float32")):
         T.func_attr({"hexagon.dma_queue_capacity": 6})
-        with T.Kernel(groups, threads=1, num_workers=num_workers) as group:
+        with T.Kernel(groups, num_workers=num_workers) as group:
             sx = T.alloc_shared((2, tile_rows, N), "float32")
             sy = T.alloc_shared((2, tile_rows, N), "float32")
             result = T.alloc_shared((tile_rows, N), "float32")
@@ -197,7 +197,7 @@ def make_gemm_f16_io(M, N, K, BN=128, copy_workers=1, fused_copy=False):
     @T.prim_func
     def gemm(A: T.Tensor((M, K), "float32"), W: T.Tensor((N, K), "float16"), C: T.Tensor((M, N), "float32")):
         T.func_attr({"hexagon.dma_queue_capacity": 3})
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             a_dma = T.alloc_shared((M, K), "float32", align=2048)
             a_row = T.alloc_shared((M, K), "float16", align=2048)
             a_native = T.alloc_shared((M, K), "float16", align=2048)

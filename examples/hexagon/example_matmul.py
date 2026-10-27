@@ -21,7 +21,7 @@ def make_matmul(M, N, K, BM, BN):
     @T.prim_func
     def matmul(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"), C: T.Tensor((M, N), "float16")):
         # 2-D grid of BM x BN output tiles; one HW thread per block (for now).
-        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=1) as (bx, by):
+        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM)) as (bx, by):
             A_hmx = T.alloc_shared((BM, K), "float16")  # native Crouton VTCM
             B_hmx = T.alloc_shared((K, BN), "float16")
             C_hmx = T.alloc_shared((BM, BN), "float16")

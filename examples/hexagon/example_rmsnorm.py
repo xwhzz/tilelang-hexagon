@@ -43,7 +43,7 @@ def hexreduce(src, dst, rtype, dim):
 def make_rmsnorm(M, N):
     @T.prim_func
     def rmsnorm(X: T.Tensor((M, N), "float16"), G: T.Tensor((N,), "float16"), O: T.Tensor((M, N), "float16")):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             X_sh = T.alloc_shared((M, N), "float16")
             Xsq = T.alloc_shared((M, N), "float16")
             G_sh = T.alloc_shared((N,), "float16")

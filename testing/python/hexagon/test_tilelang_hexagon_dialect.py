@@ -45,7 +45,7 @@ def test_hexagon_symbols_stay_out_of_other_dialects():
 @pytest.mark.parametrize("num_workers", [0, -1, True, 2.0])
 def test_hexagon_kernel_rejects_invalid_num_workers(num_workers):
     with pytest.raises(ValueError, match="num_workers"):
-        T.Kernel(4, threads=1, num_workers=num_workers)
+        T.Kernel(4, num_workers=num_workers)
 
 
 def test_hexagon_backend_context():

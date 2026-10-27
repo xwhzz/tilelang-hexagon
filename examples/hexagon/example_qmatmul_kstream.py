@@ -51,7 +51,7 @@ def make(M, N, K, input_dtype="float16", output_dtype="float16"):
         W: T.Tensor((NT, KT, Q4_TILE_BYTES), "uint8"),
         C: T.Tensor((M, N), output_dtype),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             A_hmx = T.alloc_shared((M, K), "float16", align=2048)
             B_hmx = T.alloc_shared((K, 32), "float16", align=2048)
             C_hmx = T.alloc_shared((32, 32), "float16", align=2048)
@@ -167,7 +167,7 @@ def make_staged_pack(M, K):
         A_hmx: T.Tensor((M, K), "float16"),
         bias_vtcm: T.Tensor((64,), "uint32"),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             T.annotate_layout({A_hmx: E.activation_layout(A_hmx)})
             for i in T.serial(32):
                 bias_vtcm[i] = T.Cast("uint32", 0x3C00)
@@ -205,7 +205,7 @@ def make_staged_dequant(N, K, padded_tile_bytes=640):
         tile_begin: T.int32,
         tile_end: T.int32,
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             T.annotate_layout({B_hmx: E.weight_layout(B_hmx)})
             for tile in T.serial(tile_begin, tile_end):
                 nt = tile // KT
@@ -238,7 +238,7 @@ def make_staged_hmx(M, N, K):
         C_hmx: T.Tensor((M, 32), "float16"),
         C: T.Tensor((M, dst_stride), "float32"),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             acc = T.hmx.alloc_accumulator()
             cvt = T.hmx.alloc_convert_state()
             bias = T.hmx.alloc_bias_state()
@@ -294,7 +294,7 @@ def make_dequant_tile(output_dtype="float32"):
         W: T.Tensor((1, 1, Q4_TILE_BYTES), "uint8"),
         O: T.Tensor((32, 32), output_dtype),
     ):
-        with T.Kernel(1, threads=1) as _:
+        with T.Kernel(1) as _:
             B_hmx = T.alloc_shared((32, 32), "float16", align=2048)
             q4_scales = T.alloc_local((32,), "float16")
             q4_low = T.alloc_local((32,), "float16")

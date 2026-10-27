@@ -38,7 +38,7 @@ def make_bench(M, N, K, BM, BN):
         timing: T.Tensor((1,), "float32"),
     ):
         T.func_attr({"hexagon.dma_queue_capacity": 4})
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1):
             T.import_source("#include <HAP_perf.h>\n")
             ar = T.alloc_shared((2, BM, K), "float16", align=2048)
             br = T.alloc_shared((2, K, BN), "float16", align=2048)

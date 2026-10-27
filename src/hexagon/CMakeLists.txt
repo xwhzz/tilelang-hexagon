@@ -11,5 +11,6 @@ file(GLOB TILE_LANG_HEXAGON_SRCS
   src/hexagon/op/*.cc
   src/hexagon/target.cc
   src/hexagon/target_utils.cc
+  src/hexagon/transform/*.cc
 )
 list(APPEND TILE_LANG_SRCS ${TILE_LANG_HEXAGON_SRCS})
