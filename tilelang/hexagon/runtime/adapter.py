@@ -16,6 +16,7 @@ import itertools
 import os
 import re
 import tempfile
+import weakref
 
 import numpy as np
 import torch
@@ -48,6 +49,8 @@ class HexagonKernelAdapter(BaseKernelAdapter):
     # Process-wide sequence so concurrent adapters get distinct agent ports and
     # device workdirs — otherwise they collide on tcp:9777 and the shared dir.
     _port_seq = itertools.count()
+    # Adapters of this process, for close_all().
+    _live: weakref.WeakSet = weakref.WeakSet()
 
     def __init__(
         self,
@@ -84,7 +87,10 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self._conn = connection
         self._use_agent = use_agent
         self._agent = None
+        self._on_device = False
+        self._holds_device = False
         self._deploy()
+        HexagonKernelAdapter._live.add(self)
         # BaseKernelAdapter wires self.func = self._convert_torch_func()
         super().__init__(mod=None, params=params, result_idx=result_idx)
 
@@ -104,55 +110,72 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self._iface = iface
         if self.verbose:
             print(f"[hexagon] FastRPC project: {proj} (iface={iface})")
-        artifacts = build_cmake_fastrpc(proj, iface, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
-        # The device part: one session at a time with a device lock (device.py).
-        self._holds_device = DEVICE_LOCK.acquire()
-        try:
-            self._start_on_device(artifacts)
-        except BaseException:
-            self.close()
-            raise
-
-    def _start_on_device(self, artifacts) -> None:
-        conn = self._connection()
-        conn.push(artifacts.dsp_skel)
-        self._exe_remote = conn.push(artifacts.host_exe)
-        if self.verbose:
-            print(f"[hexagon] deployed skel + host to {conn.workdir}")
+        self._artifacts = build_cmake_fastrpc(proj, iface, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
         # Prefer the persistent agent (one held session, ~30x lower per-call
         # latency) unless the kernel has scalar params (not yet marshaled over
         # the agent); otherwise fall back to the one-shot host driver.
         has_scalar = any(p.is_scalar() for p in self._param_list)
-        if self._use_agent and artifacts.agent_exe and not has_scalar:
-            from .agent import HexagonAgentSession
+        self._agent_transport = bool(self._use_agent and self._artifacts.agent_exe and not has_scalar)
+        self._ensure_on_device()
 
-            idx = next(HexagonKernelAdapter._port_seq)
-            port = 10000 + (os.getpid() * 13 + idx) % 40000
-            self._agent = HexagonAgentSession(
-                artifacts.dsp_skel,
-                artifacts.agent_exe,
-                self._param_list,
-                self._result_idx,
-                serial=getattr(conn, "serial", None),
-                device_port=port,
-                workdir=f"/data/local/tmp/tilelang_hex_agent_{os.getpid()}_{idx}",
-            )
+    def _ensure_on_device(self) -> None:
+        """Deploys the kernel and starts its session, unless they are up.
+
+        close() takes them down; the next call brings them back. While they
+        are up the adapter holds the device lock (device.py), if one is set.
+        """
+        if self._on_device:
+            return
+        self._holds_device = DEVICE_LOCK.acquire()
+        try:
+            conn = self._connection()
+            conn.push(self._artifacts.dsp_skel)
+            self._exe_remote = conn.push(self._artifacts.host_exe)
             if self.verbose:
-                print("[hexagon] persistent agent transport active")
+                print(f"[hexagon] deployed skel + host to {conn.workdir}")
+            if self._agent_transport:
+                from .agent import HexagonAgentSession
+
+                idx = next(HexagonKernelAdapter._port_seq)
+                port = 10000 + (os.getpid() * 13 + idx) % 40000
+                self._agent = HexagonAgentSession(
+                    self._artifacts.dsp_skel,
+                    self._artifacts.agent_exe,
+                    self._param_list,
+                    self._result_idx,
+                    serial=getattr(conn, "serial", None),
+                    device_port=port,
+                    workdir=f"/data/local/tmp/tilelang_hex_agent_{os.getpid()}_{idx}",
+                )
+                if self.verbose:
+                    print("[hexagon] persistent agent transport active")
+            self._on_device = True
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
+        """Stops the kernel's session and releases the device; a call restarts them."""
         if getattr(self, "_agent", None) is not None:
             self._agent.close()
             self._agent = None
+        self._on_device = False
         if getattr(self, "_holds_device", False):
             self._holds_device = False
             DEVICE_LOCK.release()
+
+    @classmethod
+    def close_all(cls) -> None:
+        """Closes every adapter of this process (e.g. between tests)."""
+        for adapter in list(cls._live):
+            adapter.close()
 
     def __del__(self):
         with contextlib.suppress(Exception):
             self.close()
 
     def _agent_forward(self, *ins):
+        self._ensure_on_device()
         params, result_idx = self._param_list, set(self._result_idx)
         it = iter(ins)
         in_arrays = []
@@ -172,11 +195,12 @@ class HexagonKernelAdapter(BaseKernelAdapter):
     def _convert_torch_func(self):
         params = self._param_list
         result_idx = set(self._result_idx)
-        if self._agent is not None:
+        if self._agent_transport:
             return self._agent_forward
         conn = self._connection()
 
         def forward(*ins):
+            self._ensure_on_device()
             # Materialize args in kernel-param order; allocate outputs.
             values = [None] * len(params)
             it = iter(ins)

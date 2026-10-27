@@ -1,5 +1,6 @@
 """Host-only regression checks for the optional Linux BSP transport/build path."""
 
+import importlib
 import os
 import struct
 from pathlib import Path
@@ -16,6 +17,8 @@ def clean_runtime_environment(monkeypatch):
     for name in list(os.environ):
         if name.startswith("TILELANG_HEXAGON_") or name == "HEXAGON_DSP_ARCH":
             monkeypatch.delenv(name)
+    # They check the build commands themselves, over fake projects.
+    monkeypatch.setattr(importlib.import_module("tilelang.env").env, "is_cache_enabled", lambda: False)
 
 
 class FakeSDK:
