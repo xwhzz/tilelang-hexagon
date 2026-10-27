@@ -6,12 +6,12 @@
  * compiled by hexagon-clang++ (HVX/HMX) and invoked from a FastRPC skel.
  * Hardware intimacy (HMX/HVX/VTCM) is deliberately kept out of the codegen and
  * lives in tl_templates/hexagon headers; this class is a thin source emitter
- * built on TVM's CodeGenC (the same pattern as the CPU/Metal backends).
+ * built on CodeGenTileLangCBase, like the CPU and Metal backends.
  */
 #ifndef TVM_TL_CODEGEN_HEXAGON_H_
 #define TVM_TL_CODEGEN_HEXAGON_H_
 
-#include "target/source/codegen_c.h"
+#include "backend/common/codegen/codegen_c_base.h"
 #include "tvm/target/codegen.h"
 #include <optional>
 #include <string>
@@ -23,7 +23,7 @@
 namespace tvm {
 namespace codegen {
 
-class CodeGenTileLangHexagon : public CodeGenC {
+class CodeGenTileLangHexagon : public CodeGenTileLangCBase {
 public:
   CodeGenTileLangHexagon();
 
@@ -55,6 +55,9 @@ public:
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
 
+protected:
+  void EmitPreamble_(std::ostream &os) const final;
+
 private:
   /*! \brief names of the kernel functions emitted in this module */
   ffi::Array<ffi::String> function_names_;
@@ -66,6 +69,8 @@ private:
    *  and only the runtime checks the grant. */
   size_t vtcm_capacity_ = 0;
   bool dma_async_ = false;
+  /*! \brief whether any emitted kernel uses the managed DMA queue */
+  bool uses_dma_async_ = false;
   int dma_capacity_ = 16;
 
   /*! \brief worker-pool (multithreaded grid) state, set per function.  When the

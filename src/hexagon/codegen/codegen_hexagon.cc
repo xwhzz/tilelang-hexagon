@@ -21,14 +21,36 @@ using namespace ffi;
 
 namespace {
 
+// A Hexagon builtin printed as a call to its runtime template function, with
+// the call's arguments in order.
+struct HexagonBuiltin {
+  Op op;
+  const char *function;
+  bool uses_hmx;
+};
+
+const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
+  // Built on first use: the Ops are registered by static initializers in
+  // other translation units.
+  static const std::vector<HexagonBuiltin> builtins = {
+      {tl::hexagon_hmx_acquire(), "tl_hexagon_hmx_acc_acquire", true},
+      {tl::hexagon_hmx_release(), "tl_hexagon_hmx_acc_release", true},
+      {tl::hexagon_hmx_load_bias(), "tl_hexagon_hmx_load_bias", true},
+      {tl::hexagon_hmx_clear(), "tl_hexagon_hmx_clear_acc", true},
+      {tl::hexagon_hmx_mma(), "tl_hexagon_hmx_mma_atom", true},
+      {tl::hexagon_hmx_convert(), "tl_hexagon_hmx_convert_acc", true},
+      {tl::hexagon_hmx_store(), "tl_hexagon_hmx_store_cvt_state", true},
+  };
+  for (const auto &builtin : builtins) {
+    if (call->op.same_as(builtin.op))
+      return &builtin;
+  }
+  return nullptr;
+}
+
 bool IsHexagonHMXIntrinsic(const CallNode *call) {
-  return call->op.same_as(tl::hexagon_hmx_acquire()) ||
-         call->op.same_as(tl::hexagon_hmx_release()) ||
-         call->op.same_as(tl::hexagon_hmx_load_bias()) ||
-         call->op.same_as(tl::hexagon_hmx_clear()) ||
-         call->op.same_as(tl::hexagon_hmx_mma()) ||
-         call->op.same_as(tl::hexagon_hmx_convert()) ||
-         call->op.same_as(tl::hexagon_hmx_store());
+  const HexagonBuiltin *builtin = FindHexagonBuiltin(call);
+  return builtin != nullptr && builtin->uses_hmx;
 }
 
 bool IsHexagonDMAExtern(const CallNode *call) {
@@ -55,10 +77,15 @@ bool IsDMAWait(const CallNode *call) {
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
-  decl_stream << "// tilelang Hexagon (cDSP) kernel\n";
-  decl_stream << "#include <tl_templates/hexagon/common.h>\n";
-  decl_stream << "\n";
+  preamble_stream_ << "// tilelang Hexagon (cDSP) kernel\n";
+  preamble_stream_ << "#include <tl_templates/hexagon/common.h>\n";
+  preamble_stream_ << "\n";
   CodeGenC::Init(output_ssa);
+}
+
+void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
+  if (uses_dma_async_)
+    os << "#include <tl_templates/hexagon/dma.h>\n";
 }
 
 void CodeGenTileLangHexagon::PrintFuncPrefix(std::ostream &os) { // NOLINT(*)
@@ -196,7 +223,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
     ICHECK(!raw_dma)
         << "Hexagon async DMA cannot share a kernel with raw DMA calls";
     name_supply_->ReserveName("tl_dma_async");
-    decl_stream << "#include <tl_templates/hexagon/dma.h>\n";
+    uses_dma_async_ = true;
   }
 
   // Reserve the worker callback's fixed identifiers BEFORE assigning param ids,
@@ -482,24 +509,8 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
-  const char *hmx_name = nullptr;
-  if (op->op.same_as(tl::hexagon_hmx_acquire())) {
-    hmx_name = "tl_hexagon_hmx_acc_acquire";
-  } else if (op->op.same_as(tl::hexagon_hmx_release())) {
-    hmx_name = "tl_hexagon_hmx_acc_release";
-  } else if (op->op.same_as(tl::hexagon_hmx_load_bias())) {
-    hmx_name = "tl_hexagon_hmx_load_bias";
-  } else if (op->op.same_as(tl::hexagon_hmx_clear())) {
-    hmx_name = "tl_hexagon_hmx_clear_acc";
-  } else if (op->op.same_as(tl::hexagon_hmx_mma())) {
-    hmx_name = "tl_hexagon_hmx_mma_atom";
-  } else if (op->op.same_as(tl::hexagon_hmx_convert())) {
-    hmx_name = "tl_hexagon_hmx_convert_acc";
-  } else if (op->op.same_as(tl::hexagon_hmx_store())) {
-    hmx_name = "tl_hexagon_hmx_store_cvt_state";
-  }
-  if (hmx_name != nullptr) {
-    os << hmx_name << "(";
+  if (const HexagonBuiltin *builtin = FindHexagonBuiltin(op)) {
+    os << builtin->function << "(";
     for (size_t i = 0; i < op->args.size(); ++i) {
       if (i != 0)
         os << ", ";

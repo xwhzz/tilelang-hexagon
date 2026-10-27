@@ -9,6 +9,7 @@
  * produces the kernel source string.
  */
 #include "codegen_hexagon.h"
+#include "config.h"
 #include "support/check.h"
 
 #include <tvm/ffi/extra/module.h>
@@ -27,6 +28,7 @@ using namespace ffi;
 Module BuildTileLangHexagon(IRModule mod, Target target) {
   CodeGenTileLangHexagon cg;
   cg.Init(/*output_ssa=*/false);
+  cg.SetEmitLineDirectives(tl::tl_config::EmitLineDirectivesEnabled());
 
   std::vector<std::pair<GlobalVar, PrimFunc>> funcs;
   for (auto [gvar, base_func] : mod->functions) {
