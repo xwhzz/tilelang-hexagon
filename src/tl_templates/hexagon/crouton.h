@@ -220,17 +220,35 @@ TL_DEVICE void tl_crouton_transpose_stage(HVX_Vector (&v)[32]) {
   }
 }
 
-// Packs 64 matrix rows x 32 columns of a column-contiguous fp16 matrix
-// (rs == 1): the 32 columns, 64 halves each, are 32 registers of row-pair
-// words, whose word transpose is the 32 row-pair registers of two tiles.
-// `second` is the offset from the first tile to the second, 32 rows down.
-template <bool Aligned>
+// 64 rows of a matrix column that is contiguous, as the 64 fp16 halves of a
+// register in row order. fp32 rows deal into the even rows and the odd rows,
+// which the conversion to fp16 interleaves back.
+template <bool Aligned, typename M>
+TL_DEVICE HVX_Vector tl_crouton_load_column(const M *m) {
+  if constexpr (std::is_same_v<M, half>) {
+    return tl_hvx_load<Aligned>(m);
+  } else {
+    HVX_VectorPair d = Q6_W_vdeal_VVR(tl_hvx_load<Aligned>(m + 32),
+                                      tl_hvx_load<Aligned>(m), -4);
+    HVX_Vector zero = Q6_V_vzero();
+    return Q6_Vhf_equals_Wqf32(
+        Q6_W_vcombine_VV(Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(d), zero),
+                         Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(d), zero)));
+  }
+}
+
+// Packs 64 matrix rows x 32 columns of a column-contiguous fp16 or fp32
+// matrix (rs == 1): the 32 columns, 64 halves each, are 32 registers of
+// row-pair words, whose word transpose is the 32 row-pair registers of two
+// tiles. `second` is the offset from the first tile to the second, 32 rows
+// down.
+template <bool Aligned, typename M>
 TL_DEVICE void tl_crouton_pack_transposed_block(half *tile, int second,
-                                                const half *m, int cs) {
+                                                const M *m, int cs) {
   HVX_Vector v[32];
 #pragma clang loop unroll(full)
   for (int c = 0; c < 32; ++c)
-    v[c] = tl_hvx_load<Aligned>(m + c * cs);
+    v[c] = tl_crouton_load_column<Aligned>(m + c * cs);
   tl_crouton_transpose_stage<1>(v);
   tl_crouton_transpose_stage<2>(v);
   tl_crouton_transpose_stage<4>(v);
@@ -247,12 +265,12 @@ TL_DEVICE void tl_crouton_pack_transposed_block(half *tile, int second,
 }
 
 // Packs the blocks of 64 rows x 32 columns in [0, rows) x [0, cols) of a
-// column-contiguous fp16 matrix, r0 and c0 on tile boundaries. One block at a
-// time: its 32 registers fill the register file.
-template <bool ColumnTiles, bool Aligned>
+// column-contiguous matrix, r0 and c0 on tile boundaries. One block at a time:
+// its 32 registers fill the register file.
+template <bool ColumnTiles, bool Aligned, typename M>
 TL_DEVICE void
 tl_crouton_pack_transposed(half *crouton, int row_tiles, int col_tiles, int r0,
-                           int c0, int rows, int cols, const half *m, int cs) {
+                           int c0, int rows, int cols, const M *m, int cs) {
 #pragma clang loop unroll(disable)
   for (int i = 0; i < rows; i += 64)
 #pragma clang loop unroll(disable)
@@ -278,13 +296,13 @@ TL_DEVICE void tl_crouton_copy(half *crouton, int row_tiles, int col_tiles,
                                             c0, rows, cols, m, rs);
     return;
   }
-  if constexpr (Pack && std::is_same_v<M, half>) {
+  if constexpr (Pack) {
     if (rs == 1 && (r0 & 31) == 0 && (c0 & 31) == 0) {
       // Whole blocks of 64 rows x 32 columns transpose; the rest is
       // copied element by element.
       int block_rows = rows & ~63, block_cols = cols & ~31;
       if ((reinterpret_cast<uintptr_t>(m) & 127) == 0 &&
-          (cs * static_cast<int>(sizeof(half))) % 128 == 0)
+          (cs * static_cast<int>(sizeof(M))) % 128 == 0)
         tl_crouton_pack_transposed<ColumnTiles, true>(
             crouton, row_tiles, col_tiles, r0, c0, block_rows, block_cols, m,
             cs);
