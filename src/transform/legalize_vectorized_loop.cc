@@ -85,7 +85,7 @@ private:
   };
 
   // The constraints entered into a LoopAnalyzer, kept until the loop is
-  // vectorized.
+  // vectorized and then exited innermost first.
   using Constraints =
       std::vector<std::unique_ptr<With<arith::ConstraintContext>>>;
 
@@ -232,7 +232,13 @@ private:
                    << "reductions to T.unroll or T.serial if this is intended.";
     }
     // Apply vectorization transformation to the loop
-    return VectorizeLoop(for_node, analyzer.get(), {}, vectorize_size);
+    Stmt vectorized =
+        VectorizeLoop(for_node, analyzer.get(), {}, vectorize_size);
+    // Constraints exit in reverse order of entry: a vector's elements are
+    // destroyed in an order the standard leaves open.
+    while (!constraints.empty())
+      constraints.pop_back();
+    return vectorized;
   }
 
   std::vector<Fact> scope_;
