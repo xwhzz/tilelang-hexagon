@@ -82,6 +82,37 @@ template <typename V> TL_DEVICE V tl_vec_opaque(V v) {
   return v;
 }
 
+// fp32 lanes from integer lanes by the signed conversion instruction, a
+// register at a time. LLVM turns the conversion of lanes it proves non-negative
+// (a loop index, a zero-extension) into an unsigned one, which hexagon-clang 19
+// lowers to IEEE fp adds although -mhvx-ieee-fp is off: the backend fails
+// ("V6_vadd_sf_sf"), or the lanes read 0 on the cDSP. Integers of at most 32
+// bits but uint32 widen exactly to int32 first.
+#if defined(__HVX__) && __HVX_ARCH__ >= 73 && __HVX_LENGTH__ == 128
+template <typename T, typename U, int N>
+constexpr bool tl_vec_converts_by_vconv =
+    std::is_same_v<T, float> && std::is_integral_v<U> && sizeof(U) <= 4 &&
+    !std::is_same_v<U, uint32_t> && N % 32 == 0;
+
+template <int N>
+inline __attribute__((always_inline)) void tl_vec_vconv_sf_w(void *out,
+                                                             const void *in) {
+  typedef int words __attribute__((__vector_size__(128)));
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / 32; ++i) {
+    words x;
+    __builtin_memcpy(&x, static_cast<const char *>(in) + 128 * i, 128);
+    x = __builtin_HEXAGON_V6_vconv_sf_w_128B(x);
+    __builtin_memcpy(static_cast<char *>(out) + 128 * i, &x, 128);
+  }
+}
+#else
+template <typename T, typename U, int N>
+constexpr bool tl_vec_converts_by_vconv = false;
+
+template <int N> inline void tl_vec_vconv_sf_w(void *, const void *) {}
+#endif
+
 template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   typedef T nat_t __attribute__((ext_vector_type(N)));
   using mask_t = vec_type<typename tl_mask_lane<sizeof(T)>::type, N>;
@@ -104,7 +135,13 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   // Converting ctor for vector casts, e.g. (half4)float4_value when storing an
   // fp32 accumulator back as fp16 — a lane-wise numeric convert.
   template <typename U> explicit vec_type(const vec_type<U, N> &o) {
-    v = __builtin_convertvector(o.v, nat_t);
+    if constexpr (tl_vec_converts_by_vconv<T, U, N>) {
+      typedef int32_t wide_t __attribute__((ext_vector_type(N)));
+      wide_t w = __builtin_convertvector(o.v, wide_t);
+      tl_vec_vconv_sf_w<N>(&v, &w);
+    } else {
+      v = __builtin_convertvector(o.v, nat_t);
+    }
   }
   // Element-wise operators -> native (HVX) vector ops.  Members are
   // instantiated lazily, so bit-ops on float aggregates (never emitted) never

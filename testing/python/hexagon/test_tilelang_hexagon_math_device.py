@@ -174,3 +174,37 @@ def test_min_and_max_match_torch(dtype):
         torch.testing.assert_close(hi, torch.maximum(a, b), rtol=0, atol=0)
     finally:
         kernel.adapter.close()
+
+
+@pytest.mark.parametrize("src", ["lane", "uint8", "int16", "int32"])
+def test_integer_lanes_convert_to_fp32(src):
+    import torch
+
+    # LLVM converts lanes it proves non-negative (a lane index, a zero
+    # extension) as unsigned, which hexagon-clang 19 lowers to IEEE fp adds:
+    # the lanes read 0, or the backend fails on the select.
+    dtype = "int32" if src == "lane" else src
+
+    @T.prim_func
+    def convert(A: T.Tensor((LANES,), dtype), Out: T.Tensor((2, LANES), "float32")):
+        with T.Kernel(1):
+            f = T.alloc_fragment((LANES,), "float32")
+            for j in T.Parallel(LANES):
+                f[j] = T.Cast("float32", j) if src == "lane" else T.Cast("float32", A[j])
+            for j in T.Parallel(LANES):
+                Out[0, j] = f[j]
+                Out[1, j] = T.if_then_else(A[j] == A[0], T.Cast("float32", j), T.float32(-1))
+
+    kernel = tilelang.compile(convert, out_idx=[1], target="hexagon")
+    try:
+        torch.manual_seed(0)
+        top = {"int32": 1 << 30, "uint8": 256, "int16": 1 << 15}[dtype]
+        a = torch.randint(0, top, (LANES,), dtype=torch.int64)
+        a[::7] = a[0]
+        a = a.to(getattr(torch, dtype))
+        out = kernel(a)
+        lanes = torch.arange(LANES, dtype=torch.float32)
+        torch.testing.assert_close(out[0], lanes if src == "lane" else a.to(torch.float64).float(), rtol=0, atol=0)
+        torch.testing.assert_close(out[1], torch.where(a == a[0], lanes, torch.tensor(-1.0)), rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
