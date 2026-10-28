@@ -45,6 +45,30 @@ def test_vectorize_access():
     assert_vectorize_access(64, 64)
 
 
+def test_vectorized_loop_knows_the_conditions_it_is_under():
+    """The loop's own analyzer still has its branch's condition: n % 4 == 0
+    is what makes n + i a whole vector of 4."""
+
+    @T.prim_func
+    def before(A: T.Tensor((64,), T.int32), B: T.Tensor((64,), T.int32), n: T.int32):
+        for t in T.serial(4):
+            if n % 4 == 0:
+                for i in T.vectorized(4):
+                    B[n + i] = A[n + i] + t
+
+    @T.prim_func
+    def expected(A: T.Tensor((64,), T.int32), B: T.Tensor((64,), T.int32), n: T.int32):
+        for t in T.serial(4):
+            if n % 4 == 0:
+                for vec in T.vectorized(4):
+                    B[n + vec] = A[n + vec] + t
+
+    mod = tvm.IRModule.from_expr(before)
+    with tvm.target.Target("cuda"):
+        transformed = tl.transform.LegalizeVectorizedLoop()(mod)
+    tvm.ir.assert_structural_equal(transformed["before"].body, expected.body, map_free_vars=True)
+
+
 @tilelang.testing.requires_cuda
 def test_vectorized_nonzero_min_uses_aligned_vector_width():
     @T.prim_func
