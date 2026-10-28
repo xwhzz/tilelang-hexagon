@@ -377,8 +377,14 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   std::string extent = PrintExpr(op->extent);
   bool hmx = UsesHMX(op->body);
   bool grid_sync = UsesGridSync(op->body);
+  // The status is a declaration, not an if condition: hexagon-clang 19
+  // asserts on a #pragma (InterleaveMaps' unroll counts) inside a lambda that
+  // the tentative parse of a condition caches.
   PrintIndent();
-  stream << "if (int32_t tl_status = tl_parallel_for";
+  stream << "{\n";
+  int block = BeginScope();
+  PrintIndent();
+  stream << "int32_t tl_status = tl_parallel_for";
   if (hmx || grid_sync) {
     stream << '<' << (hmx ? "tl_hmx_worker_scope" : "tl_worker_scope");
     stream << (grid_sync ? ", true>" : ">");
@@ -406,7 +412,14 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   worker_program_ = std::nullopt;
   EndScope(scope);
   PrintIndent();
-  stream << "})) return tl_status;\n";
+  stream << "});\n";
+  PrintIndent();
+  stream << "if (tl_status)\n";
+  PrintIndent();
+  stream << "  return tl_status;\n";
+  EndScope(block);
+  PrintIndent();
+  stream << "}\n";
 }
 
 void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
@@ -758,6 +771,11 @@ void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
   if (IsWorkerLoop(op)) {
     PrintWorkerLoop(op);
     return;
+  }
+  if (auto count = op->annotations.Get(tl::attr::kHexagonUnrollCount)) {
+    PrintIndent();
+    stream << "#pragma clang loop unroll_count("
+           << Downcast<Integer>(count.value())->value << ")\n";
   }
   CodeGenC::VisitStmt_(op);
 }

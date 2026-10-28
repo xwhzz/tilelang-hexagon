@@ -143,6 +143,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     )(mod)
     mod = tilelang.hexagon.transform.VerifyVTCMArena()(mod)
     mod = tilelang.hexagon.transform.MarkExclusiveBuffers()(mod)
+    mod = tilelang.hexagon.transform.InterleaveMaps()(mod)
 
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)

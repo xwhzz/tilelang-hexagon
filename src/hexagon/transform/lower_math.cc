@@ -9,7 +9,8 @@
  * hvx_math.h functions. Other dtypes keep the default lowering.
  *
  * Under tl.enable_fast_math they become the fast variants instead, and a float
- * division becomes hexagon_div_fast: fp16-grade accuracy (hvx_math.h).
+ * division becomes hexagon_div_fast, or by a constant a multiply by its
+ * reciprocal: fp16-grade accuracy (hvx_math.h).
  */
 
 #include "hexagon/op/builtin.h"
@@ -80,6 +81,9 @@ private:
     const auto *node = div.as<DivNode>();
     if (!fast_ || node == nullptr || !HexagonFloat(node->dtype))
       return div;
+    // By a constant: a multiply by its reciprocal, as fast math does anyway.
+    if (const auto *c = node->b.as<FloatImmNode>())
+      return node->a * make_const(node->dtype, 1.0 / c->value);
     return Call(node->dtype, hexagon_div_fast(), {node->a, node->b});
   }
 

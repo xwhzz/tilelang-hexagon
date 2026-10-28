@@ -45,7 +45,8 @@ arithmetic flushes subnormal results (below 2^-14) to zero.
 
 The functions aim at fp32 accuracy. Under the `tl.enable_fast_math` pass config, `LowerMath`
 picks fast variants instead (`tl_hvx_<fn>_fast`), and a float division becomes
-`tl_hvx_div_fast`: fp16-grade accuracy for finite inputs in the functions' domains. They keep
+`tl_hvx_div_fast`, or a multiply by the reciprocal of a constant divisor: fp16-grade accuracy
+for finite inputs in the functions' domains. They keep
 their chains in qf32, take two Newton-Raphson steps, use lower-degree polynomials and skip
 special values and subnormals. On v79, in cycles per fp32 register, with the maximum error
 over the inputs (relative, or absolute for log, tanh, sigmoid and erf):
@@ -73,16 +74,28 @@ evaluate: no side effects but loads, each provably in bounds. A causal mask
 float lanes hides them from LLVM (`tl_vec_opaque`): it would fold a symmetric range check or
 an abs-like select into `llvm.fabs`, which hexagon-clang 19 scalarizes for HVX vectors.
 
-Two passes let LLVM's software pipeliner overlap the iterations of these maps; a map it
-does not pipeline issues about one instruction per packet. `BroadcastFromRegisters`
-handles a scalar broadcast per row (`S[i, j] - rmax[i]`, `x[i, j] * inv[i]`): such a row
-loop runs in strips of one register's worth of rows; a strip loads its rows' scalars
-into a register once (`tl_hvx_load_lanes`) and each row broadcasts its lane from it
-(`tl_hvx_broadcast_lane`, a rotate and a delta-network copy), instead of a scalar VTCM
-load at the head of every iteration. `MarkExclusiveBuffers` gives each VTCM buffer that
-shares no memory with another a pointer of its own (`tl_vtcm_exclusive`, which LLVM
-treats as a fresh allocation): the buffers of an arena are otherwise one object to LLVM,
-so a map that reads one buffer and writes another runs one iteration at a time.
+Three passes shape these maps for LLVM's software pipeliner; a map it does not pipeline
+runs one chain of dependent instructions at a time, about one instruction per packet.
+
+- `BroadcastFromRegisters` handles a scalar broadcast per row (`S[i, j] - rmax[i]`,
+  `x[i, j] * inv[i]`): such a row loop runs in strips of one register's worth of rows; a
+  strip loads its rows' scalars into a register once (`tl_hvx_load_lanes`) and each row
+  broadcasts its lane from it (`tl_hvx_broadcast_lane`, a rotate and a delta-network
+  copy), instead of a scalar VTCM load at the head of every iteration. A row of at most 8
+  vectors then unrolls, so that the loop over the strip's rows is the innermost, which
+  LLVM pipelines: on v79, `exp(s - m[i])` over 128 rows of 2 fp32 vectors went from 79 to
+  27 cycles a vector. Compute a row's factor once, in a loop over the rows
+  (`inv[i] = T.rsqrt(ss[i] * (1 / D) + eps)`), rather than in the map, where each vector
+  recomputes it: an RMSNorm's scaling went from 155 to 22 cycles a vector.
+- `MarkExclusiveBuffers` gives each VTCM buffer that shares no memory with another a
+  pointer of its own (`tl_vtcm_exclusive`, which LLVM treats as a fresh allocation): the
+  buffers of an arena are otherwise one object to LLVM, so a map that reads one buffer
+  and writes another runs one iteration at a time.
+- `InterleaveMaps`: a map that computes an HVX math function runs a chain of a few dozen
+  instructions per vector, which can exceed the initiation interval LLVM pipelines
+  (`-pipeliner-max-mii`). Its loop prints unrolled by two (`#pragma clang loop
+  unroll_count(2)`), so that an iteration interleaves two chains: SwiGLU's
+  `x * sigmoid(x) * y` over 128 x 128 fp32 went from 126 to 56 cycles a vector.
 
 `T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).

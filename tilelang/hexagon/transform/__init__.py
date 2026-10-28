@@ -109,6 +109,18 @@ def MarkUnwrittenDMASources():
     return _ffi_api.MarkUnwrittenDMASources()  # type: ignore
 
 
+def InterleaveMaps():
+    """Unroll the loops of heavy vector maps by two.
+
+    A map whose elements compute an HVX math function runs a long chain of
+    dependent instructions per vector, which LLVM pipelines only up to an
+    initiation interval it bounds. Each innermost loop that stores one vector
+    an iteration of such a map is marked for the codegen to unroll by two, so
+    that an iteration interleaves two chains.
+    """
+    return _ffi_api.InterleaveMaps()  # type: ignore
+
+
 def MarkExclusiveBuffers():
     """Give the VTCM buffers that share no memory pointers of their own.
 

@@ -15,7 +15,8 @@
  * (tl_hvx_broadcast_lane, a rotate and a delta-network copy). The row loop
  * then reads only the tile itself. A T.Parallel(M, N) loop wider than a
  * register is one loop over the vectors of all rows, whose scalar sits at
- * i // K for K vectors per row; it splits into rows of K vectors first.
+ * i // K for K vectors per row; it splits into rows of K vectors first, and a
+ * row of a few vectors unrolls.
  *
  * A Crouton tile register holds a row pair, whose values a map reads as a
  * window of two elements, replicated (LowerWindowLoads). The loop over a
@@ -51,6 +52,11 @@ using namespace ffi;
 namespace {
 
 constexpr int kRegisterBytes = 128;
+// Rows of at most this many vectors unroll: the loop over a strip's rows is
+// then the innermost, which LLVM pipelines; a loop over a row of two vectors
+// it does not. On v79, exp(s - m[i]) over 128 rows of 2, 4 and 8 fp32 vectors
+// went from 79, 42 and 32 to 27, 23 and 19 cycles a vector.
+constexpr int64_t kUnrolledVectors = 8;
 
 // A buffer that a loop reads `group` elements of per iteration, at
 // loop_var * group + base, and repeats over vectors: a broadcast scalar
@@ -288,8 +294,16 @@ private:
       Stmt body = Substitute(loop->body, {{loop->loop_var, row * k + col}});
       body = IndexSimplifier(&analyzer)(body);
       row_min = make_zero(index_t);
-      row_body = For(col, make_zero(index_t), k, ForKind::kSerial, body,
-                     std::nullopt, loop->annotations);
+      if (period <= kUnrolledVectors) {
+        Array<Stmt> vectors;
+        for (int64_t c = 0; c < period; ++c)
+          vectors.push_back(IndexSimplifier(&analyzer)(
+              Substitute(body, {{col, make_const(index_t, c)}})));
+        row_body = SeqStmt(vectors);
+      } else {
+        row_body = For(col, make_zero(index_t), k, ForKind::kSerial, body,
+                       std::nullopt, loop->annotations);
+      }
     }
     std::vector<Source> sources = CollectSources(row_body, row);
     if (sources.empty())

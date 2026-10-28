@@ -130,6 +130,37 @@ def test_fast_math_prints_the_fast_functions_and_division(dtype, vector):
     assert f"tl_hvx_div(tl_hvx_exp(*({vector}*)(A + " in accurate
 
 
+def test_heavy_maps_unroll_by_two():
+    @T.prim_func
+    def kernel(A: T.Tensor((128, 128), "float32"), B: T.Tensor((128, 128), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((128, 128), "float32")
+            T.copy(A, a)
+            for i, j in T.Parallel(128, 128):
+                a[i, j] = a[i, j] * T.sigmoid(a[i, j])
+            for i, j in T.Parallel(128, 128):
+                a[i, j] = a[i, j] * a[i, j]
+            T.copy(a, B)
+
+    lines = _source(kernel).splitlines()
+    # Only the map that computes a math function, two chains an iteration.
+    (pragma,) = [i for i, line in enumerate(lines) if "#pragma clang loop unroll_count(2)" in line]
+    assert lines[pragma + 1].strip().startswith("for (")
+    assert "tl_hvx_sigmoid(" in lines[pragma + 2]
+
+
+def test_fast_division_by_a_constant_multiplies():
+    @T.prim_func
+    def kernel(A: T.Tensor((4, 256), "float32"), B: T.Tensor((4, 256), "float32")):
+        with T.Kernel(4) as bx:
+            for j in T.Parallel(256):
+                B[bx, j] = A[bx, j] / T.float32(8)
+
+    source = _source(kernel, fast_math=True)
+    assert "tl_hvx_div" not in source
+    assert "1.250000e-01f" in source
+
+
 # ---------------------------------------------------------------------------
 # Per-row scalars broadcast from registers (BroadcastFromRegisters).
 # ---------------------------------------------------------------------------
@@ -176,13 +207,22 @@ def test_the_last_strip_loads_only_its_rows():
 
 
 def test_rows_of_several_registers_split_into_rows_and_columns():
-    # 256 fp16 columns are 4 registers per row: T.Parallel fuses them into one
-    # loop over all 256 vectors, which splits back into rows of 4.
-    source = _source(_row_map(64, 256, "float32"))
+    # 4096 fp16 columns are 64 registers per row: T.Parallel fuses them into
+    # one loop over all the vectors, which splits back into rows of 64.
+    source = _source(_row_map(64, 4096, "float32"))
     assert "for (int32_t i_strip = 0; i_strip < 2; ++i_strip) {" in source
     assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
-    assert "for (int32_t i_col = 0; i_col < 4; ++i_col) {" in source
+    assert "for (int32_t i_col = 0; i_col < 64; ++i_col) {" in source
     assert "tl_hvx_broadcast_lane<32, 1>(r_lanes, i_lane)" in source
+
+
+def test_rows_of_a_few_registers_unroll():
+    # 256 fp16 columns are 4 registers per row: the row unrolls, so that the
+    # loop over the strip's rows is the innermost.
+    source = _source(_row_map(64, 256, "float32"))
+    lanes = source.split("for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {")[1].split("tl_crouton")[0]
+    assert "i_col" not in source
+    assert lanes.count("tl_hvx_broadcast_lane<32, 1>(r_lanes, i_lane)") == 4
 
 
 def test_scalars_that_do_not_step_with_the_row_stay_loads():

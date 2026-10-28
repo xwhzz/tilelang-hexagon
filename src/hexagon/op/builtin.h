@@ -22,6 +22,10 @@ constexpr const char *kHexagonGridDim = "hexagon.grid_dim";
 // the T.gemm calls of a pool of more than one worker (GemmHMX).
 constexpr const char *kHexagonNumWorkers = "hexagon.num_workers";
 
+// How many iterations of a loop the codegen unrolls into one (#pragma clang
+// loop unroll_count). Set by InterleaveMaps.
+constexpr const char *kHexagonUnrollCount = "hexagon.unroll_count";
+
 } // namespace attr
 
 /*! \brief Acquire exclusive use of the implicit HMX accumulator state. */
