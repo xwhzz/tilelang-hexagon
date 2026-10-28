@@ -108,21 +108,22 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
 
 
 def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[BufferPlan]) -> str:
-    # qaic skel signature for run(): in seq -> (const uint8*, int); rout seq ->
-    # (uint8*, int max, int* written); in int32 -> (int).
+    # qaic skel signature for run(), in the types of its header: in seq ->
+    # (const uint8*, int); rout seq -> (uint8*, int); in int32 -> (int32), which
+    # is not an int on the DSP.
     skel_args = ["remote_handle64 _h"]
     call_args = []
     for pl in plans:
         if pl.is_scalar:
-            skel_args.append(f"int {pl.name}")
+            skel_args.append(f"int32 {pl.name}")
             call_args.append(f"({pl.ctype}){pl.name}")
         elif pl.is_output:
             # QAIC maps `rout sequence<uint8>` to (ptr, len); the length is fixed
             # by the caller and the buffer is copied back, so no written-length.
-            skel_args.append(f"unsigned char* {pl.name}, int {pl.name}Len")
+            skel_args.append(f"uint8* {pl.name}, int {pl.name}Len")
             call_args.append(f"({pl.ctype}*){pl.name}")
         else:
-            skel_args.append(f"const unsigned char* {pl.name}, int {pl.name}Len")
+            skel_args.append(f"const uint8* {pl.name}, int {pl.name}Len")
             call_args.append(f"({pl.ctype}*){pl.name}")
     # Pull in the HMX matmul runtime only when the kernel calls into it (it
     # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
