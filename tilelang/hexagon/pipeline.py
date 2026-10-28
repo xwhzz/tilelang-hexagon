@@ -128,6 +128,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.hexagon.transform.KeepKernelParams()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
     mod = tilelang.hexagon.transform.MarkUnwrittenDMASources()(mod)
 

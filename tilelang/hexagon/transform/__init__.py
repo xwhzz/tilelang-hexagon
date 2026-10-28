@@ -24,6 +24,16 @@ def MaterializeGrid():
     return _ffi_api.MaterializeGrid()  # type: ignore
 
 
+def KeepKernelParams():
+    """Give each device kernel every parameter of its PrimFunc, in order.
+
+    The FastRPC skel calls the kernel with all of them, so a parameter the body
+    never reads stays a parameter of the kernel. Runs right after
+    ``SplitHostDevice``.
+    """
+    return _ffi_api.KeepKernelParams()  # type: ignore
+
+
 def PlanDMAQueue():
     """Size and place the DMA queue of every tile program.
 

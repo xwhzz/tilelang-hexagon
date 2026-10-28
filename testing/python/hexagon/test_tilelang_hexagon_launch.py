@@ -142,6 +142,36 @@ def test_one_kernel_per_prim_func():
         _lower(two_launches)
 
 
+def _double(n):
+    """B = 2 A, past a buffer and a scalar the kernel never reads."""
+
+    @T.prim_func
+    def double(A: T.Tensor((64,), "float32"), unused: T.Tensor((n,), "int8"), count: T.int32, B: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            for j in T.Parallel(64):
+                B[j] = A[j] * T.float32(2)
+
+    return double
+
+
+def test_kernel_takes_every_parameter_in_order():
+    # The FastRPC skel calls the kernel with every parameter of the PrimFunc.
+    func = _device_func(_lower(_double(16)))
+    assert [p.name for p in func.params] == ["A", "unused", "count", "B"]
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_unused_parameters_keep_the_others_in_place():
+    import torch
+
+    kernel = tilelang.compile(_double(16), out_idx=[3], target="hexagon")
+    try:
+        a = torch.randn(64)
+        torch.testing.assert_close(kernel(a, torch.zeros(16, dtype=torch.int8), 5), 2 * a)
+    finally:
+        kernel.adapter.close()
+
+
 def _rotate(programs, rounds, num_workers):
     """Each round, every program adds one to its right neighbour's row of the
     previous round: the rows rotate left once per round."""
