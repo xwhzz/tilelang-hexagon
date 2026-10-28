@@ -95,6 +95,35 @@ def test_batched_crouton_buffers_copy_one_matrix():
     assert "tl_crouton_copy<false, false>((&(tiles[4096])), 2, 2, 0, 0, 64, 64, (&(Y[0])), 64, 1);" in source
 
 
+def _stack_round_trip(kind, dtype):
+    """X[1:3, 3:61, 5:91] -> a stack of three zeroed Crouton matrices -> Y."""
+
+    @T.prim_func
+    def kernel(X: T.Tensor((4, R, C), dtype), Y: T.Tensor((3, R, C), dtype)):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((3, R, C), "float16")
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.fill(tiles, 0)
+            T.copy(X[1:3, 3:61, 5:91], tiles[0:2, 3:61, 5:91])
+            T.copy(tiles, Y)
+
+    return kernel
+
+
+def test_stacked_crouton_copies_take_one_call_per_matrix():
+    source = _source(_stack_round_trip("activation", "float16"))
+    lines = [line.strip() for line in source.splitlines()]
+    # Each matrix of the region packs with one call, its stack index a loop:
+    # tile matrices are R x C = 6144 elements apart, X's too, and X[1, 3, 5]
+    # is 6437 elements in.
+    (pack,) = [i for i, line in enumerate(lines) if "tl_crouton_copy<true, false>(" in line]
+    assert lines[pack - 1] == "for (int32_t m0 = 0; m0 < 2; ++m0) {"
+    assert lines[pack] == "tl_crouton_copy<true, false>((&(tiles[(m0 * 6144)])), 2, 3, 3, 5, 58, 86, (&(X[((m0 * 6144) + 6437)])), 96, 1);"
+    (unpack,) = [i for i, line in enumerate(lines) if "tl_crouton_copy<false, false>(" in line]
+    assert lines[unpack - 1] == "for (int32_t m0_1 = 0; m0_1 < 3; ++m0_1) {"
+    assert "for (int32_t i" not in "\n".join(lines[pack:])
+
+
 def test_crouton_to_crouton_copies_go_element_by_element():
     @T.prim_func
     def kernel(X: T.Tensor((64, 64), "float16"), Y: T.Tensor((64, 64), "float16")):
@@ -108,6 +137,22 @@ def test_crouton_to_crouton_copies_go_element_by_element():
 
     source = _source(kernel)
     assert source.count("tl_crouton_copy<") == 2
+
+
+@DEVICE
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_stacked_round_trips_match_torch(kind, dtype):
+    import torch
+
+    kernel = tilelang.compile(_stack_round_trip(kind, dtype), out_idx=[1], target="hexagon")
+    try:
+        x = torch.randn(4, R, C, generator=torch.Generator().manual_seed(23)).to(getattr(torch, dtype))
+        expected = torch.zeros(3, R, C, dtype=x.dtype)
+        expected[0:2, 3:61, 5:91] = x[1:3, 3:61, 5:91].half().to(x.dtype)
+        torch.testing.assert_close(kernel(x), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE
