@@ -88,18 +88,30 @@ TL_HMX_GEMM void tl_hexagon_hmx_gemm_blockscaled(
   dequant(0, 0, registers);
   int slot = 0;
   if constexpr (Shared) {
+    // A worker's own MACs run while it holds HMX; when they take longer than
+    // an epilogue (K of 32 tiles or more), the previous tile's epilogue runs
+    // under them, so that the worker's HVX work outside its turn shrinks.
+    const bool under = KT >= 32;
+    int last_mt = -1, last_nt = 0;
     for (int nt = 0; nt < NT; ++nt)
       for (int mt = 0; mt < MT; ++mt, slot ^= 1) {
         tl_hmx_unit_acquire();
         tl_hmx_set_scales(config);
         tl_hmx_clear_acc();
         multiply(mt, nt);
+        if (under && last_mt >= 0)
+          epilogue(last_mt, last_nt, slot ^ 1);
         tl_hmx_convert_acc(2);
         tl_hmx_store_cvt(stage + slot * TL_HMX_TILE_ELMS);
         tl_hmx_unit_release();
-        epilogue(mt, nt, slot);
+        if (!under)
+          epilogue(mt, nt, slot);
         slice(mt, nt);
+        last_mt = mt;
+        last_nt = nt;
       }
+    if (under)
+      epilogue(last_mt, last_nt, slot ^ 1);
   } else {
     tl_hmx_unit_acquire();
     tl_hmx_set_scales(config);

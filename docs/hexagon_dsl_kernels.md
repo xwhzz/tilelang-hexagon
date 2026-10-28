@@ -180,14 +180,14 @@ With an fp16 A, `T.gemm_blockscaled` runs on HMX, for prompts rather than single
 - **Multiply.** HMX multiplies every row tile of A by the column, so each weight dequantizes once per call, however many rows A has. Two columns alternate, and a slice of the next column dequantizes alongside each tile's MACs.
 - **Out of line.** The whole call is one `tl_hexagon_hmx_gemm_blockscaled` (`hmx_gemm.h`), so the calls of one configuration share their code, as the HVX GEMMs' do below. Within it the dequantization is a function of its own: inlined into the call's loop it competes for registers and spills its lookup table.
 
-On v79, 256 x 128 x 2048 runs at:
+On v79, M x 128 x 2048 runs at:
 
-| Programs | Cycles per 32x32x32 (HMX rate: 8.1) |
-|---|---|
-| one | 13.1 |
-| a pool of 4, sharing HMX | 8.4 |
+| Programs | Cycles per 32x32x32 (HMX rate: 8.1), M = 256 | M = 128 |
+|---|---|---|
+| one | 14.1 | 22.6 |
+| a pool of 4, sharing HMX | 8.45 | 8.55 |
 
-One program reaches only 13.1 because issuing a deep packet stalls the thread, so its own HVX work overlaps HMX only in part. In a pool, a worker dequantizes and runs its epilogues while another holds HMX.
+One program is bound by its HVX work: a tile's slice of the next column and its epilogue take longer than its MACs. In a pool, a worker dequantizes while another holds HMX, and while it holds HMX itself, the previous tile's epilogue runs under its own MACs (for K of 32 tiles or more). Its dequantization does not: under the MACs, it slows them (4 workers, 128 rows: 9.8).
 
 The HVX GEMMs are functions of their own, not inlined (`TL_GEMM` in `hvx_gemm.h`): the calls
 of one shape share their code. A kernel that multiplies in many places, a megakernel whose
