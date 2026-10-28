@@ -122,8 +122,11 @@ static void tl_pool_spawn(void) {
 // Run `fn` on `nw` workers and block until all finish.  Worker 0 runs inline on
 // the calling thread; 1..nw-1 go to the persistent pool (any beyond the spawned
 // count run inline too).  Falls back to fully serial if the pool couldn't be
-// created.
-static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
+// created.  With `coresident`, the workers must all run at once (they meet at
+// tl_grid_sync), so a pool too small to hold them fails with TL_ERR_GRID
+// instead.
+static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw,
+                              bool coresident = false) {
   if (nw < 1)
     nw = 1;
   if (nw > TL_MAX_WORKERS)
@@ -134,8 +137,11 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
     tl_pool_spawn(); // lazy, once per session (tried set even on failure, no
                      // retry)
   int pooled = nw - 1;
-  if (pooled > tl_pool.spawned)
+  if (pooled > tl_pool.spawned) {
+    if (coresident)
+      return TL_ERR_GRID;
     pooled = tl_pool.spawned;
+  }
   tl_pool.fn = fn;
   tl_pool.ctx = ctx;
   tl_pool.nw = nw;
@@ -166,6 +172,10 @@ static inline int tl_parallel(tl_worker_fn fn, void *ctx, int nw) {
 // `Scope` holds per-worker resources: every worker constructs one on its own
 // thread before its first program and destroys it after its last. A scope
 // whose status is nonzero after construction fails the worker.
+//
+// A `Coresident` grid runs every program at once, one per worker, so that its
+// programs can meet at tl_grid_sync (T.sync_grid). It fails with TL_ERR_GRID
+// when fewer workers can start than it has programs.
 struct tl_worker_scope {
   int status = TL_OK;
 };
@@ -187,6 +197,39 @@ static inline tl_worker_arenas tl_vtcm_worker_arenas(unsigned int bytes) {
   return {base, bytes, count};
 }
 
+// The barrier of the running coresident grid. Launches run one at a time per
+// session, so one instance serves them all.
+static struct {
+  int32_t programs;               // programs that meet at each barrier
+  int32_t arrived;                // programs waiting at the current barrier
+  int32_t completed;              // barriers every program has passed
+  int32_t failed;                 // a program stopped with an error
+  int32_t passed[TL_MAX_WORKERS]; // barriers program i has reached, its own
+} tl_grid;
+
+// Program `program` of the running coresident grid waits until all its
+// programs reach this call. Memory written before the call, including HVX
+// stores, is visible to every program after it. The waiting workers spin and
+// keep their threads, so the barrier costs cache-line transfers, not a wake-up.
+// A program that fails never arrives, so the others leave with TL_ERR_GRID
+// instead of waiting for it.
+static inline int32_t tl_grid_sync(int32_t program) {
+  int32_t barrier = ++tl_grid.passed[program];
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_add_fetch(&tl_grid.arrived, 1, __ATOMIC_ACQ_REL) ==
+      tl_grid.programs) {
+    // The last program resets the count before it releases the others.
+    __atomic_store_n(&tl_grid.arrived, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&tl_grid.completed, barrier, __ATOMIC_RELEASE);
+    return TL_OK;
+  }
+  while (__atomic_load_n(&tl_grid.completed, __ATOMIC_ACQUIRE) != barrier) {
+    if (__atomic_load_n(&tl_grid.failed, __ATOMIC_RELAXED))
+      return TL_ERR_GRID;
+  }
+  return TL_OK;
+}
+
 template <typename Scope, typename Body> struct tl_parallel_for_job {
   Body *body;
   int32_t extent;
@@ -195,18 +238,19 @@ template <typename Scope, typename Body> struct tl_parallel_for_job {
   static int run(void *ctx, int wid, int nw) {
     tl_parallel_for_job *job = static_cast<tl_parallel_for_job *>(ctx);
     Scope scope;
-    if (scope.status != TL_OK)
-      return scope.status;
+    int status = scope.status;
     uint8_t *arena = job->arenas.base + (size_t)wid * job->arenas.bytes;
-    for (int32_t i = wid; i < job->extent; i += nw) {
-      if (int status = (*job->body)(i, arena))
-        return status;
-    }
-    return TL_OK;
+    for (int32_t i = wid; status == TL_OK && i < job->extent; i += nw)
+      status = (*job->body)(i, arena);
+    // Programs waiting at a barrier for a failed one stop (tl_grid_sync).
+    if (status != TL_OK)
+      __atomic_store_n(&tl_grid.failed, 1, __ATOMIC_RELAXED);
+    return status;
   }
 };
 
-template <typename Scope = tl_worker_scope, typename Body>
+template <typename Scope = tl_worker_scope, bool Coresident = false,
+          typename Body>
 static inline int tl_parallel_for(int32_t extent, int max_workers,
                                   tl_worker_arenas arenas, Body &&body) {
   if (extent <= 0)
@@ -220,18 +264,29 @@ static inline int tl_parallel_for(int32_t extent, int max_workers,
     nw = (int)arenas.count;
   if (nw > extent)
     nw = (int)extent;
+  if (Coresident) {
+    if (nw < extent)
+      return TL_ERR_GRID;
+    tl_grid.programs = extent;
+    tl_grid.arrived = 0;
+    tl_grid.completed = 0;
+    tl_grid.failed = 0;
+    for (int i = 0; i < TL_MAX_WORKERS; ++i)
+      tl_grid.passed[i] = 0;
+  }
   tl_parallel_for_job<Scope, typename std::remove_reference<Body>::type> job{
       &body, extent, arenas};
-  return tl_parallel(job.run, &job, nw);
+  return tl_parallel(job.run, &job, nw, Coresident);
 }
 
-template <typename Scope = tl_worker_scope, typename Body>
+template <typename Scope = tl_worker_scope, bool Coresident = false,
+          typename Body>
 static inline int tl_parallel_for(int32_t extent, int max_workers,
                                   Body &&body) {
   auto program = [&body](int32_t i, uint8_t *) { return body(i); };
-  return tl_parallel_for<Scope>(extent, max_workers,
-                                tl_worker_arenas{nullptr, 0u, TL_MAX_WORKERS},
-                                program);
+  return tl_parallel_for<Scope, Coresident>(
+      extent, max_workers, tl_worker_arenas{nullptr, 0u, TL_MAX_WORKERS},
+      program);
 }
 
 // --- threading selftest: proves dispatch + worker count run on-device, in

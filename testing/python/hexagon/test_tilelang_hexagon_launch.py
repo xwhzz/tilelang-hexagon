@@ -142,6 +142,95 @@ def test_one_kernel_per_prim_func():
         _lower(two_launches)
 
 
+def _rotate(programs, rounds, num_workers):
+    """Each round, every program adds one to its right neighbour's row of the
+    previous round: the rows rotate left once per round."""
+
+    @T.prim_func
+    def rotate(
+        A: T.Tensor((programs, 64), "float32"), rows: T.Tensor((2, programs, 64), "float32"), B: T.Tensor((programs, 64), "float32")
+    ):
+        with T.Kernel(programs, num_workers=num_workers) as w:
+            for j in T.Parallel(64):
+                rows[0, w, j] = A[w, j]
+            for r in T.serial(rounds):
+                T.sync_grid()
+                for j in T.Parallel(64):
+                    rows[(r + 1) % 2, w, j] = rows[r % 2, (w + 1) % programs, j] + T.float32(1)
+            for j in T.Parallel(64):
+                B[w, j] = rows[rounds % 2, w, j]
+
+    return rotate
+
+
+def test_programs_meet_at_sync_grid():
+    source = _lower(_rotate(4, 3, 4)).kernel_source
+    # The programs run coresident, one per worker, and wait at the barrier
+    # with their own program index.
+    assert "tl_parallel_for<tl_worker_scope, true>(4, 4, [&](int32_t bx) -> int32_t {" in source
+    assert source.count("if (int32_t tl_status = tl_grid_sync(bx)) return tl_status;") == 1
+
+
+def test_sync_grid_needs_a_worker_per_program():
+    with pytest.raises(Exception, match="the grid has 8 programs and num_workers=6"):
+        _lower(_rotate(8, 3, 6))
+
+
+def test_sync_grid_in_one_program_has_nothing_to_wait_for():
+    source = _lower(_rotate(1, 3, None)).kernel_source
+    assert "tl_grid_sync" not in source
+    assert "tl_parallel_for" not in source
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+@pytest.mark.parametrize("programs", [2, 6])
+def test_programs_exchange_rows_across_sync_grid(programs):
+    import torch
+
+    rounds = 61
+    kernel = tilelang.compile(_rotate(programs, rounds, programs), out_idx=[2], target="hexagon")
+    try:
+        a = torch.randn(programs, 64)
+        rows = torch.zeros(2, programs, 64)
+        expected = torch.roll(a, -rounds, dims=0) + rounds
+        torch.testing.assert_close(kernel(a, rows), expected)
+    finally:
+        kernel.adapter.close()
+
+
+def _prefetch(programs, n):
+    """Each program submits the DMA of its next-phase data before the barrier
+    and waits for it after: the transfer overlaps the phase change."""
+
+    @T.prim_func
+    def prefetch(A: T.Tensor((programs, n), "float32"), rows: T.Tensor((programs, 64), "float32"), B: T.Tensor((programs, n), "float32")):
+        with T.Kernel(programs, num_workers=programs) as w:
+            a = T.alloc_shared((n,), "float32")
+            T.dma_copy(A[w, :], a)
+            for j in T.Parallel(64):
+                rows[w, j] = T.Cast("float32", w)
+            T.sync_grid()
+            T.dma_wait(0)
+            for j in T.Parallel(n):
+                B[w, j] = a[j] + rows[(w + 1) % programs, j % 64]
+
+    return prefetch
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_dma_crosses_sync_grid():
+    import torch
+
+    programs, n = 6, 4096
+    kernel = tilelang.compile(_prefetch(programs, n), out_idx=[2], target="hexagon")
+    try:
+        a = torch.randn(programs, n)
+        expected = a + ((torch.arange(programs) + 1) % programs).float()[:, None]
+        torch.testing.assert_close(kernel(a, torch.zeros(programs, 64)), expected)
+    finally:
+        kernel.adapter.close()
+
+
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 def test_hmx_workers_run_on_the_device():
     import torch

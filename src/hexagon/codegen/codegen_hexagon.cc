@@ -4,6 +4,7 @@
 #include "codegen_hexagon.h"
 #include "arith/pattern_match.h"
 #include "hexagon/op/builtin.h"
+#include "op/builtin.h"
 #include "support/check.h"
 #include "transform/common/attr.h"
 #include "transform/common/storage_size.h"
@@ -153,6 +154,16 @@ bool UsesHMX(const Stmt &body) {
   tirx::PostOrderVisit(body, [&found](const ffi::ObjectRef &node) {
     if (const auto *call = node.as<CallNode>())
       found |= IsHexagonHMXIntrinsic(call);
+  });
+  return found;
+}
+
+// Whether the tile programs of `body` meet at T.sync_grid barriers.
+bool UsesGridSync(const Stmt &body) {
+  bool found = false;
+  tirx::PostOrderVisit(body, [&found](const ffi::ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>())
+      found |= call->op.same_as(tl::sync_grid());
   });
   return found;
 }
@@ -331,12 +342,17 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   // tl_parallel_for runs the body once per tile program, on the worker pool.
   // Each worker gets a private VTCM arena; a worker that issues HMX enables
   // it for its thread (tl_hmx_worker_scope). Each program declares its own
-  // DMA queue.
+  // DMA queue. Programs that meet at T.sync_grid run coresident, one per
+  // worker.
   std::string extent = PrintExpr(op->extent);
+  bool hmx = UsesHMX(op->body);
+  bool grid_sync = UsesGridSync(op->body);
   PrintIndent();
   stream << "if (int32_t tl_status = tl_parallel_for";
-  if (UsesHMX(op->body))
-    stream << "<tl_hmx_worker_scope>";
+  if (hmx || grid_sync) {
+    stream << '<' << (hmx ? "tl_hmx_worker_scope" : "tl_worker_scope");
+    stream << (grid_sync ? ", true>" : ">");
+  }
   stream << "(" << extent << ", " << num_workers << ", ";
   if (arena_bytes > 0)
     stream << "tl_vtcm_worker_arenas(" << arena_bytes << "u), ";
@@ -348,10 +364,12 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   stream << ") -> int32_t {\n";
   int scope = BeginScope();
   in_worker_ = true;
+  worker_program_ = op->loop_var;
   PrintStmt(op->body);
   PrintIndent();
   stream << "return TL_OK;\n";
   in_worker_ = false;
+  worker_program_ = std::nullopt;
   EndScope(scope);
   PrintIndent();
   stream << "})) return tl_status;\n";
@@ -469,6 +487,17 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
 
 void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
   const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tl::sync_grid())) {
+    // MaterializeGrid checked that the launch runs its programs coresident;
+    // a launch of one program has nothing to wait for.
+    if (worker_program_) {
+      PrintIndent();
+      stream << "if (int32_t tl_status = tl_grid_sync("
+             << GetVarID(worker_program_.value().get())
+             << ")) return tl_status;\n";
+    }
+    return;
+  }
   if (call && call->op.same_as(tl::hexagon_dma_queue())) {
     // The queue lives as long as the tile program; its destructor drains it on
     // early returns too.

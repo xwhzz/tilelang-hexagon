@@ -14,11 +14,14 @@
  *    linearized grid index that carries the worker count. Only the perfectly
  *    nested grid loops are linearized; a grid axis below an intervening
  *    statement stays serial inside the workers.
+ *  - Programs that meet at T.sync_grid must all run at once, so their grid
+ *    may have no more programs than workers, and no serial grid axis.
  *  - Hexagon kernels are called directly, so the whole function body is
  *    device code.
  */
 
 #include "hexagon/op/builtin.h"
+#include "op/builtin.h"
 #include "tir/transforms/ir_utils.h"
 #include "transform/common/attr.h"
 
@@ -128,6 +131,15 @@ private:
   std::unordered_set<const VarNode *> used_by_program_;
 };
 
+bool ContainsGridSync(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>())
+      found |= call->op.same_as(tl::sync_grid());
+  });
+  return found;
+}
+
 // Rejects runtime calls whose state is not per worker.
 void CheckWorkerBody(const Stmt &body) {
   PostOrderVisit(body, [](const ObjectRef &node) {
@@ -221,6 +233,8 @@ private:
     int64_t num_workers = 1;
     if (auto value = op->annotations.Get(attr::kHexagonNumWorkers))
       num_workers = value->cast<Integer>()->value;
+    if (ContainsGridSync(body))
+      CheckCoresident(chain, num_workers);
     // The programs of a num_workers grid follow the worker rules even when the
     // grid has only one, so legality does not depend on the grid size.
     if (num_workers > 1)
@@ -244,6 +258,30 @@ private:
       body = SeqStmt::Flatten(seq);
     }
     return AttrStmt(Integer(0), attr::kTileProgramScope, Integer(1), body);
+  }
+
+  // T.sync_grid makes the programs of the launch wait for each other, so each
+  // needs its own worker.
+  static void CheckCoresident(const std::vector<const ForNode *> &chain,
+                              int64_t num_workers) {
+    ICHECK(IsProgramLoop(chain.back()))
+        << "T.sync_grid() needs every tile program of the launch running at "
+           "once, but the grid axes below `"
+        << chain.back()->loop_var->name_hint
+        << "` run in the workers one program after another: a statement "
+           "separates them from it";
+    int64_t programs = 1;
+    for (const ForNode *loop : chain) {
+      const auto *extent = loop->extent.as<IntImmNode>();
+      ICHECK(extent) << "T.sync_grid() needs a grid of constant size, but "
+                     << "grid axis `" << loop->loop_var->name_hint
+                     << "` has extent " << loop->extent;
+      programs *= extent->value;
+    }
+    ICHECK(programs <= num_workers)
+        << "T.sync_grid() needs every tile program of the launch running at "
+           "once, one per worker, but the grid has "
+        << programs << " programs and num_workers=" << num_workers;
   }
 
   static bool HasSingleIteration(const std::vector<const ForNode *> &chain) {

@@ -82,6 +82,8 @@ private:
   bool uses_dma_async_ = false;
   /*! \brief whether the emitter is inside a worker loop body */
   bool in_worker_ = false;
+  /*! \brief the program index of the worker loop being emitted */
+  ffi::Optional<tirx::Var> worker_program_;
   // Print a T.Kernel(num_workers=) grid loop as a tl_parallel_for call whose
   // lambda runs one tile program.
   void PrintWorkerLoop(const ForNode *op);
