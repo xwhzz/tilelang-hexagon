@@ -58,6 +58,29 @@ def test_session_kernels_lower_under_their_own_pass_configs():
     assert "tl_hvx_exp(" in accurate and "tl_hvx_exp_fast(" not in accurate
 
 
+def test_session_kernels_lower_once(tmp_path, monkeypatch):
+    import tilelang
+    from tilelang.env import env
+
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("TILELANG_DISABLE_CACHE", raising=False)
+    calls = []
+    lower = tilelang.lower
+    monkeypatch.setattr(tilelang, "lower", lambda *a, **k: calls.append(1) or lower(*a, **k))
+    enabled = env.is_cache_enabled()
+    env.enable_cache()
+    try:
+        (first,) = session.lower_kernels([(_exp(False), [1])])
+        (again,) = session.lower_kernels([(_exp(False), [1])])
+        assert len(calls) == 1 and again[:2] == first[:2] and [p.dtype for p in again[2]] == [p.dtype for p in first[2]]
+        # Other pass configs make another kernel.
+        session.lower_kernels([(_exp(True), [1])])
+        assert len(calls) == 2
+    finally:
+        if not enabled:
+            env.disable_cache()
+
+
 def test_session_skel_dispatches_by_kernel():
     plans = fastrpc._plan([], [])
     source = session.gen_dsp(

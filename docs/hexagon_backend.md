@@ -300,7 +300,11 @@ and explicit HMX atoms.
   - **Kernels.** Several kernels build into one skel and share one agent and one
     FastRPC session: one PD, one VTCM grant and one worker pool. Each lowers under its
     own pass configs (`T.annotate_pass_configs`), as `tilelang.compile` lowers it, so a
-    prefill can have fast math while the decode beside it keeps its arithmetic.
+    prefill can have fast math while the decode beside it keeps its arithmetic. Lowered
+    sources are cached on disk (`$TILELANG_CACHE_DIR/hexagon_lowered`), keyed by the
+    kernel's script, the target, its pass configs and the compiler (tilelang's version,
+    native libraries and Python sources): the LFM2 decode lowers in 36 s, and in 2 s
+    from the cache.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call

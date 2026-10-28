@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import functools
 import hashlib
+import json
 import os
 import re
 import select
@@ -510,26 +512,75 @@ class SessionKernel:
         return self.session._run(self, given)
 
 
+@functools.cache
+def _compiler_stamp() -> str:
+    """What a kernel's lowering depends on besides the kernel: tilelang's
+    version and native libraries (as the kernel cache stamps them), and its
+    Python sources, where operators such as the GEMMs lower."""
+    import tilelang
+    from tilelang.cache.kernel_cache import KernelCache
+
+    digest = hashlib.sha256(f"{tilelang.__version__}|{KernelCache._get_tilelang_lib_stamp()}".encode())
+    root = os.path.dirname(os.path.abspath(tilelang.__file__))
+    for path, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            if name.endswith(".py"):
+                digest.update(os.path.relpath(os.path.join(path, name), root).encode() + b"\0")
+                with open(os.path.join(path, name), "rb") as f:
+                    digest.update(f.read())
+    return digest.hexdigest()
+
+
+def _lower(func, target, configs: dict) -> tuple[str, str]:
+    """The name and the source of a kernel lowered under `configs`, from the
+    cache when it holds them: a megakernel lowers in about a minute, its key
+    takes a fraction of a second (its script, the target, the configs and
+    the compiler)."""
+    import tilelang
+    from tilelang import tvm
+    from tilelang.env import env
+
+    path = None
+    if env.is_cache_enabled():
+        key = hashlib.sha256()
+        for part in (func.script(show_meta=True), str(target), json.dumps(configs, sort_keys=True, default=str), _compiler_stamp()):
+            key.update(part.encode() + b"\0")
+        path = os.path.join(env.TILELANG_CACHE_DIR, "hexagon_lowered", key.hexdigest() + ".json")
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            with open(path) as f:
+                entry = json.load(f)
+            return entry["name"], entry["source"]
+    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
+        art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
+    source = str(art.kernel_source)
+    match = _KERNEL_RE.search(source)
+    if not match:
+        raise RuntimeError("could not find the kernel function in the generated source")
+    if path is not None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"name": match.group(1), "source": source}, f)
+        os.replace(tmp, path)
+    return match.group(1), source
+
+
 def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:
     """The (name, source, params, out_idx) of each (prim_func, out_idx) pair,
     each lowered under its own pass configs (``T.annotate_pass_configs``), as
-    ``tilelang.compile`` lowers it."""
-    import tilelang
-    from tilelang import tvm
+    ``tilelang.compile`` lowers it. Lowered sources are cached on disk
+    (``$TILELANG_CACHE_DIR/hexagon_lowered``), as built skels are."""
     from tilelang.backend.target import determine_target
+    from tilelang.engine.lower import extrac_params
 
     target = determine_target(target, return_object=True)
     lowered = []
     for func, out_idx in kernels:
         configs = dict(func.attrs["tilelang_pass_configs"]) if func.attrs and "tilelang_pass_configs" in func.attrs else {}
-        with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
-            art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-        source = str(art.kernel_source)
-        match = _KERNEL_RE.search(source)
-        if not match:
-            raise RuntimeError("could not find the kernel function in the generated source")
+        name, source = _lower(func, target, configs)
         out = list(out_idx) if isinstance(out_idx, (list, tuple)) else ([] if out_idx is None else [out_idx])
-        lowered.append((match.group(1), source, art.params, out))
+        lowered.append((name, source, extrac_params(func), out))
     return lowered
 
 
