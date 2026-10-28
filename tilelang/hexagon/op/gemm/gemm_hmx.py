@@ -15,6 +15,10 @@ multiplies the next tile; the HMX accumulator is held for the whole call.
 In a worker pool, whose workers share HMX (``LowerKernelLaunch`` marks such
 calls), each staged output tile is a critical section of its own instead, and
 its epilogue runs outside it, while another worker multiplies.
+
+``T.gemm_blockscaled`` of an fp16 A runs here too (:class:`GemmHMXBlockScaled`):
+HVX dequantizes its 4-bit B into fp16 weight tiles, a column of output tiles
+at a time, for HMX to multiply every row of A by.
 """
 
 from __future__ import annotations
@@ -25,9 +29,14 @@ from tvm import tirx
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import TILE, TILE_ELEMS, CroutonLayout
 from tilelang.hexagon.intrinsics.hmx import BIAS_WORDS, HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.panel import PanelLayout, make_hvx_panel_layout
 from tilelang.tileop.gemm.gemm_base import GemmBase
+from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
+
+from .gemm_hvx import _strides, scale_group
 
 GEMM_INST_HMX = "hexagon.hmx"
+GEMM_INST_HMX_BLOCK_SCALED = "hexagon.hmx.blockscaled"
 
 # The worker count LowerKernelLaunch puts on the gemms of a worker pool.
 _NUM_WORKERS = "hexagon.num_workers"
@@ -101,6 +110,84 @@ class GemmHMX(GemmBase):
             return "rows"
         return "elements"
 
+    def _shared(self) -> bool:
+        """Whether the workers of a pool take turns at HMX for this call."""
+        workers = self.gemm_node.annotations.get(_NUM_WORKERS, None)
+        return workers is not None and int(workers) > 1
+
+    def _tile_epilogue(self, layout_map, coords, scale=None):
+        """A macro that writes, or adds per ``clear_accum``, output tile t from
+        its staging tile, slot t % 2 of `stage`, into C: tile (mt, nt) =
+        coords(t). `scale`, a factor per row of C, multiplies the rows first:
+        the buffer, the index of row 0's factor, its last two indices those of
+        a matrix, and the elements between the factors of two rows."""
+
+        C_buf = self.CRegion.buffer
+        c_origin = _origin(self.CRegion)
+        kind = self._epilogue_kind(layout_map)
+        ldc = C_buf.shape[-1]
+        # Rows of a tile on register (fp32) or half-register (fp16) boundaries:
+        # the region starts on a tile, and VTCM buffers on registers.
+        aligned = isinstance(ldc, tirx.IntImm) and ldc.value % TILE == 0
+        tile_store = tirx.op.Op.get("tl.hexagon_crouton_tile_store")
+        rows_extent = 31 * ldc + TILE if kind == "rows" else TILE_ELEMS
+        clear = self.clear_accum
+        static_clear = bool(clear.value) if isinstance(clear, tirx.IntImm) else None
+
+        def c_tile(t):
+            """The first element of C's output tile t."""
+            mt, nt = coords(t)
+            return C_buf[c_origin[:-2] + (c_origin[-2] + mt * TILE, c_origin[-1] + nt * TILE)]
+
+        def c_element(t, i, j):
+            mt, nt = coords(t)
+            return c_origin[:-2] + (c_origin[-2] + mt * TILE + i, c_origin[-1] + nt * TILE + j)
+
+        def factor(t, i):
+            """The factor of row i of output tile t."""
+            buffer, row0, _ = scale
+            return buffer[row0[:-2] + (row0[-2] + coords(t)[0] * TILE + i, row0[-1])]
+
+        # Python assignments in a macro bind TIR variables: the tile's indices
+        # stay expressions of t, which the layouts then simplify.
+        @T.macro
+        def write(stage, t, accumulate: bool):
+            """Write (or add) the staged tile t into C."""
+            if kind == "elements":
+                for i, j in T.grid(TILE, TILE):
+                    value = stage[(t % 2) * TILE_ELEMS + (i // 2) * 64 + j * 2 + i % 2]
+                    if scale is not None:
+                        value = T.cast(value, "float32") * factor(t, i)
+                    if accumulate:
+                        C_buf[c_element(t, i, j)] = C_buf[c_element(t, i, j)] + T.cast(value, C_buf.dtype)
+                    else:
+                        C_buf[c_element(t, i, j)] = T.cast(value, C_buf.dtype)
+            else:
+                args = [
+                    _flag(accumulate),
+                    _flag(kind == "rows"),
+                    _flag(aligned),
+                    _flag(scale is not None),
+                    T.access_ptr(c_tile(t), "rw" if accumulate else "w", rows_extent),
+                    ldc,
+                    T.access_ptr(stage[(t % 2) * TILE_ELEMS], "r", TILE_ELEMS),
+                ]
+                if scale is not None:
+                    args += [T.access_ptr(factor(t, 0), "r", 31 * scale[2] + 1), scale[2]]
+                T.evaluate(tirx.call_intrin("void", tile_store, *args))
+
+        @T.macro
+        def epilogue(stage, t):
+            if static_clear is None:
+                if clear:
+                    write(stage, t, False)
+                else:
+                    write(stage, t, True)
+            else:
+                write(stage, t, not static_clear)
+
+        return epilogue
+
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
         self._check_operand_layouts(layout_map)
         emitter = self._make_emitter()
@@ -115,58 +202,9 @@ class GemmHMX(GemmBase):
 
         clear = self.clear_accum
         static_clear = bool(clear.value) if isinstance(clear, tirx.IntImm) else None
-        kind = self._epilogue_kind(layout_map)
-        staged = not (kind == "crouton" and static_clear is True)
-        workers = self.gemm_node.annotations.get(_NUM_WORKERS, None)
-        shared = workers is not None and int(workers) > 1
-
-        ldc = C_buf.shape[-1]
-        # Rows of a tile on register (fp32) or half-register (fp16) boundaries:
-        # the region starts on a tile, and VTCM buffers on registers.
-        aligned = isinstance(ldc, tirx.IntImm) and ldc.value % TILE == 0
-        tile_store = tirx.op.Op.get("tl.hexagon_crouton_tile_store")
-        rows_extent = 31 * ldc + TILE if kind == "rows" else TILE_ELEMS
-
-        def c_tile(t):
-            """The first element of C's output tile t."""
-            return C_buf[c_origin[:-2] + (c_origin[-2] + (t // NT) * TILE, c_origin[-1] + (t % NT) * TILE)]
-
-        def c_element(t, i, j):
-            return c_origin[:-2] + (c_origin[-2] + (t // NT) * TILE + i, c_origin[-1] + (t % NT) * TILE + j)
-
-        @T.macro
-        def write(stage, t, accumulate: bool):
-            """Write (or add) the staged tile t into C."""
-            if kind == "elements":
-                for i, j in T.grid(TILE, TILE):
-                    value = T.cast(stage[(t % 2) * TILE_ELEMS + (i // 2) * 64 + j * 2 + i % 2], C_buf.dtype)
-                    if accumulate:
-                        C_buf[c_element(t, i, j)] = C_buf[c_element(t, i, j)] + value
-                    else:
-                        C_buf[c_element(t, i, j)] = value
-            else:
-                T.evaluate(
-                    tirx.call_intrin(
-                        "void",
-                        tile_store,
-                        _flag(accumulate),
-                        _flag(kind == "rows"),
-                        _flag(aligned),
-                        T.access_ptr(c_tile(t), "rw" if accumulate else "w", rows_extent),
-                        ldc,
-                        T.access_ptr(stage[(t % 2) * TILE_ELEMS], "r", TILE_ELEMS),
-                    )
-                )
-
-        @T.macro
-        def epilogue(stage, t):
-            if static_clear is None:
-                if clear:
-                    write(stage, t, False)
-                else:
-                    write(stage, t, True)
-            else:
-                write(stage, t, not static_clear)
+        staged = not (self._epilogue_kind(layout_map) == "crouton" and static_clear is True)
+        shared = self._shared()
+        epilogue = self._tile_epilogue(layout_map, lambda t: (t // NT, t % NT))
 
         @T.prim_func
         def _gemm_hmx() -> None:
@@ -219,3 +257,182 @@ class GemmHMX(GemmBase):
                     epilogue(stage, tiles - 1)
 
         return _gemm_hmx
+
+
+class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
+    """``T.gemm_blockscaled`` of an fp16 A on HMX: ``C (+)= (A * SFA) @ (B *
+    SFB)^T`` for a 4-bit B in the panel layout, its rows along K
+    (``transpose_B``), the decode GEMV's operand.
+
+    A has the HMX activation layout; SFA is fp32, one factor per row across
+    the call's K, ``[M, K / ga]`` with ga >= K; SFB is fp16 and group-major,
+    ``[K / gb, N]``, gb a multiple of 8. C is an fp32 row-major or fp16
+    Crouton matrix.
+
+    HVX dequantizes B 32 rows at a time, one column of output tiles, into a
+    column of fp16 weight tiles (``tl_crouton_dequant4``), and HMX multiplies
+    every row tile of A by it: each weight serves all of A's rows. Two columns
+    alternate. In one program, a slice of the next column dequantizes while
+    HMX multiplies each tile; in a worker pool each tile is a critical section,
+    and the slice and the tile's epilogue run while other workers multiply.
+    """
+
+    def __post_init__(self) -> None:
+        # B dequantizes to fp16 before HMX multiplies: an fp16 A by a 4-bit B
+        # is not a mixed-dtype GEMM, whose operands the common rule checks.
+        pass
+
+    def _make_emitter(self) -> HMXIntrinEmitter:
+        # HMX multiplies A by B's dequantized fp16 weight tiles.
+        return HMXIntrinEmitter(self.M, self.N, self.K, a_transposed=self.trans_A)
+
+    def infer_layout(self, target, thread_nums: int):
+        layouts = {self.A: self._make_emitter().activation_layout(self.A), self.B: make_hvx_panel_layout(self.B)}
+        if str(self.C.dtype) == "float16":
+            layouts[self.C] = HMXIntrinEmitter.output_layout(self.C)
+        return layouts
+
+    def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
+        name = f"T.gemm_blockscaled({self.A.name}, {self.B.name}, {self.C.name}) on HMX"
+        layout = layout_map.get(self.A, None)
+        if not (isinstance(layout, CroutonLayout) and not layout.column_tiles and not layout.transposed):
+            raise ValueError(f"{name} reads A in the HMX activation layout, but it has {layout}")
+        if not isinstance(layout_map.get(self.B, None), PanelLayout):
+            raise ValueError(f"{name} reads B in the panel layout, but it has {layout_map.get(self.B, None)}")
+        M, N, K = self.M, self.N, self.K
+        MT, NT, KT = M // TILE, N // TILE, K // TILE
+        ga, first_a = scale_group(self, "A", self.sf_a_granularity_k)
+        gb, first_b = scale_group(self, "B", self.sf_b_granularity_k)
+        if ga != K:
+            raise ValueError(f"{name} scales whole rows of A: one factor across the call's {K} columns, not one per {ga}")
+        if gb % 8:
+            raise ValueError(f"{name} dequantizes B in groups of 8 columns of K: its scale groups are a multiple of 8, not {gb}")
+
+        A_buf, B_buf = self.ARegion.buffer, self.BRegion.buffer
+        a_origin = _origin(self.ARegion)
+        # B's region starts on a panel: a pointer at the logical start of its
+        # rows [32 nt, 32 nt + 32), which LowerTileOp moves through the layout
+        # to the panel's bytes.
+        b_origin = _origin(self.BRegion)
+        signed = str(self.B.dtype).startswith("int")
+
+        def panel(nt):
+            index = b_origin[:-2] + (b_origin[-2] + nt * TILE, b_origin[-1])
+            return T.access_ptr(B_buf[index], "r", TILE * K)
+
+        sfb_region = self.SFBRegion
+        sfb_origin = _origin(sfb_region)
+        if len(sfb_origin) < 2:
+            raise ValueError(f"{name}: SFB {sfb_region.buffer.name} is [K / {gb}, N], group-major")
+        ld_sfb = int(_strides(sfb_region.buffer)[-2])
+
+        def factors(nt):
+            index = sfb_origin[:-2] + (sfb_origin[-2] + first_b, sfb_origin[-1] + nt * TILE)
+            return T.access_ptr(sfb_region.buffer[index], "r", (K // gb - 1) * ld_sfb + TILE)
+
+        sfa_region = self.SFARegion
+        sfa_origin = _origin(sfa_region)
+        if len(sfa_origin) < 2:
+            raise ValueError(f"{name}: SFA {sfa_region.buffer.name} is [M, K / {ga}], a factor per row of A")
+        row0 = sfa_origin[:-1] + (sfa_origin[-1] + first_a,)
+        scale = (sfa_region.buffer, row0, int(_strides(sfa_region.buffer)[-2]))
+
+        shared = self._shared()
+        # Output tiles by columns: tile t is (t % MT, t // MT).
+        epilogue = self._tile_epilogue(layout_map, lambda t: (t % MT, t // MT), scale)
+        dequant4 = tirx.op.Op.get("tl.hexagon_crouton_dequant4")
+        # A column is K / 8 panel registers, in MT slices.
+        registers = K // 8
+        per_slice = -(-registers // MT)
+
+        @T.macro
+        def dequant(w, nt, v0, n):
+            """Panel registers [v0, v0 + n) of B's rows [32 nt, 32 nt + 32)
+            into weight column nt % 2."""
+            T.evaluate(
+                tirx.call_intrin(
+                    "void",
+                    dequant4,
+                    _flag(signed),
+                    T.access_ptr(w[(nt % 2) * K * TILE], "w", K * TILE),
+                    panel(nt),
+                    factors(nt),
+                    ld_sfb,
+                    gb,
+                    v0,
+                    n,
+                )
+            )
+
+        @T.macro
+        def dequant_slice(w, t):
+            """The slice of the next column that dequantizes alongside tile t."""
+            if t // MT + 1 < NT:  # noqa: SIM102
+                if (t % MT) * per_slice < registers:
+                    dequant(w, t // MT + 1, (t % MT) * per_slice, T.min(per_slice, registers - (t % MT) * per_slice))
+
+        @T.macro
+        def mma(acc, w, t):
+            """A's row tile t % MT by weight column t // MT, in deep packets
+            of at most 32 K tiles."""
+            for chunk in T.serial(T.ceildiv(KT, 32)):
+                T.hmx.mma(
+                    T.access_ptr(acc[0], "rw"),
+                    T.access_ptr(
+                        A_buf[a_origin[:-2] + (a_origin[-2] + (t % MT) * TILE, a_origin[-1] + chunk * 32 * TILE)],
+                        "r",
+                        T.min(KT - chunk * 32, 32) * TILE_ELEMS,
+                    ),
+                    T.access_ptr(w[((t // MT) % 2) * K * TILE + chunk * 32 * TILE_ELEMS], "r", T.min(KT - chunk * 32, 32) * TILE_ELEMS),
+                    T.min(KT - chunk * 32, 32),
+                )
+
+        emitter = self._make_emitter()
+        tiles = MT * NT
+
+        @T.prim_func
+        def _gemm_hmx_blockscaled() -> None:
+            bias_vtcm = T.alloc_shared((BIAS_WORDS,), "uint32", align=256)
+            stage = T.alloc_shared((2 * TILE_ELEMS,), "float16", align=2048)
+            # Two columns of weight tiles: HMX reads one while HVX fills the other.
+            w = T.alloc_shared((2 * K * TILE,), "float16", align=2048)
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
+
+            for i in T.vectorized(BIAS_WORDS // 2):
+                bias_vtcm[i] = T.Cast("uint32", 0x3C00)
+            for i in T.vectorized(BIAS_WORDS // 2):
+                bias_vtcm[BIAS_WORDS // 2 + i] = T.Cast("uint32", 0)
+            dequant(w, 0, 0, registers)
+
+            if shared:
+                # Other workers multiply while this one dequantizes and runs a
+                # tile's epilogue. Each holder sets the configuration again.
+                for t in T.serial(tiles):
+                    emitter.acquire(acc)
+                    emitter.load_bias(bias, bias_vtcm)
+                    emitter.clear(acc)
+                    mma(acc, w, t)
+                    emitter.convert(cvt, acc, bias, bias_vtcm)
+                    emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
+                    emitter.release(acc)
+                    epilogue(stage, t)
+                    dequant_slice(w, t)
+            else:
+                emitter.acquire(acc)
+                emitter.load_bias(bias, bias_vtcm)
+                for t in T.serial(tiles):
+                    emitter.clear(acc)
+                    mma(acc, w, t)
+                    # HVX dequantizes and runs the previous tile's epilogue
+                    # while HMX multiplies.
+                    dequant_slice(w, t)
+                    if t > 0:
+                        epilogue(stage, t - 1)
+                    emitter.convert(cvt, acc, bias, bias_vtcm)
+                    emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
+                emitter.release(acc)
+                epilogue(stage, tiles - 1)
+
+        return _gemm_hmx_blockscaled

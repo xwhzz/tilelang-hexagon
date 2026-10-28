@@ -6,9 +6,10 @@
  * pass marks each grid loop with its axis so MaterializeGrid can find the grid
  * after the loop transformations, and moves the T.Kernel(num_workers=)
  * annotation from the launch block onto the outermost grid loop, which
- * outlives the block. With more than one worker, the T.gemm calls of the body
- * carry the count too: on HMX, which the workers share, GemmHMX then leaves
- * the unit to the other workers during each output tile's HVX epilogue.
+ * outlives the block. With more than one worker, the T.gemm and
+ * T.gemm_blockscaled calls of the body carry the count too: on HMX, which the
+ * workers share, GemmHMX and GemmHMXBlockScaled then leave the unit to the
+ * other workers during each output tile's HVX work.
  */
 
 #include "hexagon/op/builtin.h"
@@ -65,7 +66,8 @@ private:
   Optional<Integer> num_workers_;
 };
 
-// Annotates the T.gemm calls a pool of `workers` workers runs.
+// Annotates the T.gemm and T.gemm_blockscaled calls a pool of `workers`
+// workers runs.
 class WorkerGemmMarker : public StmtExprMutator {
 public:
   explicit WorkerGemmMarker(Integer workers) : workers_(std::move(workers)) {}
@@ -73,7 +75,8 @@ public:
 private:
   PrimExpr VisitExpr_(const CallNode *op) final {
     static const Op &gemm = Op::Get("tl.tileop.gemm");
-    if (!op->op.same_as(gemm))
+    static const Op &gemm_blockscaled = Op::Get("tl.tileop.gemm_blockscaled");
+    if (!op->op.same_as(gemm) && !op->op.same_as(gemm_blockscaled))
       return StmtExprMutator::VisitExpr_(op);
     Map<String, ObjectRef> annotations = op->annotations;
     annotations.Set(attr::kHexagonNumWorkers, workers_);

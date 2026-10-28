@@ -151,6 +151,31 @@ computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128)
 `T.gemm` per group and a `T.Parallel` epilogue, and streams 2048 -> 8192 at 44-50 GB/s with
 4 workers (DMA tops out near 57 GB/s).
 
+With an fp16 A, `T.gemm_blockscaled` runs on HMX, for prompts rather than single tokens:
+
+- **Operands.**
+  - B is the same 4-bit matrix in the panel layout.
+  - SFB is the same group-major fp16 factors.
+  - SFA is fp32, one factor per row (`[M, K / ga]` with ga >= K), weighing C's rows.
+  - C is an fp32 row-major or fp16 Crouton matrix.
+- **Dequantization.** HVX expands B 32 rows at a time into a column of fp16 weight tiles (`tl_crouton_dequant4`, `crouton.h`). A panel register of 32 rows by 8 columns of K becomes exactly four registers of the weight tiles:
+  - `vlut16` looks the nibbles up as fp16 (on v79 it reads entry i of its table at halfword 2i);
+  - `vshuffe`/`vshuffo` pair the columns;
+  - a qf16 multiply applies the group's factors.
+
+  This runs at about 18 weights per cycle on one thread, bit-exact with torch's fp16 products. IEEE `vmpy(hf, hf)` gives wrong results on v79.
+- **Multiply.** HMX multiplies every row tile of A by the column, so each weight dequantizes once per call, however many rows A has. Two columns alternate, and a slice of the next column dequantizes alongside each tile's MACs.
+- **Out of line.** Like the GEMMs, the dequantization is a function of its own: inlined into the call's loop it competes for registers and spills its lookup table.
+
+On v79, 256 x 128 x 2048 runs at:
+
+| Programs | Cycles per 32x32x32 (HMX rate: 8.1) |
+|---|---|
+| one | 13.1 |
+| a pool of 4, sharing HMX | 8.4 |
+
+One program reaches only 13.1 because issuing a deep packet stalls the thread, so its own HVX work overlaps HMX only in part. In a pool, a worker dequantizes and runs its epilogues while another holds HMX.
+
 The HVX GEMMs are functions of their own, not inlined (`TL_GEMM` in `hvx_gemm.h`): the calls
 of one shape share their code. A kernel that multiplies in many places, a megakernel whose
 phases each call a GEMV, otherwise outgrows the instruction cache; on v79 a chain of eight

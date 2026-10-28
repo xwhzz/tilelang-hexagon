@@ -148,13 +148,23 @@ TVM_DLL const Op &hexagon_load_repeat();
 // `column_tiles` ("true" or "false") print as template arguments.
 TVM_DLL const Op &hexagon_crouton_copy();
 
-// tl_crouton_tile_store<accumulate, rows, aligned>(dst, ldc, tile)
-// (crouton.h): writes the fp16 Crouton tile `tile`, an HMX output, into a
-// 32 x 32 block of a matrix, or adds it to the block (accumulate): a row-major
-// block whose element (i, j) is dst[i * ldc + j] (rows), fp16 or fp32, or the
-// Crouton tile dst. `aligned`: the rows start on register boundaries (fp32) or
-// half-register ones (fp16). The three print as template arguments.
+// tl_crouton_tile_store<accumulate, rows, aligned, scaled>(dst, ldc, tile[,
+// scale, ld]) (crouton.h): writes the fp16 Crouton tile `tile`, an HMX output,
+// into a 32 x 32 block of a matrix, or adds it to the block (accumulate): a
+// row-major block whose element (i, j) is dst[i * ldc + j] (rows), fp16 or
+// fp32, or the Crouton tile dst. `aligned`: the rows start on register
+// boundaries (fp32) or half-register ones (fp16). `scaled`: row i is
+// multiplied by the fp32 scale[i * ld] first. The four print as template
+// arguments.
 TVM_DLL const Op &hexagon_crouton_tile_store();
+
+// tl_crouton_dequant4<signed>(w, panel, sfb, ld_sfb, gb, v0, n) (crouton.h):
+// dequantizes panel registers [v0, v0 + n) of one 32-row panel of a 4-bit B,
+// each 8 columns of K by the 32 rows, into the fp16 HMX weight tiles `w` of
+// its 32 output columns, scaled by the panel's fp16 factors: sfb[g * ld_sfb +
+// i] for row i and group g of gb columns of K. `signed` prints as a template
+// argument.
+TVM_DLL const Op &hexagon_crouton_dequant4();
 
 // tl_hvx_gemm<M, N, K, trans_A, trans_B, lda, ldb, ldc, align_a, align_b,
 // align_c>(C, A, B, clear) (hvx_gemm.h): C = A B, or C += A B unless clear,

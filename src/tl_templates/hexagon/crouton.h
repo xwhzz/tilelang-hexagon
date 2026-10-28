@@ -1,7 +1,8 @@
 #pragma once
 // Copies between Crouton matrices in VTCM and strided matrices (T.copy),
-// reductions of Crouton matrices along rows or columns (T.reduce_*), and the
-// stores of HMX output tiles into a gemm's C (T.gemm).
+// reductions of Crouton matrices along rows or columns (T.reduce_*), the
+// stores of HMX output tiles into a gemm's C (T.gemm), and HMX weight tiles
+// dequantized from 4-bit panels (T.gemm_blockscaled).
 //
 // A Crouton tile is 32x32 fp16 stored as interleaved row pairs: element (r, c)
 // of a tile sits at (r / 2) * 64 + c * 2 + r % 2, so one HVX register holds a
@@ -456,28 +457,73 @@ TL_DEVICE void tl_crouton_half_row(half *row, HVX_Vector v) {
   }
 }
 
+// The fp16 factors of a tile's 32 rows, scale[i * ld] for row i, one HVX
+// conversion for all of them: factor i lands in halfwords 2i and 2i + 1 of
+// `h`, so word q of `pairs` below holds row pair q's two.
+TL_DEVICE void tl_crouton_row_factors(uint16_t *__restrict__ h,
+                                      const float *__restrict__ scale, int ld) {
+  HVX_Vector v;
+  if (ld == 1) {
+    v = tl_hvx_load_bytes(scale, 128);
+  } else {
+    alignas(128) float f[32];
+    for (int i = 0; i < 32; ++i)
+      f[i] = scale[i * ld];
+    v = *reinterpret_cast<const HVX_Vector *>(f);
+  }
+  HVX_Vector q = Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vzero());
+  *reinterpret_cast<HVX_Vector *>(h) =
+      Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q, q));
+}
+
+// Row pair q's factors, that of row 2q in the even lanes and that of row
+// 2q + 1 in the odd ones, from tl_crouton_row_factors' `h`.
+TL_DEVICE HVX_Vector tl_crouton_pair_factors(const uint16_t *h, int q) {
+  return Q6_V_vsplat_R(
+      static_cast<int>(h[4 * q] | (uint32_t(h[4 * q + 2]) << 16)));
+}
+
 // Writes the fp16 Crouton tile `tile` into the 32 x 32 block at `dst`, or adds
-// it (Accumulate). Rows: the block is row-major, element (i, j) at
-// dst[i * ldc + j], fp16 or fp32; Aligned when its rows start on register
-// boundaries (fp32) or half-register ones (fp16). Otherwise dst is a Crouton
-// tile, fp16.
-template <bool Accumulate, bool Rows, bool Aligned, typename D>
+// it (Accumulate); Scaled multiplies row i by scale[i * ld], in fp16. Rows: the
+// block is row-major, element (i, j) at dst[i * ldc + j], fp16 or fp32;
+// Aligned when its rows start on register boundaries (fp32) or half-register
+// ones (fp16). Otherwise dst is a Crouton tile, fp16.
+template <bool Accumulate, bool Rows, bool Aligned, bool Scaled, typename D>
 TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
-                                     const half *__restrict__ tile) {
+                                     const half *__restrict__ tile,
+                                     const float *__restrict__ scale = 0,
+                                     int ld = 1) {
   const HVX_Vector *t = reinterpret_cast<const HVX_Vector *>(tile);
+  alignas(128) uint16_t h[64];
+  if constexpr (Scaled)
+    tl_crouton_row_factors(h, scale, ld);
+  // Row pair q's factors (1.0 unscaled), and the pair scaled.
+  auto factors = [&](int q) {
+    if constexpr (Scaled)
+      return tl_crouton_pair_factors(h, q);
+    else
+      return Q6_Vh_vsplat_R(0x3c00);
+  };
+  auto pair = [&](int q) {
+    if constexpr (Scaled)
+      return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(t[q], factors(q)));
+    else
+      return t[q];
+  };
   if constexpr (!Rows) {
     static_assert(std::is_same_v<D, half>, "Crouton tiles are fp16");
     HVX_Vector *d = reinterpret_cast<HVX_Vector *>(dst);
 #pragma clang loop unroll(full)
     for (int q = 0; q < 16; ++q)
-      d[q] = Accumulate ? Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(d[q], t[q]))
-                        : t[q];
+      d[q] = Accumulate
+                 ? Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(d[q], pair(q)))
+                 : pair(q);
   } else if constexpr (std::is_same_v<D, float>) {
-    // Widening by 1.0 splits row pair q into its even lanes, row 2q, and its
-    // odd ones, row 2q + 1: one fp32 register each. Two row pairs per
-    // iteration, their rows loaded first: on v79 the fastest of the
-    // schedules measured, a full unroll and software pipelining included.
-    const HVX_Vector one = Q6_Vh_vsplat_R(0x3c00);
+    // Widening by the pair's factors (1.0 unscaled) splits row pair q into
+    // its even lanes, row 2q, and its odd ones, row 2q + 1: one fp32 register
+    // each. Two row pairs per iteration, their rows loaded first: on v79 the
+    // fastest of the schedules measured, a full unroll and software
+    // pipelining included.
 #pragma clang loop unroll(disable)
     for (int q = 0; q < 16; q += 2) {
       float *r = dst + 2 * q * ldc;
@@ -489,7 +535,7 @@ TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
       }
 #pragma clang loop unroll(full)
       for (int i = 0; i < 2; ++i) {
-        HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(t[q + i], one);
+        HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(t[q + i], factors(q + i));
         HVX_Vector even = Q6_V_lo_W(w), odd = Q6_V_hi_W(w);
         if constexpr (Accumulate) {
           even = Q6_Vqf32_vadd_Vqf32Vsf(even, x[2 * i]);
@@ -505,10 +551,96 @@ TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
     for (int q = 0; q < 16; ++q) {
       // Dealing a row pair with itself puts row 2q in both halves of the low
       // register and row 2q + 1 in both halves of the high one.
-      HVX_VectorPair d = Q6_W_vdeal_VVR(t[q], t[q], -2);
+      HVX_Vector v = pair(q);
+      HVX_VectorPair d = Q6_W_vdeal_VVR(v, v, -2);
       half *r0 = dst + 2 * q * ldc;
       tl_crouton_half_row<Accumulate, Aligned>(r0, Q6_V_lo_W(d));
       tl_crouton_half_row<Accumulate, Aligned>(r0 + ldc, Q6_V_hi_W(d));
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HMX weight tiles from 4-bit panels (T.gemm_blockscaled on HMX): 32 rows of
+// a 4-bit B [N, K] in the panel layout (tilelang.hexagon.intrinsics.panel)
+// become the K / 32 fp16 weight tiles of 32 output columns.
+// ---------------------------------------------------------------------------
+
+// The fp16 values of the nibble codes where vlut16 reads them: on v79 entry i
+// of table 0 is halfword 2i, so halfwords 2i and 2i + 1 both hold code i.
+alignas(128) static const uint16_t tl_crouton_nibble_tables[2][64] = {
+    // Unsigned: 0..15.
+    {0x0000, 0x0000, 0x3C00, 0x3C00, 0x4000, 0x4000, 0x4200, 0x4200,
+     0x4400, 0x4400, 0x4500, 0x4500, 0x4600, 0x4600, 0x4700, 0x4700,
+     0x4800, 0x4800, 0x4880, 0x4880, 0x4900, 0x4900, 0x4980, 0x4980,
+     0x4A00, 0x4A00, 0x4A80, 0x4A80, 0x4B00, 0x4B00, 0x4B80, 0x4B80},
+    // Signed: 0..7, then -8..-1.
+    {0x0000, 0x0000, 0x3C00, 0x3C00, 0x4000, 0x4000, 0x4200, 0x4200,
+     0x4400, 0x4400, 0x4500, 0x4500, 0x4600, 0x4600, 0x4700, 0x4700,
+     0xC800, 0xC800, 0xC700, 0xC700, 0xC600, 0xC600, 0xC500, 0xC500,
+     0xC400, 0xC400, 0xC200, 0xC200, 0xC000, 0xC000, 0xBC00, 0xBC00},
+};
+
+// Panel registers src[0, R) to the weight-tile registers dst[0, 4R), scaled by
+// the row pairs' factors in `scale`. A panel register holds 32 rows (output
+// columns) by 8 columns of K, a row's 8 nibbles in one 32-bit lane; its four
+// weight-tile registers each hold two columns of K by the 32 rows, interleaved.
+// vlut16 looks up the low nibbles of the even bytes into one register and of
+// the odd bytes into another, the high nibbles after a shift; vshuffe and
+// vshuffo pair the two nibbles of each byte.
+template <int R>
+TL_DEVICE void tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
+                                         const HVX_Vector *__restrict__ src,
+                                         HVX_Vector table, HVX_Vector scale) {
+  HVX_Vector v[R];
+  // All loads first, so the stores of one register do not wait behind the
+  // loads of the next.
+#pragma clang loop unroll(full)
+  for (int i = 0; i < R; ++i)
+    v[i] = src[i];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < R; ++i) {
+    HVX_VectorPair lo = Q6_Wh_vlut16_VbVhR_nomatch(v[i], table, 0);
+    HVX_VectorPair hi =
+        Q6_Wh_vlut16_VbVhR_nomatch(Q6_Vuh_vlsr_VuhR(v[i], 4), table, 0);
+    const HVX_Vector k[4] = {
+        Q6_Vh_vshuffe_VhVh(Q6_V_lo_W(hi), Q6_V_lo_W(lo)), // columns 0, 1
+        Q6_Vh_vshuffe_VhVh(Q6_V_hi_W(hi), Q6_V_hi_W(lo)), // 2, 3
+        Q6_Vh_vshuffo_VhVh(Q6_V_lo_W(hi), Q6_V_lo_W(lo)), // 4, 5
+        Q6_Vh_vshuffo_VhVh(Q6_V_hi_W(hi), Q6_V_hi_W(lo)), // 6, 7
+    };
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j)
+      dst[4 * i + j] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(k[j], scale));
+  }
+}
+
+// Dequantizes panel registers [v0, v0 + n) of one 32-row panel of a 4-bit B
+// into `w`, its weight tiles: register v covers columns [8v, 8v + 8) of K and
+// becomes registers 4v..4v + 3 of the tiles, tile kt at w + kt * 1024.
+// `sfb` holds the panel's fp16 scales, factor (g, i) for group g of gb
+// columns of K and row i at sfb[g * ld_sfb + i]; gb is a multiple of 8. A
+// function of its own, as the GEMMs are (TL_GEMM): inlined into a kernel's
+// loop it competes for registers and spills its lookup table.
+template <bool Signed>
+static __attribute__((noinline)) void
+tl_crouton_dequant4(half *__restrict__ w, const void *__restrict__ panel,
+                    const half *__restrict__ sfb, int ld_sfb, int gb, int v0,
+                    int n) {
+  const HVX_Vector table =
+      *reinterpret_cast<const HVX_Vector *>(tl_crouton_nibble_tables[Signed]);
+  const HVX_Vector *src = reinterpret_cast<const HVX_Vector *>(panel);
+  HVX_Vector *dst = reinterpret_cast<HVX_Vector *>(w);
+  const int per_group = gb >> 3; // panel registers per group of factors
+  for (int v = v0, end = v0 + n; v < end;) {
+    const int g = v / per_group;
+    const int stop = end < (g + 1) * per_group ? end : (g + 1) * per_group;
+    // The group's 32 factors, each in both lanes of its row's pair.
+    HVX_Vector s = tl_hvx_load_bytes(sfb + g * ld_sfb, 64);
+    s = Q6_V_lo_W(Q6_W_vshuff_VVR(s, s, -2));
+    for (; v + 8 <= stop; v += 8)
+      tl_crouton_dequant4_block<8>(dst + 4 * v, src + v, table, s);
+    for (; v < stop; ++v)
+      tl_crouton_dequant4_block<1>(dst + 4 * v, src + v, table, s);
   }
 }

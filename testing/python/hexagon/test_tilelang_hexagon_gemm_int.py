@@ -1,4 +1,6 @@
-"""Integer T.gemm on HVX: vrmpy over a B in the panel layout, exact in int32."""
+"""Integer T.gemm on HVX: vrmpy over a B in the panel layout, exact in int32;
+and T.gemm_blockscaled of 8- and 4-bit B: on HVX by integer A, on HMX by fp16
+A."""
 
 import os
 
@@ -278,5 +280,104 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
         fb = sb.double().t().repeat_interleave(G // g, dim=1)[None]  # [1, N, groups]
         ref = c0.double() + (dots * fa * fb).sum(-1)
         torch.testing.assert_close(c.double(), ref, rtol=1e-5, atol=1e-5 * ref.abs().max().item())
+    finally:
+        kernel.adapter.close()
+
+
+def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1):
+    """C = C0 + SA * (A @ (B * SB)^T) on HMX, for an fp16 A, a factor per row
+    of A and an fp16 one per G columns of each row of B (group-major).
+    `workers` programs each multiply their own A, B and C."""
+
+    @T.prim_func
+    def gemm(
+        A: T.Tensor((workers, M, K), "float16"),
+        SA: T.Tensor((workers, M, 1), "float32"),
+        B: T.Tensor((workers, N, K), b_dtype),
+        SB: T.Tensor((workers, K // G, N), "float16"),
+        C0: T.Tensor((workers, M, N), c_dtype),
+        C: T.Tensor((workers, M, N), c_dtype),
+    ):
+        with T.Kernel(workers, num_workers=workers) as p:
+            a = T.alloc_shared((M, K), "float16")
+            b = T.alloc_shared((N, K), b_dtype)
+            sb = T.alloc_shared((K // G, N), "float16")
+            c = T.alloc_shared((M, N), c_dtype)
+            T.annotate_layout({B: make_hvx_panel_layout(B)})
+            T.copy(A[p, :, :], a)
+            T.copy(B[p, :, :], b)
+            T.copy(SB[p, :, :], sb)
+            T.copy(C0[p, :, :], c)
+            T.gemm_blockscaled(
+                a, b, c, SA[p, :, :], sb, transpose_B=True, clear_accum=clear, k_start=0, sf_a_granularity_k=K, sf_b_granularity_k=G
+            )
+            T.copy(c, C[p, :, :])
+
+    return gemm
+
+
+def test_blockscaled_gemm_of_fp16_a_runs_on_hmx():
+    source = _lower(_blockscaled_hmx(64, 64, 256, 64, "int4", "float32", True)).kernel_source
+    # Column 0 dequantizes whole first; then half of column 1 alongside each
+    # of column 0's two row tiles.
+    assert "tl_crouton_dequant4<true>((&(((half*)w)[0])), ((int8_t*)b + ((0) >> 1)), (&(((half*)sb)[0])), 64, 64, 0, 32);" in source
+    assert (
+        "tl_crouton_dequant4<true>((&(((half*)w)[8192])), ((int8_t*)b + ((8192) >> 1)), (&(((half*)sb)[32])), 64, 64, (t * 16), 16);"
+        in source
+    )
+    assert source.count("tl_hexagon_hmx_mma_atom(") == 1
+    # Each row of a tile weighed by its row's factor of A, written to C.
+    assert "tl_crouton_tile_store<false, true, true, true>(" in source
+    assert "tl_hvx_gemm_int_scaled" not in source
+
+
+def test_blockscaled_hmx_gemm_of_a_worker_pool_takes_turns_at_hmx():
+    source = _lower(_blockscaled_hmx(64, 64, 256, 64, "uint4", "float32", True, workers=2)).kernel_source
+    body = source[source.index("tl_parallel_for") :]
+    # Per tile: take HMX, multiply, store, release; then the epilogue and a
+    # slice of the next column, while the other worker multiplies.
+    acquire, release = body.index("tl_hexagon_hmx_acc_acquire"), body.index("tl_hexagon_hmx_acc_release")
+    assert acquire < body.index("tl_hexagon_hmx_mma_atom") < release
+    assert release < body.index("tl_crouton_tile_store<") < body.index("tl_crouton_dequant4<false>((&(((half*)w)[8192]))")
+
+
+@pytest.mark.parametrize(
+    "args,error",
+    [
+        ((64, 64, 256, 64, "int8", "float32", True), "an fp16 A by a 4-bit B"),
+        ((64, 64, 256, 4, "int4", "float32", True), "groups of 8 columns of K"),
+        ((48, 64, 256, 64, "int4", "float32", True), "multiples of 32"),
+    ],
+)
+def test_blockscaled_hmx_gemm_rejects_what_it_cannot_run(args, error):
+    with pytest.raises(Exception, match=error):
+        _lower(_blockscaled_hmx(*args))
+
+
+@DEVICE
+@pytest.mark.parametrize(
+    "M,N,K,G,b_dtype,c_dtype,clear,workers",
+    [
+        (64, 64, 256, 64, "int4", "float32", True, 1),
+        (256, 128, 2048, 64, "int4", "float32", False, 1),
+        (32, 96, 512, 128, "uint4", "float32", True, 1),
+        (64, 64, 1024, 64, "int4", "float16", False, 1),
+        (96, 64, 512, 64, "int4", "float32", False, 2),
+    ],
+)
+def test_blockscaled_hmx_gemms_match_torch(M, N, K, G, b_dtype, c_dtype, clear, workers):
+    torch.manual_seed(M + N + K)
+    kernel = tilelang.compile(_blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers), out_idx=[5], target="hexagon")
+    try:
+        a = (torch.randn(workers, M, K) * 0.5).half()
+        sa = torch.rand(workers, M, 1) + 0.5
+        b = torch.stack([_random((N, K), b_dtype) for _ in range(workers)])
+        sb = (torch.rand(workers, K // G, N) * 2e-2 + 1e-3).half()
+        c0 = torch.randn(workers, M, N).to(getattr(torch, c_dtype))
+        c = kernel(a, sa, torch.stack([pack_panel(b[i], 4) for i in range(workers)]), sb, c0)
+        # B dequantizes to fp16 exactly as torch rounds the products.
+        w = (b.half() * sb.repeat_interleave(G, dim=1).transpose(1, 2)).double()  # [workers, N, K]
+        ref = sa.double() * (a.double() @ w.transpose(1, 2)) + (0 if clear else c0.double())
+        torch.testing.assert_close(c.double(), ref, rtol=4e-3, atol=4e-3 * ref.abs().max().item())
     finally:
         kernel.adapter.close()

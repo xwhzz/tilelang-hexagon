@@ -117,7 +117,7 @@ def test_k_loops_accumulate_hmx_tiles_into_an_fp32_fragment():
     assert "tl_hexagon_hmx_mma_atom(" in source
     # Each tile goes through a staging tile into the row-major fp32 C: one
     # store in the tile loop and the last tile's after it.
-    assert source.count("tl_crouton_tile_store<true, true, true>(") == 2
+    assert source.count("tl_crouton_tile_store<true, true, true, false>(") == 2
     assert "(&(((float*)c)[2080])), 64, (&(((half*)stage)[1024])));" in source
 
 
@@ -139,15 +139,15 @@ def test_each_tiles_epilogue_overlaps_the_next_tiles_macs():
 
 def test_fp16_c_accumulates_in_its_crouton_tiles():
     source = _source(_k_loop(64, 64, 128, 64, "float16"))
-    assert "tl_crouton_tile_store<true, false, true>((&(((half*)c)[((t * 1024) - 1024)]))" in source
+    assert "tl_crouton_tile_store<true, false, true, false>((&(((half*)c)[((t * 1024) - 1024)]))" in source
 
 
 def test_a_dynamic_clear_writes_the_first_block_and_adds_the_others():
     for dtype, rows in (("float32", "true"), ("float16", "false")):
         source = _source(_k_loop(64, 64, 128, 64, dtype, "shared", "first"))
         assert "if (k == 0) {" in source
-        assert f"tl_crouton_tile_store<false, {rows}, true>(" in source
-        assert f"tl_crouton_tile_store<true, {rows}, true>(" in source
+        assert f"tl_crouton_tile_store<false, {rows}, true, false>(" in source
+        assert f"tl_crouton_tile_store<true, {rows}, true, false>(" in source
 
 
 def test_sub_matrices_start_at_their_tiles():
@@ -167,8 +167,8 @@ def test_c_of_another_layout_is_written_element_by_element():
 
 
 def test_rows_off_register_boundaries_are_unaligned_stores():
-    assert "tl_crouton_tile_store<true, true, false>(" in _source(_c_layout("rows32_odd"))
-    assert "tl_crouton_tile_store<true, true, true>(" in _source(_c_layout("rows16"))
+    assert "tl_crouton_tile_store<true, true, false, false>(" in _source(_c_layout("rows32_odd"))
+    assert "tl_crouton_tile_store<true, true, true, false>(" in _source(_c_layout("rows16"))
 
 
 def test_gemms_hmx_cannot_run_go_to_hvx_saying_why(caplog):

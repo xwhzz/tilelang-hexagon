@@ -5,8 +5,9 @@
  * A GEMM runs on HMX (GemmHMX, tilelang/hexagon/op/gemm/gemm_hmx.py) when its
  * operands fit the matrix unit, on HVX (GemmHVX, gemm_hvx.py) when they are
  * row-major matrices of fp16 or fp32, or integers with a panel-layout B, and
- * as the scalar loop otherwise. A block-scaled GEMM of integers runs on HVX
- * (GemmHVXBlockScaled), or fails to compile.
+ * as the scalar loop otherwise. A block-scaled GEMM of an fp16 A by a 4-bit
+ * B runs on HMX (GemmHMXBlockScaled), one of integers on HVX
+ * (GemmHVXBlockScaled); any other fails to compile.
  */
 
 #include "hexagon/op/gemm.h"
@@ -38,6 +39,7 @@ constexpr const char *kHexagonScalar = "cpu.scalar";
 constexpr const char *kHexagonHMX = "hexagon.hmx";
 constexpr const char *kHexagonHVX = "hexagon.hvx";
 constexpr const char *kHexagonHVXBlockScaled = "hexagon.hvx.blockscaled";
+constexpr const char *kHexagonHMXBlockScaled = "hexagon.hmx.blockscaled";
 constexpr int kTile = 32;
 
 bool OnTiles(const PrimExpr &value, arith::Analyzer *analyzer) {
@@ -93,25 +95,15 @@ std::string HMXRejection(const GemmNode &op) {
   return "";
 }
 
-// Why HVX's vrmpy cannot run the integer GEMM `op`, or "".
-// C is int32, or fp32 for a block-scaled GEMM.
-std::string HVXIntRejection(const GemmNode &op, DataType c_type) {
-  DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
-  bool a_ok =
-      a == DataType::Int(8) || a == DataType::UInt(8) || a == DataType::Int(16);
-  bool b_ok = (b.is_int() || b.is_uint()) && b.lanes() == 1 &&
-              (b.bits() == 8 || b.bits() == 4);
-  if (!a_ok || !b_ok || c != c_type)
-    return "HVX multiplies an int8, uint8 or int16 A by an 8- or 4-bit B "
-           "into an " +
-           TypeName(c_type) + " C, not " + TypeName(a) + " x " + TypeName(b) +
-           " into " + TypeName(c);
+// Why the integer B of `op` is not read in whole panels from VTCM, rows of A
+// by rows of B, or "".
+std::string PanelRejection(const GemmNode &op) {
   if (op.transA_ || !op.transB_)
     return "HVX multiplies integer rows of A by rows of B: transpose_B, and "
            "A not transposed";
   if (!IsSharedBuffer(op.b_))
     return "HVX reads an integer B in its panel layout, from VTCM";
-  int64_t lane = 32 / b.bits();
+  int64_t lane = 32 / op.b_->dtype.bits();
   const Array<Range> &rb = op.bRegion_->region;
   const Range &rows = rb[rb.size() - 2], &cols = rb[rb.size() - 1];
   const auto *nrows = rows->extent.as<IntImmNode>();
@@ -127,6 +119,22 @@ std::string HVXIntRejection(const GemmNode &op, DataType c_type) {
            "start and end on multiples of 32, its columns on multiples of " +
            std::to_string(lane);
   return "";
+}
+
+// Why HVX's vrmpy cannot run the integer GEMM `op`, or "".
+// C is int32, or fp32 for a block-scaled GEMM.
+std::string HVXIntRejection(const GemmNode &op, DataType c_type) {
+  DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
+  bool a_ok =
+      a == DataType::Int(8) || a == DataType::UInt(8) || a == DataType::Int(16);
+  bool b_ok = (b.is_int() || b.is_uint()) && b.lanes() == 1 &&
+              (b.bits() == 8 || b.bits() == 4);
+  if (!a_ok || !b_ok || c != c_type)
+    return "HVX multiplies an int8, uint8 or int16 A by an 8- or 4-bit B "
+           "into an " +
+           TypeName(c_type) + " C, not " + TypeName(a) + " x " + TypeName(b) +
+           " into " + TypeName(c);
+  return PanelRejection(op);
 }
 
 std::string HVXRejection(const GemmNode &op) {
@@ -189,6 +197,38 @@ std::string HVXBlockScaledRejection(const GemmBlockScaledNode &op) {
   return "";
 }
 
+// Why HMX cannot run the block-scaled GEMM `op`, or "": an fp16 A in VTCM by a
+// 4-bit B in the panel layout, its rows along K (transpose_B), into an fp16 or
+// fp32 C, with fp32 factors for the rows of A and fp16 ones for B. HVX
+// dequantizes B into fp16 weight tiles for HMX; the group sizes are checked as
+// the GEMM lowers (GemmHMXBlockScaled).
+std::string HMXBlockScaledRejection(const GemmBlockScaledNode &op) {
+  const DataType fp16 = DataType::Float(16);
+  DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
+  if (a != fp16 || !(b == DataType::Int(4) || b == DataType::UInt(4)) ||
+      !(c == fp16 || c == DataType::Float(32)))
+    return "HMX multiplies an fp16 A by a 4-bit B into an fp16 or fp32 C, "
+           "not " +
+           TypeName(a) + " x " + TypeName(b) + " into " + TypeName(c);
+  if (op.m_ % kTile || op.n_ % kTile || op.k_ % kTile)
+    return "HMX needs M, N and K multiples of 32, not " +
+           std::to_string(op.m_) + " x " + std::to_string(op.n_) + " x " +
+           std::to_string(op.k_);
+  if (!IsSharedBuffer(op.a_) && !IsFragmentBuffer(op.a_))
+    return "HMX reads A (" + op.a_->name + ") from VTCM";
+  if (!IsSharedBuffer(op.c_) && !IsFragmentBuffer(op.c_))
+    return "HMX writes C (" + op.c_->name + ") to VTCM";
+  std::string why = PanelRejection(op);
+  if (!why.empty())
+    return why;
+  DataType sfa = op.sfaRegion_->buffer->dtype;
+  DataType sfb = op.sfbRegion_->buffer->dtype;
+  if (sfa != DataType::Float(32) || sfb != fp16)
+    return "HMX scales the rows of A by fp32 and B by fp16 factors, not " +
+           TypeName(sfa) + " and " + TypeName(sfb);
+  return "";
+}
+
 struct Gemm {
   static String SelectInst(const GemmNode &op, int block_size, Target target) {
     (void)block_size;
@@ -226,16 +266,20 @@ namespace {
 
 bool MatchHexagonGemmTarget(Target target) { return TargetIsHexagon(target); }
 
-// A block-scaled GEMM has no scalar fallback: one HVX cannot run fails.
+// A block-scaled GEMM of an fp16 A runs on HMX, any other on HVX. It has no
+// scalar fallback: one that unit cannot run fails.
 String SelectHexagonBlockScaledInst(const GemmBlockScaled &op, int block_size,
                                     const Target &target) {
   (void)block_size;
   (void)target;
-  std::string why = hexagon::HVXBlockScaledRejection(*op.get());
+  bool hmx = op->a_->dtype == DataType::Float(16);
+  std::string why = hmx ? hexagon::HMXBlockScaledRejection(*op.get())
+                        : hexagon::HVXBlockScaledRejection(*op.get());
   ICHECK(why.empty()) << "T.gemm_blockscaled(" << op->a_->name << ", "
                       << op->b_->name << ", " << op->c_->name
                       << ") cannot run on Hexagon: " << why;
-  return String(hexagon::kHexagonHVXBlockScaled);
+  return String(hmx ? hexagon::kHexagonHMXBlockScaled
+                    : hexagon::kHexagonHVXBlockScaled);
 }
 
 bool RegisterHexagonGemm() {

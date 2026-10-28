@@ -44,6 +44,23 @@ def _strides(buffer) -> list:
     return strides
 
 
+def scale_group(gemm, operand: str, g) -> tuple:
+    """The columns per factor of `operand` ("A" or "B") of the block-scaled
+    `gemm` across its K, and the index of its first factor: K when the call's
+    columns lie in one group of g, else g, when they split into whole groups
+    of g."""
+    K, k0 = gemm.K, gemm.sf_k_start
+    analyzer = arith.Analyzer()
+    if analyzer.can_prove(tirx.floormod(k0, g) + K <= g):
+        return K, k0 // g
+    if K % g or not analyzer.can_prove(tirx.floormod(k0, g) == 0):
+        raise ValueError(
+            f"T.gemm_blockscaled: columns [{k0}, {k0} + {K}) neither lie in one group of {g} {operand} scale columns "
+            "nor split into whole ones"
+        )
+    return g, k0 // g
+
+
 def _is_integer(dtype) -> bool:
     return str(dtype).startswith(("int", "uint"))
 
@@ -168,26 +185,11 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
     end.
     """
 
-    def _scale_group(self, operand: str, g) -> tuple:
-        """The columns per factor of `operand` across this call's K, and the
-        index of its first factor: K when the call's columns lie in one group
-        of g, else g, when they split into whole groups of g."""
-        K, k0 = self.K, self.sf_k_start
-        analyzer = arith.Analyzer()
-        if analyzer.can_prove(tirx.floormod(k0, g) + K <= g):
-            return K, k0 // g
-        if K % g or not analyzer.can_prove(tirx.floormod(k0, g) == 0):
-            raise ValueError(
-                f"T.gemm_blockscaled on HVX: columns [{k0}, {k0} + {K}) neither lie in one group of {g} {operand} scale columns "
-                "nor split into whole ones"
-            )
-        return g, k0 // g
-
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
         M, N, K = self.M, self.N, self.K
         a, lda, c, ldc, align_c, b, panel_bytes, bits, signed = self._integer_operands(layout_map)
-        ga, first_a = self._scale_group("A", self.sf_a_granularity_k)
-        gb, first_b = self._scale_group("B", self.sf_b_granularity_k)
+        ga, first_a = scale_group(self, "A", self.sf_a_granularity_k)
+        gb, first_b = scale_group(self, "B", self.sf_b_granularity_k)
         # A signed B's groups take whole int16 registers of A for their sums.
         group, step = min(ga, gb), 64 if signed else 32 // bits
         if max(ga, gb) % group or group % step:

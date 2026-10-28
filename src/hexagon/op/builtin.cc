@@ -151,7 +151,12 @@ TIR_DEFINE_TL_BUILTIN(hexagon_crouton_copy)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(hexagon_crouton_tile_store)
-    .set_num_inputs(6)
+    .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(hexagon_crouton_dequant4)
+    .set_num_inputs(8)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
