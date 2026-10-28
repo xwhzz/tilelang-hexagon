@@ -46,6 +46,9 @@ public:
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
   // HVX has no divide: print float vector division as tl_hvx_div (hvx_math.h).
   void VisitExpr_(const DivNode *op, std::ostream &os) final; // NOLINT(*)
+  // A lane-wise select prints as tl_vec_select, a ramp as tl_vec_ramp.
+  void VisitExpr_(const SelectNode *op, std::ostream &os) final; // NOLINT(*)
+  void VisitExpr_(const RampNode *op, std::ostream &os) final;   // NOLINT(*)
   // Print Hexagon builtins as calls to their runtime template functions.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
   // Print a worker loop as a tl_parallel_for call.

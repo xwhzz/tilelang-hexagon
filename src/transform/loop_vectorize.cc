@@ -53,6 +53,67 @@ using namespace ffi;
 
 namespace {
 
+// Whether the current target selects lane by lane
+// ("supports_vector_predicate").
+bool TargetHasVectorPredicates() {
+  Target target = Target::Current(false);
+  return target.defined() &&
+         target->GetAttr<Bool>("supports_vector_predicate", Bool(false))
+             .value();
+}
+
+// Whether `expr` can be evaluated whatever a condition around it says: no side
+// effects but loads, every load provably in bounds, and no if_then_else, which
+// guards its own branches.
+bool SafeToEvaluate(const PrimExpr &expr, arith::Analyzer *analyzer) {
+  if (SideEffect(expr) > CallEffectKind::kReadState)
+    return false;
+  bool safe = true;
+  PostOrderVisit(expr, [&](const ObjectRef &node) {
+    if (!safe)
+      return;
+    if (const auto *call = node.as<CallNode>()) {
+      safe = !call->op.same_as(builtin::if_then_else());
+      return;
+    }
+    const auto *load = node.as<BufferLoadNode>();
+    if (load == nullptr)
+      return;
+    for (size_t i = 0; i < load->indices.size() && safe; ++i) {
+      const PrimExpr &index = load->indices[i];
+      safe = index.dtype().is_scalar() && analyzer->CanProve(index >= 0) &&
+             analyzer->CanProve(index < load->buffer->shape[i]);
+    }
+  });
+  return safe;
+}
+
+// An if_then_else whose branches are both safe to evaluate is a Select: a
+// lane-wise select computes it once the loop vectorizes.
+bool SelectsLaneWise(const CallNode *call, arith::Analyzer *analyzer) {
+  return call->op.same_as(builtin::if_then_else()) &&
+         TargetHasVectorPredicates() &&
+         SafeToEvaluate(call->args[1], analyzer) &&
+         SafeToEvaluate(call->args[2], analyzer);
+}
+
+class IfThenElseToSelect : public arith::IRMutatorWithAnalyzer {
+public:
+  explicit IfThenElseToSelect(arith::Analyzer *analyzer)
+      : IRMutatorWithAnalyzer(analyzer) {}
+  using IRMutatorWithAnalyzer::VisitExpr_;
+  using IRMutatorWithAnalyzer::VisitStmt_;
+
+private:
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    PrimExpr expr = IRMutatorWithAnalyzer::VisitExpr_(op);
+    const auto *call = expr.as<CallNode>();
+    if (call != nullptr && SelectsLaneWise(call, analyzer_))
+      return Select(call->args[0], call->args[1], call->args[2]);
+    return expr;
+  }
+};
+
 PrimExpr SimplifyExprForAnalyzer(const PrimExpr &expr, int scale,
                                  arith::Analyzer *analyzer);
 
@@ -627,11 +688,7 @@ private:
     // using the same condition-uniformity rule as IfThenElse, unless the
     // target codegen supports lane-wise vector predicates and therefore
     // does not need this control-flow restriction.
-    Target target = Target::Current(false);
-    bool vector_predicate =
-        target.defined() &&
-        target->GetAttr<Bool>("supports_vector_predicate", Bool(false)).value();
-    if (!vector_predicate) {
+    if (!TargetHasVectorPredicates()) {
       CheckConditionVectorized(node->condition);
     }
     return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
@@ -702,7 +759,9 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *node) final {
     if (node->op == builtin::if_then_else()) {
-      CheckConditionVectorized(node->args[0]);
+      // VectorizeLoop makes a lane-wise one a Select (IfThenElseToSelect).
+      if (!SelectsLaneWise(node, analyzer_))
+        CheckConditionVectorized(node->args[0]);
       return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
     } else if (node->op.same_as(builtin::tvm_access_ptr())) {
       HandleTvmAccessPtr(node);
@@ -1509,14 +1568,19 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 
 For VectorizeLoop(const For &loop, const arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
+  For body = loop;
+  if (TargetHasVectorPredicates()) {
+    auto select_analyzer = analyzer->Clone();
+    body = Downcast<For>(IfThenElseToSelect(select_analyzer.get())(loop));
+  }
   if (vectorize_hint <= 0) {
-    vectorize_hint = GetVectorizeSize(loop, analyzer, layout_map);
+    vectorize_hint = GetVectorizeSize(body, analyzer, layout_map);
   }
   if (vectorize_hint == 1)
-    return ParallelToSerial(loop);
+    return ParallelToSerial(body);
   auto local_analyzer = analyzer->Clone();
   auto rewriter = VectorizeRewriter(vectorize_hint, local_analyzer.get());
-  return Downcast<For>(rewriter(loop));
+  return Downcast<For>(rewriter(body));
 }
 
 } // namespace tl

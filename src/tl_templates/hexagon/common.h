@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 
 // Hexagon has a native IEEE half type; back the codegen's `half` with it so no
 // software emulation is needed on device.
@@ -48,8 +50,40 @@ using half = __fp16;
 // `may_alias` makes those accesses legal next to scalar ones on the same array:
 // a loop the vectorizer leaves scalar writes `a[i]`, and the next statement may
 // read `*(half64*)a`, which strict aliasing would let the compiler reorder.
+// The lane type of a comparison of T lanes: a signed integer of T's width,
+// all ones where the comparison holds. The codegen prints vector bools as such
+// masks (e.g. `a < b`, `!m`, `m && n`) and selects on them (tl_vec_select).
+template <int Bytes> struct tl_mask_lane;
+template <> struct tl_mask_lane<1> {
+  using type = int8_t;
+};
+template <> struct tl_mask_lane<2> {
+  using type = int16_t;
+};
+template <> struct tl_mask_lane<4> {
+  using type = int32_t;
+};
+template <> struct tl_mask_lane<8> {
+  using type = int64_t;
+};
+
+// Hides a register or register pair of lanes from the optimizer at no cost.
+// LLVM folds a symmetric range check of float lanes (x > -c && x < c), or a
+// select that negates the negative ones, into llvm.fabs, which hexagon-clang
+// 19 scalarizes for HVX vectors: 128 libcalls for 64 fp16 lanes. A comparison
+// of hidden lanes matches neither pattern.
+template <typename V> TL_DEVICE V tl_vec_opaque(V v) {
+  // "v" is an HVX register, or a register pair for 256 bytes.
+  if constexpr (sizeof(V) == 128 || sizeof(V) == 256)
+    __asm__("" : "+v"(v));
+  return v;
+}
+
 template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   typedef T nat_t __attribute__((ext_vector_type(N)));
+  using mask_t = vec_type<typename tl_mask_lane<sizeof(T)>::type, N>;
+  static constexpr bool is_float =
+      std::is_same_v<T, half> || std::is_floating_point_v<T>;
   nat_t v;
   vec_type() = default;
   // Express copies as native vector loads/stores. The implicit aggregate copy
@@ -84,6 +118,35 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   TL_VEC_BINOP(<<)
   TL_VEC_BINOP(>>)
 #undef TL_VEC_BINOP
+  vec_type operator-() const { return vec_type(-v); }
+  vec_type operator~() const { return vec_type(~v); }
+  // Comparisons and logical operators give lane masks. Masks of different
+  // widths combine (`m && n` of fp32 and fp16 lanes) at the left one's width.
+#define TL_VEC_CMPOP(op)                                                       \
+  mask_t operator op(const vec_type &o) const {                                \
+    nat_t a = v;                                                               \
+    if constexpr (is_float)                                                    \
+      a = tl_vec_opaque(a);                                                    \
+    return mask_t(__builtin_convertvector(a op o.v, typename mask_t::nat_t));  \
+  }
+  TL_VEC_CMPOP(==)
+  TL_VEC_CMPOP(!=)
+  TL_VEC_CMPOP(<)
+  TL_VEC_CMPOP(<=)
+  TL_VEC_CMPOP(>)
+  TL_VEC_CMPOP(>=)
+#undef TL_VEC_CMPOP
+  mask_t operator!() const {
+    return mask_t(__builtin_convertvector(!v, typename mask_t::nat_t));
+  }
+  template <typename U> mask_t operator&&(const vec_type<U, N> &o) const {
+    return mask_t(
+        __builtin_convertvector((v != 0) & (o.v != 0), typename mask_t::nat_t));
+  }
+  template <typename U> mask_t operator||(const vec_type<U, N> &o) const {
+    return mask_t(
+        __builtin_convertvector((v != 0) | (o.v != 0), typename mask_t::nat_t));
+  }
 };
 
 // Widths up to 128 lanes: HVX is a 1024-bit vector, so one register holds 128
@@ -108,6 +171,33 @@ TL_DEFINE_VEC(uint8_t)
 TL_DEFINE_VEC(uint16_t)
 TL_DEFINE_VEC(uint32_t)
 TL_DEFINE_VEC(uint64_t)
+
+// Lane-wise select, which the codegen prints for a vector Select: a where
+// `mask` (lanes of any integer width) is set, b elsewhere. One vcmp and one
+// vmux on HVX.
+template <typename M, typename T, int N>
+TL_DEVICE vec_type<T, N> tl_vec_select(const vec_type<M, N> &mask,
+                                       const vec_type<T, N> &a,
+                                       const vec_type<T, N> &b) {
+  using lanes_t = typename vec_type<T, N>::mask_t::nat_t;
+  return vec_type<T, N>(__builtin_convertvector(mask.v, lanes_t) ? a.v : b.v);
+}
+
+// The lane indices 0, 1, ..., N - 1: a constant vector.
+template <typename V, int... I>
+TL_DEVICE V tl_vec_iota(std::integer_sequence<int, I...>) {
+  return V{I...};
+}
+
+// Lanes base, base + stride, ..., which the codegen prints for a Ramp: a
+// splat multiply-add of the constant lane indices.
+template <typename T, int N>
+TL_DEVICE vec_type<T, N> tl_vec_ramp(const T &base, const T &stride) {
+  using nat_t = typename vec_type<T, N>::nat_t;
+  return (nat_t)base +
+         (nat_t)stride *
+             tl_vec_iota<nat_t>(std::make_integer_sequence<int, N>());
+}
 
 // Vector min and max, which the codegen prints for vector Min/Max: one HVX
 // vmin/vmax for every fp32, fp16 and integer lane type.

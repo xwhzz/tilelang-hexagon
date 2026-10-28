@@ -23,13 +23,17 @@ namespace refl = tvm::ffi::reflection;
 // string default registered here does not survive static initialization. With
 // `vector_window_loads` the vectorizer accepts loads of small windows (a
 // Crouton tile's row and column operands), which LowerWindowLoads lowers to a
-// window load and a lane shuffle.
+// window load and a lane shuffle. `supports_vector_predicate`: a select picks
+// lane by lane (tl_vec_select), so selects whose condition varies across
+// lanes vectorize, as do if_then_else's whose branches are safe to evaluate.
 [[maybe_unused]] TargetKindRegEntry &hexagon_kind =
     TargetKindRegEntry::RegisterOrGet("hexagon")
         .add_attr_option<int64_t>("max_vector_bits", refl::DefaultValue(1024))
         .add_attr_option<int64_t>("min_vector_bits", refl::DefaultValue(1024))
         .add_attr_option<ffi::String>("fragment_scope")
-        .add_attr_option<bool>("vector_window_loads", refl::DefaultValue(true));
+        .add_attr_option<bool>("vector_window_loads", refl::DefaultValue(true))
+        .add_attr_option<bool>("supports_vector_predicate",
+                               refl::DefaultValue(true));
 
 } // namespace
 } // namespace tvm

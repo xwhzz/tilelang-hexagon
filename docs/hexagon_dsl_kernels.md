@@ -35,7 +35,19 @@ The fp16/fp32 math intrinsics (`T.exp`, `T.exp2`, `T.log`, `T.log2`, `T.sqrt`, `
 (`LowerMath`), so their loops vectorize, and print as the `hvx_math.h` functions. A scalar
 runs the same 32-lane kernel on a splat, so a result never depends on whether its loop
 vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` print as
-`tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type.
+`tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type. HVX fp16
+arithmetic flushes subnormal results (below 2^-14) to zero.
+
+Comparisons of vectors give lane masks, integers of the compared lanes' width, and a vector
+`T.Select` prints as `tl_vec_select` (`common.h`), one `vcmp` and one `vmux`; `vec_type` also
+has `-`, `~` and `!`, and `&&`/`||` on masks. The target declares `supports_vector_predicate`,
+so the vectorizer keeps a select whose condition varies across lanes (leaky ReLU, `T.abs` of
+integers), and it turns an `T.if_then_else` into a select when both branches are safe to
+evaluate: no side effects but loads, each provably in bounds. A causal mask
+(`T.if_then_else(j > i, -inf, s[i, j])`) therefore vectorizes, with the lane indices as a
+`tl_vec_ramp`, while a branch that may load past its buffer stays guarded. A comparison of
+float lanes hides them from LLVM (`tl_vec_opaque`): it would fold a symmetric range check or
+an abs-like select into `llvm.fabs`, which hexagon-clang 19 scalarizes for HVX vectors.
 
 Two passes let LLVM's software pipeliner overlap the iterations of these maps; a map it
 does not pipeline issues about one instruction per packet. `BroadcastFromRegisters`

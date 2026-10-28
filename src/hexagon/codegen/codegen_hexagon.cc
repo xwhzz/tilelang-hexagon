@@ -483,8 +483,8 @@ void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
-// vec_type has no comparisons, and a vector min or max is one HVX instruction,
-// so vectors print as the common.h functions.
+// A vector min or max is one HVX instruction, so vectors print as the
+// common.h functions.
 void CodeGenTileLangHexagon::VisitExpr_(const MinNode *op,
                                         std::ostream &os) { // NOLINT(*)
   if (op->dtype.lanes() > 1) {
@@ -510,6 +510,28 @@ void CodeGenTileLangHexagon::VisitExpr_(const DivNode *op,
     return;
   }
   CodeGenC::VisitExpr_(op, os);
+}
+
+// A vector condition selects lane by lane (common.h): `?:` on vec_type values
+// would pick whole vectors.
+void CodeGenTileLangHexagon::VisitExpr_(const SelectNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  if (op->condition.dtype().lanes() > 1) {
+    os << "tl_vec_select(" << PrintExpr(op->condition) << ", "
+       << PrintExpr(op->true_value) << ", " << PrintExpr(op->false_value)
+       << ")";
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
+// CodeGenC prints a ramp as a list of lanes, which is no vec_type constructor.
+void CodeGenTileLangHexagon::VisitExpr_(const RampNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  os << "tl_vec_ramp<";
+  PrintType(op->dtype.element_of(), os);
+  os << ", " << op->dtype.lanes() << ">(" << PrintExpr(op->base) << ", "
+     << PrintExpr(op->stride) << ")";
 }
 
 template <typename T>
