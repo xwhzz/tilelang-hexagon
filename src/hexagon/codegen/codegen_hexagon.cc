@@ -387,11 +387,13 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
   // A widened float scalar broadcasts first and widens as a vector:
   // hexagon-clang 19 crashes ("Hexagon generate widening vector float
   // instructions") on a float splat of a converted fp16 scalar times a widened
-  // fp16 vector, as in `acc += float(x[i]) * float(w[i, j])`.
+  // fp16 vector of whole registers, as in `acc += float(x[i]) * float(w[i,
+  // j])`.
   if (const auto *cast = op->value.as<CastNode>()) {
     DataType from = cast->value.dtype();
     if (from.is_float() && op->dtype.is_float() && from.is_scalar() &&
-        from.bits() < op->dtype.bits()) {
+        from.bits() < op->dtype.bits() &&
+        from.bits() * op->dtype.lanes() % 1024 == 0) {
       os << "((";
       PrintType(op->dtype, os);
       os << ")((";
