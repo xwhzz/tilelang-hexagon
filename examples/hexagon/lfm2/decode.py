@@ -33,6 +33,7 @@ from tilelang.hexagon import language as T
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bundle  # noqa: E402
 from model import Config  # noqa: E402
+from prefill import make_prefill  # noqa: E402
 from stream import Phase, Projection, Stream, gemv_block, quantize  # noqa: E402
 
 NW = 4  # workers
@@ -391,7 +392,12 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
     return decode
 
 
-# The kernel's parameters from the bundle, in order.
+# The kernels' parameters from the bundle, in order.
+PREFILL_ARGS = (
+    "conv.in_proj", "conv.in_proj.scale", "attn.qkv", "attn.qkv.scale", "out_proj", "out_proj.scale",
+    "ffn.w13", "ffn.w13.scale", "ffn.w2", "ffn.w2.scale", "embed", "embed.scale",
+    "op_norm", "ffn_norm", "q_norm", "k_norm", "conv",
+)  # fmt: skip
 BUNDLE_ARGS = (
     "conv.in_proj", "conv.in_proj.scale", "attn.qkv", "attn.qkv.scale", "out_proj", "out_proj.scale",
     "ffn.w13", "ffn.w13.scale", "ffn.w2", "ffn.w2.scale", "head", "head.scale", "embed", "embed.scale",
@@ -408,21 +414,28 @@ def rope_tables(c: Config, max_pos: int) -> tuple:
 
 
 class Decoder:
-    """LFM2 decode on the device, in one session: the bundle, the KV cache and
-    the conv state stay resident across calls.
+    """LFM2 on the device, in one session: the prefill and the decode kernels,
+    with the bundle, the KV cache and the conv state resident across calls.
 
     The bundle is read from `device_path` on the phone when given (push it there
-    once), else written from the host."""
+    once), else written from the host. `prefill_rows` is the prefill's chunk
+    (None: prompts run through the decode, a token a step)."""
 
-    def __init__(self, bundle_path: str, device_path: str | None = None, max_pos: int = 4096, max_tokens: int = 4096):
+    def __init__(
+        self, bundle_path: str, device_path: str | None = None, max_pos: int = 4096, max_tokens: int = 4096, prefill_rows: int | None = 128
+    ):
         from tilelang.hexagon.runtime.session import Session
 
         header = bundle.read_header(bundle_path)
         c = Config(**{k: tuple(v) if isinstance(v, list) else v for k, v in header["config"].items()})
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
+        self.prefill_rows = prefill_rows
         assert max_pos % POS_BLOCK == 0
         shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
-        self.session = Session([(make_decode(c, shapes, max_pos, max_tokens), [])])
+        kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
+        if prefill_rows:
+            kernels.append((make_prefill(c, shapes, prefill_rows, max_pos, max_tokens), []))
+        self.session = Session(kernels)
         size = os.path.getsize(bundle_path)
         self.weights = self.session.buffer(size)
         if device_path is not None:
@@ -433,6 +446,7 @@ class Decoder:
         start = header["data_offset"]
         tensors = header["tensors"]
         self.args = [self.weights.at(start + tensors[n]["offset"], tensors[n]["nbytes"]) for n in BUNDLE_ARGS]
+        self.prefill_args = [self.weights.at(start + tensors[n]["offset"], tensors[n]["nbytes"]) for n in PREFILL_ARGS]
         cos, sin = rope_tables(c, max_pos)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)
         kv = La * c.kv_heads * max_pos * c.head_dim * 4
@@ -448,6 +462,11 @@ class Decoder:
         self.conv_state = resident(nbytes=Lc * 2 * c.dim * 4)
         self.scratch = [resident(nbytes=c.dim * 4), resident(nbytes=c.dim * 4), resident(nbytes=c.ff * 4), resident(nbytes=NW * 2 * 4)]
         self.tokens = resident(nbytes=max_tokens * 4)
+        # The prefill's table of layers: whether each is attention, and its
+        # index among the layers of its kind.
+        attn = [int(c.is_attention(i)) for i in range(c.layers)]
+        kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
+        self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
         self.logits = resident(nbytes=c.vocab * 4)
         # A step writes its position of the KV cache before it attends, and the
         # positions past it are masked: the cache needs zeros only once, so that
@@ -472,9 +491,23 @@ class Decoder:
         logits = torch.frombuffer(bytearray(self.logits.read()), dtype=torch.float32)
         return out, logits
 
+    def prefill(self, tokens: list, pos0: int = 0) -> None:
+        """Positions pos0 .. pos0 + len(tokens) - 1 from `tokens`: their KV cache
+        entries and the conv state they leave, in chunks of prefill_rows."""
+        n, R = len(tokens), self.prefill_rows
+        assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
+        self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
+        self.session.kernels[1](*self.prefill_args, *self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds, self.tokens, pos0, n)
+
     def generate(self, prompt: list, n_new: int) -> list:
-        """Greedy: the `n_new` tokens after `prompt`, from an empty context."""
+        """Greedy: the `n_new` tokens after `prompt`, from an empty context. The
+        prefill runs the prompt but its last token, which the decode's first
+        step runs and the LM head reads."""
         self.reset()
+        if self.prefill_rows and len(prompt) > 1:
+            self.prefill(prompt[:-1])
+            tokens, _ = self.run(prompt[-1:], len(prompt) - 1, n_new, 1)
+            return tokens[1:]
         tokens, _ = self.run(prompt, 0, len(prompt) + n_new - 1, len(prompt))
         return tokens[len(prompt) :]
 

@@ -14,7 +14,7 @@ for what makes a kernel fast.
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) |
 | `example_gemv_w4a16.py` | a w4a16 decode GEMV: `T.gemm_blockscaled` of int16 activations by 4-bit panel-layout weights on HVX, streamed by DMA across `num_workers` workers |
-| [`lfm2/`](lfm2/) | LFM2-1.2B end to end: GPTQ weights, and a decode megakernel that runs every token of a generation in one call |
+| [`lfm2/`](lfm2/) | LFM2-1.2B end to end: GPTQ weights, a decode megakernel that runs every token of a generation in one call, and an HMX prefill of a whole prompt in one call |
 
 ## Prerequisites
 

@@ -1,5 +1,6 @@
-"""LFM2 on Hexagon (examples/hexagon/lfm2): the bundle and the decode kernel,
-on a small random model with the real one's structure (tiny.py)."""
+"""LFM2 on Hexagon (examples/hexagon/lfm2): the bundle, and the decode and the
+prefill kernels, on a small random model with the real one's structure
+(tiny.py)."""
 
 import os
 import sys
@@ -11,11 +12,14 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon.runtime.session import lower_kernels
 
 LFM2 = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm2"
 sys.path.insert(0, str(LFM2))
 import bundle  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
+from model import Model  # noqa: E402
+from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
 from tiny import tiny  # noqa: E402
 
@@ -102,5 +106,52 @@ def test_decode_matches_the_reference(tiny_bundle):
             tokens, logits = decoder.run(prompt, 0, n, n_forced)
             assert tokens == ref_tokens
             torch.testing.assert_close(logits, ref_logits, rtol=1e-3, atol=1e-3 * ref_logits.abs().max().item())
+    finally:
+        decoder.close()
+
+
+def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
+    c, _, _, path = tiny_bundle
+    header = bundle.read_header(path)
+    shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
+    ((_, source, _, _),) = lower_kernels([(make_prefill(c, shapes, 128, 256, 64), [])])
+    # A loop at run time, whatever the depth; the projections are calls of
+    # the HMX GEMM, and the kernel's own pass configs give it fast math.
+    assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
+    assert "tl_hexagon_hmx_gemm_blockscaled<" in source
+    assert "tl_hvx_exp_fast(" in source and "tl_hvx_exp(" not in source
+
+
+@DEVICE
+def test_prefill_matches_the_reference(tiny_bundle):
+    c, _, _, path = tiny_bundle
+    ref = BundleModel(path)
+    plain = Model(ref.c, ref.w)  # the bundle's weights, fp32 activations
+    torch.manual_seed(1)
+    n, max_pos = 200, 512  # a chunk of 128 rows and part of another
+    prompt = torch.randint(0, c.vocab, (n,))
+    La, KVH, HD = len(c.attention_layers), c.kv_heads, c.head_dim
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    try:
+        decoder.reset()
+        decoder.prefill(prompt.tolist())
+        state = plain.new_state()
+        with torch.no_grad():
+            plain.run(prompt, state)
+
+        def rel(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float32).view(La, KVH, max_pos, HD)
+        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float32).view(La, KVH, max_pos, HD)
+        conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, 2, c.dim)
+        for ai in range(La):
+            assert rel(k[ai, :, :n], state.k[ai]) < 5e-3 and rel(v[ai, :, :n], state.v[ai]) < 5e-3
+        for ci in range(conv.shape[0]):
+            assert rel(conv[ci], state.conv[ci]) < 5e-3
+        # The decode goes on from the prefilled context.
+        with torch.no_grad():
+            want = ref.generate(prompt, 8)
+        assert decoder.generate(prompt.tolist(), 8) == want
     finally:
         decoder.close()

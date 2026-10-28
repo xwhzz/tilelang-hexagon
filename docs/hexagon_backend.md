@@ -334,11 +334,11 @@ tests, and the examples):
 
 Unrecoverable device conditions (a VTCM grant too small, a DMA error, too few workers for
 a grid) reach the host as an error naming the kernel's status, not as silent wrong
-output. LFM2-1.2B decodes at 81 t/s on v79 in one kernel call per generation
-([`examples/hexagon/lfm2`](../examples/hexagon/lfm2/)), 94% of the DMA roofline.
+output. LFM2-1.2B ([`examples/hexagon/lfm2`](../examples/hexagon/lfm2/)) decodes at
+81 t/s on v79 in one kernel call per generation, 94% of the DMA roofline, and prefills a
+1024-token prompt in 217 ms (4713 t/s) on HMX, in one kernel call too.
 
-**Not yet:** prefill on HMX for LFM2, and autotuning (`num_workers` and tile sizes as
-knobs).
+**Not yet:** autotuning (`num_workers` and tile sizes as knobs).
 
 ---
 

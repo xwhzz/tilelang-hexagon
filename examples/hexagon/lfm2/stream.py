@@ -1,4 +1,4 @@
-"""The weight stream of a decode megakernel, and its w4a16 GEMV blocks.
+"""The weight streams of the megakernels, and the decode's w4a16 GEMV blocks.
 
 A decode step reads every weight once, in an order fixed ahead: phase by
 phase, block by block. Each worker program streams its share of the blocks
@@ -13,7 +13,8 @@ schedule is planned in Python while the kernel is traced: a ``Stream`` knows
 every phase of the step, so the blocks a loop submits at its end are the next
 phase's. Blocks of one shape share a ring. A step that a loop repeats, a token
 of a generation, is a cycle: its last blocks submit the first ones of the next
-round.
+round. The prefill streams each layer's phases in two streams that share their
+rings, for the layer its loop is at.
 """
 
 from __future__ import annotations
@@ -49,8 +50,9 @@ class Projection:
 @dataclass
 class Phase:
     """One worker's share of a GEMV of the step: `blocks` blocks of layer
-    `layer`, block b being rows [row(b), row(b) + proj.block) of slice
-    slice(b). `row` and `slice` take a Python or a TIR index."""
+    `layer` (a Python or a TIR index), block b being rows [row(b), row(b) +
+    proj.block) of slice slice(b). `row` and `slice` take a Python or a TIR
+    index."""
 
     proj: Projection
     layer: int
@@ -94,14 +96,16 @@ def last(b: int, ring_w, ring_s, k, pending: int, consume):
 class Stream:
     """A worker's DMA schedule over the phases of a step. With `cycle`, the
     index of the loop that repeats the step (a TIR variable), the last blocks
-    of a round submit the first ones of the next."""
+    of a round submit the first ones of the next. Streams that run one after
+    another, each drained before the next begins, can share their rings:
+    pass the same dict as `rings`."""
 
-    def __init__(self, phases: list, depth: int, cycle=None):
+    def __init__(self, phases: list, depth: int, cycle=None, rings: dict | None = None):
         self.phases = phases
         self.depth = depth
         self.cycle = cycle
         # One ring per block shape: `depth` slots of codes and of scales.
-        self.rings = {}
+        self.rings = {} if rings is None else rings
         for ph in phases:
             key = self._key(ph)
             if key not in self.rings:

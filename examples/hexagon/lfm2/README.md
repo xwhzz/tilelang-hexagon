@@ -8,9 +8,11 @@ v79 cDSP, every operation a TileLang kernel, at batch 1.
 | `model.py` | The model in plain PyTorch, on explicit decode state: the reference. |
 | `quantize.py` | GPTQ, the device bundle, and the bundle's perplexity with the device's arithmetic. |
 | `bundle.py` | The bundle file: one header and every tensor the kernels read, in their layouts. |
-| `stream.py` | The weight stream of a decode step, and its w4a16 GEMV blocks. |
-| `decode.py` | The decode kernel: every token of a generation in one call. |
+| `stream.py` | The weight streams of the kernels, and the decode's w4a16 GEMV blocks. |
+| `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds both kernels. |
+| `prefill.py` | The prefill kernel: a prompt in chunks of 128 rows on HMX, in one call. |
 | `bench_decode.py` | Decode on the device: tokens per second and the greedy tokens. |
+| `bench_prefill.py` | Prefill on the device: tokens per second by prompt length. |
 | `tiny.py` | A small random LFM2 with the same structure, for tests. |
 
 ## Weights
@@ -66,3 +68,43 @@ arithmetic, token for token.
 
     adb push lfm2.bundle /data/local/tmp/lfm2.bundle
     python bench_decode.py lfm2.bundle /data/local/tmp/lfm2.bundle --prompt 1,1098,5706,803 --new 128
+
+## Prefill
+
+`Decoder.prefill` runs a prompt in chunks of 128 rows, all in one kernel call
+(`prefill.py`), on HMX, and `Decoder.generate` prefills the prompt but its last
+token, which the decode's first step runs. The four workers keep the decode's
+shares of every projection, and a chunk's activations stay in VTCM that the
+workers share (`global.vtcm`): its residual, the normalized input of a layer's
+GEMMs, and their output or a part of the FFN's hidden units.
+
+- **GEMMs.** Each block a worker streams, 128 rows of a projection, is one
+  `T.gemm_blockscaled` by the whole chunk: HVX dequantizes the block's 4-bit
+  weights once for all 128 rows, and the workers take turns at HMX, each
+  dequantizing and running its epilogues while another multiplies.
+- **Epilogues.** They fuse the short conv's gates and its causal conv over time,
+  SwiGLU, the q/k norms and RoPE, and the residual adds, into the residual
+  itself.
+- **Attention.** Per KV head, against the KV cache in blocks of 64 positions with
+  an online softmax: HMX multiplies the scores and P V, and a block of keys and
+  values packs once for the four query heads it serves.
+- **Layers.** One loop at run time, which reads each layer's kind from a table:
+  the kernel's code does not grow with the depth.
+
+On v79, in the DSP's time (`bench_prefill.py`):
+
+| prompt | ms | t/s |
+|---:|---:|---:|
+| 40 | 24.4 | 1642 |
+| 128 | 23.9 | 5356 |
+| 256 | 48.8 | 5242 |
+| 512 | 102.8 | 4981 |
+| 1024 | 217.3 | 4713 |
+| 2048 | 500.7 | 4090 |
+
+nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
+1.1-1.5k t/s for a 40-token one on the same phone. The prefill's keys and
+values match the decode's, a token a step, to about 3e-3, and the tokens
+generated after it match the decode's.
+
+    python bench_prefill.py lfm2.bundle /data/local/tmp/lfm2.bundle --lengths 128,512,1024
