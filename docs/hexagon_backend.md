@@ -298,7 +298,9 @@ and explicit HMX atoms.
   another waited out a delayed ACK, which cost ~40 ms per call.
 - **Sessions** (`tilelang.hexagon.runtime.session.Session`) serve models.
   - **Kernels.** Several kernels build into one skel and share one agent and one
-    FastRPC session: one PD, one VTCM grant and one worker pool.
+    FastRPC session: one PD, one VTCM grant and one worker pool. Each lowers under its
+    own pass configs (`T.annotate_pass_configs`), as `tilelang.compile` lowers it, so a
+    prefill can have fast math while the decode beside it keeps its arithmetic.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call

@@ -510,6 +510,29 @@ class SessionKernel:
         return self.session._run(self, given)
 
 
+def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:
+    """The (name, source, params, out_idx) of each (prim_func, out_idx) pair,
+    each lowered under its own pass configs (``T.annotate_pass_configs``), as
+    ``tilelang.compile`` lowers it."""
+    import tilelang
+    from tilelang import tvm
+    from tilelang.backend.target import determine_target
+
+    target = determine_target(target, return_object=True)
+    lowered = []
+    for func, out_idx in kernels:
+        configs = dict(func.attrs["tilelang_pass_configs"]) if func.attrs and "tilelang_pass_configs" in func.attrs else {}
+        with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
+            art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
+        source = str(art.kernel_source)
+        match = _KERNEL_RE.search(source)
+        if not match:
+            raise RuntimeError("could not find the kernel function in the generated source")
+        out = list(out_idx) if isinstance(out_idx, (list, tuple)) else ([] if out_idx is None else [out_idx])
+        lowered.append((match.group(1), source, art.params, out))
+    return lowered
+
+
 class Session:
     """Kernels sharing one FastRPC session and its resident buffers."""
 
@@ -517,25 +540,11 @@ class Session:
 
     def __init__(self, kernels, *, target="hexagon", serial: str | None = None, verbose: bool = False, ready_timeout: float = 30.0):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel."""
-        import tilelang
-        from tilelang import tvm
-        from tilelang.backend.target import determine_target
-
         from .build import build_cmake_fastrpc
         from .config import device_serial
         from .env import HexagonSDK
 
-        target = determine_target(target, return_object=True)
-        lowered = []
-        for func, out_idx in kernels:
-            with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
-                art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-            source = str(art.kernel_source)
-            match = _KERNEL_RE.search(source)
-            if not match:
-                raise RuntimeError("could not find the kernel function in the generated source")
-            out = list(out_idx) if isinstance(out_idx, (list, tuple)) else ([] if out_idx is None else [out_idx])
-            lowered.append((match.group(1), source, art.params, out))
+        lowered = lower_kernels(kernels, target)
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")

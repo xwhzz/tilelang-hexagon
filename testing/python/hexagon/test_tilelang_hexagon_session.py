@@ -40,6 +40,24 @@ def deep(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
             out[i] = local[i] + local[i + N]
 
 
+def _exp(fast: bool):
+    @T.prim_func
+    def kernel(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
+        if fast:
+            T.annotate_pass_configs({"tl.enable_fast_math": True})
+        with T.Kernel(1):
+            for i in T.Parallel(N):
+                out[i] = T.exp(a[i])
+
+    return kernel
+
+
+def test_session_kernels_lower_under_their_own_pass_configs():
+    (_, fast, _, _), (_, accurate, _, _) = session.lower_kernels([(_exp(True), [1]), (_exp(False), [1])])
+    assert "tl_hvx_exp_fast(" in fast
+    assert "tl_hvx_exp(" in accurate and "tl_hvx_exp_fast(" not in accurate
+
+
 def test_session_skel_dispatches_by_kernel():
     plans = fastrpc._plan([], [])
     source = session.gen_dsp(
