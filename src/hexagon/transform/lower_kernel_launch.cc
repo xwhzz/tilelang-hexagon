@@ -6,13 +6,16 @@
  * pass marks each grid loop with its axis so MaterializeGrid can find the grid
  * after the loop transformations, and moves the T.Kernel(num_workers=)
  * annotation from the launch block onto the outermost grid loop, which
- * outlives the block.
+ * outlives the block. With more than one worker, the T.gemm calls of the body
+ * carry the count too: on HMX, which the workers share, GemmHMX then leaves
+ * the unit to the other workers during each output tile's HVX epilogue.
  */
 
 #include "hexagon/op/builtin.h"
 #include "transform/common/attr.h"
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -62,6 +65,24 @@ private:
   Optional<Integer> num_workers_;
 };
 
+// Annotates the T.gemm calls a pool of `workers` workers runs.
+class WorkerGemmMarker : public StmtExprMutator {
+public:
+  explicit WorkerGemmMarker(Integer workers) : workers_(std::move(workers)) {}
+
+private:
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    static const Op &gemm = Op::Get("tl.tileop.gemm");
+    if (!op->op.same_as(gemm))
+      return StmtExprMutator::VisitExpr_(op);
+    Map<String, ObjectRef> annotations = op->annotations;
+    annotations.Set(attr::kHexagonNumWorkers, workers_);
+    return Call(op->dtype, op->op, op->args, annotations, op->span);
+  }
+
+  Integer workers_;
+};
+
 class KernelLaunchLowerer : public StmtMutator {
 private:
   Stmt VisitStmt_(const ForNode *op) final {
@@ -77,6 +98,8 @@ private:
     }
     NumWorkersExtractor extractor;
     body = VisitStmt(extractor(body));
+    if (extractor.NumWorkers() && extractor.NumWorkers().value()->value > 1)
+      body = WorkerGemmMarker(extractor.NumWorkers().value())(body);
     for (size_t i = loops.size(); i-- > 0;) {
       For loop = GetRef<For>(loops[i]);
       auto *node = loop.CopyOnWrite();

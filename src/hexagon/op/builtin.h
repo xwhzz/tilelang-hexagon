@@ -18,7 +18,8 @@ namespace attr {
 constexpr const char *kHexagonGridDim = "hexagon.grid_dim";
 
 // Worker count of a launch: on the launch block (T.Kernel(num_workers=)), then
-// on the outermost grid loop, and finally on the parallel grid loop.
+// on the outermost grid loop, and finally on the parallel grid loop. Also on
+// the T.gemm calls of a pool of more than one worker (GemmHMX).
 constexpr const char *kHexagonNumWorkers = "hexagon.num_workers";
 
 } // namespace attr

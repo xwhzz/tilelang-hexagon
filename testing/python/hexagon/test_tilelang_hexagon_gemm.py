@@ -301,3 +301,63 @@ def test_c_layouts_match_torch(kind):
     out = _run(_c_layout(kind), a, b)
     ref = 2 * (a.float() @ b.float())
     torch.testing.assert_close(out, ref, atol=_tolerance(ref, 2), rtol=0)
+
+
+def _worker_k_loops(NB, M, N, K, BK, num_workers):
+    """NB independent K loops of accumulating calls into fp32 C, one per tile
+    program, spread over a worker pool."""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((NB, M, K), "float16"), B: T.Tensor((NB, K, N), "float16"), C: T.Tensor((NB, M, N), "float32")):
+        with T.Kernel(NB, num_workers=num_workers) as bx:
+            a = T.alloc_shared((M, K), "float16")
+            b = T.alloc_shared((K, N), "float16")
+            c = T.alloc_fragment((M, N), "float32")
+            T.copy(A[bx, :, :], a)
+            T.copy(B[bx, :, :], b)
+            for k in T.serial(K // BK):
+                T.gemm(a[:, k * BK : (k + 1) * BK], b[k * BK : (k + 1) * BK, :], c, clear_accum=(k == 0))
+            T.copy(c, C[bx, :, :])
+
+    return kernel
+
+
+def _hmx_sections(source):
+    """Lines of the HMX acquires and releases, and of the first output-tile loop."""
+    lines = [line.strip() for line in source.splitlines()]
+    acquire = [i for i, line in enumerate(lines) if "tl_hexagon_hmx_acc_acquire" in line]
+    release = [i for i, line in enumerate(lines) if "tl_hexagon_hmx_acc_release" in line]
+    tiles = next(i for i, line in enumerate(lines) if line.startswith("for (int32_t t"))
+    return acquire, release, tiles
+
+
+def test_workers_take_hmx_one_output_tile_at_a_time():
+    # One tile program holds HMX for its whole call, overlapping each tile's
+    # epilogue with the next tile's MACs.
+    acquire, release, tiles = _hmx_sections(_source(_worker_k_loops(6, 64, 64, 128, 64, 1)))
+    assert acquire[0] < tiles < release[0]
+    # A pool's workers share HMX: each takes it for one output tile and runs
+    # the tile's epilogue after releasing it.
+    source = _source(_worker_k_loops(6, 64, 64, 128, 64, 6))
+    acquire, release, tiles = _hmx_sections(source)
+    assert tiles < acquire[0] < release[0]
+    lines = [line.strip() for line in source.splitlines()]
+    assert "tl_hexagon_hmx_load_bias" in lines[acquire[0] + 1]
+    assert "tl_crouton_tile_store" in "\n".join(lines[release[0] : release[0] + 3])
+
+
+@DEVICE
+@pytest.mark.parametrize("num_workers", [2, 6])
+def test_worker_k_loops_match_torch(num_workers):
+    import torch
+
+    NB, M, N, K, BK = 6, 64, 96, 256, 64
+    a = (torch.randn(NB, M, K) * 0.1).half()
+    b = (torch.randn(NB, K, N) * 0.1).half()
+    kernel = tilelang.compile(_worker_k_loops(NB, M, N, K, BK, num_workers), out_idx=[2], target="hexagon")
+    try:
+        out = kernel(a, b)
+    finally:
+        kernel.adapter.close()
+    ref = torch.bmm(a.float(), b.float())
+    torch.testing.assert_close(out, ref, atol=_tolerance(ref, K // BK), rtol=0)

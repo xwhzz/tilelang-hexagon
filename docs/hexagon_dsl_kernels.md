@@ -140,8 +140,13 @@ staging tile in VTCM, which `tl_crouton_tile_store` (`crouton.h`) writes or adds
 - a C of another layout is written element by element.
 
 Two staging tiles alternate, so each tile's epilogue runs on HVX while HMX multiplies the
-next tile; the call holds the HMX accumulator throughout, so worker threads that issue gemms
-take turns call by call. A loop of calls therefore costs one HVX pass over C per call, which
+next tile, and the call holds the HMX accumulator throughout. In a worker pool, whose
+workers share HMX (`LowerKernelLaunch` marks their gemms), each staged output tile is a
+critical section of its own instead: a worker takes HMX, sets its scales, multiplies,
+converts and stores the tile, releases HMX, and runs the tile's epilogue while another
+worker multiplies. On v79, six independent 128 x 128 x 512 K loops into fp32 C run
+2.2x (BK = 256) to 3.6x (BK = 64) faster on six workers than when calls took turns, and
+5.4x to 7.2x faster than on one. A loop of calls costs one HVX pass over C per call, which
 the K inside a call does not. On v79, one call over K = 1024 runs at 8.1 cycles per
 32x32x32 multiply, the HMX rate. A loop of calls into an fp32 C (`example_gemm.py`) runs at:
 

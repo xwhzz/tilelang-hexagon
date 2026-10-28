@@ -11,6 +11,10 @@ which an HVX epilogue writes or adds into C (``tl_crouton_tile_store``): an
 fp32 C, which stays row-major, an fp16 C that the call accumulates into, or
 element by element a C of another layout. Each tile's epilogue runs while HMX
 multiplies the next tile; the HMX accumulator is held for the whole call.
+
+In a worker pool, whose workers share HMX (``LowerKernelLaunch`` marks such
+calls), each staged output tile is a critical section of its own instead, and
+its epilogue runs outside it, while another worker multiplies.
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ from tilelang.hexagon.intrinsics.hmx import BIAS_WORDS, HMXIntrinEmitter
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
 GEMM_INST_HMX = "hexagon.hmx"
+
+# The worker count LowerKernelLaunch puts on the gemms of a worker pool.
+_NUM_WORKERS = "hexagon.num_workers"
 
 _row_major = tvm_ffi.get_global_func("tl.hexagon.RowMajor")
 
@@ -110,6 +117,8 @@ class GemmHMX(GemmBase):
         static_clear = bool(clear.value) if isinstance(clear, tirx.IntImm) else None
         kind = self._epilogue_kind(layout_map)
         staged = not (kind == "crouton" and static_clear is True)
+        workers = self.gemm_node.annotations.get(_NUM_WORKERS, None)
+        shared = workers is not None and int(workers) > 1
 
         ldc = C_buf.shape[-1]
         # Rows of a tile on register (fp32) or half-register (fp16) boundaries:
@@ -176,24 +185,37 @@ class GemmHMX(GemmBase):
             for i in T.vectorized(BIAS_WORDS // 2):
                 bias_vtcm[BIAS_WORDS // 2 + i] = T.Cast("uint32", 0)
 
-            emitter.acquire(acc)
-            # All output tiles share this scale/bias configuration.
-            emitter.load_bias(bias, bias_vtcm)
-            for t in T.serial(tiles):
-                emitter.clear(acc)
-                emitter.mma_tile(acc, A_buf, B_buf, t // NT, t % NT, a_origin, b_origin)
-                # `staged` is decided here, `t > 0` in the kernel.
-                if staged:  # noqa: SIM102
-                    # The previous tile's epilogue overlaps these MACs.
-                    if t > 0:
-                        epilogue(stage, t - 1)
-                emitter.convert(cvt, acc, bias, bias_vtcm)
-                if staged:
+            if shared and staged:
+                # Other workers multiply while this one runs a tile's epilogue.
+                # Each holder sets the scale/bias configuration again.
+                for t in T.serial(tiles):
+                    emitter.acquire(acc)
+                    emitter.load_bias(bias, bias_vtcm)
+                    emitter.clear(acc)
+                    emitter.mma_tile(acc, A_buf, B_buf, t // NT, t % NT, a_origin, b_origin)
+                    emitter.convert(cvt, acc, bias, bias_vtcm)
                     emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
-                else:
-                    emitter.store(cvt, acc, C_buf, bias, bias_vtcm, t // NT, t % NT, c_origin)
-            emitter.release(acc)
-            if staged:
-                epilogue(stage, tiles - 1)
+                    emitter.release(acc)
+                    epilogue(stage, t)
+            else:
+                emitter.acquire(acc)
+                # All output tiles share this scale/bias configuration.
+                emitter.load_bias(bias, bias_vtcm)
+                for t in T.serial(tiles):
+                    emitter.clear(acc)
+                    emitter.mma_tile(acc, A_buf, B_buf, t // NT, t % NT, a_origin, b_origin)
+                    # `staged` is decided here, `t > 0` in the kernel.
+                    if staged:  # noqa: SIM102
+                        # The previous tile's epilogue overlaps these MACs.
+                        if t > 0:
+                            epilogue(stage, t - 1)
+                    emitter.convert(cvt, acc, bias, bias_vtcm)
+                    if staged:
+                        emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
+                    else:
+                        emitter.store(cvt, acc, C_buf, bias, bias_vtcm, t // NT, t % NT, c_origin)
+                emitter.release(acc)
+                if staged:
+                    epilogue(stage, tiles - 1)
 
         return _gemm_hmx
