@@ -107,6 +107,89 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
     )
 
 
+@dataclass
+class SkelRuntime:
+    """What a skel needs around kernel sources: runtime headers, and the
+    resources its session acquires at ``_open`` and releases at ``_close``."""
+
+    includes: str
+    open: str
+    close: str
+
+
+def skel_runtime(kernel_source: str) -> SkelRuntime:
+    """The skel runtime of the kernels in ``kernel_source``."""
+    # Pull in the HMX matmul runtime only when the kernel calls into it (it
+    # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
+    # alloc_shared buffers lower to `tl_vtcm_arena()` offsets, or to the per-worker
+    # arenas of `tl_vtcm_worker_arenas` — pull in the VTCM arena header when the
+    # kernel uses shared memory (same lazy-include scheme).
+    uses_vtcm = "tl_vtcm" in kernel_source
+    hmx = "tl_hexagon_hmx" in kernel_source
+    # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
+    # the multithreaded HMX path; include it directly for a non-HMX worker kernel
+    # (keyed on the public symbol prefix or a tl_parallel / tl_parallel_for call).
+    uses_worker = ("tl_hexagon_worker" in kernel_source or "tl_parallel" in kernel_source) and not hmx
+    headers = [
+        ("vtcm.h", uses_vtcm),
+        ("worker.h", uses_worker),
+        ("hmx.h", hmx),
+        # User-DMA primitives are header-only.  They use QuRT cache maintenance
+        # and Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
+        ("dma.h", "tl_hexagon_dma_" in kernel_source),
+        # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in
+        # when a kernel references the `tl_hvx` prefix (self-contained, needs
+        # only -mhvx).
+        ("hvx_math.h", "tl_hvx" in kernel_source),
+        # T.gemm on HVX.
+        ("hvx_gemm.h", "tl_hvx_gemm" in kernel_source),
+        # Copies between Crouton matrices and strided matrices (T.copy).
+        ("crouton.h", "tl_crouton_" in kernel_source),
+        # Q8_0 GEMV instruction atoms.  qgemv.h pulls in its own HVX arithmetic
+        # helpers; keep detection separate so a dot-only kernel does not depend
+        # on spelling an internal tl_hvx_* symbol in generated source.
+        ("qgemv.h", "tl_hexagon_q8_0_dot" in kernel_source),
+        # Register-granular activation-pack and Q4 dequant atoms used by the
+        # explicit HMX qmatmul schedule.
+        ("qmatmul.h", "tl_hexagon_hmx_pack_a_f32_pair_k32" in kernel_source or "tl_hexagon_q4_0_" in kernel_source),
+    ]
+    includes = "#include <tl_templates/hexagon/power.h>\n" + "".join(
+        f"#include <tl_templates/hexagon/{h}>\n" for h, used in headers if used
+    )
+    # Every session votes for clocks at _open and removes the vote at _close
+    # (power.h). Acquire/release the HMX session at _open/_close too: _close
+    # MUST deinit or VTCM/HMX leak for the agent's life.
+    # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
+    # vtcm_check only apply to non-HMX shared kernels (avoids a double release).
+    # Fail _open loudly if HMX/VTCM couldn't be acquired (e.g. a leaked agent
+    # still holds VTCM) rather than running and returning silent zeros — the
+    # kernel discards return codes, so _open is the only place to surface it.
+    open_ = "tl_power_vote(); "
+    close = ""
+    if hmx:
+        open_ += "tl_hmx_session_init(); if (!tl_hmx_session_ok()) return AEE_EFAILED; "
+        close += "tl_hmx_session_deinit(); "
+    elif uses_vtcm:
+        open_ += "if (!tl_vtcm_base()) return AEE_EFAILED; "
+        close += "tl_vtcm_release(); "
+    close += "tl_power_unvote(); "
+    return SkelRuntime(includes, open_, close)
+
+
+# A kernel's status as the FastRPC result: a void kernel always succeeds.
+FORWARD_KERNEL_STATUS = """template <typename Fn>
+static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {
+  if constexpr (std::is_void_v<decltype(fn())>) {
+    fn();
+    return AEE_SUCCESS;
+  } else {
+    int tl_rc = (int)fn();
+    return tl_rc == 0 ? AEE_SUCCESS : AEE_EFAILED;
+  }
+}
+"""
+
+
 def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[BufferPlan]) -> str:
     # qaic skel signature for run(): in seq -> (const uint8*, int); rout seq ->
     # (uint8*, int max, int* written); in int32 -> (int).
@@ -124,86 +207,19 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         else:
             skel_args.append(f"const unsigned char* {pl.name}, int {pl.name}Len")
             call_args.append(f"({pl.ctype}*){pl.name}")
-    # Pull in the HMX matmul runtime only when the kernel calls into it (it
-    # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
-    # alloc_shared buffers lower to `tl_vtcm_arena()` offsets, or to the per-worker
-    # arenas of `tl_vtcm_worker_arenas` — pull in the VTCM arena header when the
-    # kernel uses shared memory (same lazy-include scheme).
-    uses_vtcm = "tl_vtcm" in kernel_source
-    vtcm_include = "#include <tl_templates/hexagon/vtcm.h>\n" if uses_vtcm else ""
-    hmx = "tl_hexagon_hmx" in kernel_source
-    hmx_include = "#include <tl_templates/hexagon/hmx.h>\n" if hmx else ""
-    # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
-    # the multithreaded HMX path; include it directly for a non-HMX worker kernel
-    # (keyed on the public symbol prefix or a tl_parallel / tl_parallel_for call).
-    uses_worker = ("tl_hexagon_worker" in kernel_source or "tl_parallel" in kernel_source) and not hmx
-    worker_include = "#include <tl_templates/hexagon/worker.h>\n" if uses_worker else ""
-    # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in when a
-    # kernel references the `tl_hvx` prefix (self-contained, needs only -mhvx).
-    uses_hvx = "tl_hvx" in kernel_source
-    hvx_include = "#include <tl_templates/hexagon/hvx_math.h>\n" if uses_hvx else ""
-    # T.gemm on HVX.
-    uses_hvx_gemm = "tl_hvx_gemm" in kernel_source
-    hvx_gemm_include = "#include <tl_templates/hexagon/hvx_gemm.h>\n" if uses_hvx_gemm else ""
-    # User-DMA primitives are header-only.  They use QuRT cache maintenance and
-    # Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
-    uses_dma = "tl_hexagon_dma_" in kernel_source
-    dma_include = "#include <tl_templates/hexagon/dma.h>\n" if uses_dma else ""
-    # Copies between Crouton matrices and strided matrices (T.copy).
-    uses_crouton = "tl_crouton_" in kernel_source
-    crouton_include = "#include <tl_templates/hexagon/crouton.h>\n" if uses_crouton else ""
-    # Q8_0 GEMV instruction atoms.  qgemv.h pulls in its own HVX arithmetic
-    # helpers; keep detection separate so a dot-only kernel does not depend on
-    # spelling an internal tl_hvx_* symbol in generated source.
-    uses_qgemv = "tl_hexagon_q8_0_dot" in kernel_source
-    qgemv_include = "#include <tl_templates/hexagon/qgemv.h>\n" if uses_qgemv else ""
-    # Register-granular activation-pack and Q4 dequant atoms used by the
-    # explicit HMX qmatmul schedule.
-    uses_qmatmul = "tl_hexagon_hmx_pack_a_f32_pair_k32" in kernel_source or "tl_hexagon_q4_0_" in kernel_source
-    qmatmul_include = "#include <tl_templates/hexagon/qmatmul.h>\n" if uses_qmatmul else ""
-    # Every session votes for clocks at _open and removes the vote at _close
-    # (power.h). Acquire/release the HMX session at _open/_close too: _close
-    # MUST deinit or VTCM/HMX leak for the agent's life.
-    # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
-    # vtcm_check only apply to non-HMX shared kernels (avoids a double release).
-    hmx_open = "tl_hmx_session_init(); " if hmx else ""
-    hmx_close = "tl_hmx_session_deinit(); " if hmx else ""
-    vtcm_close = "tl_vtcm_release(); " if (uses_vtcm and not hmx) else ""
-    # Fail _open loudly if HMX/VTCM couldn't be acquired (e.g. a leaked agent
-    # still holds VTCM) rather than running and returning silent zeros — the
-    # kernel discards return codes, so _open is the only place to surface it.
-    hmx_check = "if (!tl_hmx_session_ok()) return AEE_EFAILED; " if hmx else ""
-    vtcm_check = "if (!tl_vtcm_base()) return AEE_EFAILED; " if (uses_vtcm and not hmx) else ""
+    rt = skel_runtime(kernel_source)
     return (
         "// Auto-generated FastRPC skel impl for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n"
         "#include <type_traits>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
-        "#include <tl_templates/hexagon/power.h>\n"
-        f"{vtcm_include}"
-        f"{worker_include}"
-        f"{hmx_include}"
-        f"{dma_include}"
-        f"{hvx_include}"
-        f"{hvx_gemm_include}"
-        f"{crouton_include}"
-        f"{qgemv_include}"
-        f"{qmatmul_include}"
+        f"{rt.includes}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
-        "template <typename Fn>\n"
-        "static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {\n"
-        "  if constexpr (std::is_void_v<decltype(fn())>) {\n"
-        "    fn();\n"
-        "    return AEE_SUCCESS;\n"
-        "  } else {\n"
-        "    int tl_rc = (int)fn();\n"
-        "    return tl_rc == 0 ? AEE_SUCCESS : AEE_EFAILED;\n"
-        "  }\n"
-        "}\n\n"
+        f"{FORWARD_KERNEL_STATUS}\n"
         '#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
-        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; tl_power_vote(); {hmx_open}{hmx_check}{vtcm_check}return AEE_SUCCESS; }}\n"
-        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {hmx_close}{vtcm_close}tl_power_unvote(); return AEE_SUCCESS; }}\n\n"
+        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {rt.open}return AEE_SUCCESS; }}\n"
+        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {rt.close}return AEE_SUCCESS; }}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
         f"  return tl_hexagon_forward_kernel_status([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
         "}\n\n"
@@ -296,14 +312,17 @@ def gen_agent(iface: str, plans: list[BufferPlan]) -> str:
         calls.append(f"rbuf_{pl.name}")
         calls.append(f"{pl.nbytes}")
         if pl.is_output:
-            writes.append(f"        write_full(cli, rbuf_{pl.name}, {pl.nbytes});")
+            writes.append(f"{{rbuf_{pl.name}, {pl.nbytes}}}")
         else:
             recvs.append(f"      if ((mask >> {in_bit}) & 1) {{ if (read_full(cli, rbuf_{pl.name}, {pl.nbytes})) break; }}")
             in_bit += 1
     body_allocs = "\n".join(allocs)
     body_frees = "\n".join(frees)
     body_recvs = "\n".join(recvs)
-    body_writes = "\n".join(writes)
+    # The status byte and the outputs leave in one write: adb relays each write
+    # as a packet, and a small packet followed by another waits out a delayed
+    # ACK, which cost ~40 ms per call.
+    body_writes = ", ".join(["{&status, 1}", *writes])
     call_str = ", ".join(calls)
     return f"""// Auto-generated persistent FastRPC agent for a tilelang Hexagon kernel.
 #include <AEEStdErr.h>
@@ -315,7 +334,9 @@ def gen_agent(iface: str, plans: list[BufferPlan]) -> str:
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "dsp_capabilities_utils.h"
 #include "{iface}.h"
 
@@ -329,6 +350,18 @@ static int read_full(int fd, void* buf, size_t n) {{
 static int write_full(int fd, const void* buf, size_t n) {{
   size_t put = 0;
   while (put < n) {{ ssize_t w = write(fd, (const char*)buf + put, n - put); if (w <= 0) return -1; put += (size_t)w; }}
+  return 0;
+}}
+// All of `io`, in one writev unless it stops short.
+static int writev_full(int fd, struct iovec* io, int count) {{
+  ssize_t w = writev(fd, io, count);
+  if (w < 0) return -1;
+  size_t done = (size_t)w;
+  for (int i = 0; i < count; ++i) {{
+    if (done >= io[i].iov_len) {{ done -= io[i].iov_len; continue; }}
+    if (write_full(fd, (const char*)io[i].iov_base + done, io[i].iov_len - done)) return -1;
+    done = 0;
+  }}
   return 0;
 }}
 
@@ -363,6 +396,7 @@ int main(int argc, char** argv) {{
   while (running) {{
     int cli = accept(srv, 0, 0);
     if (cli < 0) continue;
+    setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     for (;;) {{
       unsigned char op, mask;
       if (read_full(cli, &op, 1)) break;
@@ -372,10 +406,8 @@ int main(int argc, char** argv) {{
 {body_recvs}
       int e = {iface}_run({call_str});
       unsigned char status = (e == AEE_SUCCESS) ? 0 : 1;  // status byte so the client never hangs on a failed run
-      if (write_full(cli, &status, 1)) break;
-      if (e == AEE_SUCCESS) {{
-{body_writes}
-      }}
+      struct iovec io[] = {{{body_writes}}};
+      if (writev_full(cli, io, e == AEE_SUCCESS ? sizeof(io) / sizeof(io[0]) : 1)) break;
     }}
     close(cli);
   }}

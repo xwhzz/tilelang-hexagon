@@ -186,9 +186,9 @@ class HexagonAgentSession:
                     raise ValueError(f"Hexagon agent: input {in_i} has {len(data)} bytes, the kernel takes {pl.nbytes}")
                 payloads.append(data)
             in_i += 1
-        self._sock.sendall(bytes([1, mask]))  # op=run, then the changed-mask
-        for data in payloads:
-            self._sock.sendall(data)
+        # op=run, the changed-mask, then the inputs, in one write: adb relays
+        # each write as a packet, and small packets wait out delayed ACKs.
+        self._sock.sendall(b"".join([bytes([1, mask]), *payloads]))
         # Status byte first: the agent sends 0 on success, non-zero if the kernel
         # invoke failed.  On failure no output bytes follow, so we must read this
         # before the output loop or _recvn() would block forever.

@@ -89,7 +89,8 @@ These are the decisions that keep the adaptation small and the code navigable.
 - **Layer 5** — `tilelang/hexagon/runtime/`: `fastrpc.py` generates the IDL + skel +
   host + CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK
   build; `agent.py` runs a persistent on-DSP agent over a socket (`adb forward`);
-  `adapter.py` marshals torch tensors and invokes.
+  `adapter.py` marshals torch tensors and invokes. `session.py` holds several
+  kernels in one FastRPC session with device-resident buffers (below).
 
 ---
 
@@ -275,8 +276,24 @@ and explicit HMX atoms.
   emits the `return`s; a new recipe that can fail should return a nonzero code rather
   than fault or skip silently.
 - **Validate** with the `HexagonKernelAdapter` + a small torch reference (the
-  `test_*.py` pattern). The persistent agent (`agent.py`) makes the build→deploy→run
-  loop ~5 ms instead of ~170 ms per call.
+  `test_*.py` pattern). The persistent agent (`agent.py`) makes a call ~4 ms,
+  about 1.5 ms of it the `adb forward` round trip. Each message crosses the socket
+  in one write: `adb` relays every write as a packet, and a small packet followed by
+  another waited out a delayed ACK, which cost ~40 ms per call.
+- **Sessions** (`tilelang.hexagon.runtime.session.Session`) serve models.
+  - **Kernels.** Several kernels build into one skel and share one agent and one
+    FastRPC session: one PD, one VTCM grant and one worker pool.
+  - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
+    into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
+    (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
+    cost. The host writes a buffer, or has the agent read a file on the device into
+    it (512 MB in 0.12 s). The DSP's cached lines are invalidated after a write and
+    written back before a read.
+  - **Arguments.** Each parameter takes, per call, a `DeviceBuffer`, a tensor (copied
+    inline) or an int32 scalar.
+  - **Cost.** A call costs ~2.4 ms with resident arguments, of which the FastRPC call
+    is 0.25–0.4 ms. `Session.last_run_seconds()` reports the agent's timing of the
+    last call.
 
 ---
 
