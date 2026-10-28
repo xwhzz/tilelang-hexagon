@@ -1,5 +1,7 @@
 """Hexagon maps vectorize through the standard lowering onto whole HVX registers."""
 
+import re
+
 import pytest
 
 import tilelang
@@ -197,5 +199,79 @@ def test_row_broadcast_maps_match_torch(rows, cols, row_dtype):
         y = kernel(x, r)
         expected = torch.exp(x.float() - r.float()[:, None]).half()
         torch.testing.assert_close(y, expected, rtol=2e-3, atol=2e-3)
+    finally:
+        kernel.adapter.close()
+
+
+# Accesses off register boundaries (vmemu).
+
+
+def _shifted_map(M, N, load_shift, store_shift, dtype):
+    """y[i, j + store_shift] = 2 x[i, j + load_shift], in VTCM: rows of N +
+    shift elements, so most rows start off a register boundary."""
+
+    @T.prim_func
+    def kernel(X: T.Tensor((M, N + load_shift), dtype), Y: T.Tensor((M, N + store_shift), dtype)):
+        with T.Kernel(1):
+            x = T.alloc_shared((M, N + load_shift), dtype)
+            y = T.alloc_shared((M, N + store_shift), dtype)
+            T.copy(X, x)
+            T.clear(y)
+            for i, j in T.Parallel(M, N):
+                y[i, j + store_shift] = x[i, j + load_shift] * T.cast(2, dtype)
+            T.copy(y, Y)
+
+    return kernel
+
+
+def test_loads_off_register_boundaries_are_unaligned_vector_loads():
+    source = _source(_shifted_map(64, 64, 3, 0, "float16"))
+    # x's rows are 67 fp16 apart, y's 64: the loads take vmemu, the stores vmem.
+    assert re.search(
+        r"\*\(half64\*\)\(\(\(half\*\)y\) \+ \(i_\d+ \* 64\)\) = \(tl_hvx_vec_loadu<half64>\(\(&\(\(\(half\*\)x\)\[\(\(i_\d+ \* 67\) \+ 3\)\]\)\)\)",
+        source,
+    )
+    assert "tl_hvx_vec_storeu" not in source
+
+
+def test_stores_off_register_boundaries_are_unaligned_vector_stores():
+    source = _source(_shifted_map(64, 64, 0, 5, "float16"))
+    assert re.search(r"tl_hvx_vec_storeu\(\(&\(\(\(half\*\)y\)\[\(\(i_\d+ \* 69\) \+ 5\)\]\)\), \(\*\(half64\*\)\(\(\(half\*\)x\)", source)
+    assert "tl_hvx_vec_loadu" not in source
+
+
+def test_rows_of_odd_length_vectorize():
+    @T.prim_func
+    def kernel(X: T.Tensor((8, 200), "float16"), Y: T.Tensor((8, 192), "float16")):
+        with T.Kernel(1):
+            x = T.alloc_shared((8, 200), "float16")
+            T.copy(X, x)
+            for i, j in T.Parallel(8, 192):
+                Y[i, j] = x[i, j] + x[i, j + 8]
+
+    source = _source(kernel)
+    # Row i starts 400 bytes after row i - 1; Y's rows are whole registers.
+    (line,) = [line.strip() for line in source.splitlines() if "tl_hvx_vec_loadu" in line]
+    assert line.startswith("*(half64*)(Y + (i_1 * 64)) = (tl_hvx_vec_loadu<half64>((&(x[(((i_1 / 3) * 200) + ((i_1 % 3) * 64))])))")
+    assert "tl_hvx_vec_loadu<half64>((&(x[((((i_1 / 3) * 200) + ((i_1 % 3) * 64)) + 8)])))" in line
+
+
+@pytest.mark.skipif(__import__("os").environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+@pytest.mark.parametrize("load_shift, store_shift", [(3, 0), (0, 5), (7, 1), (64, 64)])
+@pytest.mark.parametrize("dtype", ["float16", "float32", "int8"])
+def test_shifted_maps_match_torch(dtype, load_shift, store_shift):
+    import torch
+
+    M, N = 32, 128
+    kernel = tilelang.compile(_shifted_map(M, N, load_shift, store_shift, dtype), out_idx=[1], target="hexagon")
+    try:
+        torch_dtype = getattr(torch, dtype)
+        if dtype == "int8":
+            x = torch.randint(-50, 50, (M, N + load_shift), dtype=torch_dtype)
+        else:
+            x = torch.randn(M, N + load_shift).to(torch_dtype)
+        expected = torch.zeros(M, N + store_shift, dtype=torch_dtype)
+        expected[:, store_shift:] = x[:, load_shift:] * 2
+        torch.testing.assert_close(kernel(x), expected, rtol=0, atol=0)
     finally:
         kernel.adapter.close()

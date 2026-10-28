@@ -21,6 +21,12 @@ TL_DEVICE void tl_hvx_storeu(void *p, HVX_Vector v) {
   *(tl_hvx_uvector *)p = v;
 }
 
+// A vector (vec_type) at any address, for the vector accesses the codegen
+// cannot prove aligned: vmemu register by register, and for a part of a
+// register only the aligned blocks that hold its bytes (defined below).
+template <typename V> TL_DEVICE V tl_hvx_vec_loadu(const void *p);
+template <typename V> TL_DEVICE void tl_hvx_vec_storeu(void *p, const V &v);
+
 // A whole register at `p`: aligned vmem when the caller knows `p` is on a
 // register boundary, else vmemu.
 template <bool Aligned> TL_DEVICE HVX_Vector tl_hvx_load(const void *p) {
@@ -72,6 +78,35 @@ TL_DEVICE void tl_hvx_store_bytes(void *p, HVX_Vector v, int nbytes) {
   Q6_vmem_QRIV(first, block, rotated);
   if (end > 128)
     Q6_vmem_QRIV(Q6_Q_vsetq_R(end - 128), block + 1, rotated);
+}
+
+template <typename V> TL_DEVICE V tl_hvx_vec_loadu(const void *p) {
+  constexpr int S = static_cast<int>(sizeof(V));
+  const char *src = static_cast<const char *>(p);
+  V out;
+#pragma clang loop unroll(full)
+  for (int b = 0; b < S; b += 128) {
+    int n = S - b < 128 ? S - b : 128;
+    HVX_Vector v =
+        n == 128 ? tl_hvx_loadu(src + b) : tl_hvx_load_bytes(src + b, n);
+    __builtin_memcpy(reinterpret_cast<char *>(&out) + b, &v, n);
+  }
+  return out;
+}
+
+template <typename V> TL_DEVICE void tl_hvx_vec_storeu(void *p, const V &v) {
+  constexpr int S = static_cast<int>(sizeof(V));
+  char *dst = static_cast<char *>(p);
+#pragma clang loop unroll(full)
+  for (int b = 0; b < S; b += 128) {
+    int n = S - b < 128 ? S - b : 128;
+    HVX_Vector r = Q6_V_vzero();
+    __builtin_memcpy(&r, reinterpret_cast<const char *>(&v) + b, n);
+    if (n == 128)
+      tl_hvx_storeu(dst + b, r);
+    else
+      tl_hvx_store_bytes(dst + b, r, n);
+  }
 }
 
 // The `count` (0..N) elements at `p` in the low lanes of an N-lane vector of

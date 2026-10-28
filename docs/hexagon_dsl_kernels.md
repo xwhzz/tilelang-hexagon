@@ -22,7 +22,12 @@ The vectorizer enforces this from two target attributes (`src/hexagon/target.cc`
 `max_vector_bits` = 1024 sets the vector width, and `min_vector_bits` = 1024 requires the
 final vector size to be a multiple of `1024 / min_dtype_bits`
 (`src/transform/loop_vectorize.cc`, Plan). It bumps to that width when the loop extent and
-buffer accesses allow, else **scalarizes (safe)**. Backing this,
+buffer accesses allow, else **scalarizes (safe)**. An access need not start on a register
+boundary (`supports_unaligned_vector_access`): the codegen prints the vector accesses whose
+offsets it proves multiples of their alignment as aligned `vmem`, and the others as
+`tl_hvx_vec_loadu` / `tl_hvx_vec_storeu` (`hvx_lanes.h`), `vmemu`. On v79 a map over a
+64x512 fp16 sub-tile that reads or writes rows off register boundaries runs in 3.6K to 5.1K
+cycles, as fast as an aligned one, where it was a scalar loop of 3.7M to 4.0M. Backing this,
 `src/tl_templates/hexagon/common.h`'s `vec_type` is a native clang `ext_vector` (so
 `a * b`, `a & mask` become real HVX ops, not scalar struct loops), and `PrintType` emits
 vector spellings up to 128 lanes. fp16/fp32 vector arithmetic compiles to a qfloat op

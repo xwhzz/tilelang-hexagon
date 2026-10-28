@@ -44,9 +44,10 @@ using half = __fp16;
 // A vec_type keeps the ext_vector's natural alignment, 128 bytes for a whole
 // HVX register, so the codegen's reinterpret loads and stores
 // (`*(halfN*)(ptr + off)`) compile to aligned vmem, which ignores the low
-// address bits. They are aligned: the vectorizer accesses whole registers at
-// multiples of the vector width from 128-byte-aligned bases, which are the
-// VTCM arena's buffers, DDR tensors and the stack arrays the codegen aligns.
+// address bits. The codegen prints them only for offsets it proves multiples
+// of that alignment, from 128-byte-aligned bases: the VTCM arena's buffers,
+// DDR tensors and the stack arrays the codegen aligns. Other vector accesses
+// print as tl_hvx_vec_loadu / tl_hvx_vec_storeu (hvx_lanes.h), vmemu.
 // `may_alias` makes those accesses legal next to scalar ones on the same array:
 // a loop the vectorizer leaves scalar writes `a[i]`, and the next statement may
 // read `*(half64*)a`, which strict aliasing would let the compiler reorder.

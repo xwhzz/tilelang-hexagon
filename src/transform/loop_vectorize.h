@@ -103,11 +103,24 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, const Var &var,
  *
  * The flag applies only to the analyzed address; an atomic's source value may
  * still broadcast. If the check fails, the planner can try a smaller width.
+ *
+ * With allow_unaligned=true, a unit-stride group may start anywhere: its base
+ * need not divide by the vector width. Targets whose vector loads and stores
+ * take any address (TargetHasUnalignedVectorAccess) use it for plain memory
+ * accesses; their codegen prints the accesses it cannot prove aligned as
+ * unaligned ones.
  */
 bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
                          const PrimExpr &extent, int target_vectorized_size,
                          arith::Analyzer *analyzer, bool allow_broadcast = true,
-                         const PrimExpr &min = 0, bool allow_window = false);
+                         const PrimExpr &min = 0, bool allow_window = false,
+                         bool allow_unaligned = false);
+
+/*!
+ * \brief Whether the current target's vector loads and stores take any address
+ * ("supports_unaligned_vector_access").
+ */
+bool TargetHasUnalignedVectorAccess();
 
 /*!
  * \brief A vector load whose lanes read a small window of elements.

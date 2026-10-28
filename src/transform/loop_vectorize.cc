@@ -402,7 +402,8 @@ public:
           if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
                                    inner_for_->extent, reg_lanes, analyzer_,
                                    /*allow_broadcast=*/true, inner_for_->min,
-                                   window_loads_ && !info.is_store))
+                                   window_loads_ && !info.is_store,
+                                   TargetHasUnalignedVectorAccess()))
             ok = false;
         }
         vector_size_ = ok ? reg_lanes : 1;
@@ -567,7 +568,9 @@ private:
       }
       if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
                                inner_for_->extent, vector_size, analyzer_,
-                               /*allow_broadcast=*/true, inner_for_->min)) {
+                               /*allow_broadcast=*/true, inner_for_->min,
+                               /*allow_window=*/false,
+                               TargetHasUnalignedVectorAccess())) {
         int old_vector_size = vector_size;
         vector_size = arith::ZeroAwareGCD(vector_size, info.vector_size);
         if (verbose) {
@@ -1178,7 +1181,8 @@ private:
            !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
                                 inner_for_->extent, buffer_vec_size, analyzer_,
                                 /*allow_broadcast=*/true, inner_for_->min,
-                                window_loads_ && !is_store)) {
+                                window_loads_ && !is_store,
+                                TargetHasUnalignedVectorAccess())) {
       buffer_vec_size /= 2;
     }
     return {buffer_vec_size, /*requires_scalarization=*/false};
@@ -1436,10 +1440,18 @@ DetectVectorWindow(const PrimExpr &expr, const Var &var, const PrimExpr &extent,
   return std::nullopt;
 }
 
+bool TargetHasUnalignedVectorAccess() {
+  Target target = Target::Current(false);
+  return target.defined() &&
+         target->GetAttr<Bool>("supports_unaligned_vector_access", Bool(false))
+             .value();
+}
+
 bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
                          const PrimExpr &extent, int target_vectorized_size,
                          arith::Analyzer *analyzer, bool allow_broadcast,
-                         const PrimExpr &min, bool allow_window) {
+                         const PrimExpr &min, bool allow_window,
+                         bool allow_unaligned) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1) {
     return true;
@@ -1474,8 +1486,9 @@ bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
 
   PrimExpr simplified_expr =
       analyzer->Simplify(Substitute(analysis_expr, {{ordinal, zero_ordinal}}));
-  // The base offset must be divisible
-  if (!analyzer->CanProveEqual(FloorMod(simplified_expr, target_size_for_expr),
+  // The base offset must be divisible, unless groups may start anywhere.
+  if (!allow_unaligned &&
+      !analyzer->CanProveEqual(FloorMod(simplified_expr, target_size_for_expr),
                                zero_expr)) {
     return false;
   }
@@ -1504,7 +1517,7 @@ bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
   // (ordinal // 4) * 6 + ordinal % 4 has group bases 0, 6, ... at width 4: the
   // first group is aligned, but the second is not. Atomic destinations must
   // align every group's base; the planner can retry this example at width 2.
-  return allow_broadcast ||
+  return allow_broadcast || allow_unaligned ||
          analyzer->CanProveEqual(
              FloorMod(ramp_node->base, target_size_for_expr), zero_expr);
 }

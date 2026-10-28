@@ -14,6 +14,7 @@
 #include "backend/common/codegen/codegen_c_base.h"
 #include "tvm/target/codegen.h"
 #include <string>
+#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
 #include <vector>
 
@@ -53,6 +54,16 @@ public:
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
   // Print a worker loop as a tl_parallel_for call.
   void VisitStmt_(const ForNode *op) final; // NOLINT(*)
+  // A contiguous vector load is one vector access wherever it starts (C's
+  // printer gathers the lanes of one it cannot prove aligned). A vector
+  // access that may not start on its alignment prints as tl_hvx_vec_loadu /
+  // tl_hvx_vec_storeu (hvx_lanes.h), vmemu.
+  void VisitExpr_(const BufferLoadNode *op,
+                  std::ostream &os) final; // NOLINT(*)
+  std::string GetVecLoad(DataType t, const BufferNode *buffer,
+                         PrimExpr base) final;
+  void PrintVecStore(const BufferNode *buffer, DataType t, PrimExpr base,
+                     const std::string &value) final;
 
   ffi::Array<ffi::String> GetFunctionNames() { return function_names_; }
 
@@ -74,6 +85,11 @@ private:
   // Print a T.Kernel(num_workers=) grid loop as a tl_parallel_for call whose
   // lambda runs one tile program.
   void PrintWorkerLoop(const ForNode *op);
+  // Whether a vector of `t` at element `base` provably starts on a multiple of
+  // its natural alignment, the smaller of its size and a register.
+  bool VectorAligned(DataType t, const PrimExpr &base);
+  /*! \brief modular arithmetic of vector access offsets */
+  arith::Analyzer analyzer_;
 
   template <typename T>
   inline void PrintTernaryCondExpr(const T *op, const char *compare,

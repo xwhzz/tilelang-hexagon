@@ -2,6 +2,7 @@
  * \file codegen_hexagon.cc
  */
 #include "codegen_hexagon.h"
+#include "arith/pattern_match.h"
 #include "hexagon/op/builtin.h"
 #include "support/check.h"
 #include "transform/common/attr.h"
@@ -553,6 +554,53 @@ void CodeGenTileLangHexagon::VisitExpr_(const SelectNode *op,
 }
 
 // CodeGenC prints a ramp as a list of lanes, which is no vec_type constructor.
+// Buffers start on a register boundary: VTCM arena buffers, DDR tensors and
+// the stack arrays AllocBuffer aligns. So the element offset alone decides.
+bool CodeGenTileLangHexagon::VectorAligned(DataType t, const PrimExpr &base) {
+  int64_t element = (t.bits() + 7) / 8;
+  int64_t alignment = std::min<int64_t>(element * t.lanes(), 128);
+  arith::ModularSet offset = analyzer_.modular_set(base);
+  return offset->coeff * element % alignment == 0 &&
+         offset->base * element % alignment == 0;
+}
+
+void CodeGenTileLangHexagon::VisitExpr_(const BufferLoadNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  arith::PVar<PrimExpr> base;
+  if (op->dtype.lanes() != op->buffer->dtype.lanes() &&
+      !op->predicate.defined() && op->indices.size() == 1 &&
+      arith::ramp(base, 1, op->dtype.lanes()).Match(op->indices[0])) {
+    HandleVolatileLoads(GetVecLoad(op->dtype, op->buffer.get(), base.Eval()),
+                        op, os);
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
+std::string CodeGenTileLangHexagon::GetVecLoad(DataType t,
+                                               const BufferNode *buffer,
+                                               PrimExpr base) {
+  if (VectorAligned(t, base))
+    return CodeGenTileLangCBase::GetVecLoad(t, buffer, base);
+  std::ostringstream os;
+  os << "tl_hvx_vec_loadu<";
+  PrintType(t, os);
+  os << ">((&(" << GetBufferRef(buffer->dtype, buffer, base) << ")))";
+  return os.str();
+}
+
+void CodeGenTileLangHexagon::PrintVecStore(const BufferNode *buffer, DataType t,
+                                           PrimExpr base,
+                                           const std::string &value) {
+  if (VectorAligned(t, base)) {
+    CodeGenTileLangCBase::PrintVecStore(buffer, t, base, value);
+    return;
+  }
+  PrintIndent();
+  stream << "tl_hvx_vec_storeu((&(" << GetBufferRef(buffer->dtype, buffer, base)
+         << ")), " << value << ");\n";
+}
+
 void CodeGenTileLangHexagon::VisitExpr_(const RampNode *op,
                                         std::ostream &os) { // NOLINT(*)
   os << "tl_vec_ramp<";
