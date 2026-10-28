@@ -1504,10 +1504,19 @@ private:
         best_infer_root = attempt_root;
       };
 
+      // On one thread nothing is replicated, so every root plans the same
+      // cost and the first that succeeds wins the ties anyway: stop there.
+      // Trying every root is quadratic in the component, and a megakernel's
+      // tile ops, sharing their fragments, are one component.
+      bool one_thread = std::all_of(members.begin(), members.end(), [&](int i) {
+        return is_one(thread_bounds_vec_[i]->extent);
+      });
       // Try the native plan first, then a scalar alternative at eligible
       // reducer roots. Scalar ownership can avoid replicated accumulator
       // slots; the existing cost model decides whether that is worthwhile.
       for (int attempt_infer_root : members) {
+        if (one_thread && has_best)
+          break;
         const auto *loop = infer_list_[attempt_infer_root].as<ParallelOpNode>();
         bool try_scalar =
             cost_model->ExploreReducerScalarLayouts() && loop &&
