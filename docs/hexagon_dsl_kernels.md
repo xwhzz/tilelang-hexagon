@@ -107,8 +107,22 @@ VTCM (`alloc_shared`) and never hits DDR.
 (shared buffers or fragments), M, N and K are multiples of 32, and each operand is a matrix
 of whole 32x32 tiles that starts on a tile: a whole buffer, a sub-matrix of a larger one, or
 one matrix of a stack. Transposes and `clear_accum`, also as an expression such as `k == 0`,
-combine freely. Any other GEMM runs as a scalar loop that hexagon-clang vectorizes, and the
-compiler logs why HMX does not apply (`tl.hexagon.GemmHMXRejection`).
+combine freely.
+
+Any other GEMM of row-major matrices runs on HVX (`GemmHVX`, `tl.hexagon.GemmHVXRejection`):
+fp16 operands into an fp16 or fp32 C, fp32 operands into an fp32 C, any M, N and K, at most
+one operand transposed. The whole call is one `tl_hvx_gemm` (`hvx_gemm.h`): outer products
+when B's rows run along N, A's elements broadcast from a register of its row staged on the
+stack (scalar loads from VTCM are slow), and dot products when `transpose_B` puts both
+operands' rows along K, each output's register of partial sums summed by a transpose tree.
+Products accumulate in qf32 registers over the call's K and reach C once. On v79 the outer
+products run at 17-19 MAC per cycle, the dot products at 10-12, about 1000x the scalar loop,
+and a decode GEMV that streams its weights by DMA moves 40-44 GB/s (`example_gemv.py`). v79's
+qf32 adds of two zeros step the encoding's exponent up until it reads as a huge number, so
+accumulators combine with each other and with C as IEEE fp32, and a result flushes the
+denormals a chain of zero products converts to. A GEMM neither unit runs (both operands
+transposed, other types, an operand another operator gave a layout that is not row-major)
+runs as a scalar loop, and the compiler logs why.
 
 Each 32x32 output tile reduces the call's K in the HMX accumulator and converts to fp16: HMX
 accumulates within a call, and HVX across calls. An fp16 C keeps the HMX output layout, and a
@@ -227,12 +241,13 @@ their stage. Into an HMX operand, which DMA cannot fill in Crouton order, the co
 goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX pack
 in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
-(BK = 256) faster than with serial copies, and a GEMV streaming 8 MB of fp16
-weights 2.1x (`example_gemm.py`, `example_gemv.py`). A transfer costs about 500
-cycles to submit and 200 to retire, so blocks of a few KB that serial HVX copies
-read from L2 gain little: flash attention's 8 KB K and V blocks are faster
-pipelined only once K and V outgrow L2 (17% at SEQ 4096, slower at 256). An
-explicit `T.dma_copy` stays a manual schedule and is rejected inside `T.Pipelined`.
+(BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
+8 MB of fp16 weights at 40-44 GB/s (`example_gemv.py`). A transfer costs about 150
+cycles to submit and as many to retire, so blocks of a few KB that serial HVX
+copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
+match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
+256. An explicit `T.dma_copy` stays a manual schedule and is rejected inside
+`T.Pipelined`.
 The native-layout
 `T.gemm` path is device-validated on v79: a staged
 32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has

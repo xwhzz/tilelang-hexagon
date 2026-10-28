@@ -1,6 +1,6 @@
 /*!
  * \file tl/hexagon/op/gemm.h
- * \brief Whether a T.gemm runs on HMX.
+ * \brief Whether a T.gemm runs on HMX or on HVX.
  */
 
 #ifndef TVM_TL_HEXAGON_OP_GEMM_H_
@@ -23,6 +23,16 @@ namespace hexagon {
  * whole tiles too.
  */
 std::string HMXRejection(const GemmNode &op);
+
+/*!
+ * \brief Why HVX cannot run `op` (tl_hvx_gemm, hvx_gemm.h), or an empty string
+ * when it can: A and B both fp16 into an fp16 or fp32 C, or both fp32 into an
+ * fp32 C; at most one of them transposed; and each operand a matrix of
+ * contiguous rows a constant stride apart, its leading dimensions single
+ * indices. GemmHVX also needs the operands row-major, which their layouts
+ * decide after selection.
+ */
+std::string HVXRejection(const GemmNode &op);
 
 } // namespace hexagon
 } // namespace tl

@@ -36,7 +36,8 @@ struct HexagonBuiltin {
   // dependency-only operands for compiler analyses.
   int printed_args = -1;
   // Prints the first `template_args` arguments as template arguments: a string
-  // as its text, a type annotation as its type.
+  // as its text, an integer or boolean as its value, a type annotation as its
+  // type.
   int template_args = 0;
 };
 
@@ -83,6 +84,7 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        2},
       {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", false, false,
        false, -1, 3},
+      {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", false, false, false, -1, 11},
       {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
   };
   for (const auto &builtin : builtins) {
@@ -419,12 +421,18 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
       os << (i == 0 ? "<" : ", ");
       if (const auto *text = op->args[i].as<StringImmNode>()) {
         os << text->value;
+      } else if (const auto *value = op->args[i].as<IntImmNode>()) {
+        if (value->dtype.is_bool())
+          os << (value->value ? "true" : "false");
+        else
+          os << value->value;
       } else {
         static const Op &type_annotation = Op::Get("tirx.type_annotation");
         const auto *type = op->args[i].as<CallNode>();
         ICHECK(type && type->op.same_as(type_annotation))
-            << builtin->function << " takes a string or a type annotation as "
-            << "template argument " << i << ", got " << op->args[i];
+            << builtin->function << " takes a string, an integer or a type "
+            << "annotation as template argument " << i << ", got "
+            << op->args[i];
         PrintType(type->dtype, os);
       }
       os << (i + 1 == first ? ">" : "");

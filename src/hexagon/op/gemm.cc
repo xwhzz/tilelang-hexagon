@@ -3,12 +3,13 @@
  * \brief Hexagon implementation for tl.gemm instruction selection.
  *
  * A GEMM runs on HMX (GemmHMX, tilelang/hexagon/op/gemm/gemm_hmx.py) when its
- * operands fit the matrix unit, and as the scalar loop otherwise, which
- * hexagon-clang vectorizes onto HVX.
+ * operands fit the matrix unit, on HVX (GemmHVX, gemm_hvx.py) when they are
+ * row-major matrices of fp16 or fp32, and as the scalar loop otherwise.
  */
 
 #include "hexagon/op/gemm.h"
 
+#include "hexagon/op/utils.h" // GetBufferStrides
 #include "op/gemm.h"
 #include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
@@ -32,6 +33,7 @@ namespace hexagon {
 namespace {
 constexpr const char *kHexagonScalar = "cpu.scalar";
 constexpr const char *kHexagonHMX = "hexagon.hmx";
+constexpr const char *kHexagonHVX = "hexagon.hvx";
 constexpr int kTile = 32;
 
 bool OnTiles(const PrimExpr &value, arith::Analyzer *analyzer) {
@@ -87,11 +89,45 @@ std::string HMXRejection(const GemmNode &op) {
   return "";
 }
 
+std::string HVXRejection(const GemmNode &op) {
+  const DataType fp16 = DataType::Float(16);
+  const DataType fp32 = DataType::Float(32);
+  DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
+  bool operands = a == b && (a == fp16 || a == fp32);
+  if (!operands || !(c == fp32 || (c == fp16 && a == fp16)))
+    return "HVX multiplies fp16 operands into an fp16 or fp32 C and fp32 "
+           "ones into an fp32 C, not " +
+           TypeName(a) + " x " + TypeName(b) + " into " + TypeName(c);
+  if (op.transA_ && op.transB_)
+    return "HVX reads A or B along K, so not both transposed";
+  const std::pair<const char *, const BufferRegion *> regions[] = {
+      {"A", &op.aRegion_}, {"B", &op.bRegion_}, {"C", &op.cRegion_}};
+  for (const auto &[name, region] : regions) {
+    const Buffer &buffer = (*region)->buffer;
+    std::string operand = std::string(name) + " (" + buffer->name + ")";
+    const Array<Range> &ranges = (*region)->region;
+    size_t rank = ranges.size();
+    if (rank < 2)
+      return operand + " is not a matrix";
+    for (size_t i = 0; i + 2 < rank; ++i) {
+      if (!is_one(ranges[i]->extent))
+        return operand + " spans more than one matrix of its leading "
+                         "dimensions";
+    }
+    Array<PrimExpr> strides = GetBufferStrides(buffer);
+    if (!is_one(strides[rank - 1]) || !strides[rank - 2].as<IntImmNode>())
+      return operand + "'s rows are not contiguous, a constant stride apart";
+  }
+  return "";
+}
+
 struct Gemm {
   static String SelectInst(const GemmNode &op, int block_size, Target target) {
     (void)block_size;
     (void)target;
-    return HMXRejection(op).empty() ? String(kHexagonHMX)
+    if (HMXRejection(op).empty())
+      return String(kHexagonHMX);
+    return HVXRejection(op).empty() ? String(kHexagonHVX)
                                     : String(kHexagonScalar);
   }
 
@@ -139,12 +175,20 @@ const bool hexagon_gemm_registered = RegisterHexagonGemm();
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  // The scalar fallback reports why a GEMM is not on HMX.
-  refl::GlobalDef().def("tl.hexagon.GemmHMXRejection", [](ObjectRef gemm) {
-    const auto *node = gemm.as<GemmNode>();
-    ICHECK(node) << "expected a tl.Gemm, got " << gemm->GetTypeKey();
-    return String(hexagon::HMXRejection(*node));
-  });
+  // GemmHVX reports why a GEMM is not on HMX, and the scalar fallback why
+  // it is on neither.
+  refl::GlobalDef()
+      .def("tl.hexagon.GemmHMXRejection",
+           [](ObjectRef gemm) {
+             const auto *node = gemm.as<GemmNode>();
+             ICHECK(node) << "expected a tl.Gemm, got " << gemm->GetTypeKey();
+             return String(hexagon::HMXRejection(*node));
+           })
+      .def("tl.hexagon.GemmHVXRejection", [](ObjectRef gemm) {
+        const auto *node = gemm.as<GemmNode>();
+        ICHECK(node) << "expected a tl.Gemm, got " << gemm->GetTypeKey();
+        return String(hexagon::HVXRejection(*node));
+      });
 }
 
 } // namespace tl

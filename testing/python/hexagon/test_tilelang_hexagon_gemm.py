@@ -171,7 +171,7 @@ def test_rows_off_register_boundaries_are_unaligned_stores():
     assert "tl_crouton_tile_store<true, true, true>(" in _source(_c_layout("rows16"))
 
 
-def test_gemms_hmx_cannot_run_say_why(caplog):
+def test_gemms_hmx_cannot_run_go_to_hvx_saying_why(caplog):
     @T.prim_func
     def off_tiles(A: T.Tensor((96, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((64, 64), "float32")):
         with T.Kernel(1):
@@ -199,10 +199,11 @@ def test_gemms_hmx_cannot_run_say_why(caplog):
         (fp32_operands, "HMX multiplies fp16 operands, not float32 x float32"),
     ):
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="tilelang.hexagon.op.gemm"):
+        with caplog.at_level(logging.DEBUG, logger="tilelang.hexagon.op.gemm"):
             source = _source(func)
         assert "tl_hexagon_hmx_" not in source
-        assert f"runs as a scalar loop, not on HMX: {reason}" in caplog.text
+        assert "tl_hvx_gemm<" in source
+        assert f"runs on HVX, not on HMX: {reason}" in caplog.text
 
 
 def test_operands_in_other_layouts_are_rejected():

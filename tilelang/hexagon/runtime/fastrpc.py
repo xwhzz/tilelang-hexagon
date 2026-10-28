@@ -133,6 +133,9 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     # kernel references the `tl_hvx` prefix (self-contained, needs only -mhvx).
     uses_hvx = "tl_hvx" in kernel_source
     hvx_include = "#include <tl_templates/hexagon/hvx_math.h>\n" if uses_hvx else ""
+    # T.gemm on HVX.
+    uses_hvx_gemm = "tl_hvx_gemm" in kernel_source
+    hvx_gemm_include = "#include <tl_templates/hexagon/hvx_gemm.h>\n" if uses_hvx_gemm else ""
     # User-DMA primitives are header-only.  They use QuRT cache maintenance and
     # Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
     uses_dma = "tl_hexagon_dma_" in kernel_source
@@ -173,6 +176,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{hmx_include}"
         f"{dma_include}"
         f"{hvx_include}"
+        f"{hvx_gemm_include}"
         f"{crouton_include}"
         f"{qgemv_include}"
         f"{qmatmul_include}"
@@ -452,8 +456,11 @@ else()
     # No -mhvx-ieee-fp: the SM8750 (v79) cDSP returns zeros for the IEEE .sf/.hf
     # HVX arithmetic it selects, although hexagon-sim computes it. Vector float
     # ops stay a qfloat op plus a conversion.
-    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error")
-    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions")
+    # --disable-handle-qfp: hexagon-clang 19's rewrite of qfloat spills and
+    # refills after register allocation corrupts spilled qf32 registers (an
+    # HVX GEMM's accumulators turned NaN); the registers spill as they are.
+    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error -mllvm --disable-handle-qfp")
+    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions -mllvm --disable-handle-qfp")
     copy_binaries({iface}_skel)
 endif()
 """

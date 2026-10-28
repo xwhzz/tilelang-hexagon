@@ -262,7 +262,7 @@ decode seam 特意放在 `dma_queue_pop()` 之后：权重已在 VTCM，TileLang
 | P1 | Softmax 独立算子化 | 4 | 两者 | 从 FlashAttention basis 抽取 | 抽取 |
 | P2 | RoPE | 4 | 两者 | attn 6 层的 Q、K | 未开始 |
 | P2 | SSM_CONV 短卷积 | 4 | 两者 | conv 10 层，kernel=3 | 未开始 |
-| P2 | fp16 GEMV（M=1） | 2、4、5 | decode | F16 模型全部 MUL_MAT；上限取决于工作流 2 | 未开始 |
+| P2 | fp16 GEMV（M=1） | 2、4、5 | decode | F16 模型全部 MUL_MAT；上限取决于工作流 2 | `T.gemm` 走 HVX，DMA 流式 40–44 GB/s（#26） |
 | P3 | 短卷积子图融合 in_proj→SSM_CONV→out_proj | 2、4、5、6 | decode | 唯一未被 ggml 融合的子图（15%），中间量驻 VTCM | 未开始 |
 | P3 | lm_head GEMV | 4、5 | decode | 2048→65536；host 上限 patch 已验证并入基线 | host 侧已解决 |
 

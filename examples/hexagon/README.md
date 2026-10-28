@@ -13,7 +13,7 @@ for how the adaptation works.
 | `example_dma_hmx_matmul.py` | DSL output-block DMA prefetch + Crouton packing + HMX matmul |
 | `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
 | `example_gemm.py` | the tiled GEMM with an fp32 accumulator over a pipelined K loop: DMA ahead, HMX within each call, HVX across calls |
-| `example_gemv.py` | a streaming GEMV: `T.Pipelined` streams the weights from DDR by DMA while HVX multiplies |
+| `example_gemv.py` | a streaming GEMV on an nn.Linear weight: `T.Pipelined` streams blocks of its rows from DDR by DMA while `T.gemm` multiplies them on HVX |
 | `example_flash_attention.py` | two HMX gemms + an HVX online softmax on their Crouton tiles, composed on-chip |
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |

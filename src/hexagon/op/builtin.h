@@ -143,6 +143,13 @@ TVM_DLL const Op &hexagon_crouton_copy();
 // half-register ones (fp16). The three print as template arguments.
 TVM_DLL const Op &hexagon_crouton_tile_store();
 
+// tl_hvx_gemm<M, N, K, trans_A, trans_B, lda, ldb, ldc, align_a, align_b,
+// align_c>(C, A, B, clear) (hvx_gemm.h): C = A B, or C += A B unless clear,
+// on HVX for the M x N x K GEMM whose operands start at C, A and B, their rows
+// lda, ldb and ldc elements apart; align_x: x starts on a register boundary.
+// The eleven integers and booleans print as template arguments.
+TVM_DLL const Op &hexagon_hvx_gemm();
+
 // tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();
