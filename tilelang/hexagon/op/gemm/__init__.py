@@ -17,7 +17,7 @@ from tilelang.cpu.op.gemm.gemm_scalar import GEMM_INST_SCALAR, GemmScalar
 from tilelang.tileop.gemm.registry import register_gemm_impl
 
 from .gemm_hmx import GEMM_INST_HMX, GemmHMX
-from .gemm_hvx import GEMM_INST_HVX, GemmHVX
+from .gemm_hvx import GEMM_INST_HVX, GEMM_INST_HVX_BLOCK_SCALED, GemmHVX, GemmHVXBlockScaled
 
 logger = logging.getLogger(__name__)
 
@@ -56,3 +56,4 @@ def _match_hexagon(target) -> bool:
 register_gemm_impl("hexagon.scalar", GEMM_INST_SCALAR, _match_hexagon, GemmScalarHexagon)
 register_gemm_impl("hexagon.hmx", GEMM_INST_HMX, _match_hexagon, GemmHMX)
 register_gemm_impl("hexagon.hvx", GEMM_INST_HVX, _match_hexagon, GemmHVX)
+register_gemm_impl("hexagon.hvx_blockscaled", GEMM_INST_HVX_BLOCK_SCALED, _match_hexagon, GemmHVXBlockScaled)

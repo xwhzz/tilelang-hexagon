@@ -23,9 +23,11 @@ from tvm import DataType, arith, tirx
 from tilelang.cpu.op.gemm.gemm_scalar import GemmScalar
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.panel import PanelLayout, make_hvx_panel_layout
+from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
 GEMM_INST_HVX = "hexagon.hvx"
+GEMM_INST_HVX_BLOCK_SCALED = "hexagon.hvx.blockscaled"
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +83,9 @@ class GemmHVX(GemmBase):
         pointer = T.access_ptr(buffer[tuple(origin)], access, (rows - 1) * ld + cols)
         return pointer, ld, aligned
 
-    def _lower_integer(self, layout_map):
+    def _integer_operands(self, layout_map):
+        """A, C and B of an integer GEMM: B's pointer, the bytes between its
+        panels, its bits and its signedness."""
         layout = layout_map.get(self.B, None)
         if not isinstance(layout, PanelLayout):
             raise ValueError(
@@ -102,6 +106,11 @@ class GemmHVX(GemmBase):
         b = T.access_ptr(self.B[tuple(origin)], "r", N * K)
         panel_bytes = 32 * int(self.B.shape[-1]) * bits // 8
         signed = str(self.B.dtype).startswith("int")
+        return a, lda, c, ldc, align_c, b, panel_bytes, bits, signed
+
+    def _lower_integer(self, layout_map):
+        M, N, K = self.M, self.N, self.K
+        a, lda, c, ldc, align_c, b, panel_bytes, bits, signed = self._integer_operands(layout_map)
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int")
         flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, tirx.const(bool(align_c), "bool")]
         clear = self.clear_accum
@@ -143,3 +152,71 @@ class GemmHVX(GemmBase):
             T.evaluate(tirx.call_intrin("void", gemm, M, N, K, *flags, lda, ldb, ldc, *aligned, c, a, b, T.Cast("bool", clear)))
 
         return _gemm_hvx
+
+
+class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
+    """``T.gemm_blockscaled``: ``C (+)= (A * SFA) @ (B * SFB)^T`` as one
+    ``tl_hvx_gemm_int_scaled`` call, an integer GEMM whose groups of K leave
+    the vrmpy accumulators into fp32 sums, weighed by their scales.
+
+    A, B and C are those of an integer ``T.gemm`` with ``transpose_B``, except
+    that C is fp32. SFA is fp32, one factor per ``sf_a_granularity_k`` columns
+    of each row of A: ``[M, K / ga]``, or ``[K / ga]`` for one row. SFB is fp16
+    and group-major: ``[K / gb, N]``, factor ``(g, j)`` for group g of row j of B.
+    Columns ``[k_start, k_start + K)`` of the scales' K start whole groups of
+    each, or lie in one: a factor for all of them weighs the sums once, at the
+    end.
+    """
+
+    def _scale_group(self, operand: str, g) -> tuple:
+        """The columns per factor of `operand` across this call's K, and the
+        index of its first factor: K when the call's columns lie in one group
+        of g, else g, when they split into whole groups of g."""
+        K, k0 = self.K, self.sf_k_start
+        analyzer = arith.Analyzer()
+        if analyzer.can_prove(tirx.floormod(k0, g) + K <= g):
+            return K, k0 // g
+        if K % g or not analyzer.can_prove(tirx.floormod(k0, g) == 0):
+            raise ValueError(
+                f"T.gemm_blockscaled on HVX: columns [{k0}, {k0} + {K}) neither lie in one group of {g} {operand} scale columns "
+                "nor split into whole ones"
+            )
+        return g, k0 // g
+
+    def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
+        M, N, K = self.M, self.N, self.K
+        a, lda, c, ldc, align_c, b, panel_bytes, bits, signed = self._integer_operands(layout_map)
+        ga, first_a = self._scale_group("A", self.sf_a_granularity_k)
+        gb, first_b = self._scale_group("B", self.sf_b_granularity_k)
+        # A signed B's groups take whole int16 registers of A for their sums.
+        group, step = min(ga, gb), 64 if signed else 32 // bits
+        if max(ga, gb) % group or group % step:
+            raise ValueError(
+                f"T.gemm_blockscaled on HVX: scale groups of {ga} (A) and {gb} (B) columns, one a multiple of the other "
+                f"and the smaller one of {step}"
+            )
+        # SFA: rows of A by groups (the last axis); SFB: groups by rows of B.
+        sfa_region, sfb_region = self.SFARegion, self.SFBRegion
+        sfa_origin = [r.min for r in sfa_region.region]
+        sfa_origin[-1] = sfa_origin[-1] + first_a
+        if len(sfa_origin) < 2 and M > 1:
+            raise ValueError(f"T.gemm_blockscaled: SFA {sfa_region.buffer.name} holds one row of factors for {M} rows of A")
+        ld_sfa = int(_strides(sfa_region.buffer)[-2]) if len(sfa_origin) >= 2 else 0
+        sfb_origin = [r.min for r in sfb_region.region]
+        if len(sfb_origin) < 2:
+            raise ValueError(f"T.gemm_blockscaled: SFB {sfb_region.buffer.name} is [K / {gb}, N], group-major")
+        sfb_origin[-2] = sfb_origin[-2] + first_b
+        ld_sfb = int(_strides(sfb_region.buffer)[-2])
+        sfa = T.access_ptr(sfa_region.buffer[tuple(sfa_origin)], "r", (M - 1) * ld_sfa + K // ga)
+        sfb = T.access_ptr(sfb_region.buffer[tuple(sfb_origin)], "r", (K // gb - 1) * ld_sfb + N)
+        gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int_scaled")
+        flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, ga, gb, tirx.const(bool(align_c), "bool")]
+        clear = self.clear_accum
+
+        @T.prim_func
+        def _gemm_hvx_blockscaled() -> None:
+            T.evaluate(
+                tirx.call_intrin("void", gemm, M, N, K, *flags, c, a, b, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, T.Cast("bool", clear))
+            )
+
+        return _gemm_hvx_blockscaled

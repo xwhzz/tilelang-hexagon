@@ -155,3 +155,128 @@ def test_integer_gemm_accumulates_into_c():
         assert torch.equal(c.to(torch.int64), c0.to(torch.int64) + a @ b.t())
     finally:
         kernel.adapter.close()
+
+
+def _blockscaled(M, N, K, G, a_dtype, b_dtype, clear, GA=None, split=1):
+    """C = C0 + (A * SA) @ (B * SB)^T: an fp32 factor per GA columns of each row
+    of A (all K by default), an fp16 one per G columns of each row of B
+    (group-major), in `split` calls over K."""
+    GA = GA or K
+    KS = K // split
+
+    @T.prim_func
+    def gemm(
+        A: T.Tensor((M, K), a_dtype),
+        SA: T.Tensor((M, K // GA), "float32"),
+        B: T.Tensor((N, K), b_dtype),
+        SB: T.Tensor((K // G, N), "float16"),
+        C0: T.Tensor((M, N), "float32"),
+        C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(1):
+            b = T.alloc_shared((N, K), b_dtype)
+            sb = T.alloc_shared((K // G, N), "float16")
+            c = T.alloc_fragment((M, N), "float32")
+            T.annotate_layout({B: make_hvx_panel_layout(B)})
+            T.copy(B, b)
+            T.copy(SB, sb)
+            T.copy(C0, c)
+            for s in list(range(split)):
+                cols = slice(s * KS, (s + 1) * KS)
+                T.gemm_blockscaled(
+                    A[:, cols],
+                    b[:, cols],
+                    c,
+                    SA,
+                    sb,
+                    transpose_B=True,
+                    clear_accum=clear and s == 0,
+                    k_start=s * KS,
+                    sf_a_granularity_k=GA,
+                    sf_b_granularity_k=G,
+                )
+            T.copy(c, C)
+
+    return gemm
+
+
+def test_blockscaled_gemm_is_one_fused_call():
+    source = _lower(_blockscaled(1, 128, 2048, 64, "int16", "int4", True)).kernel_source
+    # Groups of 64 for B, one factor per row of A; SFB rows of 128 factors.
+    assert "tl_hvx_gemm_int_scaled<1, 128, 2048, 4, true, 2048, 128, 2048, 64, true>(" in source
+    assert ", 32768, (&(SA[0])), 1, (&(((half*)sb)[0])), 128, (bool)1);" in source
+
+
+def test_blockscaled_gemm_needs_fp32_and_fp16_factors():
+    @T.prim_func
+    def wrong(
+        A: T.Tensor((1, 64), "int16"),
+        SA: T.Tensor((1, 1), "float16"),
+        B: T.Tensor((32, 64), "int4"),
+        SB: T.Tensor((1, 32), "float16"),
+        C: T.Tensor((1, 32), "float32"),
+    ):
+        with T.Kernel(1):
+            b = T.alloc_shared((32, 64), "int4")
+            T.annotate_layout({B: make_hvx_panel_layout(B)})
+            T.copy(B, b)
+            T.gemm_blockscaled(A, b, C, SA, SB, transpose_B=True, k_start=0, sf_a_granularity_k=64, sf_b_granularity_k=64)
+
+    with pytest.raises(Exception, match="scales A by fp32 and B by fp16 factors"):
+        _lower(wrong)
+
+
+@pytest.mark.parametrize(
+    "args,error",
+    [
+        ((1, 64, 512, 64, "int8", "int4", True), "groups of a signed B with the sums of an int16 A"),
+        ((1, 64, 512, 32, "int16", "int4", True), "the smaller one of 64"),
+        ((1, 64, 768, 512, "int16", "uint4", True), "nor split into whole ones"),
+        ((1, 64, 1024, 64, "int16", "int4", True, 768, 2), "nor split into whole ones"),
+    ],
+)
+def test_blockscaled_gemm_rejects_what_hvx_cannot_scale(args, error):
+    with pytest.raises(Exception, match=error):
+        _lower(_blockscaled(*args))
+
+
+def test_blockscaled_gemm_splits_k_by_its_start():
+    source = _lower(_blockscaled(1, 64, 1024, 64, "int16", "int4", True, 1024, 2)).kernel_source
+    # The second half's B factors start at group 8; A's one factor weighs both.
+    assert source.count("tl_hvx_gemm_int_scaled<1, 64, 512, 4, true, 1024, 64, 512, 64, true>(") == 2
+    assert "(&(SA[0])), 1, (&(((half*)sb)[512])), 64, (bool)0);" in source
+
+
+@DEVICE
+@pytest.mark.parametrize("b_dtype", ["int4", "uint4", "int8"])
+@pytest.mark.parametrize(
+    "M,N,K,G,GA,split",
+    [
+        (1, 128, 2048, 64, None, 1),
+        (2, 96, 512, 128, None, 1),
+        (1, 64, 8192, 64, None, 1),
+        # A's factors per group, finer than B's and coarser, over two calls.
+        (2, 64, 1024, 256, 64, 1),
+        (1, 64, 1024, 64, 256, 2),
+        # A's one factor per row across both calls; one panel of B.
+        (2, 32, 1024, 128, None, 2),
+    ],
+)
+def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
+    torch.manual_seed(N + K + G)
+    GA = GA or K
+    kernel = tilelang.compile(_blockscaled(M, N, K, G, "int16", b_dtype, False, GA, split), out_idx=[5], target="hexagon")
+    try:
+        a, b = _random((M, K), "int16"), _random((N, K), b_dtype)
+        sa = torch.rand(M, K // GA) * 1e-3
+        sb = (torch.rand(K // G, N) * 1e-2).half()
+        c0 = torch.randn(M, N)
+        c = kernel(a.to(torch.int16), sa, pack_panel(b, BITS[b_dtype]), sb, c0)
+        g = min(G, GA)
+        dots = (a.double().view(M, 1, K // g, g) * b.double().view(1, N, K // g, g)).sum(-1)  # [M, N, groups]
+        fa = sa.double().repeat_interleave(GA // g, dim=1)[:, None]  # [M, 1, groups]
+        fb = sb.double().t().repeat_interleave(G // g, dim=1)[None]  # [1, N, groups]
+        ref = c0.double() + (dots * fa * fb).sum(-1)
+        torch.testing.assert_close(c.double(), ref, rtol=1e-5, atol=1e-5 * ref.abs().max().item())
+    finally:
+        kernel.adapter.close()

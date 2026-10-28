@@ -166,11 +166,22 @@ region covers whole panels of one matrix, rows in multiples of 32 and columns in
 the lane. 4-bit buffers are addressed by whole registers only: copied and multiplied, never
 read element by element.
 
-Group-quantized weights follow TileLang's block-scaled idiom: one `T.gemm` per group of K
-into an int32 fragment, then a `T.Parallel` epilogue that weighs it by the group's scales
-(`example_gemv_w4a16.py`). On v79 the w4a16 GEMV, which also quantizes x to int16 with one
-dynamic scale, streams 2048 -> 8192 at 47 GB/s with 4 workers, and 2048 -> 6144 at 49 GB/s
-with 4 and 51 GB/s with 6 (DMA tops out near 57 GB/s); one worker computes 23 GB/s.
+Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
+the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
+A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
+per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). It is one
+`tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
+fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
+A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
+GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
+computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one
+`T.gemm` per group and a `T.Parallel` epilogue, and streams 2048 -> 8192 at 44-50 GB/s with
+4 workers (DMA tops out near 57 GB/s).
+
+The HVX GEMMs are functions of their own, not inlined (`TL_GEMM` in `hvx_gemm.h`): the calls
+of one shape share their code. A kernel that multiplies in many places, a megakernel whose
+phases each call a GEMV, otherwise outgrows the instruction cache; on v79 a chain of eight
+2048 -> 2048 w4a16 GEMVs streamed across 4 workers went from 31 to 53 GB/s.
 
 Each 32x32 output tile reduces the call's K in the HMX accumulator and converts to fp16: HMX
 accumulates within a call, and HVX across calls. An fp16 C keeps the HMX output layout, and a

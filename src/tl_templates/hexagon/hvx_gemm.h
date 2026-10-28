@@ -50,6 +50,11 @@
 #define TL_DEVICE static inline __attribute__((always_inline))
 #endif
 
+// A GEMM is a function of its own, never inlined into its caller: the calls of
+// one shape share one copy of its code, so a kernel that multiplies in many
+// places, as a megakernel's phases do, stays within the instruction cache.
+#define TL_GEMM static __attribute__((noinline))
+
 constexpr int tl_gemm_min(int a, int b) { return a < b ? a : b; }
 
 constexpr int tl_gemm_log2(int n) {
@@ -528,7 +533,7 @@ TL_DEVICE void tl_gemm_dot_all(TC *C, const TA *A, const TA *B, bool clear) {
 template <int M, int N, int K, bool TransA, bool TransB, int LdA, int LdB,
           int LdC, bool AlignA, bool AlignB, bool AlignC, typename TA,
           typename TC>
-TL_DEVICE void tl_hvx_gemm(TC *C, const TA *A, const TA *B, bool clear) {
+TL_GEMM void tl_hvx_gemm(TC *C, const TA *A, const TA *B, bool clear) {
   static_assert(std::is_same_v<TA, half> || std::is_same_v<TA, float>,
                 "HVX GEMM operands are fp16 or fp32");
   static_assert(std::is_same_v<TC, float> || std::is_same_v<TA, half>,
@@ -713,8 +718,8 @@ tl_gemm_int_panels(int32_t *C, const tl_gemm_int_row<TA, BBits, KC> &row,
 
 template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
           bool AlignC, typename TA>
-TL_DEVICE void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
-                               int panel_bytes, bool clear) {
+TL_GEMM void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
+                             int panel_bytes, bool clear) {
   const uint8_t *B = static_cast<const uint8_t *>(B_);
   static_assert(std::is_same_v<TA, int8_t> || std::is_same_v<TA, uint8_t> ||
                     std::is_same_v<TA, int16_t>,
@@ -747,6 +752,251 @@ TL_DEVICE void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
         tl_gemm_int_panels<TA, BBits, BSigned, N / 32 % NB, KC, RowsC>(
             c0 + 32 * p, row, b0 + p * panel_bytes, panel_bytes, k / lane,
             first);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Block-scaled integer GEMM (T.gemm_blockscaled): C += (A * SFA) (B * SFB)^T.
+// ---------------------------------------------------------------------------
+//
+// tl_hvx_gemm_int_scaled<M, N, K, BBits, BSigned, LdA, LdC, GA, GB,
+// AlignC>(C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear) computes,
+// for i < M and j < N,
+//
+//   C[i * LdC + j] = (clear ? 0 : C[i * LdC + j]) +
+//       sum_g sfa[i * ld_sfa + g / (GA / G)] sfb[(g / (GB / G)) * ld_sfb + j]
+//             dot_g(i, j)
+//
+// over the groups g of G = min(GA, GB) columns of K, with dot_g(i, j) the
+// exact int32 sum over group g of A[i, k] B(j, k): B as in tl_hvx_gemm_int,
+// the scales fp32 (SFA, one per GA columns) and fp16 (SFB, one per GB columns,
+// group-major). GA and GB divide K, or equal it for one factor per row. Each
+// group's int32 sums leave the vrmpy accumulators once, into fp32 accumulators
+// that weigh them by the group's scales: the scaling costs a few operations
+// per group of 32 outputs, against a vrmpy for every 4 or 8 columns of them.
+
+// The fp32 values of NB runs of 32 consecutive fp16 from p: two runs per
+// conversion, its pair of even and odd lanes shuffled back in order. Scales
+// are never denormal, so they skip the flush.
+template <int NB>
+TL_DEVICE void tl_gemm_half_rows_sf(HVX_Vector out[NB], const half *p) {
+  const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
+#pragma clang loop unroll(full)
+  for (int b = 0; b < NB; b += 2) {
+    HVX_Vector h = b + 1 < NB ? tl_hvx_load<false>(p + 32 * b)
+                              : tl_hvx_load_bytes(p + 32 * b, 64);
+    HVX_VectorPair q = Q6_Wqf32_vmpy_VhfVhf(h, one);
+    HVX_VectorPair ordered =
+        Q6_W_vshuff_VVR(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(q)),
+                        Q6_Vsf_equals_Vqf32(Q6_V_lo_W(q)), -4);
+    out[b] = Q6_V_lo_W(ordered);
+    if (b + 1 < NB)
+      out[b + 1] = Q6_V_hi_W(ordered);
+  }
+}
+
+// Two int32 registers summing 2n values in runs of g lanes each, [0, n) and
+// [n, 2n), into one summing them in runs of g / 2 lanes (tl_gemm_merge's int32
+// form).
+TL_DEVICE HVX_Vector tl_gemm_int_merge(HVX_Vector lo, HVX_Vector hi) {
+  HVX_VectorPair d = Q6_W_vdeal_VVR(hi, lo, -4);
+  return Q6_Vw_vadd_VwVw(Q6_V_lo_W(d), Q6_V_hi_W(d));
+}
+
+// The sum of each group of Group columns of an int16 row of K columns, for a
+// signed B's offset: each group's registers summed in pairs of lanes (vdmpy),
+// 32 groups at a time through a transpose tree that holds only its pending
+// subtrees, one per height.
+template <int K, int Group> struct tl_gemm_int_group_sums {
+  static_assert(Group % 64 == 0,
+                "a signed B's groups take whole registers of an int16 A");
+  static constexpr int groups = K / Group;
+  alignas(128) int32_t sum[(groups + 31) / 32 * 32];
+
+  inline __attribute__((always_inline)) void compute(const int16_t *a) {
+#pragma clang loop unroll(disable)
+    for (int g0 = 0; g0 < groups; g0 += 32) {
+      HVX_Vector level[6];
+#pragma clang loop unroll(full)
+      for (int g = 0; g < 32; ++g) {
+        HVX_Vector v = Q6_V_vzero();
+        if (g0 + g < groups) {
+#pragma clang loop unroll(full)
+          for (int c = 0; c < Group; c += 64)
+            v = Q6_Vw_vadd_VwVw(
+                v,
+                Q6_Vw_vdmpy_VhRh_sat(
+                    tl_hvx_load<false>(a + (g0 + g) * Group + c), 0x00010001));
+        }
+        // Merges with the pending subtrees of the heights g's trailing one
+        // bits count.
+        int h = 0;
+        for (int n = g; n & 1; n >>= 1, ++h)
+          v = tl_gemm_int_merge(level[h], v);
+        level[h] = v;
+      }
+      __builtin_memcpy(sum + g0, &level[5], sizeof(HVX_Vector));
+    }
+  }
+};
+
+// The groups [g0, g0 + groups) of NB panels, from the staged chunk of A's row
+// that starts at group g0, added to their fp32 sums `total`. sfa and sfb hold
+// the factors of the row of A and of the panels' rows of B, from group 0.
+template <typename TA, int BBits, bool BSigned, int NB, int KC, int Group,
+          bool GroupA>
+TL_DEVICE void tl_gemm_int_panels_scaled(
+    HVX_Vector *total, const tl_gemm_int_row<TA, BBits, KC> &row,
+    const int32_t *sum, const uint8_t *B, int panel_bytes, int g0, int groups,
+    const float *sfa, int sfa_per, const half *sfb, int ld_sfb, int sfb_per) {
+  constexpr int planes = sizeof(TA);
+  constexpr int lane = 32 / BBits;
+  constexpr int steps = Group / lane;
+  constexpr bool hi_signed = planes == 2 || std::is_signed_v<TA>;
+  const HVX_Vector nibble = Q6_Vb_vsplat_R(0x0F);
+  const HVX_Vector flip = Q6_Vb_vsplat_R(BBits == 4 ? 0x88 : 0x80);
+#pragma clang loop unroll(disable)
+  for (int g = 0; g < groups; ++g) {
+    HVX_Vector acc[planes][NB];
+#pragma clang loop unroll(full)
+    for (int q = 0; q < planes; ++q)
+#pragma clang loop unroll(full)
+      for (int b = 0; b < NB; ++b)
+        acc[q][b] = Q6_V_vzero();
+// Partly unrolled: a whole group of steps would spill the registers it
+// keeps live onto the stack.
+#pragma clang loop unroll_count(2)
+    for (int t = 0; t < steps; ++t) {
+      int s = g * steps + t;
+#pragma clang loop unroll(full)
+      for (int b = 0; b < NB; ++b) {
+        HVX_Vector v = *reinterpret_cast<const HVX_Vector *>(
+            B + b * panel_bytes + s * 128);
+        if constexpr (BSigned)
+          v = Q6_V_vxor_VV(v, flip);
+        HVX_Vector u[2] = {v, v};
+        if constexpr (BBits == 4) {
+          u[0] = Q6_V_vand_VV(v, nibble);
+          u[1] = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(v, 4), nibble);
+        }
+#pragma clang loop unroll(full)
+        for (int h = 0; h < (BBits == 4 ? 2 : 1); ++h) {
+          acc[0][b] =
+              tl_gemm_vrmpy<hi_signed>(acc[0][b], u[h], row.word(0, s, h == 1));
+          if constexpr (planes == 2)
+            acc[1][b] =
+                tl_gemm_vrmpy<false>(acc[1][b], u[h], row.word(1, s, h == 1));
+        }
+      }
+    }
+    // The group's int32 dots, weighed by its scales into the fp32 sums: a
+    // chain of products added to one accumulator each. A's factor joins B's
+    // here only when A has one per group (GroupA); else at the end.
+    HVX_Vector scale[NB];
+    tl_gemm_half_rows_sf<NB>(scale, sfb + ((g0 + g) / sfb_per) * ld_sfb);
+    if constexpr (GroupA) {
+      float a_scale = sfa[(g0 + g) / sfa_per];
+      int32_t a_bits;
+      __builtin_memcpy(&a_bits, &a_scale, 4);
+      HVX_Vector va = Q6_V_vsplat_R(a_bits);
+#pragma clang loop unroll(full)
+      for (int b = 0; b < NB; ++b)
+        scale[b] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale[b], va));
+    }
+    HVX_Vector offset;
+    if constexpr (BSigned)
+      offset = Q6_V_vsplat_R((BBits == 4 ? 8 : 128) * sum[g]);
+#pragma clang loop unroll(full)
+    for (int b = 0; b < NB; ++b) {
+      HVX_Vector r = acc[0][b];
+      if constexpr (planes == 2)
+        r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(r, 8), acc[1][b]);
+      if constexpr (BSigned)
+        r = Q6_Vw_vsub_VwVw(r, offset);
+      HVX_Vector p = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(r), scale[b]);
+      total[b] = Q6_Vqf32_vadd_Vqf32Vqf32(total[b], p);
+    }
+  }
+}
+
+// An unsigned B needs no group sums.
+struct tl_gemm_int_no_sums {
+  int32_t sum[1] = {0};
+};
+
+// The panels an accumulator block of tl_hvx_gemm_int_scaled holds: 4, or the
+// largest of 3, 2 and 1 that divides the panels.
+constexpr int tl_gemm_int_block(int panels) {
+  return panels % 4 == 0 ? 4 : panels % 3 == 0 ? 3 : panels % 2 == 0 ? 2 : 1;
+}
+
+template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
+          int GA, int GB, bool AlignC, typename TA>
+TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
+                                    int panel_bytes, const float *sfa,
+                                    int ld_sfa, const half *sfb, int ld_sfb,
+                                    bool clear) {
+  const uint8_t *B = static_cast<const uint8_t *>(B_);
+  static_assert(std::is_same_v<TA, int8_t> || std::is_same_v<TA, uint8_t> ||
+                    std::is_same_v<TA, int16_t>,
+                "HVX block-scaled GEMM: A is int8, uint8 or int16");
+  static_assert(!BSigned || std::is_same_v<TA, int16_t>,
+                "HVX block-scaled GEMM: a signed B takes an int16 A");
+  constexpr int lane = 32 / BBits;
+  constexpr int Group = GA < GB ? GA : GB;
+  static_assert(N % 32 == 0 && K % GA == 0 && K % GB == 0 &&
+                    Group % lane == 0 && GA % Group == 0 && GB % Group == 0,
+                "HVX block-scaled GEMM: whole panels and whole scale groups");
+  // Columns per staged chunk of A's row, whole groups; panels per block.
+  constexpr int KC = Group >= 512 ? Group : tl_gemm_min(K, 512 / Group * Group);
+  constexpr int NB = tl_gemm_int_block(N / 32);
+  constexpr bool RowsC = AlignC && LdC % 32 == 0;
+  tl_gemm_int_row<TA, BBits, KC> row;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < M; ++i) {
+    const TA *a = A + i * LdA;
+    float *c0 = C + i * LdC;
+    // A signed B subtracts its offset times each group's sum of the row.
+    std::conditional_t<BSigned, tl_gemm_int_group_sums<K, Group>,
+                       tl_gemm_int_no_sums>
+        sums;
+    if constexpr (BSigned)
+      sums.compute(a);
+    const int32_t *sum = sums.sum;
+#pragma clang loop unroll(disable)
+    for (int p = 0; p < N / 32; p += NB) {
+      HVX_Vector total[NB];
+#pragma clang loop unroll(full)
+      for (int b = 0; b < NB; ++b)
+        total[b] = Q6_V_vzero();
+#pragma clang loop unroll(disable)
+      for (int k0 = 0; k0 < K; k0 += KC) {
+        int k = tl_gemm_min(KC, K - k0);
+        row.stage(a + k0, k, false);
+        tl_gemm_int_panels_scaled<TA, BBits, BSigned, NB, KC, Group, (GA < K)>(
+            total, row, BSigned ? sum + k0 / Group : sum,
+            B + k0 / lane * 128 + p * panel_bytes, panel_bytes, k0 / Group,
+            k / Group, sfa + i * ld_sfa, GA / Group, sfb + 32 * p, ld_sfb,
+            GB / Group);
+      }
+      // A's one factor for the whole row, when it has one.
+      HVX_Vector va = Q6_V_vzero();
+      if constexpr (GA >= K) {
+        float a_scale = sfa[i * ld_sfa];
+        int32_t a_bits;
+        __builtin_memcpy(&a_bits, &a_scale, 4);
+        va = Q6_V_vsplat_R(a_bits);
+      }
+#pragma clang loop unroll(full)
+      for (int b = 0; b < NB; ++b) {
+        HVX_Vector r = tl_gemm_result(total[b]);
+        if constexpr (GA >= K)
+          r = tl_gemm_result(Q6_Vqf32_vmpy_VsfVsf(r, va));
+        if (!clear)
+          r = tl_gemm_add_sf(r, tl_hvx_load<RowsC>(c0 + 32 * (p + b)));
+        tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
       }
     }
   }

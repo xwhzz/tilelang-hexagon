@@ -99,6 +99,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", false, false, false, -1, 11},
       {tl::hexagon_hvx_gemm_int(), "tl_hvx_gemm_int", false, false, false, -1,
        8},
+      {tl::hexagon_hvx_gemm_int_scaled(), "tl_hvx_gemm_int_scaled", false,
+       false, false, -1, 10},
       {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
   };
   for (const auto &builtin : builtins) {

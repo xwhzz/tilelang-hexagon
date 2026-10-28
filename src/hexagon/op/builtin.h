@@ -172,6 +172,14 @@ TVM_DLL const Op &hexagon_hvx_gemm();
 // arguments.
 TVM_DLL const Op &hexagon_hvx_gemm_int();
 
+// tl_hvx_gemm_int_scaled<M, N, K, b_bits, b_signed, lda, ldc, ga, gb,
+// align_c>(C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear) (hvx_gemm.h):
+// C (+)= (A * SFA) (B * SFB)^T in fp32, for A and B as tl_hvx_gemm_int's, an
+// fp32 SFA of one factor per ga columns of a row (rows ld_sfa apart) and an
+// fp16 SFB of one factor per gb columns of a row, group-major (groups ld_sfb
+// apart). The ten integers and booleans print as template arguments.
+TVM_DLL const Op &hexagon_hvx_gemm_int_scaled();
+
 // tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();
