@@ -83,6 +83,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.VerifyReducerEpoch()(mod)
 
     mod = tilelang.transform.IfStmtBinding()(mod)
+    mod = tilelang.hexagon.transform.StageHMXOperandCopies()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
@@ -128,6 +129,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
+    mod = tilelang.hexagon.transform.MarkUnwrittenDMASources()(mod)
 
     # The shared buffers of a tile program become one VTCM arena. Every buffer
     # starts on a whole HVX vector (128 bytes), HMX operands on the alignment

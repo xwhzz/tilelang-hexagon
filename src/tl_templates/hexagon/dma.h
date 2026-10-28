@@ -26,6 +26,10 @@ enum tl_hexagon_dma_direction {
   TL_HEXAGON_DMA_VTCM_TO_DDR = 1,
   // Raw queues may use this when the caller handles cache maintenance.
   TL_HEXAGON_DMA_NO_CACHE = 2,
+  // DDR to VTCM from memory the DSP has not written since it was handed the
+  // memory, such as a kernel's read-only argument: no dirty cache line can
+  // hold newer bytes than DDR, so the source needs no writeback.
+  TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN = 3,
 };
 
 enum tl_hexagon_dma_result {
@@ -90,6 +94,18 @@ struct tl_hexagon_dma_transfer {
   uint32_t row_bytes;
   uint32_t rows;
   int direction;
+  // Field by field: hexagon-clang copies the struct with a memcpy call, on
+  // every submit and completion.
+  tl_hexagon_dma_transfer &operator=(const tl_hexagon_dma_transfer &o) {
+    dst = o.dst;
+    src = o.src;
+    dst_stride = o.dst_stride;
+    src_stride = o.src_stride;
+    row_bytes = o.row_bytes;
+    rows = o.rows;
+    direction = o.direction;
+    return *this;
+  }
 };
 
 struct tl_hexagon_dma_queue {
@@ -177,7 +193,8 @@ TL_DMA_INLINE tl_hexagon_dma_options tl_hexagon_dma_make_options(
 TL_DMA_INLINE tl_hexagon_dma_options
 tl_hexagon_dma_options_for_direction(int direction) {
   return {
-      direction == TL_HEXAGON_DMA_DDR_TO_VTCM,
+      direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
+          direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN,
       direction == TL_HEXAGON_DMA_VTCM_TO_DDR,
       false,
   };
@@ -194,10 +211,13 @@ TL_DMA_INLINE void
 tl_hexagon_dma_descriptor_clear(tl_hexagon_dma_descriptor *descriptor) {
   if (descriptor == nullptr)
     return;
-  for (uint32_t i = 0; i < 8; ++i)
-    descriptor->word[i] = 0;
-  for (uint32_t i = 0; i < sizeof(descriptor->padding); ++i)
-    descriptor->padding[i] = 0;
+  // The engine reads the words only; the padding keeps descriptors on lines
+  // of their own. Four doubleword stores, where loops became memset calls.
+  uint64_t *words = reinterpret_cast<uint64_t *>(descriptor->word);
+  words[0] = 0;
+  words[1] = 0;
+  words[2] = 0;
+  words[3] = 0;
 }
 
 TL_DMA_INLINE bool tl_hexagon_dma_address32(const void *ptr, uint64_t bytes,
@@ -338,8 +358,12 @@ tl_hexagon_dma_start_and_wait(tl_hexagon_dma_descriptor *descriptor) {
 // Cache maintenance for DDR endpoints
 // ---------------------------------------------------------------------------
 
+// Writes back (QURT_MEM_CACHE_FLUSH) or invalidates the cache lines of
+// [ptr, ptr + bytes). A small writeback runs inline and, with `sync`, ends with
+// the syncht that completes it; a transfer of several rows syncs once.
 TL_DMA_INLINE int tl_hexagon_dma_cache_clean(const void *ptr, uint32_t bytes,
-                                             qurt_mem_cache_op_t operation) {
+                                             qurt_mem_cache_op_t operation,
+                                             bool sync = true) {
   constexpr uint64_t kCacheLineBytes = 64;
   constexpr uint64_t kCleanBatchBytes = 4 * kCacheLineBytes;
   constexpr uint32_t kInlineCleanLimit = 128u * 1024u;
@@ -370,7 +394,8 @@ TL_DMA_INLINE int tl_hexagon_dma_cache_clean(const void *ptr, uint32_t bytes,
       }
       for (; line < end; line += kCacheLineBytes)
         Q6_dccleana_A(reinterpret_cast<void *>(static_cast<uintptr_t>(line)));
-      asm volatile("syncht" : : : "memory");
+      if (sync)
+        asm volatile("syncht" : : : "memory");
       return TL_HEXAGON_DMA_OK;
     }
 
@@ -388,13 +413,15 @@ TL_DMA_INLINE int tl_hexagon_dma_cache_clean(const void *ptr, uint32_t bytes,
 }
 
 TL_DMA_INLINE int tl_hexagon_dma_prepare_ddr(const void *dst, const void *src,
-                                             uint32_t bytes, int direction) {
+                                             uint32_t bytes, int direction,
+                                             bool sync = true) {
   if (direction == TL_HEXAGON_DMA_DDR_TO_VTCM)
-    return tl_hexagon_dma_cache_clean(src, bytes, QURT_MEM_CACHE_FLUSH);
+    return tl_hexagon_dma_cache_clean(src, bytes, QURT_MEM_CACHE_FLUSH, sync);
   if (direction == TL_HEXAGON_DMA_VTCM_TO_DDR)
     // Preserve dirty bytes sharing the destination's boundary cache lines.
-    return tl_hexagon_dma_cache_clean(dst, bytes, QURT_MEM_CACHE_FLUSH);
-  if (direction == TL_HEXAGON_DMA_NO_CACHE)
+    return tl_hexagon_dma_cache_clean(dst, bytes, QURT_MEM_CACHE_FLUSH, sync);
+  if (direction == TL_HEXAGON_DMA_NO_CACHE ||
+      direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN)
     return TL_HEXAGON_DMA_OK;
   return TL_HEXAGON_DMA_ERR_ARGUMENT;
 }
@@ -402,6 +429,7 @@ TL_DMA_INLINE int tl_hexagon_dma_prepare_ddr(const void *dst, const void *src,
 TL_DMA_INLINE int tl_hexagon_dma_finish_ddr(const void *dst, uint32_t bytes,
                                             int direction) {
   if (direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
+      direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN ||
       direction == TL_HEXAGON_DMA_NO_CACHE)
     return TL_HEXAGON_DMA_OK;
   if (direction == TL_HEXAGON_DMA_VTCM_TO_DDR)
@@ -409,18 +437,35 @@ TL_DMA_INLINE int tl_hexagon_dma_finish_ddr(const void *dst, uint32_t bytes,
   return TL_HEXAGON_DMA_ERR_ARGUMENT;
 }
 
+TL_DMA_INLINE bool tl_hexagon_dma_valid_direction(int direction) {
+  return direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
+         direction == TL_HEXAGON_DMA_VTCM_TO_DDR ||
+         direction == TL_HEXAGON_DMA_NO_CACHE ||
+         direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN;
+}
+
+// Writes back the DDR rows of a transfer: every row's lines, then one syncht.
 TL_DMA_INLINE int
 tl_hexagon_dma_prepare_transfer(const tl_hexagon_dma_transfer &transfer) {
+  if (transfer.direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
+      transfer.direction != TL_HEXAGON_DMA_VTCM_TO_DDR)
+    return tl_hexagon_dma_valid_direction(transfer.direction)
+               ? TL_HEXAGON_DMA_OK
+               : TL_HEXAGON_DMA_ERR_ARGUMENT;
   for (uint32_t row = 0; row < transfer.rows; ++row) {
     const uint8_t *src_row = static_cast<const uint8_t *>(transfer.src) +
                              static_cast<uint64_t>(row) * transfer.src_stride;
     uint8_t *dst_row = static_cast<uint8_t *>(transfer.dst) +
                        static_cast<uint64_t>(row) * transfer.dst_stride;
-    int status = tl_hexagon_dma_prepare_ddr(
-        dst_row, src_row, transfer.row_bytes, transfer.direction);
+    int status =
+        tl_hexagon_dma_prepare_ddr(dst_row, src_row, transfer.row_bytes,
+                                   transfer.direction, /*sync=*/false);
     if (status != TL_HEXAGON_DMA_OK)
       return status;
   }
+  if (transfer.rows != 0 && (transfer.direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
+                             transfer.direction == TL_HEXAGON_DMA_VTCM_TO_DDR))
+    asm volatile("syncht" : : : "memory");
   return TL_HEXAGON_DMA_OK;
 }
 
@@ -441,10 +486,13 @@ tl_hexagon_dma_finish_transfer(const tl_hexagon_dma_transfer &transfer) {
 // Caller-owned descriptor queue
 // ---------------------------------------------------------------------------
 
+// The slot `offset` (at most the capacity) past the head. head + offset is
+// under twice the capacity, so one compare wraps it: a modulo by the runtime
+// capacity is a division libcall on Hexagon, on every submit and pop.
 TL_DMA_INLINE uint32_t
 tl_hexagon_dma_queue_index(const tl_hexagon_dma_queue *queue, uint32_t offset) {
-  return static_cast<uint32_t>((static_cast<uint64_t>(queue->head) + offset) %
-                               queue->capacity);
+  uint32_t index = queue->head + offset;
+  return index >= queue->capacity ? index - queue->capacity : index;
 }
 
 TL_DMA_INLINE int tl_hexagon_dma_queue_init(
@@ -546,9 +594,7 @@ tl_hexagon_dma_queue_submit_prepared(tl_hexagon_dma_queue *queue,
 TL_DMA_INLINE int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
                                                void *dst, const void *src,
                                                uint32_t bytes, int direction) {
-  if (direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
-      direction != TL_HEXAGON_DMA_VTCM_TO_DDR &&
-      direction != TL_HEXAGON_DMA_NO_CACHE)
+  if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
       tl_hexagon_dma_queue_next_descriptor(queue);
@@ -576,9 +622,7 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
                                                uint32_t src_stride,
                                                uint32_t row_bytes,
                                                uint32_t rows, int direction) {
-  if (direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
-      direction != TL_HEXAGON_DMA_VTCM_TO_DDR &&
-      direction != TL_HEXAGON_DMA_NO_CACHE)
+  if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
       tl_hexagon_dma_queue_next_descriptor(queue);
@@ -692,7 +736,7 @@ tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
   tl_hexagon_dma_descriptor_clear(descriptor);
   queue->transfers[queue->head] = {
       nullptr, nullptr, 0, 0, 0, 0, TL_HEXAGON_DMA_NO_CACHE};
-  queue->head = (queue->head + 1) % queue->capacity;
+  queue->head = tl_hexagon_dma_queue_index(queue, 1);
   --queue->count;
   if (queue->count == 0)
     queue->tail = nullptr;

@@ -11,6 +11,12 @@ namespace tvm {
 namespace tl {
 
 bool TargetHasAsyncCopy(Target target) {
+  // A target that declares async copies lowers a software pipeline's async
+  // copies itself, and names the statements that commit and wait for them
+  // ("async_copy_commit", "async_copy_wait"; PTX cp.async groups without).
+  if (auto declared = target->GetAttr<Bool>("supports_async_copy")) {
+    return declared.value();
+  }
   if (TargetIsCuda(target)) {
     return TargetCudaHasAsyncCopy(target);
   }

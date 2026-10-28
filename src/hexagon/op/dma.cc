@@ -11,9 +11,12 @@
 
 #include "dma.h"
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
 
 #include <algorithm>
+#include <optional>
+#include <string>
 
 #include "hexagon/op/builtin.h"
 #include "hexagon/target_utils.h"
@@ -31,60 +34,133 @@ namespace hexagon {
 
 namespace {
 
-Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
-                  arith::Analyzer *analyzer) {
+// A region of a buffer as a matrix of `rows` x `cols` elements whose rows are
+// `stride` elements apart: the last dimension, or the last two.
+struct Matrix {
+  PrimExpr rows, cols, stride;
+  Array<PrimExpr> strides;
+};
+
+std::optional<Matrix> MatrixOf(const Buffer &buf, const Array<Range> &region,
+                               arith::Analyzer *analyzer, std::string *why) {
+  size_t rank = buf->shape.size();
+  ICHECK(rank > 0 && region.size() == rank);
+  Array<PrimExpr> strides = GetBufferStrides(buf);
+  if (!analyzer->CanProveEqual(strides.back(), 1)) {
+    *why = "Hexagon T.dma_copy requires unit innermost stride";
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < rank; ++i) {
+    if (i + 2 < rank && !analyzer->CanProveEqual(region[i]->extent, 1)) {
+      *why = "Hexagon T.dma_copy supports only 1D/2D regions";
+      return std::nullopt;
+    }
+    if (!analyzer->CanProve(region[i]->min >= 0) ||
+        !analyzer->CanProve(region[i]->min + region[i]->extent <=
+                            buf->shape[i])) {
+      *why = "Hexagon T.dma_copy requires provably in-bounds regions";
+      return std::nullopt;
+    }
+  }
+  PrimExpr cols = region.back()->extent;
+  PrimExpr rows = rank == 1 ? PrimExpr(1) : region[rank - 2]->extent;
+  PrimExpr stride = rank == 1 ? cols : strides[rank - 2];
+  return Matrix{rows, cols, stride, strides};
+}
+
+int64_t PositiveConstant(const PrimExpr &e, arith::Analyzer *analyzer) {
+  const auto *v = analyzer->Simplify(e).as<IntImmNode>();
+  return v && v->value > 0 ? v->value : 0;
+}
+
+// Descriptor fields are 24 bits wide, and a 2D descriptor has at most 65535
+// rows; larger transfers take several descriptors of one group.
+constexpr int64_t kField = 0x00ffffff;
+constexpr int64_t kRows = 0xffff;
+// 1D chunks stay aligned for every element size.
+constexpr int64_t kChunk = int64_t(1) << 23;
+
+} // namespace
+
+std::string DMARejection(const CopyNode &op, const LowerArgs &T,
+                         arith::Analyzer *analyzer) {
   const bool load = IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst);
   const bool store = IsSharedBuffer(op.src) && IsGlobalBuffer(op.dst);
-  ICHECK((load || store) && op.src->dtype == op.dst->dtype &&
-         op.src->dtype.lanes() == 1 && op.src->dtype.bits() % 8 == 0 &&
-         !T.layout_map.count(op.src) && !T.layout_map.count(op.dst))
-      << "Hexagon T.dma_copy requires equal scalar byte-addressable dtypes "
-         "and row-major global <-> shared buffers (no Crouton layouts)";
-  ICHECK(!op.annotations.count("parallel_loop_layout") &&
-         !op.annotations.count("coalesced_width"))
-      << "Hexagon T.dma_copy does not support SIMT copy hints";
-
-  struct Matrix {
-    PrimExpr rows, cols, stride, span;
-    Array<PrimExpr> strides;
-  };
-  auto matrix = [&](const Buffer &buf, const Array<Range> &region) -> Matrix {
-    size_t rank = buf->shape.size();
-    ICHECK(rank > 0 && region.size() == rank);
-    auto strides = GetBufferStrides(buf);
-    ICHECK(analyzer->CanProveEqual(strides.back(), 1))
-        << "Hexagon T.dma_copy requires unit innermost stride";
-    for (size_t i = 0; i < rank; ++i) {
-      if (i + 2 < rank)
-        ICHECK(analyzer->CanProveEqual(region[i]->extent, 1))
-            << "Hexagon T.dma_copy supports only 1D/2D regions";
-      ICHECK(analyzer->CanProve(region[i]->min >= 0) &&
-             analyzer->CanProve(region[i]->min + region[i]->extent <=
-                                buf->shape[i]))
-          << "Hexagon T.dma_copy requires provably in-bounds regions";
-    }
-    PrimExpr cols = region.back()->extent;
-    PrimExpr rows = rank == 1 ? PrimExpr(1) : region[rank - 2]->extent;
-    PrimExpr stride = rank == 1 ? cols : strides[rank - 2];
-    return {rows, cols, stride, (rows - 1) * stride + cols, strides};
-  };
-  auto src = matrix(op.src, op.src_range);
-  auto dst = matrix(op.dst, op.dst_range);
-  ICHECK(analyzer->CanProveEqual(src.rows, dst.rows) &&
-         analyzer->CanProveEqual(src.cols, dst.cols))
-      << "Hexagon T.dma_copy requires matching region shapes";
-  auto constant = [&](PrimExpr e) -> int64_t {
-    e = analyzer->Simplify(e);
-    const auto *v = e.as<IntImmNode>();
-    ICHECK(v && v->value > 0)
-        << "Hexagon T.dma_copy requires positive static extents and strides";
-    return v->value;
-  };
-  int64_t rows = constant(src.rows), cols = constant(src.cols);
-  int64_t ss = constant(src.stride), ds = constant(dst.stride);
+  if (!(load || store) || op.src->dtype != op.dst->dtype ||
+      op.src->dtype.lanes() != 1 || op.src->dtype.bits() % 8 != 0 ||
+      T.layout_map.count(op.src) || T.layout_map.count(op.dst))
+    return "Hexagon T.dma_copy requires equal scalar byte-addressable dtypes "
+           "and row-major global <-> shared buffers (no Crouton layouts)";
+  if (op.annotations.count("parallel_loop_layout") ||
+      op.annotations.count("coalesced_width"))
+    return "Hexagon T.dma_copy does not support SIMT copy hints";
+  std::string why;
+  auto src = MatrixOf(op.src, op.src_range, analyzer, &why);
+  auto dst = src ? MatrixOf(op.dst, op.dst_range, analyzer, &why) : src;
+  if (!src || !dst)
+    return why;
+  if (!analyzer->CanProveEqual(src->rows, dst->rows) ||
+      !analyzer->CanProveEqual(src->cols, dst->cols))
+    return "Hexagon T.dma_copy requires matching region shapes";
+  int64_t rows = PositiveConstant(src->rows, analyzer);
+  int64_t cols = PositiveConstant(src->cols, analyzer);
+  int64_t ss = PositiveConstant(src->stride, analyzer);
+  int64_t ds = PositiveConstant(dst->stride, analyzer);
+  if (!rows || !cols || !ss || !ds)
+    return "Hexagon T.dma_copy requires positive static extents and strides";
+  if (ss < cols || ds < cols)
+    return "Hexagon T.dma_copy requires rows that do not overlap";
   int64_t bytes = op.src->dtype.bytes();
-  ICHECK(ss >= cols && ds >= cols)
-      << "Hexagon T.dma_copy requires rows that do not overlap";
+  if (rows == 1 || (ss == cols && ds == cols))
+    return "";
+  if (cols * bytes > kField || ss * bytes > kField || ds * bytes > kField)
+    return "Hexagon T.dma_copy rows and strides must fit the 24-bit DMA "
+           "descriptor fields (16 MiB)";
+  // The runtime builds the v75+ type-9 2D descriptor; older architectures
+  // would need another descriptor format.
+  const int arch = HexagonArchVersion(T.target);
+  if (arch != 0 && arch < 75)
+    return "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv" +
+           std::to_string(arch) +
+           ". Copy contiguous rows with 1D transfers instead.";
+  return "";
+}
+
+bool DMAOutpacesHVX(const CopyNode &op, arith::Analyzer *analyzer) {
+  constexpr int64_t kMinRowBytes = 512;
+  // The row length, and whether the rows of a buffer's region follow each
+  // other in memory.
+  const Array<Range> &region = op.src_range;
+  int64_t cols = PositiveConstant(region.back()->extent, analyzer);
+  int64_t rows =
+      region.size() == 1
+          ? 1
+          : PositiveConstant(region[region.size() - 2]->extent, analyzer);
+  if (!rows || !cols)
+    return false;
+  auto dense = [&](const Buffer &buffer) {
+    Array<PrimExpr> strides = GetBufferStrides(buffer);
+    return strides.size() < 2 ||
+           analyzer->CanProveEqual(strides[strides.size() - 2],
+                                   IntImm(DataType::Int(64), cols));
+  };
+  bool contiguous = rows == 1 || (dense(op.src) && dense(op.dst));
+  return contiguous || cols * op.src->dtype.bytes() >= kMinRowBytes;
+}
+
+Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
+                      arith::Analyzer *analyzer, bool commit) {
+  std::string why = DMARejection(op, T, analyzer);
+  ICHECK(why.empty()) << why;
+  const bool load = IsGlobalBuffer(op.src);
+  std::string unused;
+  Matrix src = *MatrixOf(op.src, op.src_range, analyzer, &unused);
+  Matrix dst = *MatrixOf(op.dst, op.dst_range, analyzer, &unused);
+  int64_t rows = PositiveConstant(src.rows, analyzer);
+  int64_t cols = PositiveConstant(src.cols, analyzer);
+  int64_t ss = PositiveConstant(src.stride, analyzer);
+  int64_t ds = PositiveConstant(dst.stride, analyzer);
+  int64_t bytes = op.src->dtype.bytes();
   auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   // One descriptor of `count` rows starting `src_offset`/`dst_offset` elements
@@ -103,13 +179,6 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                          {dp, sp, u32(dst_stride), u32(src_stride),
                           u32(row_bytes), u32(count), direction}));
   };
-
-  // Descriptor fields are 24 bits wide, and a 2D descriptor has at most
-  // 65535 rows; larger transfers take several descriptors of one group.
-  constexpr int64_t kField = 0x00ffffff;
-  constexpr int64_t kRows = 0xffff;
-  // 1D chunks stay aligned for every element size.
-  constexpr int64_t kChunk = int64_t(1) << 23;
   Array<Stmt> seq;
   if (rows == 1 || (ss == cols && ds == cols)) {
     int64_t total = rows * cols * bytes;
@@ -118,24 +187,17 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       seq.push_back(submit(done / bytes, done / bytes, 1, n, n, n));
     }
   } else {
-    ICHECK(cols * bytes <= kField && ss * bytes <= kField &&
-           ds * bytes <= kField)
-        << "Hexagon T.dma_copy rows and strides must fit the 24-bit DMA "
-           "descriptor fields (16 MiB)";
-    // The runtime builds the v75+ type-9 2D descriptor; older architectures
-    // would need another descriptor format.
-    const int arch = HexagonArchVersion(T.target);
-    ICHECK(arch == 0 || arch >= 75)
-        << "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv"
-        << arch << ". Copy contiguous rows with 1D transfers instead.";
     for (int64_t row = 0; row < rows; row += kRows) {
       seq.push_back(submit(row * ss, row * ds, std::min(kRows, rows - row),
                            cols * bytes, ss * bytes, ds * bytes));
     }
   }
-  seq.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {})));
-  return SeqStmt(seq);
+  if (commit)
+    seq.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {})));
+  return SeqStmt::Flatten(seq);
 }
+
+namespace {
 
 void CheckHexagonTarget(const Target &target) {
   ICHECK(TargetIsHexagon(target))
@@ -180,7 +242,8 @@ LayoutMap HexagonDmaCopyNode::InferLayout(const LayoutInferArgs &layout_args,
 Stmt HexagonDmaCopyNode::Lower(const LowerArgs &lower_args,
                                arith::Analyzer *analyzer) const {
   hexagon::CheckHexagonTarget(lower_args.target);
-  return hexagon::LowerDMACopy(*this, lower_args, analyzer);
+  return hexagon::LowerDMATransfer(*this, lower_args, analyzer,
+                                   /*commit=*/true);
 }
 
 TIR_REGISTER_TL_TILE_OP(HexagonDmaCopy, dma_copy)
@@ -188,7 +251,20 @@ TIR_REGISTER_TL_TILE_OP(HexagonDmaCopy, dma_copy)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TVM_FFI_STATIC_INIT_BLOCK() { HexagonDmaCopyNode::RegisterReflection(); }
+TVM_FFI_STATIC_INIT_BLOCK() {
+  HexagonDmaCopyNode::RegisterReflection();
+  namespace refl = tvm::ffi::reflection;
+  // The commit and wait of a software pipeline's async copies (the target's
+  // "async_copy_commit" and "async_copy_wait"): DMA groups of the queue.
+  refl::GlobalDef()
+      .def("tl.hexagon.AsyncCopyCommit",
+           []() -> Stmt {
+             return Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {}));
+           })
+      .def("tl.hexagon.AsyncCopyWait", [](PrimExpr pending) -> Stmt {
+        return Evaluate(Call(DataType::Int(32), hexagon_dma_wait(), {pending}));
+      });
+}
 
 } // namespace tl
 } // namespace tvm

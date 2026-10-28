@@ -8,8 +8,38 @@
 
 #include "op/copy.h"
 
+#include <string>
+
 namespace tvm {
 namespace tl {
+
+namespace hexagon {
+
+/*!
+ * \brief Why `op` cannot be one User-DMA transfer between DDR and VTCM, or
+ * an empty string: equal byte-addressable dtypes, row-major buffers, and a
+ * static, in-bounds 1D or 2D region on each side.
+ */
+std::string DMARejection(const CopyNode &op, const LowerArgs &T,
+                         arith::Analyzer *analyzer);
+
+/*!
+ * \brief The descriptors of the transfer `op`, and with `commit` the commit
+ * that makes them one group of the tile program's queue.
+ */
+Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
+                      arith::Analyzer *analyzer, bool commit);
+
+/*!
+ * \brief Whether DMA moves the copy `op` from DDR faster than HVX loads do:
+ * one contiguous block, or rows of at least 512 bytes. On v79 DMA moves
+ * 128-byte rows at 3 GB/s, 512-byte ones at 9 GB/s and contiguous blocks at
+ * 23 GB/s, while HVX loads 128-byte rows at up to 14 GB/s. A software
+ * pipeline's other copies stay HVX copies.
+ */
+bool DMAOutpacesHVX(const CopyNode &op, arith::Analyzer *analyzer);
+
+} // namespace hexagon
 
 /*!
  * \brief One explicit asynchronous DDR <-> VTCM transfer.

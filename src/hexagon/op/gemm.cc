@@ -7,6 +7,8 @@
  * hexagon-clang vectorizes onto HVX.
  */
 
+#include "hexagon/op/gemm.h"
+
 #include "op/gemm.h"
 #include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
@@ -42,12 +44,8 @@ std::string TypeName(DataType dtype) {
   return os.str();
 }
 
-// Why HMX cannot run `op`, or an empty string when it can: A and B fp16 and C
-// fp16 or fp32, all in VTCM (shared buffers or fragments, which are VTCM on
-// Hexagon); M, N and K multiples of 32; and each operand a matrix of whole
-// 32 x 32 tiles: its region starts on a tile, its leading dimensions are
-// single indices, and A's and B's matrices, which take Crouton layouts, are
-// whole tiles too.
+} // namespace
+
 std::string HMXRejection(const GemmNode &op) {
   const DataType fp16 = DataType::Float(16);
   if (op.a_->dtype != fp16 || op.b_->dtype != fp16)
@@ -88,7 +86,6 @@ std::string HMXRejection(const GemmNode &op) {
   }
   return "";
 }
-} // namespace
 
 struct Gemm {
   static String SelectInst(const GemmNode &op, int block_size, Target target) {

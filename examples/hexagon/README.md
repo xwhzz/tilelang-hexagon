@@ -12,7 +12,8 @@ for how the adaptation works.
 | `benchmark_dma_matmul.py` | DSP-timed serial vs output-block prefetch, entirely DSL DMA/copy/HMX scheduling |
 | `example_dma_hmx_matmul.py` | DSL output-block DMA prefetch + Crouton packing + HMX matmul |
 | `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
-| `example_gemm.py` | the tiled GEMM with an fp32 accumulator over a K loop: HMX within each call, HVX across calls |
+| `example_gemm.py` | the tiled GEMM with an fp32 accumulator over a pipelined K loop: DMA ahead, HMX within each call, HVX across calls |
+| `example_gemv.py` | a streaming GEMV: `T.Pipelined` streams the weights from DDR by DMA while HVX multiplies |
 | `example_flash_attention.py` | two HMX gemms + an HVX online softmax on their Crouton tiles, composed on-chip |
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
@@ -45,6 +46,7 @@ cd examples/hexagon
 
 python example_matmul.py --m 256 --n 256 --k 256 --block 64
 python example_gemm.py --m 256 --n 256 --k 1024 --block-k 256
+python example_gemv.py --k 4096 --n 1024
 python example_dma_hmx_matmul.py
 python example_flash_attention.py --seq 256
 python example_ffn.py

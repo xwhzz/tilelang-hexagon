@@ -111,8 +111,9 @@ def test_async_strided_load_store():
     source = lower(probe)
     calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     assert len(calls) == 2
-    # dst stride, src stride, row bytes, rows, direction
-    assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 0)" in calls[0]
+    # dst stride, src stride, row bytes, rows, direction: 3 loads from an
+    # argument the kernel does not write, with no cache writeback first.
+    assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 3)" in calls[0]
     assert "(uint32_t)256, (uint32_t)128, (uint32_t)128, (uint32_t)32, 1)" in calls[1]
     assert "A[32]" in calls[0] and "B[32]" in calls[1]
     # The store is still in flight at the end, so the program drains it.
@@ -313,7 +314,7 @@ def test_async_scalar_access_is_not_silently_synchronous():
 
     source = lower(probe)
     (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
-    assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 0)" in call
+    assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 3)" in call
 
 
 @pytest.mark.parametrize("shape,dtype", [((2, 8, 8), "float16"), ((256,), "float32")])

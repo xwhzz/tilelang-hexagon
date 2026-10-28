@@ -26,6 +26,9 @@ namespace refl = tvm::ffi::reflection;
 // window load and a lane shuffle. `supports_vector_predicate`: a select picks
 // lane by lane (tl_vec_select), so selects whose condition varies across
 // lanes vectorize, as do if_then_else's whose branches are safe to evaluate.
+// `supports_async_copy`: a software pipeline's copies from DDR become DMA
+// transfers, whose stages commit and wait as groups of the tile program's DMA
+// queue (`async_copy_commit` and `async_copy_wait`, set by the normalizer).
 [[maybe_unused]] TargetKindRegEntry &hexagon_kind =
     TargetKindRegEntry::RegisterOrGet("hexagon")
         .add_attr_option<int64_t>("max_vector_bits", refl::DefaultValue(1024))
@@ -33,7 +36,10 @@ namespace refl = tvm::ffi::reflection;
         .add_attr_option<ffi::String>("fragment_scope")
         .add_attr_option<bool>("vector_window_loads", refl::DefaultValue(true))
         .add_attr_option<bool>("supports_vector_predicate",
-                               refl::DefaultValue(true));
+                               refl::DefaultValue(true))
+        .add_attr_option<bool>("supports_async_copy", refl::DefaultValue(true))
+        .add_attr_option<ffi::String>("async_copy_commit")
+        .add_attr_option<ffi::String>("async_copy_wait");
 
 } // namespace
 } // namespace tvm

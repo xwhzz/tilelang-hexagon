@@ -77,6 +77,28 @@ def LowerWindowLoads():
     return _ffi_api.LowerWindowLoads()  # type: ignore
 
 
+def StageHMXOperandCopies():
+    """Stage a software pipeline's copies into HMX operands through DMA.
+
+    In a ``T.Pipelined`` loop, a copy from DDR into the A or B of a gemm on HMX
+    becomes a copy into a row-major staging buffer, which the pipeline
+    transfers ahead by DMA, and a copy from it into the operand's Crouton
+    tiles, which the pipeline places with the gemm. Runs before
+    ``PipelinePlanning``.
+    """
+    return _ffi_api.StageHMXOperandCopies()  # type: ignore
+
+
+def MarkUnwrittenDMASources():
+    """DMA loads from read-only kernel arguments skip the cache writeback.
+
+    The runtime writes a DMA source's cache lines back before the transfer;
+    an argument the kernel never writes (``AnnotateReadOnlyParams``) has none
+    to write. Runs after ``AnnotateReadOnlyParams``.
+    """
+    return _ffi_api.MarkUnwrittenDMASources()  # type: ignore
+
+
 def MarkExclusiveBuffers():
     """Give the VTCM buffers that share no memory pointers of their own.
 

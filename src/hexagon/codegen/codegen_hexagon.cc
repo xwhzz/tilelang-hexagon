@@ -383,6 +383,23 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
   // Emit ((float4)(v)) — the vec_type broadcast ctor in common.h fills all
   // lanes from one value.  (Repeating the value would form a comma expression,
   // which hexagon-clang rejects under -Werror=unused-value.)
+  //
+  // A widened float scalar broadcasts first and widens as a vector:
+  // hexagon-clang 19 crashes ("Hexagon generate widening vector float
+  // instructions") on a float splat of a converted fp16 scalar times a widened
+  // fp16 vector, as in `acc += float(x[i]) * float(w[i, j])`.
+  if (const auto *cast = op->value.as<CastNode>()) {
+    DataType from = cast->value.dtype();
+    if (from.is_float() && op->dtype.is_float() && from.is_scalar() &&
+        from.bits() < op->dtype.bits()) {
+      os << "((";
+      PrintType(op->dtype, os);
+      os << ")((";
+      PrintType(from.with_lanes(op->dtype.lanes()), os);
+      os << ")(" << PrintExpr(cast->value) << ")))";
+      return;
+    }
+  }
   std::string v = PrintExpr(op->value);
   os << "((";
   PrintType(op->dtype, os);

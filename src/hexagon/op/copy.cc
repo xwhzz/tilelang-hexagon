@@ -6,15 +6,23 @@
  * row-major one is one tl_crouton_copy call (crouton.h) over the region, in
  * the matrix's coordinates: any sub-region, a DDR or VTCM endpoint with any
  * strides, and fp32 <-> fp16 on the way. Other copies reuse LowerNormalCopy.
+ *
+ * A software pipeline's async copy (the injector marks it, and commits and
+ * waits for its stage) becomes the descriptors of a User-DMA transfer when
+ * DMA can make it and moves it faster than HVX (DMAOutpacesHVX); the
+ * pipeline's commit makes a stage's transfers one group. Otherwise it is
+ * copied right away, which the pipeline's waits allow.
  */
 
 #include "op/copy.h"
+#include "op/builtin.h"
 #include "op/utils.h"
 #include "utils.h"
 
 #include "backend/common/target_utils.h"
 #include "hexagon/layout/crouton.h"
 #include "hexagon/op/builtin.h"
+#include "hexagon/op/dma.h"
 
 #include <tvm/tirx/builtin.h>
 
@@ -124,6 +132,11 @@ struct Copy {
       ICHECK(!Downcast<IntImm>(async.value())->value)
           << "Hexagon requires T.dma_copy instead of T.async_copy";
     }
+    if (auto pipelined =
+            op.annotations.Get(attr::kAsyncCopyNoImplicitCommitWait);
+        pipelined && !is_zero(Downcast<PrimExpr>(pipelined.value())) &&
+        DMAOutpacesHVX(op, analyzer) && DMARejection(op, T, analyzer).empty())
+      return LowerDMATransfer(op, T, analyzer, /*commit=*/false);
     if (auto crouton = LowerCroutonCopy(op, T, analyzer))
       return *crouton;
     return LowerNormalCopy(op, T, analyzer);

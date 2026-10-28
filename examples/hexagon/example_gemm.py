@@ -1,10 +1,12 @@
 """The tiled GEMM with an fp32 accumulator and a K loop, on the Hexagon HMX matrix engine.
 
-Each tile program computes a BM x BN block of C. Its K loop copies a BM x BK block
-of A and a BK x BN block of B into Crouton tiles in VTCM, and `T.gemm` multiplies
-them on HMX and adds the product into the fp32 fragment `acc` on HVX; the first
-call overwrites `acc` instead (`clear_accum=(k == 0)`). Each call reduces its K in
-the HMX accumulator, so a larger BK means fewer HVX passes over `acc`.
+Each tile program computes a BM x BN block of C. Its K loop is a software pipeline
+(`T.Pipelined`): the copies of a BM x BK block of A and a BK x BN block of B become
+DMA transfers into VTCM, issued ahead of the blocks' use, and in the block's stage
+an HVX pack puts them into Crouton tiles. `T.gemm` multiplies them on HMX and adds
+the product into the fp32 fragment `acc` on HVX; the first call overwrites `acc`
+instead (`clear_accum=(k == 0)`). Each call reduces its K in the HMX accumulator,
+so a larger BK means fewer HVX passes over `acc`.
 
 Requires a Hexagon device + SDK over adb (see README.md).
 
@@ -26,7 +28,7 @@ def make_gemm(M, N, K, BM, BN, BK):
             a = T.alloc_shared((BM, BK), "float16")
             b = T.alloc_shared((BK, BN), "float16")
             acc = T.alloc_fragment((BM, BN), "float32")
-            for k in T.serial(T.ceildiv(K, BK)):
+            for k in T.Pipelined(T.ceildiv(K, BK), num_stages=2):
                 T.copy(A[by * BM, k * BK], a)
                 T.copy(B[k * BK, bx * BN], b)
                 T.gemm(a, b, acc, clear_accum=(k == 0))

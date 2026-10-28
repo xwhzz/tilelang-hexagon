@@ -12,6 +12,9 @@ A normalized Hexagon target names its DSP architecture in ``mcpu``
 * ``fragment_scope``: ``shared.dyn``. A fragment is the tile of the one hardware
   thread that runs a tile program, so it lives in VTCM, the HVX working memory,
   in the tile program's arena with the shared buffers.
+* ``async_copy_commit`` and ``async_copy_wait``: the functions that build a
+  software pipeline's commit and wait (``supports_async_copy``, a kind default):
+  groups of the tile program's DMA queue.
 
 ``vtcm-capacity`` and ``num-cores`` default only for architectures measured on
 hardware. Elsewhere they stay unset unless given, and only the runtime checks
@@ -94,6 +97,8 @@ def normalize_hexagon_target(target: TargetLike) -> Target | None:
     for key, value in _MEASURED_CAPABILITIES.get(arch, {}).items():
         config.setdefault(key, value)
     config.setdefault("fragment_scope", "shared.dyn")
+    config.setdefault("async_copy_commit", "tl.hexagon.AsyncCopyCommit")
+    config.setdefault("async_copy_wait", "tl.hexagon.AsyncCopyWait")
     return Target(config)
 
 

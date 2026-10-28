@@ -66,8 +66,8 @@ def test_tall_copy_splits_into_one_group():
     assert _ops(artifact) == ["queue", "submit", "submit", "commit", "wait"]
     assert _queue(artifact) == (2, 1)
     submits = re.findall(r"tl_hexagon_dma_async_submit\(tl_dma_async, (.*)\)\) return", artifact.kernel_source)
-    assert submits[0].endswith("(uint32_t)65535, 0")
-    assert submits[1].endswith(f"(uint32_t){rows - 65535}, 0")
+    assert submits[0].endswith("(uint32_t)65535, 3")
+    assert submits[1].endswith(f"(uint32_t){rows - 65535}, 3")
     assert "A[131070]" in submits[1]
 
 

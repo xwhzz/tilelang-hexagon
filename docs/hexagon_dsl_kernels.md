@@ -207,11 +207,33 @@ before it ends, including error cleanup. A worker must issue and complete its ow
 same QuRT thread; managed and raw/foreign DMA may not be mixed. Concurrent DDR
 stores must own disjoint cache lines, including the lines around partial rows.
 Scalar/vector producers are published before DMA reads, and DMA stores finish
-cache maintenance before completion. Small source flushes use `dccleana` plus
-`syncht`, preserving the QuRT flush semantics. This path is device-tested on v79;
-it does not imply independent physical engines or arbitrary nested dispatch.
-Compiler-managed `T.Pipelined` is still unsupported; the examples use explicit
-double buffering. `T.copy` has no DMA-specific lowering. The native-layout
+cache maintenance before completion. Small source flushes use `dccleana` plus one
+`syncht` per transfer, preserving the QuRT flush semantics. A load from a kernel
+argument the kernel never writes skips the flush (`MarkUnwrittenDMASources`,
+`TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN`): the DSP gets its arguments with clean
+caches. That flush was most of a transfer's cost on v79. With it, two 128-byte rows
+in flight moved at 3.3 GB/s and 16 KB blocks at 23 GB/s; without it, 14.6 and
+34 GB/s. This path is device-tested on v79; it does not imply independent physical
+engines or arbitrary nested dispatch.
+
+`T.Pipelined` makes the copies of a loop from DDR asynchronous: the target declares
+`supports_async_copy` and names the functions that build the pipeline's commit and
+wait (`async_copy_commit`, `async_copy_wait`), so the shared pipeline injector
+commits a stage's copies as one group of the tile program's DMA queue and waits for
+them before their consumers. A pipelined `T.copy` from DDR becomes the descriptors
+of a DMA transfer, when DMA moves it faster than HVX loads: one contiguous block,
+or rows of at least 512 bytes (`DMAOutpacesHVX`). Other copies run at once in
+their stage. Into an HMX operand, which DMA cannot fill in Crouton order, the copy
+goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX pack
+in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
+128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
+(BK = 256) faster than with serial copies, and a GEMV streaming 8 MB of fp16
+weights 2.1x (`example_gemm.py`, `example_gemv.py`). A transfer costs about 500
+cycles to submit and 200 to retire, so blocks of a few KB that serial HVX copies
+read from L2 gain little: flash attention's 8 KB K and V blocks are faster
+pipelined only once K and V outgrow L2 (17% at SEQ 4096, slower at 256). An
+explicit `T.dma_copy` stays a manual schedule and is rejected inside `T.Pipelined`.
+The native-layout
 `T.gemm` path is device-validated on v79: a staged
 32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has
 maximum absolute error 0.0009766.
