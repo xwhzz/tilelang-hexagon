@@ -125,6 +125,29 @@ def test_dma_destination_stays_live_until_its_wait():
     assert offsets["s"] != offsets["t"]
 
 
+def test_tile_operators_reuse_their_scratch_across_calls():
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((64, 64), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((64, 64), "float16")
+            b = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_shared((64, 64), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            for r in T.serial(2):
+                for k in list(range(4)):
+                    T.gemm(a, b, c, clear_accum=(r == 0 and k == 0))
+            T.copy(c, C)
+
+    source = _source(kernel)
+    # Each call stages its tiles in 4 KB of its own, live only during the
+    # call: inside the loop too, the four calls share one, next to a, b and c
+    # (32 KB).
+    assert source.count("stage") > 4
+    high_water = int(re.search(r"tl_vtcm_shared_high_water = (\d+)u;", source).group(1))
+    assert high_water <= 32768 + 4096 + 2048, high_water
+
+
 def test_generated_source_is_deterministic():
     spec = importlib.util.spec_from_file_location("flash", ROOT / "examples/hexagon/example_flash_attention.py")
     flash = importlib.util.module_from_spec(spec)

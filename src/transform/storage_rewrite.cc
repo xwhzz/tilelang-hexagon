@@ -903,11 +903,17 @@ private:
    * lexical_alloc_scope is intended to bound register/local-like allocations.
    * Shared/global allocations should continue to follow thread_scope_ so we do
    * not accidentally re-scope shared buffers nested inside a lexical block.
+   * Outside any thread scope (a target without thread bindings, whose
+   * function is one program), a shared allocation follows the lexical scope
+   * too: hoisted to the function it would stay live for the whole function,
+   * and MergeSharedMemoryAllocations could not reuse a tile operator's
+   * scratch across its call sites.
    */
   const Object *effective_scope(const StorageScope &storage_scope) const {
     if (lexical_scope_ != nullptr &&
         storage_scope.rank != StorageRank::kGlobal &&
-        storage_scope.rank != StorageRank::kShared) {
+        (storage_scope.rank != StorageRank::kShared ||
+         thread_scope_ == nullptr)) {
       return lexical_scope_;
     }
     return thread_scope_;
