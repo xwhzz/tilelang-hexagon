@@ -1084,6 +1084,15 @@ private:
     }
     if (SideEffect(value) <= CallEffectKind::kPure) {
       analyzer_->Bind(op->var, value);
+    } else if (op->var.dtype().is_int() || op->var.dtype().is_uint()) {
+      // A value that reads memory is not substituted, but its bounds hold
+      // whatever it reads: an index read from a table and clamped to a range
+      // stays in it, and the tile operators that use it can prove so.
+      analyzer_->const_int_bound.Update(op->var,
+                                        analyzer_->const_int_bound(value),
+                                        /*allow_override=*/true);
+      analyzer_->modular_set.Update(op->var, analyzer_->modular_set(value),
+                                    /*allow_override=*/true);
     }
     if (value.same_as(op->value)) {
       return GetRef<Stmt>(op);

@@ -239,6 +239,27 @@ def test_reject_out_of_bounds():
         lower(probe)
 
 
+@pytest.mark.parametrize("clamped", [True, False])
+def test_rows_read_from_a_table_are_in_bounds_once_clamped(clamped):
+    # A row the kernel reads from memory has no known value, but clamped to
+    # the tensor's rows, it is provably in them.
+    @T.prim_func
+    def probe(A: T.Tensor((4, 256), "float16"), rows: T.Tensor((2,), "int32"), B: T.Tensor((2, 256), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            for j in T.serial(2):
+                r = T.max(T.min(rows[j], 3), 0) if clamped else rows[j]
+                T.dma_copy(A[r, 0:256], s)
+                T.dma_wait()
+                T.copy(s, B[j, 0:256])
+
+    if clamped:
+        assert "tl_hexagon_dma_async_submit" in lower(probe)
+    else:
+        with pytest.raises(Exception, match="in-bounds"):
+            lower(probe)
+
+
 def test_reject_software_pipeline():
     @T.prim_func
     def probe(A: T.Tensor((4, 256), "float16"), B: T.Tensor((4, 256), "float16")):
