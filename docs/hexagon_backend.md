@@ -109,8 +109,8 @@ The backend registers itself through upstream's backend plugin interface
 - `tilelang/hexagon/pipeline.py` — the pass order
 - `tilelang/hexagon/op/` — tile-op implementations; `op/gemm/` registers the
   gemm dispatch (`register_gemm_impl(...)`)
-- `tilelang/hexagon/intrinsics/` — Crouton layouts and the HMX emitter. The ggml
-  Q4_0/Q8_0 format helpers live with the examples in `examples/hexagon/quantize/`
+- `tilelang/hexagon/intrinsics/` — Crouton layouts, the HMX emitter, and the panel
+  layouts of integer GEMM operands
 - `tilelang/hexagon/language/` — the Hexagon dialect: `T.Kernel(num_workers=...)`,
   `T.dma_copy`/`T.dma_wait`, and the expert HMX atoms under `T.hmx`. Kernels import
   it as `from tilelang.hexagon import language as T`
@@ -147,8 +147,9 @@ hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP 
 
 You can run it three ways: `tilelang.lower(fn, target="hexagon")` (inspect the C),
 `tilelang.compile(...)` / `@tilelang.jit(target="hexagon")` (build+deploy+run),
-or the direct `HexagonKernelAdapter`. Runnable end-to-end examples (matmul, flash
-attention, worker pool) live in [`examples/hexagon/`](../examples/hexagon/).
+or the direct `HexagonKernelAdapter`. Runnable operator examples (GEMM, flash
+attention, FFN, RMSNorm, a w4a16 GEMV) and the LFM2-1.2B model end to end live in
+[`examples/hexagon/`](../examples/hexagon/).
 
 ---
 
@@ -298,38 +299,28 @@ and explicit HMX atoms.
 
 ---
 
-## 9. Status and what's left
+## 9. Status
 
-**Device-validated:** the native-layout emitter-based `T.gemm` path passes the standalone
-32×128×128 q4 regression (`rel err = 0.000351`) and the fused-copy 256×256×256 FP16
-offline matmul (`max abs err = 0.0009766`) on v79. The earlier monolithic row-major path
-also validated idiomatic `T.gemm`→HMX
-(~17 TFLOPS), single-block and flash attention, HVX-vectorized data movement,
-`@tilelang.jit(target="hexagon")`,
-and a full **1-HMX/6-HVX worker pool** that parallelizes any multi-block kernel via
-`T.Kernel(num_workers=N)` — including `alloc_shared` blocks (per-worker VTCM) and
-`T.gemm` (historically per-worker scratch), with a persistent pool (2–4.5× speedups).
-Correctness is fresh; performance of the native-layout replacement has not yet been
-benchmarked against the earlier path. Unrecoverable
-device conditions (VTCM grant too small, per-worker HMX enable fails) propagate to the
-host as a raised error via the int32 kernel-status ABI rather than silent wrong output.
+**Device-validated on v79** (the Hexagon test suite with device tests enabled, about 730
+tests, and the examples):
 
-The DMA primitive layer is device-validated on v79 with two linked 1D descriptors and a
-strided type-9 2D descriptor in both directions. This establishes descriptor, dmlink,
-done-bit reclamation, cache, stride, and error-propagation semantics.
-`example_dma_hmx_matmul.py` expresses a two-slot
-output-block prefetch schedule in TileLang: submit two blocks, complete the
-oldest A/B pair, pack it into separate native Crouton buffers, and submit block
-i+2 into the released row-major slot before executing the current block's HMX
-MACs. Each output block spans the full K dimension. `benchmark_dma_matmul.py`
-compares serial and prefetch versions using DSP-local SDK timing; neither file
-imports a handwritten C/C++ compute or DMA scheduling kernel.
+- `T.gemm` on HMX: fp16 into fp16 or fp32, any tile-aligned shape, transposes, and K loops
+  accumulated across calls; on HVX: floating point, integer GEMMs of panel-layout weights,
+  and `T.gemm_blockscaled`.
+- Flash attention and gated FFNs composed on Crouton tiles; HVX maps and reductions with
+  the HVX math library.
+- `T.Pipelined` loops whose copies stream by DMA, and explicit `T.dma_copy`/`T.dma_wait`.
+- Worker pools (`T.Kernel(num_workers=N)`), and `T.sync_grid()` between programs that run
+  together.
+- Sessions that keep weights and state resident across calls and kernels.
 
-**Optional, not yet done:** autotune (`num_workers` + tile sizes as knobs);
-automatic software-pipeline DMA lowering; and schedules for blocks larger than VTCM.
-Worker-local managed DMA and synchronous parallel layout copies are now supported
-within the [validated implementation boundaries](hexagon_dsl_demo_ops_zh.md#实现边界).
-Explicit DMA prefetch alone does not establish cross-stage HMX/HVX overlap.
+Unrecoverable device conditions (a VTCM grant too small, a DMA error, too few workers for
+a grid) reach the host as an error naming the kernel's status, not as silent wrong
+output. LFM2-1.2B decodes at 81 t/s on v79 in one kernel call per generation
+([`examples/hexagon/lfm2`](../examples/hexagon/lfm2/)), 94% of the DMA roofline.
+
+**Not yet:** prefill on HMX for LFM2, and autotuning (`num_workers` and tile sizes as
+knobs).
 
 ---
 

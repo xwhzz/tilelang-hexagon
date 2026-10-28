@@ -1,8 +1,6 @@
 """Hexagon async submission, completion, and VTCM allocation contracts."""
 
-import importlib.util
 import os
-from pathlib import Path
 import re
 
 import pytest
@@ -11,8 +9,6 @@ from tilelang.hexagon import language as T
 from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
-
-ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
@@ -69,11 +65,66 @@ def lower(func):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
 
-def example(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / "examples/hexagon" / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
+    """An HMX matmul over output blocks of BM x BN, whose A and B rows of the
+    next blocks stream in by DMA, two blocks ahead, while HMX multiplies one."""
+    assert M % BM == N % BN == K % 32 == BM % 32 == BN % 32 == 0
+    E = HMXIntrinEmitter(BM, BN, K)
+    count = (M // BM) * (N // BN)
+
+    @T.macro
+    def submit(A, B, ar, br, tile):
+        mi = tile // (N // BN)
+        ni = tile % (N // BN)
+        T.dma_copy(A[mi * BM : (mi + 1) * BM, 0:K], ar[tile % 2, 0:BM, 0:K])
+        T.dma_copy(B[0:K, ni * BN : (ni + 1) * BN], br[tile % 2, 0:K, 0:BN])
+
+    @T.prim_func
+    def dma_hmx_matmul(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"), C: T.Tensor((M, N), "float16")):
+        with T.Kernel(1):
+            ar = T.alloc_shared((2, BM, K), "float16", align=2048)
+            br = T.alloc_shared((2, K, BN), "float16", align=2048)
+            an = T.alloc_shared((BM, K), "float16", align=2048)
+            bn = T.alloc_shared((K, BN), "float16", align=2048)
+            cn = T.alloc_shared((BM, BN), "float16", align=2048)
+            config = T.alloc_shared((64,), "uint32", align=256)
+            acc = T.hmx.alloc_accumulator()
+            cvt = T.hmx.alloc_convert_state()
+            bias = T.hmx.alloc_bias_state()
+            T.annotate_layout({an: E.activation_layout(an), bn: E.weight_layout(bn), cn: E.output_layout(cn)})
+            for i in T.serial(32):
+                config[i] = T.uint32(0x3C00)
+                config[32 + i] = T.uint32(0)
+            # Each output block contributes two queue entries: A and B.
+            for tile in T.serial(min(2, count)):
+                submit(A, B, ar, br, tile)
+            for tile in T.serial(count):
+                if tile < count - 1:
+                    T.dma_wait(2)
+                else:
+                    T.dma_wait()
+                T.copy(ar[tile % 2, 0, 0], an)
+                T.copy(br[tile % 2, 0, 0], bn)
+                # Packing has finished reading this slot. Refill it while HMX
+                # computes from the separate native Crouton buffers.
+                if tile + 2 < count:
+                    submit(A, B, ar, br, tile + 2)
+                E.acquire(acc)
+                E.load_bias(bias, config)
+                for mt in T.serial(BM // 32):
+                    for nt in T.serial(BN // 32):
+                        E.clear(acc)
+                        for kt in T.serial(K // 32):
+                            E.mma_atom(acc, an, bn, mt, nt, kt)
+                        E.convert(cvt, acc, bias, config)
+                        E.store(cvt, acc, cn, bias, config, mt, nt)
+                E.release(acc)
+                T.copy(
+                    cn,
+                    C[(tile // (N // BN)) * BM : ((tile // (N // BN)) + 1) * BM, (tile % (N // BN)) * BN : ((tile % (N // BN)) + 1) * BN],
+                )
+
+    return dma_hmx_matmul
 
 
 def test_async_manual_ping_pong():
@@ -121,7 +172,7 @@ def test_async_strided_load_store():
 
 
 def test_async_hmx_dsl_schedule():
-    source = lower(example("example_dma_hmx_matmul").make_dma_hmx_matmul())
+    source = lower(make_dma_hmx_matmul())
     # Double buffering: two output blocks of two copies each are in flight.
     assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async;" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in source
@@ -240,7 +291,7 @@ def test_dsp_build_avoids_exception_runtime():
 
 
 def test_async_hmx_error_cleanup_is_armed_and_disarmed():
-    source = lower(example("example_dma_hmx_matmul").make_dma_hmx_matmul())
+    source = lower(make_dma_hmx_matmul())
     assert "tl_dma_async.release_hmx = tl_hmx_unit_release;" in source
     assert "tl_dma_async.release_hmx = nullptr;" in source
 

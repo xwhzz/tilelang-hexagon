@@ -18,8 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <tl_templates/hexagon/power.h>   // the session's power requests
-#include <tl_templates/hexagon/qmatmul.h> // reusable FP32/Crouton row-pair atoms
+#include <tl_templates/hexagon/power.h> // the session's power requests
 #include <tl_templates/hexagon/vtcm.h> // unified VTCM arena (shared with alloc_shared)
 #include <tl_templates/hexagon/worker.h> // HW-thread worker pool (multithreaded HMX/HVX)
 

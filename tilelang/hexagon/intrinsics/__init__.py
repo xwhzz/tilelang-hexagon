@@ -5,6 +5,6 @@
 * :mod:`.panel`: panel layouts of the integer GEMM operands HVX ``vrmpy``
   reads, and the host packing of weights into them.
 
-Quantized weight formats are model-level, not hardware primitives; the ggml
-Q4_0/Q8_0 helpers live in ``examples/hexagon/quantize``.
+Quantized weight formats are model-level, not hardware primitives: a model
+packs its codes into a panel layout itself (``examples/hexagon/lfm2``).
 """

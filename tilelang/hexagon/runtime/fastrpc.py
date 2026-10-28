@@ -145,13 +145,6 @@ def skel_runtime(kernel_source: str) -> SkelRuntime:
         ("hvx_gemm.h", "tl_hvx_gemm" in kernel_source),
         # Copies between Crouton matrices and strided matrices (T.copy).
         ("crouton.h", "tl_crouton_" in kernel_source),
-        # Q8_0 GEMV instruction atoms.  qgemv.h pulls in its own HVX arithmetic
-        # helpers; keep detection separate so a dot-only kernel does not depend
-        # on spelling an internal tl_hvx_* symbol in generated source.
-        ("qgemv.h", "tl_hexagon_q8_0_dot" in kernel_source),
-        # Register-granular activation-pack and Q4 dequant atoms used by the
-        # explicit HMX qmatmul schedule.
-        ("qmatmul.h", "tl_hexagon_hmx_pack_a_f32_pair_k32" in kernel_source or "tl_hexagon_q4_0_" in kernel_source),
     ]
     includes = "#include <tl_templates/hexagon/power.h>\n" + "".join(
         f"#include <tl_templates/hexagon/{h}>\n" for h, used in headers if used

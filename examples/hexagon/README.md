@@ -4,23 +4,17 @@ Runnable tilelang kernels on the Qualcomm Hexagon NPU (HMX matrix engine + HVX v
 units), driven from an x86 host over FastRPC. They use the **public** API
 (`tilelang.compile(..., target="hexagon")`) — the same kernels you'd write for a GPU,
 lowered onto Hexagon. See [`docs/hexagon_backend.md`](../../docs/hexagon_backend.md)
-for how the adaptation works.
+for how the adaptation works and [`docs/hexagon_dsl_kernels.md`](../../docs/hexagon_dsl_kernels.md)
+for what makes a kernel fast.
 
 | Example | Shows |
 |---|---|
-| `example_demo_ops.py` | Five DSL operator implementations |
-| `benchmark_dma_matmul.py` | DSP-timed serial vs output-block prefetch, entirely DSL DMA/copy/HMX scheduling |
-| `example_dma_hmx_matmul.py` | DSL output-block DMA prefetch + Crouton packing + HMX matmul |
-| `example_matmul.py` | tiled `T.gemm` → the HMX matrix engine |
 | `example_gemm.py` | the tiled GEMM with an fp32 accumulator over a pipelined K loop: DMA ahead, HMX within each call, HVX across calls |
-| `example_gemv.py` | a streaming GEMV on an nn.Linear weight: `T.Pipelined` streams blocks of its rows from DDR by DMA while `T.gemm` multiplies them on HVX |
-| `example_flash_attention.py` | two HMX gemms + an HVX online softmax on their Crouton tiles, composed on-chip |
+| `example_flash_attention.py` | two HMX gemms and an HVX online softmax on their Crouton tiles, composed on-chip |
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
-| `example_worker_pool.py` | `T.Kernel(num_workers=N)` → parallel across the 6 HW threads |
-| `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) — the basis beyond softmax |
-| `example_qgemv_q8_0.py` | Q8_0 staged layout + `Q8GemvIntrinEmitter` → HVX signed-int8 decode dot |
-| `example_qmatmul_kstream.py` | native Q4_0 HVX tile atom -> Crouton `T.Layout` -> explicit HMX atoms |
-| `offline_matmul/` | the generated kernel built with the **bare Hexagon SDK** + run on device vs a golden reference (no `tilelang.compile` in the loop) |
+| `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) |
+| `example_gemv_w4a16.py` | a w4a16 decode GEMV: `T.gemm_blockscaled` of int16 activations by 4-bit panel-layout weights on HVX, streamed by DMA across `num_workers` workers |
+| [`lfm2/`](lfm2/) | LFM2-1.2B end to end: GPTQ weights, and a decode megakernel that runs every token of a generation in one call |
 
 ## Prerequisites
 
@@ -29,11 +23,12 @@ These examples run on **real hardware** (not an emulator), so they need:
 - A Hexagon device — developed/validated on a **OnePlus 13 (Snapdragon 8 Gen 4,
   Hexagon v79)** — connected and **authorized over `adb`** (`adb devices` shows it).
 - The **Qualcomm Hexagon SDK** installed, with `HEXAGON_SDK_ROOT` / the SDK env set
-  (the build harness compiles a FastRPC skel with `hexagon-clang++ -mhmx -mhvx`).
-- tilelang built from this repo with the Hexagon backend (the `tl` conda env in our
-  setup), and `torch` for the reference check.
+  (the build harness compiles a FastRPC skel with `hexagon-clang++ -mhmx -mhvx`); see
+  [`docs/hexagon_env_setup.md`](../../docs/hexagon_env_setup.md).
+- tilelang built from this repo with the Hexagon backend, and `torch` for the
+  reference check.
 
-The first run of each kernel builds + deploys a FastRPC skel and starts a small
+The first run of each kernel builds and deploys a FastRPC skel and starts a small
 persistent on-device agent (kept warm across calls). Build products are cached on
 disk under `$TILELANG_CACHE_DIR/hexagon_builds`, keyed by the generated sources,
 the Hexagon template headers and the toolchain, so a rerun of an unchanged kernel
@@ -44,17 +39,15 @@ only deploys it.
 ```bash
 cd examples/hexagon
 
-python example_matmul.py --m 256 --n 256 --k 256 --block 64
 python example_gemm.py --m 256 --n 256 --k 1024 --block-k 256
-python example_gemv.py --k 4096 --n 1024
-python example_dma_hmx_matmul.py
 python example_flash_attention.py --seq 256
 python example_ffn.py
-python example_worker_pool.py
 python example_rmsnorm.py --m 64 --n 256
-python example_qgemv_q8_0.py --k 2048
-python example_qmatmul_kstream.py --n 128 --k 512 --io-dtype float32
+python example_gemv_w4a16.py --k 2048 --n 8192
 ```
+
+Each prints its error against a torch reference and `PASS` or `FAIL`. The LFM2 example
+has its own [README](lfm2/README.md).
 
 ## Device tests
 
@@ -68,108 +61,16 @@ TL_HEXAGON_DEVICE_TEST=1 TILELANG_HEXAGON_DEVICE_LOCK=/tmp/tl_hexagon_device.loc
     python -m pytest testing/python/hexagon -n 4
 ```
 
-## Expected output
-
-```
-matmul 256x256x256 (block 64) on HMX: max abs err = 0.001947  (PASS)
-
-Hexagon DMA primitives: linked-1D=PASS, 2D=PASS
-
-Hexagon DMA double buffer: tiles=8, max abs err = 0 (PASS)
-
-Hexagon DMA+HMX double-buffer matmul (native ping/pong source buffers):
-32x32x256, trials=5, worst max abs err = 0.000243545 (PASS). Recompiled and
-device-validated on v79 on 2026-09-13, including explicit finite-output checks.
-
-flash attention (M=64, SEQ=256, BN=64, D=64) on HMX+HVX: max abs err = 7.492e-05  (PASS)
-
-[1] batched matmul (6x 128x128x128) across 6 workers: max abs err = 0.0009701  (PASS)
-[2] compute-heavy HVX grid: num_workers=1 1056 ms  num_workers=6 272 ms  ->  3.89x
-
-RMSNorm (M=64, N=256) on HVX: max abs err = 0.001996  (PASS)
-
-Q8_0 dot 32x2048: max_abs=7.62939e-06 max_rel=8.20345e-07 (PASS)
-
-HMX atom q4_0 matmul 32x128x512: rel err = 0.0003 (PASS)
-```
-
-The explicit path spells the hardware protocol as
-`acquire/load_bias/clear/mma/convert/store/release`.  Its raw Q4 tile is expanded
-directly into the final weight Crouton before `mma`; it does not call `T.gemm`,
-materialize a row-major FP16 weight tile, or call `pack_b`.  FP32 boundaries are
-converted in 32-lane chunks, the native width of one HVX FP32 vector.
-
-The llama.cpp integration also emits separate activation-pack, dequant-range,
-and HMX-compute stages. The host's existing 2D DMA queue and six-worker pool
-schedule those stages; TileLang still owns the Q4/HVX instruction atom, Crouton
-layouts, and HMX protocol.
-
-(Errors are fp16 rounding; the matmul runs the HMX engine at ~17 TFLOPS, and the
-worker pool fans the grid across the 6 HW threads with the 1 HMX serialized.)
-
 ## Notes
 
 - **`num_workers`** runs the grid's tile programs on up to that many HW threads, each
-  worker with its own buffers and VTCM arena. It helps HVX-heavy and
-  batched/multi-block work; a single HMX-bound matmul is limited
-  by the one matrix engine (the spinlock serializes the MACs). The compute-heavy demo
-  is HVX-bound, so its speedup is visible end-to-end.
-- **Explicit async DMA is available as `T.dma_copy(src, dst)` and
-  `T.dma_wait(pending=0)`.** Each copy is one group of the tile program's queue;
-  wait completes the older copies until at most the newest `pending` are in flight.
-  No separate commit is required. Wait before reading a destination or modifying a
-  source. Every tile program drains its queue before it ends. The compiler sizes the
-  queue for the most copies the program keeps in flight and rejects a loop that
-  submits without waiting.
-  Static, in-bounds 1D/2D row-major DDR ↔ VTCM regions are supported. Crouton
-  conversion remains a separate `T.copy`; unsupported async regions fail lowering.
-  Use a manual `T.serial` schedule. Under `num_workers` each tile program owns its
-  queue and its worker's VTCM arena, with submission and completion on the same
-  QuRT thread; automatic
-  `T.Pipelined` and mixing managed queues with raw/external DMA remain unsupported.
-  This does not imply a separate physical DMA engine per worker. Managed async
-  kernels conservatively disable automatic VTCM allocation
-  reuse; explicit ping/pong still works. Their generated DSP project uses
-  `-fno-exceptions` for scope-based error cleanup.
-  `example_dma_hmx_matmul.py` demonstrates output-block prefetch (BK=K):
-  pack the current row-major slot, submit block i+2 into that slot, then execute
-  HMX from separate native Crouton buffers. `benchmark_dma_matmul.py` compares
-  serial and prefetch schedules using the same DSL operations.
-- **The DMA primitive layer includes caller-owned linked descriptor queues and
-  1D/2D submission primitives.** These remain available for backend integration;
-  `T.copy` has no DMA-specific lowering. Native Crouton endpoints use the HMX
-  pack/unpack path. See the [DMA/worker implementation boundaries](../../docs/hexagon_dsl_demo_ops_zh.md#实现边界)
-  for the currently validated composition and cleanup rules.
-- The flash-attention softmax runs on **HVX**: the elementwise `T.Parallel` maps
-  (`exp`, rescale, `/l`) vectorize onto whole HVX registers, with `T.exp` and division
-  lowered to the HVX math functions, and `T.reduce_max`/`T.reduce_sum` reduce the rows
-  of the shared tile in place.
-- If a run reports an agent/VTCM error, clear stale agents: `adb shell pkill -f _agent`.
-
-## DMA matmul example and benchmark
-
-`example_dma_hmx_matmul.py` computes a matrix product with output-block DMA
-prefetch (BK=K), using `T.dma_copy`, `T.dma_wait`, Crouton `T.copy`, and
-`HMXIntrinEmitter` atoms. Its default shape is 256×512×2048 with 128×128 output
-blocks. Two row-major staging slots are reused after packing into separate
-native HMX buffers; block i+2 is submitted before block i's HMX computation.
-
-`benchmark_dma_matmul.py` contains a standalone DSL kernel and host runner for
-serial vs prefetch comparison. It imports only the SDK timer header and calls
-`HAP_perf_get_time_us()`; there is no imported C/C++ compute or scheduling kernel.
-
-```bash
-source /home/lyn/workspace/hexagon-env.sh
-export CMAKE_BUILD_PARALLEL_LEVEL=1
-python examples/hexagon/example_dma_hmx_matmul.py
-python examples/hexagon/benchmark_dma_matmul.py --out /tmp/dma-bench
-```
-
-The benchmark uses three correctness seeds, five warmup batches per mode, and
-fifteen alternating samples with ten DSP repetitions per sample.
-`--configs '256,512,2048,128,128'` selects M,N,K,BM,BN; `--samples` and `--repeats`
-override the defaults. Outputs include generated C, individual DSP times,
-medians, errors, and speedups. Each configuration closes its agent, including
-on validation failures. Measurements use warm resident inputs and exclude
-FastRPC round trips; they do not measure cold DDR bandwidth or automatic
-software pipelining.
+  worker with its own buffers and VTCM arena. It helps HVX-heavy, streaming and
+  batched work; a single HMX-bound matmul is limited by the one matrix engine. Worker
+  programs that run together can meet at `T.sync_grid()`, as the LFM2 decode does.
+- **Explicit async DMA is `T.dma_copy(src, dst)` and `T.dma_wait(pending=0)`.** Each
+  copy is one group of the tile program's queue; a wait completes the older copies
+  until at most the newest `pending` are in flight. Wait before reading a destination
+  or modifying a source. Every tile program drains its queue before it ends, and the
+  compiler sizes the queue for the most copies the program keeps in flight.
+  `T.Pipelined` schedules copies the same way on its own.
+- If a run reports an agent or VTCM error, clear stale agents: `adb shell pkill -f _agent`.

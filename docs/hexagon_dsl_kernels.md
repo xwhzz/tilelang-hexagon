@@ -1,10 +1,10 @@
-# Writing high-performance DSL kernels on Hexagon (quantized matmul & the HVX rules)
+# Writing high-performance DSL kernels on Hexagon
 
-This captures what it takes to express a **fully-DSL quantized matmul** (q4_0 dequant +
-HMX gemm) in tilelang on Hexagon — the codegen support that makes the DSL lower to full
-HVX, the non-obvious rules, the DSL-driven HMX K-loop, and an honest read on where the
-performance actually lands. Companion to `edge_tilelang_vs_cuda.md` (why edge is hard) and
-`llama_cpp_inference_flow.md` (the runtime).
+How DSL constructs lower on Hexagon and what makes them fast: the HVX register rule, GEMMs
+on HMX and HVX (floating point, integer and block-scaled), pipelines that stream by DMA, and
+programs that meet at `T.sync_grid()`. Companion to [`hexagon_backend.md`](hexagon_backend.md),
+the backend's architecture. The kernels of `examples/hexagon/` use what is described here;
+`examples/hexagon/lfm2/` composes it into a whole model.
 
 ## 1. The essential HVX rule: the narrowest dtype must fill a whole register
 
@@ -98,34 +98,7 @@ fp32; max and min stay in fp16 for an fp16 source when that is exact.
 Practical: **DSL guidance** — for a loop that touches uint8, use `T.vectorized(≥128)` (a
 multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 20 ms → 1.4 ms.
 
-## 2. Writing the q4_0 dequant in the DSL (not a hand template)
-
-The nibble decode is plain DSL arithmetic that lowers to HVX — see `examples/hexagon/
-example_qmatmul.py`. Two non-obvious rules beyond §1:
-
-```python
-q = T.Cast("int16", qcm[j, n])  # widen to int16 FIRST
-lo = (q & T.Cast("int16", 0xF)) - T.Cast("int16", 8)  # then mask/shift on int16
-hi = (q >> T.Cast("int16", 4)) - T.Cast("int16", 8)  # int16 consts -> no int32 promotion
-B[2 * j, n] = T.Cast("float16", lo) * scb[2 * j, n]
-B[2 * j + 1, n] = T.Cast("float16", hi) * scb[2 * j + 1, n]
-```
-- **Widen to int16 before the bitwise** — uint8 bitwise below full-register width faults;
-  int16 at 64 lanes is a full register.
-- **Keep the mask/shift constants int16** — `int16 & 0xF(int)` promotes to int32 in C,
-  which caps the vector width to `1024/32 = 32`.
-- **Pre-pack the weight column-major** (`qcm[K/2][N]`, `scb[K][N]`) so the dequant store is
-  contiguous over N (no interleave/shuffle). The interleave/quant is *codec*, not a
-  `layout` — it's computation, expressed here as DSL vector ops (like CUDA composes `mma`
-  intrinsics, not scalar loops the vectorizer must magically widen).
-
-Result: bit-exact vs numpy, and the DSL dequant **matches the hand-written HVX intrinsic
-template** (~1.4 ms/512K weights) — so the template is not needed; the DSL generates it.
-
-## 3. The fused matmul, and the DSL-driven HMX K-loop
-
-`example_qmatmul.py` fuses dequant + `T.gemm` in one kernel: the dequantized weight lands in
-VTCM (`alloc_shared`) and never hits DDR.
+## 2. GEMMs, and the pipelined K loop
 
 `T.gemm(A, B, C)` runs on HMX when A and B are fp16 and C is fp16 or fp32, all three in VTCM
 (shared buffers or fragments), M, N and K are multiples of 32, and each operand is a matrix
@@ -141,7 +114,7 @@ stack (scalar loads from VTCM are slow), and dot products when `transpose_B` put
 operands' rows along K, each output's register of partial sums summed by a transpose tree.
 Products accumulate in qf32 registers over the call's K and reach C once. On v79 the outer
 products run at 17-19 MAC per cycle, the dot products at 10-12, about 1000x the scalar loop,
-and a decode GEMV that streams its weights by DMA moves 40-44 GB/s (`example_gemv.py`). v79's
+and a decode GEMV that streams fp16 weights by DMA moves 40-44 GB/s. v79's
 qf32 adds of two zeros step the encoding's exponent up until it reads as a huge number, so
 accumulators combine with each other and with C as IEEE fp32, and a result flushes the
 denormals a chain of zero products converts to. A GEMM neither unit runs (both operands
@@ -317,7 +290,7 @@ goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX p
 in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
 (BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
-8 MB of fp16 weights at 40-44 GB/s (`example_gemv.py`). A transfer costs about 150
+8 MB of fp16 weights at 40-44 GB/s. A transfer costs about 150
 cycles to submit and as many to retire, so blocks of a few KB that serial HVX
 copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
 match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
@@ -331,40 +304,13 @@ flash attention's K and V do, or when each staged HMX operand's transfer feeds i
 own pack. So flash attention double-buffers with `num_stages=1`, and a K loop of
 gemms with staged operands at `num_stages=2` prefetches two iterations ahead, which
 pays off for small blocks (BK = 64: 14% faster than two deep).
-The native-layout
-`T.gemm` path is device-validated on v79: a staged
-32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has
-maximum absolute error 0.0009766.
 
-**Status: device-validated correct** (atom-granular K-streaming, single- and multi-N-tile, rel
-2–4e-4). The perf/hiding optimization (whole-register 64-feature dequant slices vs the
-32-feature HMX tile — the per-tile dequant is scalar today; double-buffering; worker-pool
-overlap) is **not yet done** — see §4.
+## 3. Measuring
 
-## 4. Honest performance reality (read this before integrating)
-
-- **Measure compute, not single-call wall-clock.** A Hexagon kernel's single `kernel()`
-  call is dominated by FastRPC **marshaling** of the inputs; we twice misdiagnosed perf from
-  it (a phantom "transposed-pack 55 ms" that was really marshaling). Always amortize
-  (reps, or resident buffers) before reading a number as "compute".
-- **HMX accumulates K in high precision.** The K-loop MACs each K-tile into the accumulator
-  without clearing; fp16 conversion happens only at `cvt.hf = acc` readout. So "K can't be
-  split" is wrong — K streams; the accumulator holds the running sum in high precision.
-  (One physical accumulator, though, so K-parallel across workers isn't possible.)
-- **A single q4_0 matmul is a parity ceiling.** The backend already fuses HVX dequant into
-  the HMX MAC (dequant hidden under MAC). Our current fused kernel *materializes* the whole
-  fp16 weight then gemms — the dequant is a serial, exposed pass (~0.75 GB/s materialize,
-  slow), so integrating it as-is would **regress**, not win. K-streaming (§3, incomplete)
-  hides the dequant → reaches **parity**. **Beating stock needs subgraph fusion** (e.g. FFN
-  gate/up → SwiGLU → down keeping intermediates in VTCM) — the thing the backend does per-op
-  with DDR round-trips. That is the real win and a separate, graph-level effort.
-- In llama.cpp specifically, the intercept is the HMX path (`hmx_mm_2d_f32`); decode (M=1) is
-  a GEMV on the HVX path and is **not** touched — so a single-op swap only affects prefill.
-
-## 5. What's here / what's next
-
-Device-validated, in-tree: the whole-register codegen fix (§1), the native `vec_type`, the
-DSL q4_0 dequant + fused matmul (`example_qmatmul.py`), the exposed HMX K-loop primitives,
-and the K-streaming *structure* (correct). Next, in priority order: (a) finish K-streaming
-perf (hide the dequant → parity), or (b) subgraph fusion (→ beat stock); (c) make the
-one-time weight repack a generated op; (d) a `T.dequantize` tile op wrapping the pattern.
+- **Measure compute, not one call's wall clock.** A standalone kernel's call is dominated
+  by moving its arguments over FastRPC and `adb`. Time inside the kernel
+  (`HAP_perf_get_pcycles`), repeat the work, or keep the arguments resident in a session
+  (`tilelang.hexagon.runtime.session`) before reading a number as compute.
+- **HMX accumulates K in high precision.** Each K tile accumulates without a clear, and
+  the conversion to fp16 happens only when the accumulator is read out, so K streams.
+  There is one physical accumulator, so K cannot be split across workers.
