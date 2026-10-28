@@ -197,8 +197,10 @@ class HexagonAgentSession:
         # Status byte first: the agent sends 0 on success, non-zero if the kernel
         # invoke failed.  On failure no output bytes follow, so we must read this
         # before the output loop or _recvn() would block forever.
-        if self._recvn(1)[0] != 0:
-            raise RuntimeError("Hexagon agent: on-device kernel run failed")
+        status = self._recvn(1)[0]
+        if status != 0:
+            reason = fastrpc.KERNEL_STATUS.get(status, f"status {status}") if status != 255 else "the FastRPC call failed"
+            raise RuntimeError(f"Hexagon agent: on-device kernel run failed: {reason}")
         outs: list[np.ndarray] = []
         for pl in self.plans:
             if not pl.is_output:

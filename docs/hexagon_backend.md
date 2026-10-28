@@ -287,8 +287,9 @@ and explicit HMX atoms.
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
     cost. The host writes a buffer, or has the agent read a file on the device into
-    it (512 MB in 0.12 s). The DSP's cached lines are invalidated after a write and
-    written back before a read.
+    it (512 MB in 0.12 s). Before a host write, the DSP writes its cached lines of the
+    bytes back and drops them, so a dirty line a kernel left cannot overwrite the
+    host's bytes later; before a host read, it writes them back.
   - **Arguments.** Each parameter takes, per call, a `DeviceBuffer`, a tensor (copied
     inline) or an int32 scalar.
   - **Cost.** A call costs ~2.4 ms with resident arguments, of which the FastRPC call

@@ -27,7 +27,9 @@
 #include <type_traits>
 
 #define TL_MAX_WORKERS 6
-#define TL_WORKER_STACK_SZ (2 * 16384) // 32 KiB/worker (htp-ops-lib default)
+// 64 KiB a worker: a megakernel's program body and the out-of-line GEMMs it
+// calls take tens of KiB of frames.
+#define TL_WORKER_STACK_SZ (64 * 1024)
 
 // Worker callback: (ctx, worker id in [0,nw), total worker count nw).  Returns
 // a status code (0 = ok); tl_parallel returns the code of the lowest-numbered

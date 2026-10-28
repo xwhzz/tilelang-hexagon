@@ -172,6 +172,30 @@ def test_unused_parameters_keep_the_others_in_place():
         kernel.adapter.close()
 
 
+@T.prim_func
+def _deep(A: T.Tensor((4096,), "float32"), B: T.Tensor((4096,), "float32")):
+    """B = 4 A, through 32 KB of stack: more than the FastRPC thread, which runs
+    the kernel's first program, had by default."""
+    with T.Kernel(1):
+        local = T.alloc_local((8192,), "float32")
+        for i in T.serial(8192):
+            local[i] = A[i % 4096] * T.float32(2)
+        for i in T.serial(4096):
+            B[i] = local[i] + local[i + 4096]
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_a_kernel_has_a_deep_stack():
+    import torch
+
+    kernel = tilelang.compile(_deep, out_idx=[1], target="hexagon")
+    try:
+        a = torch.randn(4096)
+        torch.testing.assert_close(kernel(a), 4 * a)
+    finally:
+        kernel.adapter.close()
+
+
 def _rotate(programs, rounds, num_workers):
     """Each round, every program adds one to its right neighbour's row of the
     previous round: the rows rotate left once per round."""

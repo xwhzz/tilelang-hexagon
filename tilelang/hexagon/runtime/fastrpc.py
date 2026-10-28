@@ -177,16 +177,38 @@ def skel_runtime(kernel_source: str) -> SkelRuntime:
 
 
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
-FORWARD_KERNEL_STATUS = """template <typename Fn>
-static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {
-  if constexpr (std::is_void_v<decltype(fn())>) {
+# Bytes of stack of the FastRPC thread, which runs a kernel's first program:
+# its default, 16 KB, overflows at a large kernel's frames.
+PD_THREAD_STACK = 256 * 1024
+
+# Before the host opens the session's handle: an unsigned PD, and the stack of
+# its FastRPC thread. In open_session(domain_id) of the host programs.
+PD_SETUP = f"""  if (&remote_session_control) {{
+    struct remote_rpc_control_unsigned_module c; c.domain = domain_id; c.enable = 1;
+    int e = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &c, sizeof(c));
+    if (e != AEE_SUCCESS) {{ fprintf(stderr, "unsigned-PD failed: 0x%x\\n", e); return -1; }}
+    struct remote_rpc_thread_params t; t.domain = domain_id; t.prio = -1; t.stack_size = {PD_THREAD_STACK};
+    e = remote_session_control(FASTRPC_THREAD_PARAMS, &t, sizeof(t));
+    if (e != AEE_SUCCESS) {{ fprintf(stderr, "thread params failed: 0x%x\\n", e); return -1; }}
+  }}
+"""
+
+# A kernel's nonzero status (TL_ERR_*, common.h) comes back from run() as
+# KERNEL_STATUS_BASE + status, an error FastRPC passes through.
+KERNEL_STATUS_BASE = 0x1000
+# The TL_ERR_* statuses, by code.
+KERNEL_STATUS = {1: "TL_ERR_VTCM (no VTCM region fits)", 2: "TL_ERR_HMX", 3: "TL_ERR_DMA", 4: "TL_ERR_GRID (too few workers for the grid)"}
+
+FORWARD_KERNEL_STATUS = f"""template <typename Fn>
+static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {{
+  if constexpr (std::is_void_v<decltype(fn())>) {{
     fn();
     return AEE_SUCCESS;
-  } else {
+  }} else {{
     int tl_rc = (int)fn();
-    return tl_rc == 0 ? AEE_SUCCESS : AEE_EFAILED;
-  }
-}
+    return tl_rc == 0 ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
+  }}
+}}
 """
 
 
@@ -268,11 +290,7 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
         "static int open_session(int domain_id) {\n"
         "  domain* d = get_domain(domain_id);\n"
         '  if (!d) { fprintf(stderr, "get_domain failed\\n"); return -1; }\n'
-        "  if (&remote_session_control) {\n"
-        "    struct remote_rpc_control_unsigned_module c; c.domain = domain_id; c.enable = 1;\n"
-        "    int e = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &c, sizeof(c));\n"
-        '    if (e != AEE_SUCCESS) { fprintf(stderr, "unsigned-PD failed: 0x%x\\n", e); return -1; }\n'
-        "  }\n"
+        f"{PD_SETUP}"
         "  int len = strlen(" + iface + "_URI) + MAX_DOMAIN_URI_SIZE;\n"
         "  char* uri = (char*)malloc(len);\n"
         f'  snprintf(uri, len, "%s%s", {iface}_URI, d->uri);\n'
@@ -369,12 +387,7 @@ static int writev_full(int fd, struct iovec* io, int count) {{
 static int open_session(int domain_id) {{
   domain* d = get_domain(domain_id);
   if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
-  if (&remote_session_control) {{
-    struct remote_rpc_control_unsigned_module c; c.domain = domain_id; c.enable = 1;
-    int e = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &c, sizeof(c));
-    if (e != AEE_SUCCESS) {{ fprintf(stderr, "unsigned-PD failed: 0x%x\\n", e); return -1; }}
-  }}
-  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
+{PD_SETUP}  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
   char* uri = (char*)malloc(len);
   snprintf(uri, len, "%s%s", {iface}_URI, d->uri);
   int e = {iface}_open(uri, &g_handle); free(uri);
@@ -406,7 +419,9 @@ int main(int argc, char** argv) {{
       if (read_full(cli, &mask, 1)) break;
 {body_recvs}
       int e = {iface}_run({call_str});
-      unsigned char status = (e == AEE_SUCCESS) ? 0 : 1;  // status byte so the client never hangs on a failed run
+      // A status byte, so the client never hangs on a failed run: 0, a
+      // kernel's TL_ERR_* status, or 255 for another error.
+      unsigned char status = e == AEE_SUCCESS ? 0 : (e > {KERNEL_STATUS_BASE:#x} && e < {KERNEL_STATUS_BASE + 255:#x}) ? (unsigned char)(e - {KERNEL_STATUS_BASE:#x}) : 255;
       struct iovec io[] = {{{body_writes}}};
       if (writev_full(cli, io, e == AEE_SUCCESS ? sizeof(io) / sizeof(io[0]) : 1)) break;
     }}

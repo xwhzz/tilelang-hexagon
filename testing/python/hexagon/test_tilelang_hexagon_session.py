@@ -28,6 +28,18 @@ def add(a: T.Tensor((N,), "float32"), b: T.Tensor((N,), "float32"), out: T.Tenso
             out[i] = a[i] + b[i]
 
 
+@T.prim_func
+def deep(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
+    """out = 2 a[i] + 2 a[i], through 32 KB of stack: more than the FastRPC
+    thread, which runs the kernel, had by default."""
+    with T.Kernel(1):
+        local = T.alloc_local((2 * N,), "float32")
+        for i in T.serial(2 * N):
+            local[i] = a[i % N] * T.float32(2)
+        for i in T.serial(N):
+            out[i] = local[i] + local[i + N]
+
+
 def test_session_skel_dispatches_by_kernel():
     plans = fastrpc._plan([], [])
     source = session.gen_dsp(
@@ -84,6 +96,27 @@ def test_host_writes_and_device_files_reach_kernels(sess):
     torch.testing.assert_close(k_add(a, b.at(N * 4)), 2 * x + y)
     a.free()
     b.free()
+
+
+@DEVICE
+def test_a_host_write_replaces_what_a_kernel_wrote(sess):
+    k_fill, k_add = sess.kernels
+    buf = sess.buffer(N * 4)
+    # fill leaves the DSP's lines of buf dirty; the host's zeros must win.
+    k_fill(torch.tensor([3.0]), buf)
+    buf.write(torch.zeros(N))
+    torch.testing.assert_close(torch.frombuffer(bytearray(buf.read()), dtype=torch.float32), torch.zeros(N))
+    x = torch.randn(N)
+    torch.testing.assert_close(k_add(x, buf), x)
+    buf.free()
+
+
+@DEVICE
+def test_a_kernel_has_a_deep_stack():
+    with session.Session([(deep, [1])]) as s:
+        (k_deep,) = s.kernels
+        x = torch.randn(N)
+        torch.testing.assert_close(k_deep(x), 4 * x)
 
 
 @DEVICE

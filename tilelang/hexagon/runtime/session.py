@@ -14,10 +14,11 @@ scalar a Python int. Its ``out_idx`` parameters come back as tensors unless a
 :class:`DeviceBuffer` is passed for them too.
 
 The host writes a buffer's bytes with :meth:`DeviceBuffer.write`, or has the
-agent read them from a file on the device (:meth:`DeviceBuffer.load`); the
-DSP's copies of the written lines are invalidated. :meth:`DeviceBuffer.read`
-writes the DSP's back first. The buffers are uncached on the CPU, so the host
-needs no cache maintenance of its own.
+agent read them from a file on the device (:meth:`DeviceBuffer.load`); the DSP
+first writes back and drops its copies of the lines written, so neither a
+stale copy nor a dirty line a kernel left survives the write.
+:meth:`DeviceBuffer.read` writes the DSP's lines back first. The buffers are
+uncached on the CPU, so the host needs no cache maintenance of its own.
 
     session = Session([(prefill, [3]), (decode, [4])])
     weights = session.buffer(nbytes)
@@ -154,7 +155,11 @@ AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, 
   uint8_t* base = tl_session_address(fd);
   if (!base) return AEE_EBADPARM;
   if (size == 0) return AEE_SUCCESS;
-  qurt_mem_cache_clean((qurt_addr_t)(base + offset), size, writeback ? QURT_MEM_CACHE_FLUSH : QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+  // Before the host reads the bytes, the DSP's dirty lines of them go to DDR;
+  // before it writes them, they go there too and the DSP's copies go. A dirty
+  // line left behind would overwrite the host's bytes when evicted, and an
+  // invalidate on its own writes dirty lines back.
+  qurt_mem_cache_clean((qurt_addr_t)(base + offset), size, writeback ? QURT_MEM_CACHE_FLUSH : QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
   return AEE_SUCCESS;
 }}
 
@@ -261,12 +266,7 @@ static uint8_t* grow(uint8_t* buf, uint32_t* size, uint32_t need) {{
 static int open_session(int domain_id) {{
   domain* d = get_domain(domain_id);
   if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
-  if (&remote_session_control) {{
-    struct remote_rpc_control_unsigned_module c; c.domain = domain_id; c.enable = 1;
-    int e = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &c, sizeof(c));
-    if (e != AEE_SUCCESS) {{ fprintf(stderr, "unsigned-PD failed: 0x%x\\n", e); return -1; }}
-  }}
-  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
+{fastrpc.PD_SETUP}  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
   char* uri = (char*)malloc(len);
   snprintf(uri, len, "%s%s", {iface}_URI, d->uri);
   int e = {iface}_open(uri, &g_handle); free(uri);
@@ -310,7 +310,8 @@ static int serve(int cli, unsigned char op, int* running) {{
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
     free(args);
-    unsigned char status = e == AEE_SUCCESS ? 0 : 1;
+    // 0, a kernel's TL_ERR_* status, or 255 for another error.
+    unsigned char status = e == AEE_SUCCESS ? 0 : (e > {fastrpc.KERNEL_STATUS_BASE:#x} && e < {fastrpc.KERNEL_STATUS_BASE + 255:#x}) ? (unsigned char)(e - {fastrpc.KERNEL_STATUS_BASE:#x}) : 255;
     return reply(cli, status, g_outputs, status == 0 ? out_bytes : 0);
   }}
   if (op == {_OP_TIMING}) return write_full(cli, &g_last_run_ns, 8);
@@ -350,9 +351,9 @@ static int serve(int cli, unsigned char op, int* running) {{
       uint64_t got = 0;
       FILE* f = ok ? fopen(path, "rb") : 0;
       if (f) {{
+        {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)(g_buffers[id].size - offset), 0);
         got = fread(g_buffers[id].ptr + offset, 1, g_buffers[id].size - offset, f);
         fclose(f);
-        {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)got, 0);
       }}
       int64_t result = f ? (int64_t)got : -1;
       return write_full(cli, &result, 8);
@@ -361,13 +362,13 @@ static int serve(int cli, unsigned char op, int* running) {{
     if (op == {_OP_WRITE}) {{
       // The bytes come either way, so the wire stays in step.
       uint8_t* dst = ok ? g_buffers[id].ptr + offset : 0;
+      if (ok) {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 0);
       uint8_t chunk[65536];
       for (uint64_t done = 0; done < size;) {{
         uint64_t n = size - done < sizeof(chunk) ? size - done : sizeof(chunk);
         if (read_full(cli, dst ? dst + done : chunk, n)) return 1;
         done += n;
       }}
-      if (ok) {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 0);
       unsigned char status = ok ? 0 : 1;
       return write_full(cli, &status, 1);
     }}
@@ -638,8 +639,10 @@ class Session:
         return b"".join(chunks)
 
     def _status(self, what: str) -> None:
-        if self._recv(1)[0] != 0:
-            raise RuntimeError(f"Hexagon session: {what} failed")
+        status = self._recv(1)[0]
+        if status != 0:
+            reason = fastrpc.KERNEL_STATUS.get(status, f"status {status}") if status != 255 else "the FastRPC call failed"
+            raise RuntimeError(f"Hexagon session: {what} failed: {reason}")
 
     # ---- buffers ----------------------------------------------------------
     def buffer(self, nbytes: int) -> DeviceBuffer:
