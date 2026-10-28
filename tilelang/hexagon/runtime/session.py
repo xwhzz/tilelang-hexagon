@@ -47,6 +47,7 @@ import numpy as np
 import torch
 
 from . import fastrpc
+from .agent import CALL_TIMEOUT
 from .device import _DEFAULT_ADSP_DIRS, DEVICE_LOCK
 
 # Parameter kinds of a run, with their two values.
@@ -584,8 +585,10 @@ class Session:
                 break
         for _ in range(100):
             try:
-                self._sock = socket.create_connection(("127.0.0.1", self._host_port), timeout=60)
+                self._sock = socket.create_connection(("127.0.0.1", self._host_port), timeout=2.0)
                 self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # A call may move hundreds of MB or run long: not the connect's timeout.
+                self._sock.settimeout(CALL_TIMEOUT)
                 return
             except OSError:
                 time.sleep(0.05)

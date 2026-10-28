@@ -28,6 +28,9 @@ from tvm import DataType
 from . import fastrpc
 from .device import _DEFAULT_ADSP_DIRS
 
+# Seconds one call to an agent may take, its transfers included.
+CALL_TIMEOUT = 600.0
+
 
 class HexagonAgentSession:
     """Lifecycle + invoke channel for a generated FastRPC agent."""
@@ -114,6 +117,8 @@ class HexagonAgentSession:
             try:
                 s = socket.create_connection(("127.0.0.1", self.host_port), timeout=2.0)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # A call may move hundreds of MB or run long: not the connect's timeout.
+                s.settimeout(CALL_TIMEOUT)
                 return s
             except OSError:
                 time.sleep(0.05)
