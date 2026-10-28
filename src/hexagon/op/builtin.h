@@ -94,6 +94,18 @@ TVM_DLL const Op &hexagon_tanh();
 TVM_DLL const Op &hexagon_sigmoid();
 TVM_DLL const Op &hexagon_erf();
 TVM_DLL const Op &hexagon_fabs();
+// The fast variants (tl.enable_fast_math), hvx_math.h's tl_hvx_<fn>_fast, and
+// a float division a / b as hexagon_div_fast(a, b).
+TVM_DLL const Op &hexagon_exp_fast();
+TVM_DLL const Op &hexagon_exp2_fast();
+TVM_DLL const Op &hexagon_log_fast();
+TVM_DLL const Op &hexagon_log2_fast();
+TVM_DLL const Op &hexagon_sqrt_fast();
+TVM_DLL const Op &hexagon_rsqrt_fast();
+TVM_DLL const Op &hexagon_tanh_fast();
+TVM_DLL const Op &hexagon_sigmoid_fast();
+TVM_DLL const Op &hexagon_erf_fast();
+TVM_DLL const Op &hexagon_div_fast();
 
 // tl_hvx_reduce_rows<kind, acc, aligned>(dst, src, rows, cols, src_stride,
 // dst_stride, clear) (hvx_reduce.h): reduces `rows` rows of `cols` elements

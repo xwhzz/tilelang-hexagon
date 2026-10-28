@@ -43,6 +43,25 @@ vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` pr
 `tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type. HVX fp16
 arithmetic flushes subnormal results (below 2^-14) to zero.
 
+The functions aim at fp32 accuracy. Under the `tl.enable_fast_math` pass config, `LowerMath`
+picks fast variants instead (`tl_hvx_<fn>_fast`), and a float division becomes
+`tl_hvx_div_fast`: fp16-grade accuracy for finite inputs in the functions' domains. They keep
+their chains in qf32, take two Newton-Raphson steps, use lower-degree polynomials and skip
+special values and subnormals. On v79, in cycles per fp32 register, with the maximum error
+over the inputs (relative, or absolute for log, tanh, sigmoid and erf):
+
+| function | accurate | error | fast | error |
+|---|---|---|---|---|
+| exp | 36.1 | 3.8e-6 | 22.1 | 7.6e-5 |
+| exp2 | 28.1 | 3.6e-6 | 20.1 | 7.6e-5 |
+| log, log2 | 92-94 | 6e-7 | 30.1 | 2.5e-6 |
+| sqrt | 98.1 | 1.9e-7 | 24.0 | 4.7e-6 |
+| rsqrt | 90.1 | 1.6e-7 | 18.0 | 4.8e-6 |
+| tanh | 66.2 | 1.5e-6 | 38.1 | 3.7e-5 |
+| sigmoid | 54.2 | 7.9e-7 | 32.1 | 1.8e-5 |
+| erf | 176.1 | 1.5e-6 | 44.1 | 1.1e-4 |
+| a / b | 26.1 | 2.4e-7 | 16.0 | 1.1e-5 |
+
 Comparisons of vectors give lane masks, integers of the compared lanes' width, and a vector
 `T.Select` prints as `tl_vec_select` (`common.h`), one `vcmp` and one `vmux`; `vec_type` also
 has `-`, `~` and `!`, and `&&`/`||` on masks. The target declares `supports_vector_predicate`,

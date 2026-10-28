@@ -10,9 +10,9 @@ from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
 
 
-def _source(func):
+def _source(func, fast_math=False):
     target = determine_target("hexagon", return_object=True)
-    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
+    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config={"tl.enable_fast_math": fast_math}):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
 
@@ -111,6 +111,23 @@ def test_math_vectorizes_to_hvx_functions(fn, dtype, vector):
     # No libm call, scalar or vector.
     for libm in ("expf", "exp2f", "logf", "log2f", "sqrtf", "tanhf", "erff", "fabsf"):
         assert f"{libm}(" not in source
+
+
+@pytest.mark.parametrize("dtype,vector", [("float32", "float32"), ("float16", "half64")])
+def test_fast_math_prints_the_fast_functions_and_division(dtype, vector):
+    @T.prim_func
+    def kernel(A: T.Tensor((4, 256), dtype), B: T.Tensor((4, 256), dtype)):
+        with T.Kernel(4) as bx:
+            for j in T.Parallel(256):
+                B[bx, j] = T.exp(A[bx, j]) / (T.abs(A[bx, j]) + T.cast(1, dtype))
+
+    source = _source(kernel, fast_math=True)
+    assert f"tl_hvx_div_fast(tl_hvx_exp_fast(*({vector}*)(A + " in source
+    # |x| is exact: no fast variant.
+    assert "tl_hvx_fabs(" in source
+    accurate = _source(kernel)
+    assert "_fast(" not in accurate
+    assert f"tl_hvx_div(tl_hvx_exp(*({vector}*)(A + " in accurate
 
 
 # ---------------------------------------------------------------------------

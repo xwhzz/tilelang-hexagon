@@ -281,6 +281,162 @@ TL_DEVICE HVX_Vector tl_hvx_erf_vsf(HVX_Vector x) {
   return tl_hvx_select(Q6_Q_vcmp_gt_VwVw(tl_hvx_bits(0x3f000000), a), small, y);
 }
 
+// ---------------------------------------------------------------------------
+// Fast variants (tl.enable_fast_math): fp16-grade accuracy, about 1e-4
+// relative (1e-4 absolute for tanh, sigmoid and erf), for finite inputs in the
+// functions' domains. Chains stay in qf32 between operations instead of
+// rounding to IEEE after each; Newton-Raphson takes two steps; polynomials
+// have lower degrees; special values and subnormals get no fixups. v79 has no
+// qf32 negation, nor c − qf32 for an IEEE c, so the steps keep their signs
+// with the forms it has: qf32 − c, qf32 + c, and products by a scalar.
+// ---------------------------------------------------------------------------
+TL_DEVICE HVX_Vector tl_hvx_qf(HVX_Vector sf) {
+  return Q6_Vqf32_vadd_VsfVsf(sf, Q6_V_vzero());
+}
+TL_DEVICE int tl_hvx_float_bits(float c) {
+  int b;
+  __builtin_memcpy(&b, &c, 4);
+  return b;
+}
+
+// 1/x: y = y·(2 + (−x)·y) twice from the bit-pattern seed, about 1e-5.
+TL_DEVICE HVX_Vector tl_hvx_recip_fast_vsf(HVX_Vector x) {
+  HVX_Vector y = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7EF127EA), x);
+  HVX_Vector neg_x = Q6_V_vxor_VV(x, tl_hvx_bits((int)0x80000000));
+  HVX_Vector two = tl_hvx_splat_f(2.0f);
+  HVX_Vector yq = Q6_Vqf32_vmpy_Vqf32Vqf32(
+      tl_hvx_qf(y),
+      Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(neg_x, y), two));
+  yq = Q6_Vqf32_vmpy_Vqf32Vqf32(
+      yq, Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(tl_hvx_qf(neg_x), yq),
+                                 two));
+  return Q6_Vsf_equals_Vqf32(yq);
+}
+
+// 1/sqrt(x): w = w·(x/2·w² − 1.5) twice from the bit-pattern seed, about 5e-6.
+// Each step is the Newton step y·(1.5 − x/2·y²) negated, so two of them keep
+// the sign.
+TL_DEVICE HVX_Vector tl_hvx_rsqrt_fast_vsf(HVX_Vector x) {
+  HVX_Vector y =
+      Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x5F3759DF), Q6_Vw_vasr_VwR(x, 1));
+  HVX_Vector half_x = Q6_Vqf32_vmpy_VsfRsf(x, tl_hvx_float_bits(0.5f));
+  HVX_Vector c15 = tl_hvx_splat_f(1.5f);
+  HVX_Vector wq = tl_hvx_qf(y);
+#pragma clang loop unroll(full)
+  for (int it = 0; it < 2; ++it) {
+    HVX_Vector t =
+        Q6_Vqf32_vmpy_Vqf32Vqf32(half_x, Q6_Vqf32_vmpy_Vqf32Vqf32(wq, wq));
+    wq = Q6_Vqf32_vmpy_Vqf32Vqf32(wq, Q6_Vqf32_vsub_Vqf32Vsf(t, c15));
+  }
+  return Q6_Vsf_equals_Vqf32(wq);
+}
+
+// x·rsqrt(x); 0 stays 0, since the seed of 0 is finite.
+TL_DEVICE HVX_Vector tl_hvx_sqrt_fast_vsf(HVX_Vector x) {
+  return tl_hvx_mul_sf(x, tl_hvx_rsqrt_fast_vsf(x));
+}
+
+// 2^x = 2^k·2^f for x in [-126, 126]: k = round(x) from the truncation of
+// x + 128.5, f = x − k in [-0.5, 0.5], 2^f by a degree-3 minimax polynomial
+// (7.5e-5 relative), and k added to the exponent field.
+TL_DEVICE HVX_Vector tl_hvx_exp2_fast_vsf(HVX_Vector x) {
+  x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, tl_hvx_splat_f(-126.0f)),
+                         tl_hvx_splat_f(126.0f));
+  HVX_Vector biased =
+      Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, tl_hvx_splat_f(128.5f)));
+  HVX_Vector k = Q6_Vw_vsub_VwVw(biased, Q6_V_vsplat_R(128));
+  HVX_Vector fq = Q6_Vqf32_vsub_VsfVsf(x, Q6_Vsf_equals_Vw(k));
+  HVX_Vector f = Q6_Vsf_equals_Vqf32(fq);
+  HVX_Vector p = Q6_Vqf32_vadd_Vqf32Vsf(
+      Q6_Vqf32_vmpy_VsfRsf(f, tl_hvx_float_bits(0.0551716045f)),
+      tl_hvx_splat_f(0.2426111173f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, fq),
+                             tl_hvx_splat_f(0.6932609974f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, fq),
+                             tl_hvx_splat_f(0.9999280741f));
+  return Q6_Vw_vadd_VwVw(Q6_Vsf_equals_Vqf32(p), Q6_Vw_vasl_VwR(k, 23));
+}
+
+TL_DEVICE HVX_Vector tl_hvx_exp_fast_vsf(HVX_Vector x) {
+  return tl_hvx_exp2_fast_vsf(Q6_Vsf_equals_Vqf32(
+      Q6_Vqf32_vmpy_VsfRsf(x, tl_hvx_float_bits(1.4426950408889634f))));
+}
+
+// log2 of a positive normal x = m·2^e, m in [sqrt(1/2), sqrt(2)): three terms
+// of 2·atanh(s)/ln 2, s = (m − 1)/(m + 1), |s| <= 0.172, about 2e-6.
+TL_DEVICE HVX_Vector tl_hvx_log2_fast_vsf(HVX_Vector x) {
+  HVX_Vector e =
+      Q6_Vw_vsub_VwVw(Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(x, 23), tl_hvx_bits(0xff)),
+                      tl_hvx_bits(127));
+  HVX_Vector m = Q6_V_vor_VV(Q6_V_vand_VV(x, tl_hvx_bits(0x007fffff)),
+                             tl_hvx_bits(0x3f800000));
+  HVX_VectorPred big = Q6_Q_vcmp_gt_VwVw(m, tl_hvx_bits(0x3fb504f3)); // sqrt 2
+  m = tl_hvx_select(big, Q6_Vw_vsub_VwVw(m, tl_hvx_bits(0x00800000)), m);
+  e = tl_hvx_select(big, Q6_Vw_vadd_VwVw(e, tl_hvx_bits(1)), e);
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector sq = Q6_Vqf32_vmpy_Vqf32Vqf32(
+      Q6_Vqf32_vsub_VsfVsf(m, one),
+      tl_hvx_qf(tl_hvx_recip_fast_vsf(tl_hvx_add_sf(m, one))));
+  HVX_Vector s2 = Q6_Vqf32_vmpy_Vqf32Vqf32(sq, sq);
+  HVX_Vector p = Q6_Vqf32_vadd_Vqf32Vsf(
+      Q6_Vqf32_vmpy_VsfRsf(Q6_Vsf_equals_Vqf32(s2), tl_hvx_float_bits(0.2f)),
+      tl_hvx_splat_f(1.0f / 3.0f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, s2), one);
+  HVX_Vector r =
+      Q6_Vqf32_vmpy_VsfRsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(sq, p)),
+                           tl_hvx_float_bits(2.8853900817779268f));
+  return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(r, Q6_Vsf_equals_Vw(e)));
+}
+
+TL_DEVICE HVX_Vector tl_hvx_log_fast_vsf(HVX_Vector x) {
+  return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfRsf(
+      tl_hvx_log2_fast_vsf(x), tl_hvx_float_bits(0.6931471805599453f)));
+}
+
+TL_DEVICE HVX_Vector tl_hvx_sigmoid_fast_vsf(HVX_Vector x) {
+  HVX_Vector e =
+      tl_hvx_exp_fast_vsf(Q6_V_vxor_VV(x, tl_hvx_bits((int)0x80000000)));
+  return tl_hvx_recip_fast_vsf(tl_hvx_add_sf(tl_hvx_splat_f(1.0f), e));
+}
+
+// 1 − 2/(e^2x + 1), with no small-|x| branch: its absolute error stays small.
+TL_DEVICE HVX_Vector tl_hvx_tanh_fast_vsf(HVX_Vector x) {
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector e = tl_hvx_exp_fast_vsf(tl_hvx_add_sf(x, x));
+  HVX_Vector q = tl_hvx_recip_fast_vsf(tl_hvx_add_sf(e, one));
+  return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
+      Q6_Vqf32_vmpy_VsfRsf(q, tl_hvx_float_bits(-2.0f)), one));
+}
+
+// Abramowitz-Stegun 7.1.26 alone (absolute error below 1.5e-7 in exact
+// arithmetic), with the fast exp and reciprocal.
+TL_DEVICE HVX_Vector tl_hvx_erf_fast_vsf(HVX_Vector x) {
+  HVX_Vector sign = Q6_V_vand_VV(x, tl_hvx_bits((int)0x80000000));
+  HVX_Vector a = Q6_V_vand_VV(x, tl_hvx_bits(0x7fffffff));
+  HVX_Vector one = tl_hvx_splat_f(1.0f);
+  HVX_Vector t =
+      tl_hvx_recip_fast_vsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
+          Q6_Vqf32_vmpy_VsfRsf(a, tl_hvx_float_bits(0.3275911f)), one)));
+  HVX_Vector tq = tl_hvx_qf(t);
+  HVX_Vector p = Q6_Vqf32_vadd_Vqf32Vsf(
+      Q6_Vqf32_vmpy_VsfRsf(t, tl_hvx_float_bits(1.061405429f)),
+      tl_hvx_splat_f(-1.453152027f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, tq),
+                             tl_hvx_splat_f(1.421413741f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, tq),
+                             tl_hvx_splat_f(-0.284496736f));
+  p = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(p, tq),
+                             tl_hvx_splat_f(0.254829592f));
+  p = Q6_Vqf32_vmpy_Vqf32Vqf32(p, tq);
+  HVX_Vector neg_a = Q6_V_vxor_VV(a, tl_hvx_bits((int)0x80000000));
+  HVX_Vector neg_g = Q6_V_vxor_VV(
+      tl_hvx_exp_fast_vsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, neg_a))),
+      tl_hvx_bits((int)0x80000000));
+  HVX_Vector y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
+      Q6_Vqf32_vmpy_Vqf32Vqf32(p, tl_hvx_qf(neg_g)), one));
+  return Q6_V_vor_VV(y, sign);
+}
+
 // Applies a register kernel to every register of a vector. This loop and the
 // division's unroll in full: rolled, they pass every register through the stack
 // and run the registers' dependency chains one after another, which made exp
@@ -346,6 +502,15 @@ TL_HVX_MATH(rsqrt, tl_hvx_rsqrt_ieee_vsf)
 TL_HVX_MATH(tanh, tl_hvx_tanh_vsf)
 TL_HVX_MATH(sigmoid, tl_hvx_sigmoid_vsf)
 TL_HVX_MATH(erf, tl_hvx_erf_vsf)
+TL_HVX_MATH(exp_fast, tl_hvx_exp_fast_vsf)
+TL_HVX_MATH(exp2_fast, tl_hvx_exp2_fast_vsf)
+TL_HVX_MATH(log_fast, tl_hvx_log_fast_vsf)
+TL_HVX_MATH(log2_fast, tl_hvx_log2_fast_vsf)
+TL_HVX_MATH(sqrt_fast, tl_hvx_sqrt_fast_vsf)
+TL_HVX_MATH(rsqrt_fast, tl_hvx_rsqrt_fast_vsf)
+TL_HVX_MATH(tanh_fast, tl_hvx_tanh_fast_vsf)
+TL_HVX_MATH(sigmoid_fast, tl_hvx_sigmoid_fast_vsf)
+TL_HVX_MATH(erf_fast, tl_hvx_erf_fast_vsf)
 #undef TL_HVX_MATH
 
 // |x| is one vector and that clears the sign bit; clang scalarizes a float
@@ -402,6 +567,58 @@ TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
     __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
   }
   return out;
+}
+
+// a / b as a times the fast reciprocal of b (tl.enable_fast_math): LowerMath
+// rewrites a float division into hexagon_div_fast, which prints as this for
+// scalars and vectors alike.
+TL_DEVICE HVX_Vector tl_hvx_div_fast_vsf(HVX_Vector a, HVX_Vector b) {
+  return tl_hvx_mul_sf(a, tl_hvx_recip_fast_vsf(b));
+}
+
+template <int N>
+TL_DEVICE vec_type<float, N> tl_hvx_div_fast(const vec_type<float, N> &a,
+                                             const vec_type<float, N> &b) {
+  static_assert(N % TL_HVX_F32_LANES == 0, "HVX math needs whole registers");
+  vec_type<float, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
+    HVX_Vector x, y;
+    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
+    __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
+    HVX_Vector q = tl_hvx_div_fast_vsf(x, y);
+    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  }
+  return out;
+}
+
+template <int N>
+TL_DEVICE vec_type<half, N> tl_hvx_div_fast(const vec_type<half, N> &a,
+                                            const vec_type<half, N> &b) {
+  static_assert(N % TL_HVX_F16_LANES == 0, "HVX math needs whole registers");
+  vec_type<half, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F16_LANES; ++i) {
+    HVX_Vector x, y, xlo, xhi, ylo, yhi;
+    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
+    __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
+    tl_hvx_widen_hf(x, &xlo, &xhi);
+    tl_hvx_widen_hf(y, &ylo, &yhi);
+    HVX_Vector q = tl_hvx_narrow_hf(tl_hvx_div_fast_vsf(xlo, ylo),
+                                    tl_hvx_div_fast_vsf(xhi, yhi));
+    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  }
+  return out;
+}
+
+TL_DEVICE float tl_hvx_div_fast(float a, float b) {
+  HVX_Vector v = tl_hvx_div_fast_vsf(tl_hvx_splat_f(a), tl_hvx_splat_f(b));
+  float r;
+  __builtin_memcpy(&r, &v, 4);
+  return r;
+}
+TL_DEVICE float tl_hvx_div_fast(const half &a, const half &b) {
+  return tl_hvx_div_fast((float)a, (float)b);
 }
 
 // ---------------------------------------------------------------------------

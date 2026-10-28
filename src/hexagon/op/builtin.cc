@@ -97,8 +97,23 @@ TL_HEXAGON_MATH_BUILTIN(hexagon_tanh);
 TL_HEXAGON_MATH_BUILTIN(hexagon_sigmoid);
 TL_HEXAGON_MATH_BUILTIN(hexagon_erf);
 TL_HEXAGON_MATH_BUILTIN(hexagon_fabs);
+TL_HEXAGON_MATH_BUILTIN(hexagon_exp_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_exp2_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_log_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_log2_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_sqrt_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_rsqrt_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_tanh_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_sigmoid_fast);
+TL_HEXAGON_MATH_BUILTIN(hexagon_erf_fast);
 
 #undef TL_HEXAGON_MATH_BUILTIN
+
+TIR_DEFINE_TL_BUILTIN(hexagon_div_fast)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TVectorizable>("TVectorizable", true);
 
 TIR_DEFINE_TL_BUILTIN(hexagon_reduce_rows)
     .set_num_inputs(10)
