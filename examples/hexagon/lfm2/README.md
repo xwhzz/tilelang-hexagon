@@ -11,8 +11,10 @@ v79 cDSP, every operation a TileLang kernel, at batch 1.
 | `stream.py` | The weight streams of the kernels, and the decode's w4a16 GEMV blocks. |
 | `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds both kernels. |
 | `prefill.py` | The prefill kernel: a prompt in chunks of 128 rows on HMX, in one call. |
-| `bench_decode.py` | Decode on the device: tokens per second and the greedy tokens. |
-| `bench_prefill.py` | Prefill on the device: tokens per second by prompt length. |
+| `text.py` | The checkpoint's tokenizer and chat template, on the host, without transformers. |
+| `generate.py` | Chat on the device: the reply streams as it is generated. |
+| `bench.py` | Prompt processing and token generation on the device, in the style of llama-bench. |
+| `ppl.py` | The bundle's perplexity on the device. |
 | `tiny.py` | A small random LFM2 with the same structure, for tests. |
 
 ## Weights
@@ -25,7 +27,11 @@ device. WikiText-2 perplexity (40 windows of 1024 tokens):
 | | ppl |
 |---|---:|
 | bf16 | 16.29 |
-| bundle, device arithmetic | 16.68 |
+| bundle, device arithmetic (`quantize.py --eval`) | 16.683 |
+| bundle, on the device (`ppl.py`) | 16.684 |
+
+`ppl.py` scores the same windows on the device, with the decode, every token
+forced (`Decoder.score`).
 
 The bundle streams 653.5 MB per token, of 781.8 MB on disk (the embedding is
 read one row a token).
@@ -66,8 +72,12 @@ of the DMA roofline (57 GB/s); nexa measured 65-68 t/s on the same phone. Its
 greedy tokens match `BundleModel`'s, the reference with the device's
 arithmetic, token for token.
 
-    adb push lfm2.bundle /data/local/tmp/lfm2.bundle
-    python bench_decode.py lfm2.bundle /data/local/tmp/lfm2.bundle --prompt 1,1098,5706,803 --new 128
+The head also samples on the device: at a temperature, a sample is the argmax
+of the logits over the temperature plus Gumbel noise, from a hash of (seed,
+position, token) that a decode call computes in rounds of add, rotate and xor
+(hexagon-clang 19 miscompiles a vector product shifted right, so it multiplies
+nothing). And for every forced token it writes the log-probability the step
+gives it, the scores of `Decoder.score`.
 
 ## Prefill
 
@@ -91,7 +101,7 @@ GEMMs, and their output or a part of the FFN's hidden units.
 - **Layers.** One loop at run time, which reads each layer's kind from a table:
   the kernel's code does not grow with the depth.
 
-On v79, in the DSP's time (`bench_prefill.py`):
+On v79, in the DSP's time:
 
 | prompt | ms | t/s |
 |---:|---:|---:|
@@ -107,4 +117,37 @@ nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
 values match the decode's, a token a step, to about 3e-3, and the tokens
 generated after it match the decode's.
 
-    python bench_prefill.py lfm2.bundle /data/local/tmp/lfm2.bundle --lengths 128,512,1024
+## On the device
+
+    adb push lfm2.bundle /data/local/tmp/lfm2.bundle
+    python generate.py lfm2.bundle /data/local/tmp/lfm2.bundle LFM2-1.2B --prompt "What is 17 times 23?"
+    python bench.py lfm2.bundle /data/local/tmp/lfm2.bundle --pp 512,1024 --tg 128
+    python ppl.py lfm2.bundle /data/local/tmp/lfm2.bundle LFM2-1.2B --text wikitext2_test.txt
+
+`generate.py` renders the checkpoint's chat template and tokenizes on the
+host (it needs `tokenizers` and `jinja2`), prefills the prompt and streams the
+reply, a decode call per 16 tokens; `--temperature` and `--seed` sample.
+Greedy, on v79:
+
+    > What is 17 times 23?
+    To find the product of 17 and 23, we can use the standard multiplication
+    method or leverage the distributive property of multiplication over addition.
+    ...
+    Therefore, 17 times 23 is 391.
+    [prompt 17 tokens, prefill 25 ms; 105 tokens, decode 80.6 t/s; 1.59 s in all]
+
+    > Translate to French: The weather is nice today.
+    Le temps est agréable aujourd'hui.
+    ...
+
+`bench.py`, the median of 5 runs in the DSP's time:
+
+| test | ms | t/s |
+|---|---:|---:|
+| pp128 | 24.4 | 5247 |
+| pp512 | 103.7 | 4938 |
+| pp1024 | 217.4 | 4711 |
+| tg128 | 1580.2 | 81.0 |
+
+nexa on the same chip: pp1024 3618 t/s and tg128 69.5 t/s published, 65-68
+t/s measured on this phone.

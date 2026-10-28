@@ -83,13 +83,17 @@ def test_decode_is_one_cycle_of_phases(tiny_bundle):
 
 
 def _reference(model, tokens, n, n_forced):
+    """The tokens of n greedy steps from tokens[:n_forced], the last step's
+    logits, and the log-probabilities of the forced next tokens."""
     state = model.new_state()
-    out, logits = list(tokens[:n_forced]), None
+    out, logits, scores = list(tokens[:n_forced]), None, []
     for t in range(n):
         logits = model.logits(model.run(torch.tensor([out[t]]), state)[-1])
         if t + 1 >= n_forced:
             out.append(int(logits.argmax()))
-    return out, logits
+        else:
+            scores.append(torch.log_softmax(logits.double(), -1)[out[t + 1]].item())
+    return out, logits, scores
 
 
 @DEVICE
@@ -98,7 +102,7 @@ def test_decode_matches_the_reference(tiny_bundle):
     prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000]
     n_forced, n = len(prompt), len(prompt) + 8 - 1
     with torch.no_grad():
-        ref_tokens, ref_logits = _reference(BundleModel(path), prompt, n, n_forced)
+        ref_tokens, ref_logits, ref_scores = _reference(BundleModel(path), prompt, n, n_forced)
     decoder = Decoder(path, max_pos=256, max_tokens=64)
     try:
         for _ in range(2):  # the second call starts over from reset state
@@ -106,6 +110,27 @@ def test_decode_matches_the_reference(tiny_bundle):
             tokens, logits = decoder.run(prompt, 0, n, n_forced)
             assert tokens == ref_tokens
             torch.testing.assert_close(logits, ref_logits, rtol=1e-3, atol=1e-3 * ref_logits.abs().max().item())
+        # The log-probabilities of the prompt's tokens, every one forced.
+        scores = decoder.score(prompt)
+        torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=1e-3, atol=1e-3)
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_decode_samples_at_a_temperature(tiny_bundle):
+    _, _, _, path = tiny_bundle
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000]
+    decoder = Decoder(path, max_pos=256, max_tokens=64)
+    try:
+        greedy = decoder.generate(prompt, 12)
+        # Near zero, the noise cannot move the argmax.
+        assert decoder.generate(prompt, 12, temperature=1e-6, seed=5) == greedy
+        a = decoder.generate(prompt, 12, temperature=1.0, seed=1)
+        assert decoder.generate(prompt, 12, temperature=1.0, seed=1) == a
+        assert decoder.generate(prompt, 12, temperature=1.0, seed=2) != a
+        # A stream of decode calls gives the tokens of one call.
+        assert [t for part in decoder.stream(prompt, 12, temperature=1.0, seed=1, chunk=5) for t in part] == a
     finally:
         decoder.close()
 

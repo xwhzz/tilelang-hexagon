@@ -157,6 +157,33 @@ def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb,
         mix[0, out0 + g * 64 + d] = o[g, d] / l[g]
 
 
+# The round keys of the sampling noise's hash: the digits of pi.
+NOISE_KEYS = (0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344, 0xA4093822, 0x299F31D0, 0x082EFA98, 0xEC4E6C89)
+
+
+@T.macro
+def add_gumbel(logit, scale, seed, pos, first, hx, hy):
+    """logit = logit * scale + Gumbel noise -log(-log(u)) for vocabulary entries
+    first + j at position pos: u is uniform in (0, 1), from a hash of (seed,
+    pos, index) in rounds of add, rotate and xor (Speck's round function).
+    hexagon-clang 19 miscompiles a vector product shifted right, so the hash
+    multiplies nothing; its state hx, hy goes through memory between rounds,
+    as an expression of them all would double with each round."""
+    for i, j in T.Parallel(1, logit.shape[1]):
+        hx[i, j] = T.Cast("uint32", first + j)
+        hy[i, j] = T.Cast("uint32", pos) ^ (T.Cast("uint32", seed) << T.uint32(16))
+    for r in list(range(len(NOISE_KEYS))):
+        for i, j in T.Parallel(1, logit.shape[1]):
+            hx[i, j] = (((hx[i, j] >> T.uint32(8)) | (hx[i, j] << T.uint32(24))) + hy[i, j]) ^ T.uint32(NOISE_KEYS[r])
+        for i, j in T.Parallel(1, logit.shape[1]):
+            hy[i, j] = ((hy[i, j] << T.uint32(3)) | (hy[i, j] >> T.uint32(29))) ^ hx[i, j]
+    for i, j in T.Parallel(1, logit.shape[1]):
+        # 24 bits, through int32: an unsigned conversion to float is not safe
+        # on HVX (hexagon-clang 19 selects IEEE instructions v79 does not run).
+        u = (T.Cast("float32", T.Cast("int32", hy[i, j] >> T.uint32(8))) + T.float32(0.5)) * T.float32(1.0 / (1 << 24))
+        logit[i, j] = logit[i, j] * scale + -T.log(-T.log(u))
+
+
 def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
     """The decode kernel for config c and the bundle's tensor `shapes`."""
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
@@ -206,9 +233,11 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
         x: T.Tensor((1, D), "float32"),
         mix: T.Tensor((1, D), "float32"),
         ff: T.Tensor((1, F), "float32"),
-        cand: T.Tensor((NW, 2), "float32"),
+        cand: T.Tensor((NW, 4), "float32"),
         tokens: T.Tensor((max_tokens,), "int32"),
         logits: T.Tensor((1, V), "float32"),
+        scores: T.Tensor((max_tokens,), "float32"),
+        sampling: T.Tensor((2,), "float32"),
         pos0: T.int32,
         n: T.int32,
         n_forced: T.int32,
@@ -250,6 +279,10 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
             lb = T.alloc_fragment((group,), "float32")
             alpha = T.alloc_fragment((group,), "float32")
             logit = T.alloc_fragment((1, VW), "float32")
+            ex = T.alloc_fragment((1, VW), "float32")
+            se = T.alloc_fragment((1,), "float32")
+            hx = T.alloc_fragment((1, VW), "uint32")
+            hy = T.alloc_fragment((1, VW), "uint32")
             idx = T.alloc_fragment((1, VW), "float32")
             best = T.alloc_fragment((1,), "float32")
             besti = T.alloc_fragment((1,), "float32")
@@ -364,19 +397,31 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
                     i_ph += 1
                     T.sync_grid()
 
-                # The LM head and the worker's argmax.
+                # The LM head: the worker's logits, their max and sum of
+                # exponentials (for the scores), and its proposal.
                 T.copy(x, xf)
                 rms_norm(xf, lambda k: final_norm[k], hf, sq, s1, D, eps)
                 quantize(hf, xq, sa, amax, D)
                 st.run(i_ph, lambda b, rw, rs, k: head_block(b, rw, rs, k, xq, sa, acc_h, D, logit))
+                for j in T.Parallel(VW):
+                    logits[0, w * VW + j] = logit[0, j]
                 T.reduce_max(logit, best, dim=1)
+                for i, j in T.Parallel(1, VW):
+                    ex[i, j] = T.exp(logit[i, j] - best[0])
+                T.reduce_sum(ex, se, dim=1)
+                cand[w, 2] = best[0]
+                cand[w, 3] = se[0]
+                # At temperature 1 / sampling[0], a sample is the argmax of
+                # the logits over the temperature plus Gumbel noise, which
+                # sampling[1] seeds; at 0, the argmax of the logits.
+                if sampling[0] > T.float32(0):
+                    add_gumbel(logit, sampling[0], T.Cast("int32", sampling[1]), pos, w * VW, hx, hy)
+                    T.reduce_max(logit, best, dim=1)
                 for i, j in T.Parallel(1, VW):
                     idx[i, j] = T.if_then_else(logit[i, j] == best[0], T.Cast("float32", j), T.float32(3.0e38))
                 T.reduce_min(idx, besti, dim=1)
                 cand[w, 0] = best[0]
                 cand[w, 1] = besti[0] + T.Cast("float32", w * VW)
-                for j in T.Parallel(VW):
-                    logits[0, w * VW + j] = logit[0, j]
                 T.sync_grid()
                 # Every worker takes the first of the largest proposals.
                 best[0] = cand[0, 0]
@@ -388,6 +433,15 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
                 nxt[0] = T.Cast("int32", besti[0])
                 if w == 0 and t + 1 >= n_forced and t + 1 < max_tokens:
                     tokens[t + 1] = nxt[0]
+                # The log-probability of a forced next token.
+                if w == 0 and t + 1 < n_forced:
+                    top = cand[0, 2]
+                    for v in list(range(1, NW)):
+                        top = T.max(top, cand[v, 2])
+                    total = cand[0, 3] * T.exp(cand[0, 2] - top)
+                    for v in list(range(1, NW)):
+                        total = total + cand[v, 3] * T.exp(cand[v, 2] - top)
+                    scores[t] = logits[0, tokens[t + 1]] - top - T.log(total)
 
     return decode
 
@@ -460,7 +514,7 @@ class Decoder:
         self.rope = [resident(cos), resident(sin)]
         self.kv_k, self.kv_v = resident(nbytes=kv), resident(nbytes=kv)
         self.conv_state = resident(nbytes=Lc * 2 * c.dim * 4)
-        self.scratch = [resident(nbytes=c.dim * 4), resident(nbytes=c.dim * 4), resident(nbytes=c.ff * 4), resident(nbytes=NW * 2 * 4)]
+        self.scratch = [resident(nbytes=c.dim * 4), resident(nbytes=c.dim * 4), resident(nbytes=c.ff * 4), resident(nbytes=NW * 4 * 4)]
         self.tokens = resident(nbytes=max_tokens * 4)
         # The prefill's table of layers: whether each is attention, and its
         # index among the layers of its kind.
@@ -468,6 +522,8 @@ class Decoder:
         kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
         self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
         self.logits = resident(nbytes=c.vocab * 4)
+        self.scores = resident(nbytes=max_tokens * 4)
+        self.sampling = resident(nbytes=2 * 4)
         # A step writes its position of the KV cache before it attends, and the
         # positions past it are masked: the cache needs zeros only once, so that
         # no position ever holds a NaN.
@@ -479,14 +535,19 @@ class Decoder:
         """Forget the context: the conv state starts from zeros."""
         self.conv_state.write(bytes(self.conv_state.nbytes))
 
-    def run(self, tokens: list, pos0: int, n: int, n_forced: int) -> tuple:
+    def run(self, tokens: list, pos0: int, n: int, n_forced: int, temperature: float = 0.0, seed: int = 0) -> tuple:
         """Steps pos0 .. pos0 + n - 1 from tokens[0 .. n_forced): the tokens of all
-        n + 1 positions, and the last step's logits."""
-        assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos
+        n + 1 positions, and the last step's logits. Past the forced tokens,
+        each step's token is the argmax of its logits, or at a temperature
+        a sample of their softmax, which `seed` (below 2^24) makes
+        reproducible."""
+        assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos and 0 <= seed < 1 << 24
         self.tokens.write(torch.tensor(list(tokens[:n_forced]), dtype=torch.int32))
+        self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
         self.session.kernels[0](
-            *self.args, *self.rope, self.kv_k, self.kv_v, self.conv_state, *self.scratch, self.tokens, self.logits, pos0, n, n_forced
-        )
+            *self.args, *self.rope, self.kv_k, self.kv_v, self.conv_state, *self.scratch, self.tokens, self.logits,
+            self.scores, self.sampling, pos0, n, n_forced,
+        )  # fmt: skip
         out = torch.frombuffer(bytearray(self.tokens.read((n + 1) * 4)), dtype=torch.int32).tolist()
         logits = torch.frombuffer(bytearray(self.logits.read()), dtype=torch.float32)
         return out, logits
@@ -499,17 +560,47 @@ class Decoder:
         self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
         self.session.kernels[1](*self.prefill_args, *self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds, self.tokens, pos0, n)
 
-    def generate(self, prompt: list, n_new: int) -> list:
-        """Greedy: the `n_new` tokens after `prompt`, from an empty context. The
-        prefill runs the prompt but its last token, which the decode's first
-        step runs and the LM head reads."""
+    def score(self, tokens: list) -> list:
+        """From an empty context, log p(tokens[i + 1] | tokens[: i + 1]) for
+        each i: the decode, every token forced."""
+        self.reset()
+        n = len(tokens) - 1
+        self.run(tokens, 0, n, n + 1)
+        return torch.frombuffer(bytearray(self.scores.read(n * 4)), dtype=torch.float32).tolist()
+
+    def stream(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0, chunk: int = 16, timings: list | None = None):
+        """The `n_new` tokens after `prompt`, from an empty context, in lists of
+        up to `chunk`: a decode call each, so that a caller can show them as
+        they come. The prefill runs the prompt but its last token, which the
+        decode's first step runs and the LM head reads. `timings`, if given,
+        gets (kernel, tokens, seconds on the DSP) for each call."""
+
+        def timed(kernel: str, tokens: int) -> None:
+            if timings is not None:
+                timings.append((kernel, tokens, self.session.last_run_seconds()))
+
         self.reset()
         if self.prefill_rows and len(prompt) > 1:
             self.prefill(prompt[:-1])
-            tokens, _ = self.run(prompt[-1:], len(prompt) - 1, n_new, 1)
-            return tokens[1:]
-        tokens, _ = self.run(prompt, 0, len(prompt) + n_new - 1, len(prompt))
-        return tokens[len(prompt) :]
+            timed("prefill", len(prompt) - 1)
+            last, pos, done = prompt[-1], len(prompt) - 1, 0
+        else:
+            k = min(chunk, n_new)
+            tokens, _ = self.run(prompt, 0, len(prompt) + k - 1, len(prompt), temperature, seed)
+            timed("decode", len(prompt) + k - 1)
+            yield tokens[len(prompt) :]
+            last, pos, done = tokens[-1], len(prompt) - 1 + k, k
+        while done < n_new:
+            k = min(chunk, n_new - done)
+            tokens, _ = self.run([last], pos, k, 1, temperature, seed)
+            timed("decode", k)
+            yield tokens[1:]
+            last, pos, done = tokens[-1], pos + k, done + k
+
+    def generate(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0) -> list:
+        """The `n_new` tokens after `prompt`, from an empty context: greedy, or
+        sampled at a temperature (``stream``)."""
+        return [t for part in self.stream(prompt, n_new, temperature, seed, chunk=n_new) for t in part]
 
     def close(self) -> None:
         self.session.close()
