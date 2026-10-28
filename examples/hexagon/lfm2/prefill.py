@@ -24,7 +24,7 @@ while another multiplies. The epilogues fuse the rest:
 - q/k norm and RoPE;
 - the residual adds, into x itself.
 
-Attention runs per KV head, against the KV cache in blocks of 64 positions
+Attention runs per KV head, against the KV cache in blocks of 128 positions
 with an online softmax, on HMX: a block packs once for the four query heads
 the KV head serves. The chunk's keys and values go into the cache first.
 
@@ -50,7 +50,7 @@ from stream import Phase, Projection, Stream  # noqa: E402
 NW = 4  # workers, as the decode's
 DEPTH = 2  # blocks in flight per worker: a block multiplies far longer than it streams
 BLOCK = 128  # rows per block of a 4-bit projection
-KEYS = 64  # KV positions per attention step
+KEYS = 128  # KV positions per attention step
 NEG = -3.0e38
 
 

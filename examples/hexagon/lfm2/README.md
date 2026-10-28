@@ -95,7 +95,7 @@ GEMMs, and their output or a part of the FFN's hidden units.
 - **Epilogues.** They fuse the short conv's gates and its causal conv over time,
   SwiGLU, the q/k norms and RoPE, and the residual adds, into the residual
   itself.
-- **Attention.** Per KV head, against the KV cache in blocks of 64 positions with
+- **Attention.** Per KV head, against the KV cache in blocks of 128 positions with
   an online softmax: HMX multiplies the scores and P V, and a block of keys and
   values packs once for the four query heads it serves.
 - **Layers.** One loop at run time, which reads each layer's kind from a table:
@@ -105,12 +105,12 @@ On v79, in the DSP's time:
 
 | prompt | ms | t/s |
 |---:|---:|---:|
-| 40 | 24.4 | 1642 |
-| 128 | 23.9 | 5356 |
-| 256 | 48.8 | 5242 |
-| 512 | 102.8 | 4981 |
-| 1024 | 217.3 | 4713 |
-| 2048 | 500.7 | 4090 |
+| 40 | 24.5 | 1633 |
+| 128 | 22.6 | 5657 |
+| 256 | 45.5 | 5622 |
+| 512 | 95.2 | 5379 |
+| 1024 | 198.9 | 5147 |
+| 2048 | 443.0 | 4624 |
 
 nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
 1.1-1.5k t/s for a 40-token one on the same phone. The prefill's keys and
@@ -144,10 +144,10 @@ Greedy, on v79:
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp128 | 24.4 | 5247 |
-| pp512 | 103.7 | 4938 |
-| pp1024 | 217.4 | 4711 |
-| tg128 | 1580.2 | 81.0 |
+| pp128 | 22.6 | 5657 |
+| pp512 | 95.2 | 5379 |
+| pp1024 | 198.9 | 5147 |
+| tg128 | 1594.2 | 80.3 |
 
 nexa on the same chip: pp1024 3618 t/s and tg128 69.5 t/s published, 65-68
 t/s measured on this phone.
