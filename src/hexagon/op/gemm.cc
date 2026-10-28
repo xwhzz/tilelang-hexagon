@@ -12,10 +12,9 @@
 
 #include "hexagon/op/gemm.h"
 
-#include "hexagon/op/utils.h" // GetBufferStrides
+#include "hexagon/op/utils.h" // GetBufferStrides, IsVTCMBuffer
 #include "op/gemm.h"
 #include "op/gemm_blockscaled.h"
-#include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
 
 #include "backend/common/target_utils.h"
@@ -71,9 +70,9 @@ std::string HMXRejection(const GemmNode &op) {
   for (const auto &[name, region] : operands) {
     const Buffer &buffer = (*region)->buffer;
     std::string operand = std::string(name) + " (" + buffer->name + ")";
-    if (!IsSharedBuffer(buffer) && !IsFragmentBuffer(buffer))
-      return operand + " is not in VTCM: HMX operands are shared buffers or "
-                       "fragments";
+    if (!IsVTCMBuffer(buffer))
+      return operand + " is not in VTCM: HMX operands are shared buffers, "
+                       "fragments or global.vtcm buffers";
     const Array<Range> &ranges = (*region)->region;
     size_t rank = ranges.size();
     if (rank < 2)
@@ -101,7 +100,7 @@ std::string PanelRejection(const GemmNode &op) {
   if (op.transA_ || !op.transB_)
     return "HVX multiplies integer rows of A by rows of B: transpose_B, and "
            "A not transposed";
-  if (!IsSharedBuffer(op.b_))
+  if (!IsVTCMBuffer(op.b_))
     return "HVX reads an integer B in its panel layout, from VTCM";
   int64_t lane = 32 / op.b_->dtype.bits();
   const Array<Range> &rb = op.bRegion_->region;
@@ -214,9 +213,9 @@ std::string HMXBlockScaledRejection(const GemmBlockScaledNode &op) {
     return "HMX needs M, N and K multiples of 32, not " +
            std::to_string(op.m_) + " x " + std::to_string(op.n_) + " x " +
            std::to_string(op.k_);
-  if (!IsSharedBuffer(op.a_) && !IsFragmentBuffer(op.a_))
+  if (!IsVTCMBuffer(op.a_))
     return "HMX reads A (" + op.a_->name + ") from VTCM";
-  if (!IsSharedBuffer(op.c_) && !IsFragmentBuffer(op.c_))
+  if (!IsVTCMBuffer(op.c_))
     return "HMX writes C (" + op.c_->name + ") to VTCM";
   std::string why = PanelRejection(op);
   if (!why.empty())

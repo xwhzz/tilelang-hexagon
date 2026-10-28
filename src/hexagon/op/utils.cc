@@ -10,6 +10,7 @@
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
+#include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
 
 namespace tvm {
@@ -18,6 +19,15 @@ namespace hexagon {
 
 using namespace tirx;
 using namespace ffi;
+
+bool IsGridVTCMBuffer(const Buffer &buffer) {
+  return buffer.defined() && buffer.scope() == kGridVTCMScope;
+}
+
+bool IsVTCMBuffer(const Buffer &buffer) {
+  return IsSharedBuffer(buffer) || IsFragmentBuffer(buffer) ||
+         IsGridVTCMBuffer(buffer);
+}
 
 Array<PrimExpr> GetBufferStrides(const Buffer &buffer) {
   if (!buffer->strides.empty()) {

@@ -50,8 +50,7 @@ namespace hexagon {
 constexpr int kVectorBits = 1024;
 
 bool InPlace(const Buffer &buffer) {
-  return IsSharedBuffer(buffer) || IsFragmentBuffer(buffer) ||
-         IsLocalBuffer(buffer, /*allow_var=*/true);
+  return IsVTCMBuffer(buffer) || IsLocalBuffer(buffer, /*allow_var=*/true);
 }
 
 bool Supported(DataType t) {

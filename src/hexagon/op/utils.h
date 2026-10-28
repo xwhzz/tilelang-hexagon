@@ -15,6 +15,22 @@ namespace tvm {
 namespace tl {
 namespace hexagon {
 
+/*!
+ * \brief The storage scope of VTCM buffers that every program of a launch
+ * shares (T.alloc_global(..., scope="global.vtcm")): device-global memory
+ * placed in VTCM, as in TVM's Hexagon backend.
+ */
+constexpr const char *kGridVTCMScope = "global.vtcm";
+
+/*! \brief Whether `buffer` is in VTCM shared by the programs of a launch. */
+bool IsGridVTCMBuffer(const tirx::Buffer &buffer);
+
+/*!
+ * \brief Whether `buffer` is in VTCM: a program's shared buffer or fragment,
+ * or a buffer the programs of a launch share.
+ */
+bool IsVTCMBuffer(const tirx::Buffer &buffer);
+
 /*! \brief Explicit buffer strides, or compact row-major strides if none. */
 ffi::Array<PrimExpr> GetBufferStrides(const tirx::Buffer &buffer);
 

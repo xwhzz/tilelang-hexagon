@@ -160,6 +160,7 @@ attention, FFN, RMSNorm, a w4a16 GEMV) and the LFM2-1.2B model end to end live i
 | `T.Kernel(grid)` | nested `for` loops (grid serialized on one HW thread) | — |
 | `T.Kernel(..., num_workers=N)` | one `tl_parallel_for` over the linearized grid: up to N HW threads run its tile programs, each worker with a private VTCM arena | `worker.h` |
 | `T.alloc_shared` | a byte offset into the tile program's VTCM arena (`tl_vtcm_arena()+off`, or the worker's `tl_arena+off`) | `vtcm.h` |
+| `T.alloc_global(..., scope="global.vtcm")` | one buffer all the programs share, bound before the worker loop at a byte offset from the VTCM base; the arenas follow | `vtcm.h`, `worker.h` |
 | `T.copy(matrix, crouton_shared)` | one `tl_crouton_copy`: pack a region of a strided fp16/fp32 matrix (DDR or VTCM) into Crouton tiles | `copy.cc`, `crouton.h` |
 | `T.copy(crouton_shared, matrix)` | one `tl_crouton_copy`: unpack a Crouton region into a strided matrix | `copy.cc`, `crouton.h` |
 | `T.gemm(A,B,C)` | explicit HMX atom loops; each result stores directly into its 2 KB-aligned native C tile | `gemm_hmx.py`, `hmx.h` |
@@ -236,6 +237,20 @@ and explicit HMX atoms.
   `num_workers` whose slices exceed the target's `vtcm-capacity`.
   HMX atoms and Crouton copies use explicit shared buffers; there is no hidden
   top-down GEMM scratch allocation.
+
+- **The programs of a launch can share VTCM** (`T.alloc_global(shape, dtype,
+  scope="global.vtcm")`). The scope is TVM's Hexagon one: device-global memory
+  placed in VTCM. Such a buffer is one allocation for all the programs; HMX
+  reads it like a shared buffer, and copies and DMA reach it. Programs that run
+  together (`T.sync_grid()`) exchange data through it without going through DDR,
+  for example the activations of a GEMM split across workers by output columns,
+  which every worker multiplies.
+  - **Placement.** `MaterializeGrid` keeps the allocation outside the programs.
+    The codegen lays the kernel's `global.vtcm` buffers out from the VTCM base,
+    whole HMX tiles each, and binds them before the worker loop, whose lambda
+    captures them.
+  - **Arenas.** The programs' arenas start after these buffers.
+  - **Capacity.** `VerifyVTCMArena` counts the buffers with the arenas.
 
 - **The worker pool = 1 HMX + 6 HVX.** The producer/consumer model: the 6 HVX units
   run pack/unpack/softmax/copies in parallel; the 1 HMX MAC is serialized by a

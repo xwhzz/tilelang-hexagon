@@ -4,6 +4,7 @@
 #include "codegen_hexagon.h"
 #include "arith/pattern_match.h"
 #include "hexagon/op/builtin.h"
+#include "hexagon/op/utils.h" // kGridVTCMScope
 #include "op/builtin.h"
 #include "support/check.h"
 #include "transform/common/attr.h"
@@ -126,6 +127,9 @@ bool IsWorkerLoop(const ForNode *loop) {
 bool IsSharedScope(const std::string &scope) {
   return scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
 }
+
+// VTCM shared by the programs of a launch: whole HMX tiles each.
+constexpr int64_t kGridAlignment = 2048;
 
 size_t ConstantElements(const tirx::Buffer &buffer) {
   size_t elems = 1;
@@ -282,6 +286,19 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   this->InitFuncState(f);
   ReserveKeywordsAsUnique();
   arena_bound_ = false;
+  // Lay out the global.vtcm buffers from the VTCM base, in order.
+  grid_offsets_.clear();
+  grid_bytes_ = 0;
+  tirx::PostOrderVisit(f->body, [this](const ffi::ObjectRef &node) {
+    const auto *alloc = node.as<AllocBufferNode>();
+    if (!alloc ||
+        GetPtrStorageScope(alloc->buffer->data) != tl::hexagon::kGridVTCMScope)
+      return;
+    grid_offsets_[alloc->buffer->data.get()] = grid_bytes_;
+    int64_t bytes = ConstantBytes(alloc->buffer);
+    grid_bytes_ +=
+        (bytes + kGridAlignment - 1) / kGridAlignment * kGridAlignment;
+  });
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
@@ -367,8 +384,12 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
     stream << (grid_sync ? ", true>" : ">");
   }
   stream << "(" << extent << ", " << num_workers << ", ";
-  if (arena_bytes > 0)
-    stream << "tl_vtcm_worker_arenas(" << arena_bytes << "u), ";
+  if (arena_bytes > 0) {
+    stream << "tl_vtcm_worker_arenas(" << arena_bytes << "u";
+    if (grid_bytes_ > 0)
+      stream << ", " << grid_bytes_ << "u";
+    stream << "), ";
+  }
   stream << "[&](";
   PrintType(op->loop_var.dtype(), stream);
   stream << ' ' << AllocVarID(op->loop_var.get());
@@ -393,7 +414,19 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
   size_t constant_size = ConstantElements(op->buffer);
 
   this->PrintIndent();
-  if (IsSharedScope(GetPtrStorageScope(op->buffer->data))) {
+  auto grid = grid_offsets_.find(op->buffer->data.get());
+  if (grid != grid_offsets_.end()) {
+    // VTCM all the programs share, outside the worker loop: one binding,
+    // which the programs' lambdas capture. It shares no memory with the
+    // arenas or the other grid buffers.
+    ICHECK(!in_worker_) << "global.vtcm buffer `" << op->buffer->name
+                        << "` is allocated inside a tile program";
+    PrintType(op->buffer->dtype, stream);
+    stream << "* " << vid << " = (";
+    PrintType(op->buffer->dtype, stream);
+    stream << "*)tl_vtcm_exclusive(tl_vtcm_arena() + " << grid->second
+           << ");\n";
+  } else if (IsSharedScope(GetPtrStorageScope(op->buffer->data))) {
     // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and
     // HVX wants its scratch there, so a `shared` tile cannot live on the stack.
     // MergeSharedMemoryAllocations laid out the tile program's shared buffers
@@ -404,13 +437,20 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
-    stream << "*)" << (in_worker_ ? "tl_arena" : "tl_vtcm_arena()") << ";\n";
+    stream << "*)";
+    if (in_worker_)
+      stream << "tl_arena";
+    else if (grid_bytes_ > 0)
+      stream << "(tl_vtcm_arena() + " << grid_bytes_ << ")";
+    else
+      stream << "tl_vtcm_arena()";
+    stream << ";\n";
     // Publish the kernel's VTCM usage for embedding/export capacity checks.
     // Worker arenas are sized by tl_parallel_for instead.
     if (!in_worker_) {
       this->PrintIndent();
-      stream << "tl_vtcm_shared_high_water = " << ConstantBytes(op->buffer)
-             << "u;\n";
+      stream << "tl_vtcm_shared_high_water = "
+             << grid_bytes_ + ConstantBytes(op->buffer) << "u;\n";
     }
   } else {
     // Stack-local scratch. Whole-register vector accesses to it are aligned

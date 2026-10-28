@@ -7,7 +7,8 @@
  *
  *  - StorageRewrite hoists allocations to function scope. Those used only by
  *    the tile program are sunk back into it, so every program, and so every
- *    worker, owns its buffers.
+ *    worker, owns its buffers; global and global.vtcm buffers stay, one for
+ *    all the programs.
  *  - The program body becomes a tile program scope, where
  *    MergeSharedMemoryAllocations places the program's VTCM arena.
  *  - With num_workers > 1 the grid becomes one parallel loop over the
@@ -190,7 +191,10 @@ private:
   const ForNode *SinkTarget(const Stmt &stmt) {
     if (const auto *alloc = stmt.as<AllocBufferNode>()) {
       const Var &data = alloc->buffer->data;
-      if (GetPtrStorageScope(data) == "global")
+      // DDR workspaces, and VTCM the programs share (global.vtcm), stay
+      // outside the programs: one buffer for all of them.
+      std::string scope = GetPtrStorageScope(data);
+      if (scope == "global" || scope == "global.vtcm")
         return nullptr;
       const ForNode *program = uses_.Owner(data.get());
       if (!program) {

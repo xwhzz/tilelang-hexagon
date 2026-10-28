@@ -102,8 +102,8 @@ std::string PanelRejection(const CopyNode &op, const LowerArgs &T,
     return "the copy from " + op.src->name + " to " + op.dst->name +
            " moves a panel layout, so both sides need it, for the same "
            "element width: the other side is packed once, ahead of the kernel";
-  const bool load = IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst);
-  const bool store = IsSharedBuffer(op.src) && IsGlobalBuffer(op.dst);
+  const bool load = IsGlobalBuffer(op.src) && IsVTCMBuffer(op.dst);
+  const bool store = IsVTCMBuffer(op.src) && IsGlobalBuffer(op.dst);
   if (!(load || store))
     return "panel copies move panels between DDR and VTCM";
   for (const auto &[buffer, region] :
@@ -209,8 +209,8 @@ std::string DMARejection(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer) {
   if (PanelOf(op.src, T.layout_map) || PanelOf(op.dst, T.layout_map))
     return PanelRejection(op, T, analyzer);
-  const bool load = IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst);
-  const bool store = IsSharedBuffer(op.src) && IsGlobalBuffer(op.dst);
+  const bool load = IsGlobalBuffer(op.src) && IsVTCMBuffer(op.dst);
+  const bool store = IsVTCMBuffer(op.src) && IsGlobalBuffer(op.dst);
   if (!(load || store) || op.src->dtype != op.dst->dtype ||
       op.src->dtype.lanes() != 1 || op.src->dtype.bits() % 8 != 0 ||
       T.layout_map.count(op.src) || T.layout_map.count(op.dst))

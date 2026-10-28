@@ -16,6 +16,7 @@
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
+#include <unordered_map>
 #include <vector>
 
 namespace tvm {
@@ -77,6 +78,13 @@ private:
 
   /*! \brief whether the current tile program's VTCM arena is bound */
   bool arena_bound_ = false;
+  /*!
+   * \brief The VTCM the programs of the function share (global.vtcm): each
+   * buffer's offset from the VTCM base, and the bytes they take, whole HMX
+   * tiles. The programs' arenas follow it.
+   */
+  std::unordered_map<const tirx::VarNode *, int64_t> grid_offsets_;
+  int64_t grid_bytes_ = 0;
   /*! \brief whether a tile program's DMA queue (tl_dma_async) is in scope */
   bool dma_in_scope_ = false;
   /*! \brief whether any emitted kernel uses the managed DMA queue */

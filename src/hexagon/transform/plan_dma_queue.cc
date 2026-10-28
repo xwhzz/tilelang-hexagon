@@ -65,7 +65,10 @@ bool UsesDMA(const Stmt &stmt) {
   return found;
 }
 
-bool IsVTCMBuffer(const VarNode *var) {
+// A buffer of the tile program's VTCM arena, whose space
+// MergeSharedMemoryAllocations reuses: a DMA buffer must stay live until the
+// wait that completes it.
+bool IsArenaBuffer(const VarNode *var) {
   const auto *ptr = var->type_annotation.as<PointerTypeNode>();
   return ptr &&
          (ptr->storage_scope == "shared" || ptr->storage_scope == "shared.dyn");
@@ -150,7 +153,7 @@ private:
       ++queue_.open.descriptors;
       for (const PrimExpr &arg : call->args) {
         PostOrderVisit(arg, [this](const ObjectRef &node) {
-          if (const auto *var = node.as<VarNode>(); var && IsVTCMBuffer(var))
+          if (const auto *var = node.as<VarNode>(); var && IsArenaBuffer(var))
             queue_.open.buffers.insert(BufferIndex(var));
         });
       }

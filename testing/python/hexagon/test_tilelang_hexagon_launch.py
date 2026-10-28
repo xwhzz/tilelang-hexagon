@@ -252,6 +252,111 @@ def test_programs_exchange_rows_across_sync_grid(programs):
         kernel.adapter.close()
 
 
+def _grid_rotate(programs, rounds):
+    """_rotate with the rows in VTCM the programs share (global.vtcm)."""
+
+    @T.prim_func
+    def rotate(A: T.Tensor((programs, 64), "float32"), B: T.Tensor((programs, 64), "float32")):
+        with T.Kernel(programs, num_workers=programs) as w:
+            rows = T.alloc_global((2, programs, 64), "float32", scope="global.vtcm")
+            for j in T.Parallel(64):
+                rows[0, w, j] = A[w, j]
+            for r in T.serial(rounds):
+                T.sync_grid()
+                for j in T.Parallel(64):
+                    rows[(r + 1) % 2, w, j] = rows[r % 2, (w + 1) % programs, j] + T.float32(1)
+            for j in T.Parallel(64):
+                B[w, j] = rows[rounds % 2, w, j]
+
+    return rotate
+
+
+def test_programs_share_global_vtcm_buffers():
+    source = _lower(_grid_rotate(4, 3)).kernel_source
+    # One buffer at the VTCM base, bound outside the programs, which capture it.
+    head = source[: source.index("tl_parallel_for")]
+    assert "float* rows = (float*)tl_vtcm_exclusive(tl_vtcm_arena() + 0);" in head
+    assert "tl_vtcm_worker_arenas" not in source
+
+
+def _grid_gemm(programs, M, N, K):
+    """C[p] = A @ B[p] on HMX, A in VTCM the programs share: each program
+    copies its rows of A in, and after the barrier multiplies all of them."""
+    rows = M // programs
+
+    @T.prim_func
+    def gemm(A: T.Tensor((M, K), "float16"), B: T.Tensor((programs, K, N), "float16"), C: T.Tensor((programs, M, N), "float32")):
+        with T.Kernel(programs, num_workers=programs) as p:
+            a = T.alloc_global((M, K), "float16", scope="global.vtcm")
+            b = T.alloc_shared((K, N), "float16")
+            c = T.alloc_shared((M, N), "float32")
+            T.copy(A[p * rows : (p + 1) * rows, :], a[p * rows : (p + 1) * rows, :])
+            T.copy(B[p, :, :], b)
+            T.sync_grid()
+            T.gemm(a, b, c, clear_accum=True)
+            T.copy(c, C[p, :, :])
+
+    return gemm
+
+
+def test_global_vtcm_buffers_come_before_the_program_arenas():
+    source = _lower(_grid_gemm(4, 128, 64, 256)).kernel_source
+    head = source[: source.index("tl_parallel_for")]
+    # A, 64 KB, then the programs' arenas after it.
+    assert "half* a = (half*)tl_vtcm_exclusive(tl_vtcm_arena() + 0);" in head
+    assert "tl_vtcm_worker_arenas(" in source and ", 65536u), [&](int32_t bx, uint8_t *tl_arena)" in source
+    # Each program packs its rows of the shared HMX operand.
+    assert "tl_crouton_copy<true, false>((&(a[0])), 4, 8, (bx * 32), 0, 32, 256, (&(A[(bx * 8192)])), 256, 1);" in source
+    # All of them multiply all of it.
+    assert "tl_hexagon_hmx_mma_atom((&(acc[0])), (&(a[((t >> 1) * 8192)]))" in source
+
+
+def test_global_vtcm_buffers_must_fit_with_the_arenas():
+    @T.prim_func
+    def big(A: T.Tensor((4, 64), "float32"), B: T.Tensor((4, 64), "float32")):
+        with T.Kernel(4, num_workers=4) as w:
+            g = T.alloc_global((1024, 1024, 2), "float32", scope="global.vtcm")
+            s = T.alloc_shared((64,), "float32")
+            for j in T.Parallel(64):
+                s[j] = A[w, j]
+            for j in T.Parallel(64):
+                g[w, j, 0] = s[j]
+            T.sync_grid()
+            for j in T.Parallel(64):
+                B[w, j] = g[(w + 1) % 4, j, 0]
+
+    with pytest.raises(Exception, match="leave after its 8388608 bytes of global.vtcm buffers"):
+        _lower(big)
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_programs_exchange_rows_through_global_vtcm():
+    import torch
+
+    programs, rounds = 6, 61
+    kernel = tilelang.compile(_grid_rotate(programs, rounds), out_idx=[1], target="hexagon")
+    try:
+        a = torch.randn(programs, 64)
+        torch.testing.assert_close(kernel(a), torch.roll(a, -rounds, dims=0) + rounds)
+    finally:
+        kernel.adapter.close()
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_hmx_workers_multiply_a_shared_operand():
+    import torch
+
+    programs, M, N, K = 4, 128, 64, 256
+    kernel = tilelang.compile(_grid_gemm(programs, M, N, K), out_idx=[2], target="hexagon")
+    try:
+        a = torch.randn(M, K).half()
+        b = torch.randn(programs, K, N).half()
+        expected = a.float() @ b.float()
+        torch.testing.assert_close(kernel(a, b), expected, rtol=2e-3, atol=2e-2)
+    finally:
+        kernel.adapter.close()
+
+
 def _prefetch(programs, n):
     """Each program submits the DMA of its next-phase data before the barrier
     and waits for it after: the transfer overlaps the phase change."""

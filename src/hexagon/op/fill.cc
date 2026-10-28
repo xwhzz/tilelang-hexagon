@@ -10,6 +10,7 @@
 #include <tvm/runtime/logging.h>
 
 #include "backend/common/target_utils.h"
+#include "hexagon/op/utils.h"
 #include "op/utils.h"
 #include "transform/loop_partition.h"
 #include "transform/loop_vectorize.h"
@@ -23,7 +24,7 @@ struct Fill {
   static Stmt Lower(const FillNode &op, const LowerArgs &T,
                     arith::Analyzer *analyzer) {
     if (IsLocalBuffer(op.dst, true) || IsGlobalBuffer(op.dst) ||
-        IsSharedBuffer(op.dst) || IsFragmentBuffer(op.dst)) {
+        IsVTCMBuffer(op.dst)) {
       auto init_loop = op.MakeSIMTLoop(analyzer);
       auto vectorized_loop = VectorizeLoop(init_loop, analyzer, T.layout_map);
       return PragmaUnrollLoop(vectorized_loop);

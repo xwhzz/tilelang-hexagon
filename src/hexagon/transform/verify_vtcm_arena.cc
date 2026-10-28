@@ -6,8 +6,9 @@
  * one allocation, its VTCM arena. A kernel's arena starts at the VTCM base. A
  * T.Kernel(num_workers=N) grid gives each of N workers its own slice, which the
  * runtime rounds up to whole HMX tiles so that every slice keeps the arena's
- * alignment. The arenas must fit the target's vtcm-capacity; the runtime still
- * checks the region it is granted.
+ * alignment. Buffers all the programs share (global.vtcm) come first, whole
+ * HMX tiles each, and the arenas after them. All of it must fit the target's
+ * vtcm-capacity; the runtime still checks the region it is granted.
  */
 
 #include "hexagon/op/builtin.h"
@@ -36,7 +37,8 @@ constexpr int64_t kSliceAlignment = 2048;
 
 class ArenaVerifier : public StmtVisitor {
 public:
-  explicit ArenaVerifier(int64_t capacity) : capacity_(capacity) {}
+  ArenaVerifier(int64_t capacity, int64_t grid)
+      : capacity_(capacity), grid_(grid) {}
 
 private:
   void VisitStmt_(const ForNode *op) final {
@@ -88,32 +90,38 @@ private:
   void Check(int64_t bytes) const {
     if (capacity_ <= 0)
       return;
+    // What the global.vtcm buffers leave, and how to say so.
+    int64_t capacity = capacity_ - grid_;
+    std::string room =
+        grid_ ? "the " + std::to_string(capacity) + " bytes the target's " +
+                    std::to_string(capacity_) + " leave after its " +
+                    std::to_string(grid_) + " bytes of global.vtcm buffers"
+              : "the target's " + std::to_string(capacity_);
     if (workers_ == 0) {
-      if (bytes > capacity_) {
+      if (bytes > capacity) {
         LOG(FATAL) << "The tile program's shared buffers take " << bytes
-                   << " bytes of VTCM, more than the target's " << capacity_
+                   << " bytes of VTCM, more than " << room
                    << "; use smaller tiles";
       }
       return;
     }
     int64_t slice =
         (bytes + kSliceAlignment - 1) / kSliceAlignment * kSliceAlignment;
-    if (workers_ * slice <= capacity_)
+    if (workers_ * slice <= capacity)
       return;
-    int64_t fit = capacity_ / slice;
+    int64_t fit = capacity / slice;
     if (fit == 0) {
       LOG(FATAL) << "A worker's VTCM arena takes " << slice
-                 << " bytes, more than the target's " << capacity_
-                 << "; use smaller tiles";
+                 << " bytes, more than " << room << "; use smaller tiles";
     }
     LOG(FATAL) << "T.Kernel(num_workers=" << workers_
                << ") needs a VTCM arena of " << slice << " bytes per worker, "
-               << workers_ * slice << " bytes in all, more than the target's "
-               << capacity_ << "; use num_workers=" << fit
-               << " or fewer, or smaller tiles";
+               << workers_ * slice << " bytes in all, more than " << room
+               << "; use num_workers=" << fit << " or fewer, or smaller tiles";
   }
 
   int64_t capacity_;
+  int64_t grid_;
   int64_t workers_ = 0;
   bool has_arena_ = false;
 };
@@ -130,7 +138,26 @@ tvm::transform::Pass VerifyVTCMArena() {
       if (auto vtcm = target.value()->GetAttr<Integer>("vtcm-capacity"))
         capacity = vtcm.value()->value;
     }
-    ArenaVerifier verifier(capacity);
+    // The global.vtcm buffers, whole HMX tiles each.
+    int64_t grid = 0;
+    PostOrderVisit(func->body, [&grid](const ObjectRef &node) {
+      const auto *alloc = node.as<AllocBufferNode>();
+      if (!alloc || GetPtrStorageScope(alloc->buffer->data) != "global.vtcm")
+        return;
+      auto elements = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
+      if (!elements) {
+        LOG(FATAL) << "Hexagon VTCM buffers need constant shapes; `"
+                   << alloc->buffer->data->name_hint << "` does not have one";
+      }
+      int64_t bytes =
+          GetBufferStorageSizeBytes(elements.value(), alloc->buffer->dtype);
+      grid += (bytes + kSliceAlignment - 1) / kSliceAlignment * kSliceAlignment;
+    });
+    if (capacity > 0 && grid > capacity) {
+      LOG(FATAL) << "The kernel's global.vtcm buffers take " << grid
+                 << " bytes of VTCM, more than the target's " << capacity;
+    }
+    ArenaVerifier verifier(capacity, grid);
     verifier(func->body);
     return func;
   };
