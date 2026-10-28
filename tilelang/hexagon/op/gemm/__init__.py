@@ -29,6 +29,14 @@ class GemmScalarHexagon(GemmScalar):
     """The scalar loop, for a GEMM that neither HMX nor HVX can run; far slower
     than either."""
 
+    def __post_init__(self) -> None:
+        # 4-bit elements are not addressable one at a time: only HVX runs them.
+        if any(str(buffer.dtype) in ("int4", "uint4") for buffer in (self.A, self.B)):
+            raise ValueError(
+                f"T.gemm({self.A.name}, {self.B.name}, {self.C.name}) has 4-bit operands, which only HVX multiplies, but: {_hvx_rejection(self.gemm_node)}"
+            )
+        super().__post_init__()
+
     def lower(self, *args, **kwargs):
         logger.warning(
             "T.gemm(%s, %s, %s) runs as a scalar loop, not on HMX: %s; not on HVX: %s",

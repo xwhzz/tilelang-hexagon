@@ -13,12 +13,20 @@
 namespace tvm {
 namespace tl {
 
+class PanelLayoutNode;
+
 namespace hexagon {
+
+//! The panel layout (hexagon/layout/panel.h) of `buffer`, if it has one.
+const PanelLayoutNode *PanelOf(const tirx::Buffer &buffer,
+                               const LayoutMap &layout_map);
 
 /*!
  * \brief Why `op` cannot be one User-DMA transfer between DDR and VTCM, or
  * an empty string: equal byte-addressable dtypes, row-major buffers, and a
- * static, in-bounds 1D or 2D region on each side.
+ * static, in-bounds 1D or 2D region on each side. Between two buffers in the
+ * panel layout, the region instead covers whole panels of one matrix, which
+ * move as rows of their column blocks.
  */
 std::string DMARejection(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer);

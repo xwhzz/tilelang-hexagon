@@ -546,3 +546,208 @@ TL_DEVICE void tl_hvx_gemm(TC *C, const TA *A, const TA *B, bool clear) {
     tl_gemm_outer_all<TA, TC, M, N, K, TransA, LdA, LdB, LdC, RowsA, RowsB,
                       RowsC>(C, A, B, clear);
 }
+
+// ---------------------------------------------------------------------------
+// Integer GEMM: B in the panel layout (src/hexagon/layout/panel.h).
+// ---------------------------------------------------------------------------
+//
+// tl_hvx_gemm_int<M, N, K, BBits, BSigned, LdA, LdC, AlignC>(C, A, B,
+// panel_bytes, clear) computes, for i < M and j < N, exactly in int32,
+//
+//   C[i * LdC + j] = (clear ? 0 : C[i * LdC + j]) + sum_k A[i * LdA + k] B(j,
+//   k)
+//
+// for an int8, uint8 or int16 A and a BBits-bit B (8 or 4), signed or not,
+// whose panel of rows [32 p, 32 p + 32) starts p * panel_bytes bytes into B.
+//
+// vrmpy multiplies the 4 bytes of each 32-bit lane of a register by the 4
+// bytes of a scalar, and adds the products into the lane of an int32
+// accumulator. A register of B is a column block of a panel: 32 rows, so 32
+// outputs, and in each row's lane the next 4 (8-bit) or 8 (4-bit) k.
+// - The scalars hold A's values at those k. A's row reaches them through the
+//   stack, its bytes regrouped into 32-bit words by the k a lane holds: two
+//   4-bit columns share a byte, so a register's low nibbles hold the even k
+//   of each lane and its high nibbles the odd k.
+// - An int16 a is 256 * hi + lo, hi its signed and lo its unsigned byte: two
+//   vrmpy per register, into two accumulators that meet at the end.
+// - vrmpy reads B's bytes unsigned: a signed b with its sign bit flipped is
+//   b + 128 (8-bit) or b + 8 (4-bit), and the call subtracts that offset
+//   times the sum of A's row.
+
+// A's row in 32-bit words for vrmpy, at most KC columns: per 128 columns and
+// per byte plane of A (hi then lo for int16), one register of words; with
+// 4-bit B its low half holds the even columns' words, its high half the odd
+// columns'.
+template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
+  static constexpr int planes = sizeof(TA);
+  static constexpr int chunks = (KC + 127) / 128;
+  alignas(128) int32_t words[chunks][planes][32];
+  // The row's sum, for a signed B.
+  int32_t sum = 0;
+
+  TL_DEVICE HVX_Vector deal(HVX_Vector v) {
+    if constexpr (BBits == 4)
+      return Q6_Vb_vdeal_Vb(v);
+    return v;
+  }
+
+  inline __attribute__((always_inline)) void put(int c, int plane,
+                                                 HVX_Vector v) {
+    v = deal(v);
+    __builtin_memcpy(words[c][plane], &v, sizeof(v));
+  }
+
+  // Columns [0, k) of the row at `a`, k <= KC; past k, zeros.
+  inline __attribute__((always_inline)) void stage(const TA *a, int k,
+                                                   bool want_sum) {
+    HVX_Vector sums = Q6_V_vzero();
+#pragma clang loop unroll(disable)
+    for (int c = 0; c * 128 < k; ++c) {
+      int n = tl_gemm_min(128, k - c * 128);
+      if constexpr (planes == 2) {
+        HVX_Vector v0 =
+            tl_gemm_load_zeroed<2, false>(a + c * 128, tl_gemm_min(n, 64));
+        HVX_Vector v1 =
+            n > 64 ? tl_gemm_load_zeroed<2, false>(a + c * 128 + 64, n - 64)
+                   : Q6_V_vzero();
+        put(c, 0, Q6_Vb_vpacko_VhVh(v1, v0));
+        put(c, 1, Q6_Vb_vpacke_VhVh(v1, v0));
+        if (want_sum) {
+          sums = Q6_Vw_vadd_VwVw(sums, Q6_Vw_vdmpy_VhRh_sat(v0, 0x00010001));
+          sums = Q6_Vw_vadd_VwVw(sums, Q6_Vw_vdmpy_VhRh_sat(v1, 0x00010001));
+        }
+      } else {
+        HVX_Vector v = tl_gemm_load_zeroed<1, false>(a + c * 128, n);
+        put(c, 0, v);
+        if (want_sum) {
+          if constexpr (std::is_signed_v<TA>)
+            sums = Q6_Vw_vrmpyacc_VwVbVb(sums, v, Q6_Vb_vsplat_R(1));
+          else
+            sums = Q6_Vuw_vrmpyacc_VuwVubRub(sums, v, 0x01010101);
+        }
+      }
+    }
+    if (want_sum) {
+      alignas(128) int32_t lanes[32];
+      __builtin_memcpy(lanes, &sums, sizeof(sums));
+      int32_t total = 0;
+      for (int i = 0; i < 32; ++i)
+        total += lanes[i];
+      sum = total;
+    }
+  }
+
+  // The word of `plane` for the columns of step `s`, of the lane's 4 (8-bit
+  // B) or 8 (4-bit) columns; `odd` picks the odd columns of a 4-bit step.
+  inline __attribute__((always_inline)) int32_t word(int plane, int s,
+                                                     bool odd) const {
+    if constexpr (BBits == 4)
+      return words[s / 16][plane][(odd ? 16 : 0) + s % 16];
+    return words[s / 32][plane][s % 32];
+  }
+};
+
+// acc + the products of each lane's 4 unsigned bytes of u with the 4 bytes
+// of w, signed or unsigned.
+template <bool Signed>
+TL_DEVICE HVX_Vector tl_gemm_vrmpy(HVX_Vector acc, HVX_Vector u, int32_t w) {
+  if constexpr (Signed)
+    return Q6_Vw_vrmpyacc_VwVubRb(acc, u, w);
+  return Q6_Vuw_vrmpyacc_VuwVubRub(acc, u, w);
+}
+
+// Accumulates the panels [p, p + NB) of B for the staged row `row` over its
+// `steps` column blocks, then writes the row's 32 * NB outputs at C.
+template <typename TA, int BBits, bool BSigned, int NB, int KC, bool AlignC>
+TL_DEVICE void
+tl_gemm_int_panels(int32_t *C, const tl_gemm_int_row<TA, BBits, KC> &row,
+                   const uint8_t *B, int panel_bytes, int steps, bool clear) {
+  constexpr int planes = sizeof(TA);
+  HVX_Vector acc[planes][NB];
+#pragma clang loop unroll(full)
+  for (int q = 0; q < planes; ++q)
+#pragma clang loop unroll(full)
+    for (int b = 0; b < NB; ++b)
+      acc[q][b] = Q6_V_vzero();
+  const HVX_Vector nibble = Q6_Vb_vsplat_R(0x0F);
+  const HVX_Vector flip = Q6_Vb_vsplat_R(BBits == 4 ? 0x88 : 0x80);
+  // The scalar bytes of int16's hi plane and of int8 are signed.
+  constexpr bool hi_signed = planes == 2 || std::is_signed_v<TA>;
+#pragma clang loop unroll_count(2)
+  for (int s = 0; s < steps; ++s) {
+#pragma clang loop unroll(full)
+    for (int b = 0; b < NB; ++b) {
+      HVX_Vector v =
+          *reinterpret_cast<const HVX_Vector *>(B + b * panel_bytes + s * 128);
+      if constexpr (BSigned)
+        v = Q6_V_vxor_VV(v, flip);
+      HVX_Vector u[2] = {v, v};
+      if constexpr (BBits == 4) {
+        u[0] = Q6_V_vand_VV(v, nibble);
+        u[1] = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(v, 4), nibble);
+      }
+#pragma clang loop unroll(full)
+      for (int h = 0; h < (BBits == 4 ? 2 : 1); ++h) {
+        acc[0][b] =
+            tl_gemm_vrmpy<hi_signed>(acc[0][b], u[h], row.word(0, s, h == 1));
+        if constexpr (planes == 2)
+          acc[1][b] =
+              tl_gemm_vrmpy<false>(acc[1][b], u[h], row.word(1, s, h == 1));
+      }
+    }
+  }
+  // The offset of a signed B's bytes times the row's sum.
+  const int32_t offset = BSigned ? (BBits == 4 ? 8 : 128) * row.sum : 0;
+#pragma clang loop unroll(full)
+  for (int b = 0; b < NB; ++b) {
+    HVX_Vector r = acc[0][b];
+    if constexpr (planes == 2)
+      r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(r, 8), acc[1][b]);
+    if constexpr (BSigned)
+      r = Q6_Vw_vsub_VwVw(r, Q6_V_vsplat_R(offset));
+    if (!clear)
+      r = Q6_Vw_vadd_VwVw(r, tl_hvx_load<AlignC>(C + 32 * b));
+    tl_hvx_store<AlignC>(C + 32 * b, r);
+  }
+}
+
+template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
+          bool AlignC, typename TA>
+TL_DEVICE void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
+                               int panel_bytes, bool clear) {
+  const uint8_t *B = static_cast<const uint8_t *>(B_);
+  static_assert(std::is_same_v<TA, int8_t> || std::is_same_v<TA, uint8_t> ||
+                    std::is_same_v<TA, int16_t>,
+                "HVX integer GEMM: A is int8, uint8 or int16");
+  static_assert(BBits == 4 || BBits == 8, "HVX integer GEMM: B is 4 or 8 bits");
+  constexpr int lane = 32 / BBits;
+  static_assert(N % 32 == 0 && K % lane == 0,
+                "HVX integer GEMM: B covers whole panels");
+  // Columns per staged chunk of A's row, and panels per accumulator block.
+  constexpr int KC = tl_gemm_min(K, 512);
+  constexpr int NB = 4;
+  constexpr bool RowsC = AlignC && LdC % 32 == 0;
+  tl_gemm_int_row<TA, BBits, KC> row;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < M; ++i) {
+#pragma clang loop unroll(disable)
+    for (int k0 = 0; k0 < K; k0 += KC) {
+      int k = tl_gemm_min(KC, K - k0);
+      row.stage(A + i * LdA + k0, k, BSigned);
+      bool first = clear && k0 == 0;
+      const uint8_t *b0 = B + k0 / lane * 128;
+      int32_t *c0 = C + i * LdC;
+#pragma clang loop unroll(disable)
+      for (int p = 0; p + NB <= N / 32; p += NB)
+        tl_gemm_int_panels<TA, BBits, BSigned, NB, KC, RowsC>(
+            c0 + 32 * p, row, b0 + p * panel_bytes, panel_bytes, k / lane,
+            first);
+      if constexpr (N / 32 % NB != 0) {
+        constexpr int p = N / 32 - N / 32 % NB;
+        tl_gemm_int_panels<TA, BBits, BSigned, N / 32 % NB, KC, RowsC>(
+            c0 + 32 * p, row, b0 + p * panel_bytes, panel_bytes, k / lane,
+            first);
+      }
+    }
+  }
+}

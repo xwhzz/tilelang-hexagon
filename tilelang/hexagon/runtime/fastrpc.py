@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-import numpy as np
+from tvm import DataType
 
 # tilelang/numpy dtype -> the C scalar type the kernel pointer is cast to.
 _CTYPE = {
@@ -28,6 +28,9 @@ _CTYPE = {
     "int16": "int16_t",
     "int8": "int8_t",
     "uint8": "uint8_t",
+    # 4-bit integers: two to a byte, the first in its low nibble.
+    "int4": "int8_t",
+    "uint4": "uint8_t",
     "bool": "uint8_t",
 }
 
@@ -40,13 +43,19 @@ def _ctype(dtype) -> str:
 
 
 def _nbytes(param) -> int:
-    """Static byte size of a buffer param (raises on dynamic shapes for now)."""
+    """Static byte size of a buffer param (raises on dynamic shapes for now).
+
+    Elements narrower than a byte are packed: a 4-bit param of n elements
+    takes n / 2 bytes, passed as any tensor of those bytes."""
     n = 1
     for s in param.shape:
         if not isinstance(s, int):
             raise NotImplementedError("Hexagon adapter: dynamic shapes not supported yet")
         n *= int(s)
-    return n * np.dtype(str(param.dtype)).itemsize
+    bits = DataType(str(param.dtype)).bits
+    if n * bits % 8:
+        raise NotImplementedError(f"Hexagon adapter: {param.dtype} param of {n} elements is not whole bytes")
+    return n * bits // 8
 
 
 @dataclass

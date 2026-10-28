@@ -23,6 +23,7 @@ import subprocess
 import time
 
 import numpy as np
+from tvm import DataType
 
 from . import fastrpc
 from .device import _DEFAULT_ADSP_DIRS
@@ -173,14 +174,21 @@ class HexagonAgentSession:
         mask = 0
         for i in changed:
             mask |= 1 << i
-        self._sock.sendall(bytes([1, mask]))  # op=run, then the changed-mask
         in_i = 0
+        payloads = []
         for pl in self.plans:
             if pl.is_output or pl.is_scalar:
                 continue
             if in_i in changed:
-                self._sock.sendall(np.ascontiguousarray(inputs[in_i]).tobytes())
+                data = np.ascontiguousarray(inputs[in_i]).tobytes()
+                # A short or long payload would desynchronize the wire.
+                if len(data) != pl.nbytes:
+                    raise ValueError(f"Hexagon agent: input {in_i} has {len(data)} bytes, the kernel takes {pl.nbytes}")
+                payloads.append(data)
             in_i += 1
+        self._sock.sendall(bytes([1, mask]))  # op=run, then the changed-mask
+        for data in payloads:
+            self._sock.sendall(data)
         # Status byte first: the agent sends 0 on success, non-zero if the kernel
         # invoke failed.  On failure no output bytes follow, so we must read this
         # before the output loop or _recvn() would block forever.
@@ -192,6 +200,10 @@ class HexagonAgentSession:
                 continue
             p = self.params[pl.index]
             buf = self._recvn(pl.nbytes)
+            if DataType(str(p.dtype)).bits < 8:
+                # Packed sub-byte elements come back as their bytes.
+                outs.append(np.frombuffer(buf, dtype=np.uint8).copy())
+                continue
             arr = np.frombuffer(buf, dtype=np.dtype(str(p.dtype))).reshape([int(s) for s in p.shape])
             outs.append(arr.copy())
         return outs

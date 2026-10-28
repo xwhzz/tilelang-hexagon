@@ -97,6 +97,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", false, false,
        false, -1, 3},
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", false, false, false, -1, 11},
+      {tl::hexagon_hvx_gemm_int(), "tl_hvx_gemm_int", false, false, false, -1,
+       8},
       {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
   };
   for (const auto &builtin : builtins) {
@@ -230,6 +232,13 @@ void CodeGenTileLangHexagon::PrintType(DataType t,
       os << lanes;
       return;
     }
+  } else if ((t.is_uint() || t.is_int()) && t.bits() == 4) {
+    // Two 4-bit elements share a byte, the first in its low nibble: pointers
+    // and whole registers are of bytes (scalars are not addressable).
+    ICHECK(lanes == 1 || lanes % 2 == 0)
+        << "Cannot convert type " << t << " to Hexagon C type";
+    PrintType(t.with_bits(8).with_lanes(std::max(lanes / 2, 1)), os);
+    return;
   } else if (t.is_uint() || t.is_int()) {
     if (t.is_uint()) {
       os << 'u';
@@ -441,6 +450,14 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
+  if (op->op.same_as(builtin::address_of())) {
+    const auto *load = op->args[0].as<BufferLoadNode>();
+    if (load && load->buffer->dtype.bits() == 4) {
+      ICHECK_EQ(load->indices.size(), 1U);
+      os << SubByteAddress(load->buffer.get(), load->indices[0]);
+      return;
+    }
+  }
   if (const HexagonBuiltin *builtin = FindHexagonBuiltin(op)) {
     ICHECK(!builtin->on_dma_queue || dma_in_scope_)
         << builtin->function << " needs the tile program's DMA queue";
@@ -595,15 +612,29 @@ void CodeGenTileLangHexagon::VisitExpr_(const SelectNode *op,
 // Buffers start on a register boundary: VTCM arena buffers, DDR tensors and
 // the stack arrays AllocBuffer aligns. So the element offset alone decides.
 bool CodeGenTileLangHexagon::VectorAligned(DataType t, const PrimExpr &base) {
-  int64_t element = (t.bits() + 7) / 8;
-  int64_t alignment = std::min<int64_t>(element * t.lanes(), 128);
+  int64_t bits = t.bits();
+  int64_t alignment = std::min<int64_t>(bits * t.lanes(), 1024);
   arith::ModularSet offset = analyzer_.modular_set(base);
-  return offset->coeff * element % alignment == 0 &&
-         offset->base * element % alignment == 0;
+  return offset->coeff * bits % alignment == 0 &&
+         offset->base * bits % alignment == 0;
+}
+
+std::string CodeGenTileLangHexagon::SubByteAddress(const BufferNode *buffer,
+                                                   const PrimExpr &index) {
+  std::ostringstream os;
+  os << "((";
+  PrintType(buffer->dtype, os);
+  os << "*)" << GetVarID(buffer->data.get()) << " + ((" << PrintExpr(index)
+     << ") >> 1))";
+  return os.str();
 }
 
 void CodeGenTileLangHexagon::VisitExpr_(const BufferLoadNode *op,
                                         std::ostream &os) { // NOLINT(*)
+  ICHECK(op->buffer->dtype.bits() != 4 || op->dtype.lanes() > 1)
+      << "Hexagon reads 4-bit buffer `" << op->buffer->name
+      << "` by whole registers: copy it with T.copy and multiply it with "
+         "T.gemm, element by element it is not addressable";
   arith::PVar<PrimExpr> base;
   if (op->dtype.lanes() != op->buffer->dtype.lanes() &&
       !op->predicate.defined() && op->indices.size() == 1 &&
@@ -623,7 +654,12 @@ std::string CodeGenTileLangHexagon::GetVecLoad(DataType t,
   std::ostringstream os;
   os << "tl_hvx_vec_loadu<";
   PrintType(t, os);
-  os << ">((&(" << GetBufferRef(buffer->dtype, buffer, base) << ")))";
+  os << ">(";
+  if (buffer->dtype.bits() == 4)
+    os << SubByteAddress(buffer, base);
+  else
+    os << "(&(" << GetBufferRef(buffer->dtype, buffer, base) << "))";
+  os << ")";
   return os.str();
 }
 
@@ -635,8 +671,20 @@ void CodeGenTileLangHexagon::PrintVecStore(const BufferNode *buffer, DataType t,
     return;
   }
   PrintIndent();
-  stream << "tl_hvx_vec_storeu((&(" << GetBufferRef(buffer->dtype, buffer, base)
-         << ")), " << value << ");\n";
+  stream << "tl_hvx_vec_storeu(";
+  if (buffer->dtype.bits() == 4)
+    stream << SubByteAddress(buffer, base);
+  else
+    stream << "(&(" << GetBufferRef(buffer->dtype, buffer, base) << "))";
+  stream << ", " << value << ");\n";
+}
+
+void CodeGenTileLangHexagon::VisitStmt_(const BufferStoreNode *op) {
+  ICHECK(op->buffer->dtype.bits() != 4 || op->value.dtype().lanes() > 1)
+      << "Hexagon writes 4-bit buffer `" << op->buffer->name
+      << "` by whole registers: copy it with T.copy, element by element it is "
+         "not addressable";
+  CodeGenTileLangCBase::VisitStmt_(op);
 }
 
 // CodeGenC prints a ramp as a list of lanes, which is no vec_type constructor.

@@ -163,6 +163,15 @@ TVM_DLL const Op &hexagon_crouton_tile_store();
 // The eleven integers and booleans print as template arguments.
 TVM_DLL const Op &hexagon_hvx_gemm();
 
+// tl_hvx_gemm_int<M, N, K, b_bits, b_signed, lda, ldc, align_c>(C, A, B,
+// panel_bytes, clear) (hvx_gemm.h): C = A B^T exactly in int32, or C += A B^T
+// unless clear, on HVX: A int8, uint8 or int16 with rows lda elements apart, B
+// b_bits-bit (8 or 4) in the panel layout with panels panel_bytes bytes
+// apart, and C int32 with rows ldc elements apart; align_c: C starts on a
+// register boundary. The eight integers and booleans print as template
+// arguments.
+TVM_DLL const Op &hexagon_hvx_gemm_int();
+
 // tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();

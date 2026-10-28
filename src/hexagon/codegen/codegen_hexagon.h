@@ -39,7 +39,8 @@ public:
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   // Declare the DMA queue, and return the status of failing runtime calls.
-  void VisitStmt_(const EvaluateNode *op) final; // NOLINT(*)
+  void VisitStmt_(const EvaluateNode *op) final;    // NOLINT(*)
+  void VisitStmt_(const BufferStoreNode *op) final; // NOLINT(*)
   // Scope the DMA queue to its tile program.
   void VisitStmt_(const AttrStmtNode *op) final; // NOLINT(*)
   // Use the ternary operator for min/max so we don't depend on a host stdlib.
@@ -90,6 +91,8 @@ private:
   // Whether a vector of `t` at element `base` provably starts on a multiple of
   // its natural alignment, the smaller of its size and a register.
   bool VectorAligned(DataType t, const PrimExpr &base);
+  // The byte that holds 4-bit element `index` of `buffer`, two to a byte.
+  std::string SubByteAddress(const BufferNode *buffer, const PrimExpr &index);
   /*! \brief modular arithmetic of vector access offsets */
   arith::Analyzer analyzer_;
 

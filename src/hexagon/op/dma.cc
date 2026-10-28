@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 
+#include "hexagon/layout/panel.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/target_utils.h"
 #include "op/utils.h"
@@ -82,8 +83,132 @@ constexpr int64_t kChunk = int64_t(1) << 23;
 
 } // namespace
 
+const PanelLayoutNode *PanelOf(const Buffer &buffer,
+                               const LayoutMap &layout_map) {
+  Optional<Layout> layout = layout_map.Get(buffer);
+  return layout ? layout.value().as<PanelLayoutNode>() : nullptr;
+}
+
+namespace {
+
+// Why the copy between panel buffers `op` cannot move whole panels, or "":
+// one matrix on each side, rows on panel boundaries and columns on lane
+// boundaries, in bounds.
+std::string PanelRejection(const CopyNode &op, const LowerArgs &T,
+                           arith::Analyzer *analyzer) {
+  const PanelLayoutNode *src = PanelOf(op.src, T.layout_map);
+  const PanelLayoutNode *dst = PanelOf(op.dst, T.layout_map);
+  if (!src || !dst || src->lane != dst->lane || op.src->dtype != op.dst->dtype)
+    return "the copy from " + op.src->name + " to " + op.dst->name +
+           " moves a panel layout, so both sides need it, for the same "
+           "element width: the other side is packed once, ahead of the kernel";
+  const bool load = IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst);
+  const bool store = IsSharedBuffer(op.src) && IsGlobalBuffer(op.dst);
+  if (!(load || store))
+    return "panel copies move panels between DDR and VTCM";
+  for (const auto &[buffer, region] :
+       {std::pair{op.src, op.src_range}, std::pair{op.dst, op.dst_range}}) {
+    size_t n = region.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (i + 2 < n && !analyzer->CanProveEqual(region[i]->extent, 1))
+        return "a panel copy moves one matrix at a time";
+      if (!analyzer->CanProve(region[i]->min >= 0) ||
+          !analyzer->CanProve(region[i]->min + region[i]->extent <=
+                              buffer->shape[i]))
+        return "a panel copy needs provably in-bounds regions";
+    }
+    PrimExpr rows = make_const(region[n - 2]->min.dtype(), kPanelRows);
+    PrimExpr lane = make_const(region[n - 1]->min.dtype(), src->lane);
+    if (!analyzer->CanProveEqual(floormod(region[n - 2]->min, rows), 0) ||
+        !analyzer->CanProveEqual(floormod(region[n - 2]->extent, rows), 0) ||
+        !analyzer->CanProveEqual(floormod(region[n - 1]->min, lane), 0) ||
+        !analyzer->CanProveEqual(floormod(region[n - 1]->extent, lane), 0))
+      return "a panel copy covers whole panels: rows on multiples of 32 and "
+             "columns on multiples of " +
+             std::to_string(src->lane);
+  }
+  size_t sn = op.src_range.size(), dn = op.dst_range.size();
+  if (!analyzer->CanProveEqual(op.src_range[sn - 2]->extent,
+                               op.dst_range[dn - 2]->extent) ||
+      !analyzer->CanProveEqual(op.src_range[sn - 1]->extent,
+                               op.dst_range[dn - 1]->extent) ||
+      !op.src_range[sn - 2]->extent.as<IntImmNode>() ||
+      !op.src_range[sn - 1]->extent.as<IntImmNode>())
+    return "a panel copy needs static, matching region shapes";
+  return "";
+}
+
+// A column block of a panel, 32 lanes of 32 bits, is one register.
+constexpr int64_t kPanelBlockBytes = 128;
+
+// The transfer of `op` between panel buffers: each panel of the region is a
+// row of its column blocks, panels a panel's bytes apart on each side.
+Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
+                        arith::Analyzer *analyzer, bool commit) {
+  const PanelLayoutNode *panel = PanelOf(op.src, T.layout_map);
+  const bool load = IsGlobalBuffer(op.src);
+  size_t sn = op.src_range.size(), dn = op.dst_range.size();
+  int64_t panels =
+      op.src_range[sn - 2]->extent.as<IntImmNode>()->value / kPanelRows;
+  int64_t row_bytes = op.src_range[sn - 1]->extent.as<IntImmNode>()->value /
+                      panel->lane * kPanelBlockBytes;
+  auto stride = [&](const Buffer &buffer) {
+    return PanelOf(buffer, T.layout_map)->Cols() / panel->lane *
+           kPanelBlockBytes;
+  };
+  int64_t ss = stride(op.src), ds = stride(op.dst);
+  ICHECK(row_bytes <= kField && ss <= kField && ds <= kField)
+      << "a panel copy's panels must fit the 24-bit DMA descriptor fields";
+  int64_t bits = op.src->dtype.bits();
+  auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
+  // A pointer at the region's logical start, `first` panels in: LowerTileOp
+  // maps it through the layout to the panel's bytes.
+  auto at = [&](const Buffer &buffer, const Array<Range> &region, int rw,
+                int64_t first, int64_t count, int64_t panel_stride) {
+    Array<Range> start = region;
+    size_t r = region.size() - 2;
+    start.Set(
+        r, Range::FromMinExtent(region[r]->min + IntImm(region[r]->min.dtype(),
+                                                        first * kPanelRows),
+                                region[r]->extent));
+    int64_t span = (count - 1) * panel_stride + row_bytes;
+    return MakeAccessPtrAtRegion(buffer, start, GetBufferStrides(buffer), rw,
+                                 IntImm(DataType::Int(32), span * 8 / bits));
+  };
+  PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
+  Array<Stmt> seq;
+  // Contiguous panels go in chunks of whole panels.
+  bool dense = ss == row_bytes && ds == row_bytes;
+  int64_t per = dense ? std::max<int64_t>(1, kChunk / row_bytes) : kRows;
+  for (int64_t first = 0; first < panels; first += per) {
+    int64_t count = std::min(per, panels - first);
+    PrimExpr sp = at(op.src, op.src_range, 1, first, count, ss);
+    PrimExpr dp = at(op.dst, op.dst_range, 2, first, count, ds);
+    Array<PrimExpr> args =
+        dense ? Array<PrimExpr>{dp,
+                                sp,
+                                u32(count * row_bytes),
+                                u32(count * row_bytes),
+                                u32(count * row_bytes),
+                                u32(1),
+                                direction}
+              : Array<PrimExpr>{
+                    dp,         sp,       u32(ds), u32(ss), u32(row_bytes),
+                    u32(count), direction};
+    seq.push_back(
+        Evaluate(Call(DataType::Int(32), hexagon_dma_submit(), args)));
+  }
+  if (commit)
+    seq.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {})));
+  return SeqStmt::Flatten(seq);
+}
+
+} // namespace
+
 std::string DMARejection(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer) {
+  if (PanelOf(op.src, T.layout_map) || PanelOf(op.dst, T.layout_map))
+    return PanelRejection(op, T, analyzer);
   const bool load = IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst);
   const bool store = IsSharedBuffer(op.src) && IsGlobalBuffer(op.dst);
   if (!(load || store) || op.src->dtype != op.dst->dtype ||
@@ -152,6 +277,8 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
                       arith::Analyzer *analyzer, bool commit) {
   std::string why = DMARejection(op, T, analyzer);
   ICHECK(why.empty()) << why;
+  if (PanelOf(op.src, T.layout_map))
+    return LowerPanelTransfer(op, T, analyzer, commit);
   const bool load = IsGlobalBuffer(op.src);
   std::string unused;
   Matrix src = *MatrixOf(op.src, op.src_range, analyzer, &unused);

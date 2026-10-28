@@ -89,15 +89,56 @@ std::string HMXRejection(const GemmNode &op) {
   return "";
 }
 
+// Why HVX's vrmpy cannot run the integer GEMM `op`, or "".
+std::string HVXIntRejection(const GemmNode &op) {
+  DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
+  bool a_ok =
+      a == DataType::Int(8) || a == DataType::UInt(8) || a == DataType::Int(16);
+  bool b_ok = (b.is_int() || b.is_uint()) && b.lanes() == 1 &&
+              (b.bits() == 8 || b.bits() == 4);
+  if (!a_ok || !b_ok || c != DataType::Int(32))
+    return "HVX multiplies an int8, uint8 or int16 A by an 8- or 4-bit B "
+           "into an int32 C, not " +
+           TypeName(a) + " x " + TypeName(b) + " into " + TypeName(c);
+  if (op.transA_ || !op.transB_)
+    return "HVX multiplies integer rows of A by rows of B: transpose_B, and "
+           "A not transposed";
+  if (!IsSharedBuffer(op.b_))
+    return "HVX reads an integer B in its panel layout, from VTCM";
+  int64_t lane = 32 / b.bits();
+  const Array<Range> &rb = op.bRegion_->region;
+  const Range &rows = rb[rb.size() - 2], &cols = rb[rb.size() - 1];
+  const auto *nrows = rows->extent.as<IntImmNode>();
+  const auto *ncols = cols->extent.as<IntImmNode>();
+  arith::Analyzer analyzer;
+  auto aligned = [&analyzer](const PrimExpr &min, int64_t to) {
+    return analyzer.CanProveEqual(floormod(min, make_const(min.dtype(), to)),
+                                  0);
+  };
+  if (!nrows || !ncols || nrows->value % 32 || ncols->value % lane ||
+      !aligned(rows->min, 32) || !aligned(cols->min, lane))
+    return "HVX multiplies whole panels of an integer B: its region's rows "
+           "start and end on multiples of 32, its columns on multiples of " +
+           std::to_string(lane);
+  return "";
+}
+
 std::string HVXRejection(const GemmNode &op) {
   const DataType fp16 = DataType::Float(16);
   const DataType fp32 = DataType::Float(32);
   DataType a = op.a_->dtype, b = op.b_->dtype, c = op.c_->dtype;
-  bool operands = a == b && (a == fp16 || a == fp32);
-  if (!operands || !(c == fp32 || (c == fp16 && a == fp16)))
-    return "HVX multiplies fp16 operands into an fp16 or fp32 C and fp32 "
-           "ones into an fp32 C, not " +
-           TypeName(a) + " x " + TypeName(b) + " into " + TypeName(c);
+  bool integer = (a.is_int() || a.is_uint()) && (b.is_int() || b.is_uint());
+  if (integer) {
+    std::string why = HVXIntRejection(op);
+    if (!why.empty())
+      return why;
+  } else {
+    bool operands = a == b && (a == fp16 || a == fp32);
+    if (!operands || !(c == fp32 || (c == fp16 && a == fp16)))
+      return "HVX multiplies fp16 operands into an fp16 or fp32 C and fp32 "
+             "ones into an fp32 C, not " +
+             TypeName(a) + " x " + TypeName(b) + " into " + TypeName(c);
+  }
   if (op.transA_ && op.transB_)
     return "HVX reads A or B along K, so not both transposed";
   const std::pair<const char *, const BufferRegion *> regions[] = {
@@ -114,6 +155,8 @@ std::string HVXRejection(const GemmNode &op) {
         return operand + " spans more than one matrix of its leading "
                          "dimensions";
     }
+    if (integer && region == &op.bRegion_)
+      continue;
     Array<PrimExpr> strides = GetBufferStrides(buffer);
     if (!is_one(strides[rank - 1]) || !strides[rank - 2].as<IntImmNode>())
       return operand + "'s rows are not contiguous, a constant stride apart";

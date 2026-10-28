@@ -148,6 +148,30 @@ denormals a chain of zero products converts to. A GEMM neither unit runs (both o
 transposed, other types, an operand another operator gave a layout that is not row-major)
 runs as a scalar loop, and the compiler logs why.
 
+An integer `T.gemm(A, B, C, transpose_B=True)` also runs on HVX, exactly: an int8, uint8 or
+int16 A times an 8- or 4-bit B (`int8`, `uint8`, `T.int4`, `T.uint4`) into an int32 C. It is
+one `tl_hvx_gemm_int` call (`hvx_gemm.h`). `vrmpy` multiplies the 4 bytes of each 32-bit lane
+of a register by the 4 bytes of a scalar and adds them up, so B, in VTCM, takes the panel
+layout (`tilelang.hexagon.intrinsics.panel`): each register holds 32 rows of B, a row's lane
+its next 4 (8-bit) or 8 (4-bit) columns, so one register is 32 outputs' partial dot products.
+`T.gemm` gives a VTCM B this layout itself, also one a pipeline multi-buffers. A's row reaches
+the scalars through the stack, regrouped by the columns a lane holds. An int16 a is 256 hi + lo,
+its signed high and unsigned low bytes, so it takes two `vrmpy`; a signed B's bytes read as
+unsigned with the sign bit flipped, and the call subtracts the offset times the row's sum.
+
+Weights go to the device packed in the panel layout (`pack_panel`). A parameter annotated
+with it, `T.annotate_layout({W: make_hvx_panel_layout(W)})`, arrives in that order, and a
+`T.copy` between two panel buffers moves whole panels by DMA, also outside a pipeline: the
+region covers whole panels of one matrix, rows in multiples of 32 and columns in multiples of
+the lane. 4-bit buffers are addressed by whole registers only: copied and multiplied, never
+read element by element.
+
+Group-quantized weights follow TileLang's block-scaled idiom: one `T.gemm` per group of K
+into an int32 fragment, then a `T.Parallel` epilogue that weighs it by the group's scales
+(`example_gemv_w4a16.py`). On v79 the w4a16 GEMV, which also quantizes x to int16 with one
+dynamic scale, streams 2048 -> 8192 at 47 GB/s with 4 workers, and 2048 -> 6144 at 49 GB/s
+with 4 and 51 GB/s with 6 (DMA tops out near 57 GB/s); one worker computes 23 GB/s.
+
 Each 32x32 output tile reduces the call's K in the HMX accumulator and converts to fp16: HMX
 accumulates within a call, and HVX across calls. An fp16 C keeps the HMX output layout, and a
 call that overwrites it takes the tiles directly. Every other C takes each tile through a

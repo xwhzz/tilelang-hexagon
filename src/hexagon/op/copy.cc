@@ -13,6 +13,10 @@
  * DMA can make it and moves it faster than HVX (DMAOutpacesHVX); the
  * pipeline's commit makes a stage's transfers one group. Otherwise it is
  * copied right away, which the pipeline's waits allow.
+ *
+ * A copy between two buffers in the panel layout (integer GEMM operands)
+ * moves whole panels by DMA, also outside a pipeline, where it waits for its
+ * transfer right away.
  */
 
 #include "op/copy.h"
@@ -168,10 +172,22 @@ struct Copy {
       ICHECK(!Downcast<IntImm>(async.value())->value)
           << "Hexagon requires T.dma_copy instead of T.async_copy";
     }
-    if (auto pipelined =
-            op.annotations.Get(attr::kAsyncCopyNoImplicitCommitWait);
-        pipelined && !is_zero(Downcast<PrimExpr>(pipelined.value())) &&
-        DMAOutpacesHVX(op, analyzer) && DMARejection(op, T, analyzer).empty())
+    auto pipelined = op.annotations.Get(attr::kAsyncCopyNoImplicitCommitWait);
+    bool async = pipelined && !is_zero(Downcast<PrimExpr>(pipelined.value()));
+    // Panel buffers move by whole panels, packed on both sides: by DMA, in
+    // the pipeline's group, or waited for right away.
+    if (PanelOf(op.src, T.layout_map) || PanelOf(op.dst, T.layout_map)) {
+      std::string why = DMARejection(op, T, analyzer);
+      ICHECK(why.empty()) << why;
+      Stmt transfer = LowerDMATransfer(op, T, analyzer, /*commit=*/!async);
+      if (async)
+        return transfer;
+      Stmt wait = Evaluate(Call(DataType::Int(32), hexagon_dma_wait(),
+                                {IntImm(DataType::Int(32), 0)}));
+      return SeqStmt({transfer, wait});
+    }
+    if (async && DMAOutpacesHVX(op, analyzer) &&
+        DMARejection(op, T, analyzer).empty())
       return LowerDMATransfer(op, T, analyzer, /*commit=*/false);
     if (auto crouton = LowerCroutonCopy(op, T, analyzer))
       return *crouton;
