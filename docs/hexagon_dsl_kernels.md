@@ -253,6 +253,14 @@ copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
 match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
 256. An explicit `T.dma_copy` stays a manual schedule and is rejected inside
 `T.Pipelined`.
+
+The shared planner (`PipelinePlanning`) runs a loop `num_stages` deep when every
+copy comes after every statement that reads a copied buffer, as in `copy A; copy B;
+gemm`, and one stage deeper otherwise: when copies feed different statements, as
+flash attention's K and V do, or when each staged HMX operand's transfer feeds its
+own pack. So flash attention double-buffers with `num_stages=1`, and a K loop of
+gemms with staged operands at `num_stages=2` prefetches two iterations ahead, which
+pays off for small blocks (BK = 64: 14% faster than two deep).
 The native-layout
 `T.gemm` path is device-validated on v79: a staged
 32x128x128 q4 case has relative error 0.000351 and the fused-copy 256x256x256 FP16 path has
