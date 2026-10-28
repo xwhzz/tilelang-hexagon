@@ -553,7 +553,6 @@ void CodeGenTileLangHexagon::VisitExpr_(const SelectNode *op,
   CodeGenC::VisitExpr_(op, os);
 }
 
-// CodeGenC prints a ramp as a list of lanes, which is no vec_type constructor.
 // Buffers start on a register boundary: VTCM arena buffers, DDR tensors and
 // the stack arrays AllocBuffer aligns. So the element offset alone decides.
 bool CodeGenTileLangHexagon::VectorAligned(DataType t, const PrimExpr &base) {
@@ -601,6 +600,7 @@ void CodeGenTileLangHexagon::PrintVecStore(const BufferNode *buffer, DataType t,
          << ")), " << value << ");\n";
 }
 
+// CodeGenC prints a ramp as a list of lanes, which is no vec_type constructor.
 void CodeGenTileLangHexagon::VisitExpr_(const RampNode *op,
                                         std::ostream &os) { // NOLINT(*)
   os << "tl_vec_ramp<";
