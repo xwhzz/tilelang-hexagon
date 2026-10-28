@@ -215,14 +215,15 @@ class HexagonKernelAdapter(BaseKernelAdapter):
                     values[i] = torch.empty(tuple(int(s) for s in p.shape), dtype=p.torch_dtype(), device="cpu")
                 else:
                     t = next(it)
-                    values[i] = t.detach().to("cpu").contiguous()
+                    # A scalar is a Python number or a 0-d tensor.
+                    values[i] = t if p.is_scalar() else t.detach().to("cpu").contiguous()
 
             # Build argv (kernel-param order): buffer -> pushed file; scalar -> int.
             argv = []
             pulls = []  # (local_path, remote_name, out_tensor)
             for i, p in enumerate(params):
                 if p.is_scalar():
-                    argv.append(str(int(values[i].item())))
+                    argv.append(str(int(values[i])))
                     continue
                 fname = f"{self._iface}_p{i}.bin"
                 local = os.path.join(self._workdir, fname)
