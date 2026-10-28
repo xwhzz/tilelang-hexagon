@@ -318,27 +318,20 @@ def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1):
 
 def test_blockscaled_gemm_of_fp16_a_runs_on_hmx():
     source = _lower(_blockscaled_hmx(64, 64, 256, 64, "int4", "float32", True)).kernel_source
-    # Column 0 dequantizes whole first; then half of column 1 alongside each
-    # of column 0's two row tiles.
-    assert "tl_crouton_dequant4<true>((&(((half*)w)[0])), ((int8_t*)b + ((0) >> 1)), (&(((half*)sb)[0])), 64, 64, 0, 32);" in source
+    # One call of the out-of-line HMX GEMM: A's row tiles 8 tiles of K apart,
+    # B's panels 4096 bytes apart, groups of 64, a factor per row of A.
     assert (
-        "tl_crouton_dequant4<true>((&(((half*)w)[8192])), ((int8_t*)b + ((8192) >> 1)), (&(((half*)sb)[32])), 64, 64, (t * 16), 16);"
-        in source
-    )
-    assert source.count("tl_hexagon_hmx_mma_atom(") == 1
-    # Each row of a tile weighed by its row's factor of A, written to C.
-    assert "tl_crouton_tile_store<false, true, true, true>(" in source
+        "tl_hexagon_hmx_gemm_blockscaled<true, true, true, true, false>(64, 64, 256, (&(((float*)c)[0])), 64, "
+        "(&(((half*)a)[0])), 8192, ((int8_t*)b + ((0) >> 1)), 4096, (&(((half*)sb)[0])), 64, 64, (&(SA[0])), 1, (bool)1, "
+    ) in source
     assert "tl_hvx_gemm_int_scaled" not in source
 
 
 def test_blockscaled_hmx_gemm_of_a_worker_pool_takes_turns_at_hmx():
     source = _lower(_blockscaled_hmx(64, 64, 256, 64, "uint4", "float32", True, workers=2)).kernel_source
-    body = source[source.index("tl_parallel_for") :]
-    # Per tile: take HMX, multiply, store, release; then the epilogue and a
-    # slice of the next column, while the other worker multiplies.
-    acquire, release = body.index("tl_hexagon_hmx_acc_acquire"), body.index("tl_hexagon_hmx_acc_release")
-    assert acquire < body.index("tl_hexagon_hmx_mma_atom") < release
-    assert release < body.index("tl_crouton_tile_store<") < body.index("tl_crouton_dequant4<false>((&(((half*)w)[8192]))")
+    body = source[source.index("tl_parallel_for<tl_hmx_worker_scope") :]
+    # The workers share HMX: a tile each at a time.
+    assert "tl_hexagon_hmx_gemm_blockscaled<false, true, true, true, true>(" in body
 
 
 @pytest.mark.parametrize(

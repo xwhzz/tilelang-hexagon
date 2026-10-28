@@ -84,8 +84,8 @@ These are the decisions that keep the adaptation small and the code navigable.
   (`VisitStmt_(AllocBufferNode)`).
 - **Layer 4** — the recipe headers (Section 6/7). `common.h` (types), `vtcm.h` (the
   arena), `hmx.h` (the HMX atoms + session), `crouton.h` (copies to and from
-  Crouton matrices), `worker.h`
-  (the HW-thread pool).
+  Crouton matrices), `hvx_gemm.h` and `hmx_gemm.h` (the GEMMs that are functions of
+  their own), `worker.h` (the HW-thread pool).
 - **Layer 5** — `tilelang/hexagon/runtime/`: `fastrpc.py` generates the IDL + skel +
   host + CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK
   build; `agent.py` runs a persistent on-DSP agent over a socket (`adb forward`);

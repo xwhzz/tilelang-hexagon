@@ -155,8 +155,8 @@ TIR_DEFINE_TL_BUILTIN(hexagon_crouton_tile_store)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(hexagon_crouton_dequant4)
-    .set_num_inputs(8)
+TIR_DEFINE_TL_BUILTIN(hexagon_hmx_gemm_blockscaled)
+    .set_num_inputs(23)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

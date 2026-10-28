@@ -632,8 +632,10 @@ tl_crouton_dequant4(half *__restrict__ w, const void *__restrict__ panel,
   const HVX_Vector *src = reinterpret_cast<const HVX_Vector *>(panel);
   HVX_Vector *dst = reinterpret_cast<HVX_Vector *>(w);
   const int per_group = gb >> 3; // panel registers per group of factors
-  for (int v = v0, end = v0 + n; v < end;) {
-    const int g = v / per_group;
+  // One division a call: Hexagon divides in software, and a caller's gb is
+  // not always a constant here.
+  int g = v0 / per_group;
+  for (int v = v0, end = v0 + n; v < end; ++g) {
     const int stop = end < (g + 1) * per_group ? end : (g + 1) * per_group;
     // The group's 32 factors, each in both lanes of its row's pair.
     HVX_Vector s = tl_hvx_load_bytes(sfb + g * ld_sfb, 64);

@@ -269,11 +269,12 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
     ``[K / gb, N]``, gb a multiple of 8. C is an fp32 row-major or fp16
     Crouton matrix.
 
-    HVX dequantizes B 32 rows at a time, one column of output tiles, into a
-    column of fp16 weight tiles (``tl_crouton_dequant4``), and HMX multiplies
-    every row tile of A by it: each weight serves all of A's rows. Two columns
-    alternate. In one program, a slice of the next column dequantizes while
-    HMX multiplies each tile; in a worker pool each tile is a critical section,
+    The call is one ``tl_hexagon_hmx_gemm_blockscaled`` (``hmx_gemm.h``), a
+    function of its own: HVX dequantizes B 32 rows at a time, one column of
+    output tiles, into fp16 weight tiles (``tl_crouton_dequant4``), and HMX
+    multiplies every row tile of A by them, so each weight serves all of A's
+    rows. In one program a slice of the next column dequantizes while HMX
+    multiplies each tile; in a worker pool each tile is a critical section,
     and the slice and the tile's epilogue run while other workers multiply.
     """
 
@@ -299,8 +300,10 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
             raise ValueError(f"{name} reads A in the HMX activation layout, but it has {layout}")
         if not isinstance(layout_map.get(self.B, None), PanelLayout):
             raise ValueError(f"{name} reads B in the panel layout, but it has {layout_map.get(self.B, None)}")
+        kind = self._epilogue_kind(layout_map)
+        if kind == "elements":
+            raise ValueError(f"{name} writes C row-major or in Crouton tiles, not {layout_map.get(self.C, None)}")
         M, N, K = self.M, self.N, self.K
-        MT, NT, KT = M // TILE, N // TILE, K // TILE
         ga, first_a = scale_group(self, "A", self.sf_a_granularity_k)
         gb, first_b = scale_group(self, "B", self.sf_b_granularity_k)
         if ga != K:
@@ -308,131 +311,80 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
         if gb % 8:
             raise ValueError(f"{name} dequantizes B in groups of 8 columns of K: its scale groups are a multiple of 8, not {gb}")
 
-        A_buf, B_buf = self.ARegion.buffer, self.BRegion.buffer
-        a_origin = _origin(self.ARegion)
-        # B's region starts on a panel: a pointer at the logical start of its
-        # rows [32 nt, 32 nt + 32), which LowerTileOp moves through the layout
-        # to the panel's bytes.
-        b_origin = _origin(self.BRegion)
-        signed = str(self.B.dtype).startswith("int")
+        def first(region):
+            return region.buffer[_origin(region)]
 
-        def panel(nt):
-            index = b_origin[:-2] + (b_origin[-2] + nt * TILE, b_origin[-1])
-            return T.access_ptr(B_buf[index], "r", TILE * K)
+        A_buf, C_buf = self.ARegion.buffer, self.CRegion.buffer
+        # A's row tiles are its buffer's column tiles of 1024 elements apart.
+        a_row_tile = int(A_buf.shape[-1]) // TILE * TILE_ELEMS
+        a = T.access_ptr(first(self.ARegion), "r", (M // TILE - 1) * a_row_tile + K * TILE)
+        # B's region starts on a panel: a pointer at its logical start, which
+        # LowerTileOp moves through the layout to the panel's bytes.
+        b = T.access_ptr(first(self.BRegion), "r", N * K)
+        panel_bytes = TILE * int(self.B.shape[-1]) * 4 // 8
+        signed = str(self.B.dtype).startswith("int")
 
         sfb_region = self.SFBRegion
         sfb_origin = _origin(sfb_region)
         if len(sfb_origin) < 2:
             raise ValueError(f"{name}: SFB {sfb_region.buffer.name} is [K / {gb}, N], group-major")
         ld_sfb = int(_strides(sfb_region.buffer)[-2])
-
-        def factors(nt):
-            index = sfb_origin[:-2] + (sfb_origin[-2] + first_b, sfb_origin[-1] + nt * TILE)
-            return T.access_ptr(sfb_region.buffer[index], "r", (K // gb - 1) * ld_sfb + TILE)
+        sfb_first = sfb_origin[:-2] + (sfb_origin[-2] + first_b, sfb_origin[-1])
+        sfb = T.access_ptr(sfb_region.buffer[sfb_first], "r", (K // gb - 1) * ld_sfb + N)
 
         sfa_region = self.SFARegion
         sfa_origin = _origin(sfa_region)
         if len(sfa_origin) < 2:
             raise ValueError(f"{name}: SFA {sfa_region.buffer.name} is [M, K / {ga}], a factor per row of A")
-        row0 = sfa_origin[:-1] + (sfa_origin[-1] + first_a,)
-        scale = (sfa_region.buffer, row0, int(_strides(sfa_region.buffer)[-2]))
+        ld_sfa = int(_strides(sfa_region.buffer)[-2])
+        sfa_first = sfa_origin[:-1] + (sfa_origin[-1] + first_a,)
+        sfa = T.access_ptr(sfa_region.buffer[sfa_first], "r", (M - 1) * ld_sfa + 1)
 
-        shared = self._shared()
-        # Output tiles by columns: tile t is (t % MT, t // MT).
-        epilogue = self._tile_epilogue(layout_map, lambda t: (t % MT, t // MT), scale)
-        dequant4 = tirx.op.Op.get("tl.hexagon_crouton_dequant4")
-        # A column is K / 8 panel registers, in MT slices.
-        registers = K // 8
-        per_slice = -(-registers // MT)
-
-        @T.macro
-        def dequant(w, nt, v0, n):
-            """Panel registers [v0, v0 + n) of B's rows [32 nt, 32 nt + 32)
-            into weight column nt % 2."""
-            T.evaluate(
-                tirx.call_intrin(
-                    "void",
-                    dequant4,
-                    _flag(signed),
-                    T.access_ptr(w[(nt % 2) * K * TILE], "w", K * TILE),
-                    panel(nt),
-                    factors(nt),
-                    ld_sfb,
-                    gb,
-                    v0,
-                    n,
-                )
-            )
-
-        @T.macro
-        def dequant_slice(w, t):
-            """The slice of the next column that dequantizes alongside tile t."""
-            if t // MT + 1 < NT:  # noqa: SIM102
-                if (t % MT) * per_slice < registers:
-                    dequant(w, t // MT + 1, (t % MT) * per_slice, T.min(per_slice, registers - (t % MT) * per_slice))
-
-        @T.macro
-        def mma(acc, w, t):
-            """A's row tile t % MT by weight column t // MT, in deep packets
-            of at most 32 K tiles."""
-            for chunk in T.serial(T.ceildiv(KT, 32)):
-                T.hmx.mma(
-                    T.access_ptr(acc[0], "rw"),
-                    T.access_ptr(
-                        A_buf[a_origin[:-2] + (a_origin[-2] + (t % MT) * TILE, a_origin[-1] + chunk * 32 * TILE)],
-                        "r",
-                        T.min(KT - chunk * 32, 32) * TILE_ELEMS,
-                    ),
-                    T.access_ptr(w[((t // MT) % 2) * K * TILE + chunk * 32 * TILE_ELEMS], "r", T.min(KT - chunk * 32, 32) * TILE_ELEMS),
-                    T.min(KT - chunk * 32, 32),
-                )
-
-        emitter = self._make_emitter()
-        tiles = MT * NT
+        rows = kind == "rows"
+        if rows:
+            ldc = C_buf.shape[-1]
+            aligned = isinstance(ldc, tirx.IntImm) and ldc.value % TILE == 0
+            c_extent = (M - 1) * ldc + N
+        else:
+            ldc = int(C_buf.shape[-1]) // TILE
+            aligned = True
+            c_extent = M * N
+        clear = self.clear_accum
+        c = T.access_ptr(first(self.CRegion), "w" if clear is True else "rw", c_extent)
+        gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm_blockscaled")
+        flags = [_flag(signed), _flag(rows), _flag(aligned), _flag(True), _flag(self._shared())]
 
         @T.prim_func
         def _gemm_hmx_blockscaled() -> None:
-            bias_vtcm = T.alloc_shared((BIAS_WORDS,), "uint32", align=256)
+            # Two columns of weight tiles, two staging tiles and the conversion
+            # config: HMX reads one column while HVX fills the other.
+            config = T.alloc_shared((BIAS_WORDS,), "uint32", align=256)
             stage = T.alloc_shared((2 * TILE_ELEMS,), "float16", align=2048)
-            # Two columns of weight tiles: HMX reads one while HVX fills the other.
             w = T.alloc_shared((2 * K * TILE,), "float16", align=2048)
-            acc = T.hmx.alloc_accumulator()
-            cvt = T.hmx.alloc_convert_state()
-            bias = T.hmx.alloc_bias_state()
-
-            for i in T.vectorized(BIAS_WORDS // 2):
-                bias_vtcm[i] = T.Cast("uint32", 0x3C00)
-            for i in T.vectorized(BIAS_WORDS // 2):
-                bias_vtcm[BIAS_WORDS // 2 + i] = T.Cast("uint32", 0)
-            dequant(w, 0, 0, registers)
-
-            if shared:
-                # Other workers multiply while this one dequantizes and runs a
-                # tile's epilogue. Each holder sets the configuration again.
-                for t in T.serial(tiles):
-                    emitter.acquire(acc)
-                    emitter.load_bias(bias, bias_vtcm)
-                    emitter.clear(acc)
-                    mma(acc, w, t)
-                    emitter.convert(cvt, acc, bias, bias_vtcm)
-                    emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
-                    emitter.release(acc)
-                    epilogue(stage, t)
-                    dequant_slice(w, t)
-            else:
-                emitter.acquire(acc)
-                emitter.load_bias(bias, bias_vtcm)
-                for t in T.serial(tiles):
-                    emitter.clear(acc)
-                    mma(acc, w, t)
-                    # HVX dequantizes and runs the previous tile's epilogue
-                    # while HMX multiplies.
-                    dequant_slice(w, t)
-                    if t > 0:
-                        epilogue(stage, t - 1)
-                    emitter.convert(cvt, acc, bias, bias_vtcm)
-                    emitter.store_at(cvt, acc, stage[(t % 2) * TILE_ELEMS], bias, bias_vtcm)
-                emitter.release(acc)
-                epilogue(stage, tiles - 1)
+            T.evaluate(
+                tirx.call_intrin(
+                    "void",
+                    gemm,
+                    *flags,
+                    M,
+                    N,
+                    K,
+                    c,
+                    ldc,
+                    a,
+                    a_row_tile,
+                    b,
+                    panel_bytes,
+                    sfb,
+                    ld_sfb,
+                    gb,
+                    sfa,
+                    ld_sfa,
+                    T.Cast("bool", clear),
+                    T.access_ptr(w[0], "rw", 2 * K * TILE),
+                    T.access_ptr(stage[0], "rw", 2 * TILE_ELEMS),
+                    T.access_ptr(config[0], "rw", BIAS_WORDS),
+                )
+            )
 
         return _gemm_hmx_blockscaled

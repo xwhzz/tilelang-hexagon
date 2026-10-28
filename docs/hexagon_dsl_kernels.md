@@ -165,7 +165,7 @@ With an fp16 A, `T.gemm_blockscaled` runs on HMX, for prompts rather than single
 
   This runs at about 18 weights per cycle on one thread, bit-exact with torch's fp16 products. IEEE `vmpy(hf, hf)` gives wrong results on v79.
 - **Multiply.** HMX multiplies every row tile of A by the column, so each weight dequantizes once per call, however many rows A has. Two columns alternate, and a slice of the next column dequantizes alongside each tile's MACs.
-- **Out of line.** Like the GEMMs, the dequantization is a function of its own: inlined into the call's loop it competes for registers and spills its lookup table.
+- **Out of line.** The whole call is one `tl_hexagon_hmx_gemm_blockscaled` (`hmx_gemm.h`), so the calls of one configuration share their code, as the HVX GEMMs' do below. Within it the dequantization is a function of its own: inlined into the call's loop it competes for registers and spills its lookup table.
 
 On v79, 256 x 128 x 2048 runs at:
 

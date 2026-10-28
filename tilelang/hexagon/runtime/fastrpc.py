@@ -145,6 +145,8 @@ def skel_runtime(kernel_source: str) -> SkelRuntime:
         ("hvx_gemm.h", "tl_hvx_gemm" in kernel_source),
         # Copies between Crouton matrices and strided matrices (T.copy).
         ("crouton.h", "tl_crouton_" in kernel_source),
+        # T.gemm_blockscaled on HMX.
+        ("hmx_gemm.h", "tl_hexagon_hmx_gemm" in kernel_source),
     ]
     includes = "#include <tl_templates/hexagon/power.h>\n" + "".join(
         f"#include <tl_templates/hexagon/{h}>\n" for h, used in headers if used

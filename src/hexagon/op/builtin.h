@@ -158,13 +158,14 @@ TVM_DLL const Op &hexagon_crouton_copy();
 // arguments.
 TVM_DLL const Op &hexagon_crouton_tile_store();
 
-// tl_crouton_dequant4<signed>(w, panel, sfb, ld_sfb, gb, v0, n) (crouton.h):
-// dequantizes panel registers [v0, v0 + n) of one 32-row panel of a 4-bit B,
-// each 8 columns of K by the 32 rows, into the fp16 HMX weight tiles `w` of
-// its 32 output columns, scaled by the panel's fp16 factors: sfb[g * ld_sfb +
-// i] for row i and group g of gb columns of K. `signed` prints as a template
-// argument.
-TVM_DLL const Op &hexagon_crouton_dequant4();
+// tl_hexagon_hmx_gemm_blockscaled<signed, rows, aligned, scaled, shared>(M, N,
+// K, c, ldc, a, a_row_tile, b, panel_bytes, sfb, ld_sfb, gb, sfa, ld_sfa,
+// clear, w, stage, config) (hmx_gemm.h): C (+)= (A * SFA) (B * SFB)^T on HMX
+// for an fp16 A in the HMX activation layout and a 4-bit B in the panel
+// layout, B dequantized on HVX into the weight tiles `w`; `stage` and
+// `config` are its staging tiles and conversion config. The five flags print
+// as template arguments.
+TVM_DLL const Op &hexagon_hmx_gemm_blockscaled();
 
 // tl_hvx_gemm<M, N, K, trans_A, trans_B, lda, ldb, ldc, align_a, align_b,
 // align_c>(C, A, B, clear) (hvx_gemm.h): C = A B, or C += A B unless clear,
