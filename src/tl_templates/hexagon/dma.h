@@ -20,6 +20,9 @@
 #ifndef TL_DMA_INLINE
 #define TL_DMA_INLINE static inline
 #endif
+// The submit, commit and wait path of every transfer, inlined: as calls it
+// cost several times its instructions (#78).
+#define TL_DMA_HOT TL_DMA_INLINE __attribute__((always_inline))
 
 enum tl_hexagon_dma_direction {
   TL_HEXAGON_DMA_DDR_TO_VTCM = 0,
@@ -190,7 +193,7 @@ TL_DMA_INLINE tl_hexagon_dma_options tl_hexagon_dma_make_options(
   return {src_l2_bypass, dst_l2_bypass, ordered};
 }
 
-TL_DMA_INLINE tl_hexagon_dma_options
+TL_DMA_HOT tl_hexagon_dma_options
 tl_hexagon_dma_options_for_direction(int direction) {
   return {
       direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
@@ -200,14 +203,14 @@ tl_hexagon_dma_options_for_direction(int direction) {
   };
 }
 
-TL_DMA_INLINE uint32_t
+TL_DMA_HOT uint32_t
 tl_hexagon_dma_option_bits(const tl_hexagon_dma_options &options) {
   return (options.src_l2_bypass ? TL_HEXAGON_DMA_SRC_BYPASS_MASK : 0u) |
          (options.dst_l2_bypass ? TL_HEXAGON_DMA_DST_BYPASS_MASK : 0u) |
          (options.ordered ? TL_HEXAGON_DMA_ORDERED_MASK : 0u);
 }
 
-TL_DMA_INLINE void
+TL_DMA_HOT void
 tl_hexagon_dma_descriptor_clear(tl_hexagon_dma_descriptor *descriptor) {
   if (descriptor == nullptr)
     return;
@@ -220,8 +223,8 @@ tl_hexagon_dma_descriptor_clear(tl_hexagon_dma_descriptor *descriptor) {
   words[3] = 0;
 }
 
-TL_DMA_INLINE bool tl_hexagon_dma_address32(const void *ptr, uint64_t bytes,
-                                            uint32_t *address) {
+TL_DMA_HOT bool tl_hexagon_dma_address32(const void *ptr, uint64_t bytes,
+                                         uint32_t *address) {
   if (ptr == nullptr || address == nullptr)
     return false;
   uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
@@ -236,9 +239,8 @@ TL_DMA_INLINE bool tl_hexagon_dma_address32(const void *ptr, uint64_t bytes,
   return true;
 }
 
-TL_DMA_INLINE uint64_t tl_hexagon_dma_2d_span(uint32_t stride,
-                                              uint32_t row_bytes,
-                                              uint32_t rows) {
+TL_DMA_HOT uint64_t tl_hexagon_dma_2d_span(uint32_t stride, uint32_t row_bytes,
+                                           uint32_t rows) {
   if (rows == 0 || row_bytes == 0)
     return 0;
   return static_cast<uint64_t>(rows - 1) * stride + row_bytes;
@@ -249,7 +251,7 @@ tl_hexagon_dma_descriptor_mark_done(tl_hexagon_dma_descriptor *descriptor) {
   descriptor->word[1] |= TL_HEXAGON_DMA_DONE_MASK;
 }
 
-TL_DMA_INLINE bool
+TL_DMA_HOT bool
 tl_hexagon_dma_descriptor_done(const tl_hexagon_dma_descriptor *descriptor) {
   if (descriptor == nullptr)
     return false;
@@ -257,7 +259,7 @@ tl_hexagon_dma_descriptor_done(const tl_hexagon_dma_descriptor *descriptor) {
   return (*state & TL_HEXAGON_DMA_DONE_MASK) != 0;
 }
 
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_descriptor_init_1d(tl_hexagon_dma_descriptor *descriptor,
                                   void *dst, const void *src, uint32_t bytes,
                                   tl_hexagon_dma_options options) {
@@ -287,7 +289,7 @@ tl_hexagon_dma_descriptor_init_1d(tl_hexagon_dma_descriptor *descriptor,
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE int tl_hexagon_dma_descriptor_init_2d(
+TL_DMA_HOT int tl_hexagon_dma_descriptor_init_2d(
     tl_hexagon_dma_descriptor *descriptor, void *dst, const void *src,
     uint32_t dst_stride, uint32_t src_stride, uint32_t row_bytes, uint32_t rows,
     tl_hexagon_dma_options options) {
@@ -437,7 +439,7 @@ TL_DMA_INLINE int tl_hexagon_dma_finish_ddr(const void *dst, uint32_t bytes,
   return TL_HEXAGON_DMA_ERR_ARGUMENT;
 }
 
-TL_DMA_INLINE bool tl_hexagon_dma_valid_direction(int direction) {
+TL_DMA_HOT bool tl_hexagon_dma_valid_direction(int direction) {
   return direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
          direction == TL_HEXAGON_DMA_VTCM_TO_DDR ||
          direction == TL_HEXAGON_DMA_NO_CACHE ||
@@ -445,7 +447,7 @@ TL_DMA_INLINE bool tl_hexagon_dma_valid_direction(int direction) {
 }
 
 // Writes back the DDR rows of a transfer: every row's lines, then one syncht.
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_prepare_transfer(const tl_hexagon_dma_transfer &transfer) {
   if (transfer.direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
       transfer.direction != TL_HEXAGON_DMA_VTCM_TO_DDR)
@@ -469,8 +471,11 @@ tl_hexagon_dma_prepare_transfer(const tl_hexagon_dma_transfer &transfer) {
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_finish_transfer(const tl_hexagon_dma_transfer &transfer) {
+  // Only a store to DDR has cache lines to invalidate, row by row.
+  if (transfer.direction != TL_HEXAGON_DMA_VTCM_TO_DDR)
+    return TL_HEXAGON_DMA_OK;
   for (uint32_t row = 0; row < transfer.rows; ++row) {
     uint8_t *dst_row = static_cast<uint8_t *>(transfer.dst) +
                        static_cast<uint64_t>(row) * transfer.dst_stride;
@@ -489,7 +494,7 @@ tl_hexagon_dma_finish_transfer(const tl_hexagon_dma_transfer &transfer) {
 // The slot `offset` (at most the capacity) past the head. head + offset is
 // under twice the capacity, so one compare wraps it: a modulo by the runtime
 // capacity is a division libcall on Hexagon, on every submit and pop.
-TL_DMA_INLINE uint32_t
+TL_DMA_HOT uint32_t
 tl_hexagon_dma_queue_index(const tl_hexagon_dma_queue *queue, uint32_t offset) {
   uint32_t index = queue->head + offset;
   return index >= queue->capacity ? index - queue->capacity : index;
@@ -523,13 +528,11 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_init(
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE bool
-tl_hexagon_dma_queue_empty(const tl_hexagon_dma_queue *queue) {
+TL_DMA_HOT bool tl_hexagon_dma_queue_empty(const tl_hexagon_dma_queue *queue) {
   return queue == nullptr || queue->count == 0;
 }
 
-TL_DMA_INLINE bool
-tl_hexagon_dma_queue_full(const tl_hexagon_dma_queue *queue) {
+TL_DMA_HOT bool tl_hexagon_dma_queue_full(const tl_hexagon_dma_queue *queue) {
   return queue != nullptr && queue->count == queue->capacity;
 }
 
@@ -543,7 +546,7 @@ tl_hexagon_dma_queue_capacity(const tl_hexagon_dma_queue *queue) {
   return queue == nullptr ? 0 : queue->capacity;
 }
 
-TL_DMA_INLINE tl_hexagon_dma_descriptor *
+TL_DMA_HOT tl_hexagon_dma_descriptor *
 tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
   if (queue == nullptr || queue->capacity == 0 ||
       tl_hexagon_dma_queue_full(queue))
@@ -561,7 +564,7 @@ tl_hexagon_dma_queue_front(const tl_hexagon_dma_queue *queue) {
 // Submit the descriptor in the next queue slot.  This is the raw extension
 // point for custom descriptor options: the caller initializes the descriptor,
 // performs any required cache maintenance, then supplies completion metadata.
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_queue_submit_prepared(tl_hexagon_dma_queue *queue,
                                      const tl_hexagon_dma_transfer &transfer) {
   tl_hexagon_dma_descriptor *descriptor =
@@ -591,9 +594,9 @@ tl_hexagon_dma_queue_submit_prepared(tl_hexagon_dma_queue *queue,
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
-                                               void *dst, const void *src,
-                                               uint32_t bytes, int direction) {
+TL_DMA_HOT int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
+                                            void *dst, const void *src,
+                                            uint32_t bytes, int direction) {
   if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
@@ -616,12 +619,12 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
   return tl_hexagon_dma_queue_submit_prepared(queue, transfer);
 }
 
-TL_DMA_INLINE int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
-                                               void *dst, const void *src,
-                                               uint32_t dst_stride,
-                                               uint32_t src_stride,
-                                               uint32_t row_bytes,
-                                               uint32_t rows, int direction) {
+TL_DMA_HOT int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
+                                            void *dst, const void *src,
+                                            uint32_t dst_stride,
+                                            uint32_t src_stride,
+                                            uint32_t row_bytes, uint32_t rows,
+                                            int direction) {
   if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
@@ -644,12 +647,11 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
   return tl_hexagon_dma_queue_submit_prepared(queue, transfer);
 }
 
-TL_DMA_INLINE int tl_hexagon_dma_queue_push(tl_hexagon_dma_queue *queue,
-                                            void *dst, const void *src,
-                                            uint32_t dst_stride,
-                                            uint32_t src_stride,
-                                            uint32_t row_bytes, uint32_t rows,
-                                            int direction) {
+TL_DMA_HOT int tl_hexagon_dma_queue_push(tl_hexagon_dma_queue *queue, void *dst,
+                                         const void *src, uint32_t dst_stride,
+                                         uint32_t src_stride,
+                                         uint32_t row_bytes, uint32_t rows,
+                                         int direction) {
   if (rows == 1 && dst_stride == row_bytes && src_stride == row_bytes)
     return tl_hexagon_dma_queue_push_1d(queue, dst, src, row_bytes, direction);
   return tl_hexagon_dma_queue_push_2d(queue, dst, src, dst_stride, src_stride,
@@ -710,7 +712,7 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_wait(tl_hexagon_dma_queue *queue,
   }
 }
 
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
                              tl_hexagon_dma_transfer *completed) {
   if (queue == nullptr)
@@ -743,7 +745,7 @@ tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE int
+TL_DMA_HOT int
 tl_hexagon_dma_queue_pop(tl_hexagon_dma_queue *queue,
                          tl_hexagon_dma_transfer *completed = nullptr) {
   int status = TL_HEXAGON_DMA_ERR_BUSY;
@@ -823,23 +825,23 @@ struct tl_hexagon_dma_async_context {
   tl_hexagon_dma_async_context &
   operator=(const tl_hexagon_dma_async_context &) = delete;
 
-  int submit(void *dst, const void *src, uint32_t dst_stride,
-             uint32_t src_stride, uint32_t row_bytes, uint32_t rows,
-             int direction) {
+  __attribute__((always_inline)) int
+  submit(void *dst, const void *src, uint32_t dst_stride, uint32_t src_stride,
+         uint32_t row_bytes, uint32_t rows, int direction) {
     int result = tl_hexagon_dma_queue_push(
         &queue, dst, src, dst_stride, src_stride, row_bytes, rows, direction);
     if (result == TL_HEXAGON_DMA_OK)
       ++submitted;
     return result;
   }
-  int commit() {
+  __attribute__((always_inline)) int commit() {
     if (group_count == Groups)
       return TL_HEXAGON_DMA_ERR_QUEUE_FULL;
     group_end[(group_head + group_count) % Groups] = submitted;
     ++group_count;
     return TL_HEXAGON_DMA_OK;
   }
-  int wait(uint32_t groups) {
+  __attribute__((always_inline)) int wait(uint32_t groups) {
     while (group_count > groups) {
       // Unsigned differences stay correct when the counters wrap.
       while (group_end[group_head] - retired != 0) {
