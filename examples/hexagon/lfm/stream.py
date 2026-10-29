@@ -73,23 +73,29 @@ class Projection:
 class Weights:
     """An fp16 projection of the bundle as the HMX weight operand, w [K, N] in
     Crouton tiles, or a stack of them [L, K, N]: a block is `block` of its N
-    (whole panels of 32) by a slice of `cols` of its K (whole tiles), in one
-    ring slot of that layout."""
+    (whole panels of 32) by a slice of `cols` of its K (whole tiles), in the
+    first `cols` of a ring slot of that layout. A slot holds `ring_cols` of K
+    (`cols` by default), so that projections of different K share a ring."""
 
     w: object
     block: int
     cols: int
+    ring_cols: int | None = None
     groups = 1
 
     @property
     def slices(self) -> int:
         return int(self.w.shape[-2]) // self.cols
 
+    @property
+    def slot_cols(self) -> int:
+        return self.ring_cols or self.cols
+
     def key(self):
-        return ("float16", self.block, self.cols)
+        return ("float16", self.block, self.slot_cols)
 
     def rings(self, depth: int) -> tuple:
-        return (T.alloc_shared((depth, self.cols, self.block), "float16"),)
+        return (T.alloc_shared((depth, self.slot_cols, self.block), "float16"),)
 
     def layouts(self, rings) -> dict:
         return {self.w: make_hmx_weight_layout(self.w), rings[0]: make_hmx_weight_layout(rings[0])}
@@ -131,9 +137,9 @@ def submit_tiles(w, ring, layer, sl, row, k, cols: int, block: int, stacked: boo
     """Columns [row, row + block) of slice sl of w's K (of layer `layer` of a
     stack), whole Crouton tiles: one DMA group."""
     if stacked:
-        T.dma_copy(w[layer, sl * cols : (sl + 1) * cols, row : row + block], ring[k, :, :])
+        T.dma_copy(w[layer, sl * cols : (sl + 1) * cols, row : row + block], ring[k, 0:cols, :])
     else:
-        T.dma_copy(w[sl * cols : (sl + 1) * cols, row : row + block], ring[k, :, :])
+        T.dma_copy(w[sl * cols : (sl + 1) * cols, row : row + block], ring[k, 0:cols, :])
 
 
 @T.macro

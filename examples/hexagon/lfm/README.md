@@ -2,10 +2,10 @@
 
 LFM2-1.2B (`LiquidAI/LFM2-1.2B`; LFM2.5-1.2B has the same architecture) on the
 v79 cDSP, every operation a TileLang kernel, at batch 1. LFM3-1.7B
-(`LiquidAI/LFM3-1.7B`), unquantized, is on its way
+(`LiquidAI/LFM3-1.7B`) runs unquantized
 ([#179](https://github.com/xwhzz/tilelang-hexagon/issues/179)): its reference,
-its fp16 bundle and its decode are here (see [LFM3](#lfm3)), its prefill not
-yet. The other sections are LFM2's.
+its fp16 bundle, its decode and its prefill are here (see [LFM3](#lfm3)). The
+other sections are LFM2's.
 
 | File | |
 |---|---|
@@ -16,6 +16,7 @@ yet. The other sections are LFM2's.
 | `stream.py` | The weight streams of the kernels (4-bit panels or fp16 Crouton tiles), and the decode's w4a16 GEMV blocks. |
 | `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds a bundle's kernels. |
 | `decode_fp16.py` | The fp16 bundle's decode kernel, LFM2's or LFM3's. |
+| `prefill_fp16.py` | The fp16 bundle's prefill kernel: a prompt in chunks of 256 rows on HMX, in one call. |
 | `prefill.py` | The prefill kernel: a prompt in chunks of 128 rows on HMX, in one call. |
 | `text.py` | The checkpoint's tokenizer and chat template, on the host, without transformers. |
 | `generate.py` | Chat on the device: the reply streams as it is generated. |
@@ -220,6 +221,49 @@ On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
 call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a
 token at 57.7 GB/s, the DMA's top rate. After a chat prompt, its first 64
 greedy tokens match the checkpoint's own code (transformers 5.22, fp32) one
-for one. Prompts run through the decode until the HMX prefill lands.
+for one.
 
-    python bench.py lfm3.head /data/local/tmp/lfm3.bundle --pp "" --tg 128
+### LFM3's prefill
+
+`prefill_fp16.py` runs a prompt in chunks of 256 rows, all in one kernel call,
+as `prefill.py` runs LFM2's. The bundle's fp16 tiles are HMX's weight operand
+as they are: each worker streams the decode's share of every projection, a
+panel of 32 channels a block, and multiplies it by the whole chunk on HMX,
+with nothing to dequantize.
+
+- **VTCM.** A chunk's activations stay in VTCM the workers share:
+  - the normalized input and the hidden units, which HMX reads;
+  - the branch outputs, in fp32, into which the output projections' GEMMs write
+    and the FFN's parts add, and which LFM3's sandwich norm normalizes over each
+    row before the residual add.
+
+  The residual itself is in DDR, a worker's rows moving by DMA two slots deep.
+- **Attention** runs per query head, in blocks of 128 rows against 64 keys at a
+  time, with an online softmax in base 2. The queries go to DDR in HMX's
+  activation tiles, so that a block of them comes back into HMX's operand by
+  one DMA.
+- **The last layer's** output projection and FFN feed nothing a prefill leaves
+  (the decode runs the prompt's last token), so it skips them.
+
+On v79 (`bench.py`, median of 3, timed on the phone around the kernel's FastRPC
+call):
+
+| test | ms | t/s |
+|---|---:|---:|
+| pp256 | 67.4 | 3799 |
+| pp512 | 133.4 | 3838 |
+| pp1024 | 270.9 | 3780 |
+| pp2048 | 570.6 | 3590 |
+
+A chunk streams 2835 MB of weights: for 1024 tokens, 201 ms of GEMM phases at
+56 GB/s, the DMA's rate, while HMX's multiplies alone take 180 ms at 8.1
+cycles a 32 x 32 x 32 op. A cycle profile puts the rest of pp1024 in three
+places:
+- attention, mostly HVX: its packs, exp2 and rescaling (28 ms);
+- the residual adds and norms (30 ms);
+- the barriers (8 ms).
+
+After a chat prompt, prefilled, the first 64 greedy tokens still match the
+checkpoint's own code.
+
+    python bench.py lfm3.head /data/local/tmp/lfm3.bundle --pp 512,1024 --tg 128

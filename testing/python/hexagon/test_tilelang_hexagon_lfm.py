@@ -21,6 +21,7 @@ sys.path.insert(0, str(LFM))
 import bundle  # noqa: E402
 import convert  # noqa: E402
 import decode_fp16  # noqa: E402
+import prefill_fp16  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
 from model import Config, Model, load_hf_weights  # noqa: E402
 from prefill import make_prefill  # noqa: E402
@@ -262,6 +263,52 @@ def test_fp16_decode_matches_the_reference(model, tmp_path):
         # The log-probabilities of the prompt's tokens, every one forced.
         scores = decoder.score(prompt)
         torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=2e-3, atol=2e-3)
+    finally:
+        decoder.close()
+
+
+@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
+def test_fp16_prefill_is_one_loop_over_the_layers(model, tmp_path):
+    c = Config.from_dict(bundle.read_header(_fp16_bundle(tmp_path, model))["config"])
+    ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64), [])])
+    # A loop at run time, whatever the depth; the projections are calls of
+    # the HMX GEMM.
+    assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
+    assert "tl_hexagon_hmx_gemm<" in source
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
+def test_fp16_prefill_matches_the_reference(model, tmp_path):
+    path = _fp16_bundle(tmp_path, model)
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    torch.manual_seed(1)
+    # A chunk of 128 rows and part of another, past the tiny LFM3's window.
+    n, max_pos = 200, 512
+    prompt = torch.randint(0, c.vocab, (n,))
+    La, KVH, HD = len(c.attention_layers), c.kv_heads, c.head_dim
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    try:
+        decoder.reset()
+        decoder.prefill(prompt.tolist())
+        state = ref.new_state()
+        with torch.no_grad():
+            ref.run(prompt, state)
+
+        def rel(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16).view(La, KVH, max_pos, HD).float()
+        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16).view(La, KVH, max_pos, HD).float()
+        conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, c.conv_taps - 1, c.dim)
+        errors = [rel(k[ai, :, :n], state.k[ai]) for ai in range(La)] + [rel(v[ai, :, :n], state.v[ai]) for ai in range(La)]
+        errors += [rel(conv[ci], state.conv[ci]) for ci in range(conv.shape[0])]
+        assert max(errors) < 1e-2, errors
+        # The decode goes on from the prefilled context.
+        with torch.no_grad():
+            want = ref.generate(prompt, 8)
+        assert decoder.generate(prompt.tolist(), 8) == want
     finally:
         decoder.close()
 

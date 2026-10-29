@@ -7,8 +7,8 @@ FastRPC call (`Session.last_run_seconds`).
     python bench.py <bundle> <bundle on the device> --pp 512,1024 --tg 128
 
 The bundle is read on the host for its header and on the device for its
-tensors (push it there once). Without a prefill kernel (the fp16 bundle's
-decoder, for now), ppN runs the prompt through the decode, a token a step.
+tensors (push it there once). Without a prefill kernel (`--prefill-rows
+none`), ppN runs the prompt through the decode, a token a step.
 """
 
 import argparse
@@ -31,11 +31,14 @@ def main():
     p.add_argument("--tg", default="128", help="comma-separated generation lengths")
     p.add_argument("--temperature", type=float, default=0.0, help="sample the generated tokens (0: greedy)")
     p.add_argument("--runs", type=int, default=5)
+    p.add_argument("--prefill-rows", default="auto", help="the prefill's chunk (Decoder's prefill_rows)")
     args = p.parse_args()
     pp = [int(v) for v in args.pp.split(",") if v]
     tg = [int(v) for v in args.tg.split(",") if v]
     t0 = time.time()
-    decoder = Decoder(args.bundle, args.device_bundle)
+    named = {"auto": "auto", "none": None}
+    rows = named[args.prefill_rows] if args.prefill_rows in named else int(args.prefill_rows)
+    decoder = Decoder(args.bundle, args.device_bundle, prefill_rows=rows)
     print(f"session ready in {time.time() - t0:.0f} s")
     torch.manual_seed(0)
     prompt = torch.randint(1000, decoder.c.vocab, (max(pp + [1]),)).tolist()

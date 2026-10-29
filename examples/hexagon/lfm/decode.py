@@ -471,19 +471,25 @@ def rope_tables(c: Config, max_pos: int) -> tuple:
 
 
 class Decoder:
-    """A model on the device, in one session: its decode kernel (and, for the
-    4-bit bundle, its prefill), with the bundle, the KV cache and the conv
-    state resident across calls. The 4-bit bundle (quantize.py) runs LFM2's
-    kernels here; the fp16 one (convert.py), LFM2's or LFM3's, those of
-    decode_fp16.py, whose prompts run through the decode.
+    """A model on the device, in one session: its decode and prefill kernels,
+    with the bundle, the KV cache and the conv state resident across calls.
+    The 4-bit bundle (quantize.py) runs LFM2's kernels here; the fp16 one
+    (convert.py), LFM2's or LFM3's, those of decode_fp16.py and
+    prefill_fp16.py.
 
     The bundle is read from `device_path` on the phone when given (push it there
     once), and the host needs only its header at `bundle_path`; else it is
-    written from the host. `prefill_rows` is the prefill's chunk (None:
-    prompts run through the decode, a token a step)."""
+    written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
+    rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
+    the decode, a token a step)."""
 
     def __init__(
-        self, bundle_path: str, device_path: str | None = None, max_pos: int = 4096, max_tokens: int = 4096, prefill_rows: int | None = 128
+        self,
+        bundle_path: str,
+        device_path: str | None = None,
+        max_pos: int = 4096,
+        max_tokens: int = 4096,
+        prefill_rows: int | str | None = "auto",
     ):
         from tilelang.hexagon.runtime.session import Session
 
@@ -491,13 +497,16 @@ class Decoder:
         c = Config.from_dict(header["config"])
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
         # The fp16 bundle has no quantized tensors.
-        fp16 = not header["quant"]
-        self.prefill_rows = None if fp16 else prefill_rows
+        self.fp16 = fp16 = not header["quant"]
+        self.prefill_rows = (256 if fp16 else 128) if prefill_rows == "auto" else prefill_rows
         assert max_pos % POS_BLOCK == 0
         if fp16:
             import decode_fp16
+            import prefill_fp16
 
             kernels = [(decode_fp16.make_decode(c, max_pos, max_tokens), [])]
+            if self.prefill_rows:
+                kernels.append((prefill_fp16.make_prefill(c, self.prefill_rows, max_pos, max_tokens), []))
         else:
             shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
             kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
@@ -525,6 +534,12 @@ class Decoder:
             # The workers' slices of a branch's input and output, of the FFN's
             # hidden units, their sums of squares, and the head's proposals.
             sizes = (D * 2, D * 4, F * 2, decode_fp16.NW * 4, decode_fp16.NW * 4 * 4)
+            if self.prefill_rows:
+                # A chunk's residual and its queries.
+                R = self.prefill_rows
+                self.prefill_args = prefill_fp16.prefill_args(c, self.weights)
+                self.prefill_scratch = [resident(nbytes=R * D * 4), resident(nbytes=c.heads * R * HD * 2)]
+                self.kinds = resident(torch.tensor(prefill_fp16.kinds_table(c), dtype=torch.int32))
         else:
             self.args = [self.weights[n] for n in BUNDLE_ARGS]
             self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
@@ -574,7 +589,11 @@ class Decoder:
         n, R = len(tokens), self.prefill_rows
         assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
         self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
-        self.session.kernels[1](*self.prefill_args, *self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds, self.tokens, pos0, n)
+        state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
+        if self.fp16:
+            self.session.kernels[1](*self.prefill_args, *state, *self.prefill_scratch, self.tokens, pos0, n)
+        else:
+            self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
 
     def score(self, tokens: list) -> list:
         """From an empty context, log p(tokens[i + 1] | tokens[: i + 1]) for
