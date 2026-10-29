@@ -20,6 +20,7 @@ LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
 sys.path.insert(0, str(LFM))
 import bundle  # noqa: E402
 import convert  # noqa: E402
+import decode_fp16  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
 from model import Config, Model, load_hf_weights  # noqa: E402
 from prefill import make_prefill  # noqa: E402
@@ -218,6 +219,51 @@ def test_a_decoder_reads_its_bundle_on_the_device(tiny_bundle, tmp_path):
             decoder.close()
     finally:
         subprocess.run(adb + ["shell", f"rm -f {on_device}.bundle {on_device}.head"], capture_output=True)
+
+
+def _fp16_bundle(tmp_path, model: str) -> str:
+    """The fp16 bundle of the tiny LFM2 or LFM3."""
+    c, w = tiny_lfm3() if model == "lfm3" else tiny()[:2]
+    path = str(tmp_path / f"{model}.bundle")
+    bundle.write(path, c.to_dict(), convert.build_tensors(c, w), {})
+    return path
+
+
+@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
+def test_fp16_decode_is_one_cycle_of_phases(model, tmp_path):
+    c = Config.from_dict(bundle.read_header(_fp16_bundle(tmp_path, model))["config"])
+    target = determine_target("hexagon", return_object=True)
+    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
+        art = tilelang.lower(decode_fp16.make_decode(c, 256, 64), target=target, enable_host_codegen=False, enable_device_compile=False)
+    source = art.kernel_source
+    # Four barriers a layer and one after the head; the GEMVs are calls of
+    # the weight-layout GEMV.
+    assert source.count("tl_grid_sync(") == 4 * c.layers + 1
+    assert "tl_hvx_gemm_weight<" in source and "TL_GEMM" not in source
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
+def test_fp16_decode_matches_the_reference(model, tmp_path):
+    path = _fp16_bundle(tmp_path, model)
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    torch.manual_seed(2)
+    # Past the tiny LFM3's sliding window of 48 positions.
+    prompt = torch.randint(0, c.vocab, (60,)).tolist()
+    n_forced, n = len(prompt), len(prompt) + 8 - 1
+    with torch.no_grad():
+        ref_tokens, ref_logits, ref_scores = _reference(ref, prompt, n, n_forced)
+    decoder = Decoder(path, max_pos=256, max_tokens=128)
+    try:
+        tokens, logits = decoder.run(prompt, 0, n, n_forced)
+        assert tokens == ref_tokens
+        torch.testing.assert_close(logits, ref_logits, rtol=0, atol=2e-3 * ref_logits.abs().max().item())
+        # The log-probabilities of the prompt's tokens, every one forced.
+        scores = decoder.score(prompt)
+        torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=2e-3, atol=2e-3)
+    finally:
+        decoder.close()
 
 
 def test_prefill_is_one_loop_over_the_layers(tiny_bundle):

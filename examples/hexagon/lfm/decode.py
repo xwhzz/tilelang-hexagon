@@ -471,8 +471,11 @@ def rope_tables(c: Config, max_pos: int) -> tuple:
 
 
 class Decoder:
-    """LFM2 on the device, in one session: the prefill and the decode kernels,
-    with the bundle, the KV cache and the conv state resident across calls.
+    """A model on the device, in one session: its decode kernel (and, for the
+    4-bit bundle, its prefill), with the bundle, the KV cache and the conv
+    state resident across calls. The 4-bit bundle (quantize.py) runs LFM2's
+    kernels here; the fp16 one (convert.py), LFM2's or LFM3's, those of
+    decode_fp16.py, whose prompts run through the decode.
 
     The bundle is read from `device_path` on the phone when given (push it there
     once), and the host needs only its header at `bundle_path`; else it is
@@ -487,44 +490,61 @@ class Decoder:
         header = bundle.read_header(bundle_path)
         c = Config.from_dict(header["config"])
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
-        self.prefill_rows = prefill_rows
+        # The fp16 bundle has no quantized tensors.
+        fp16 = not header["quant"]
+        self.prefill_rows = None if fp16 else prefill_rows
         assert max_pos % POS_BLOCK == 0
-        shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
-        kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
-        if prefill_rows:
-            kernels.append((make_prefill(c, shapes, prefill_rows, max_pos, max_tokens), []))
+        if fp16:
+            import decode_fp16
+
+            kernels = [(decode_fp16.make_decode(c, max_pos, max_tokens), [])]
+        else:
+            shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
+            kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
+            if self.prefill_rows:
+                kernels.append((make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens), []))
         self.session = Session(kernels)
         self.weights = bundle.load(self.session, bundle_path, device_path)
-        self.args = [self.weights[n] for n in BUNDLE_ARGS]
-        self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
-        cos, sin = rope_tables(c, max_pos)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)
-        kv = La * c.kv_heads * max_pos * c.head_dim * 4
+        D, F, HD = c.dim, c.ff, c.head_dim
 
         def resident(data=None, nbytes=None):
+            # Session buffers start zeroed.
             buf = self.session.buffer(nbytes if data is None else data.numel() * data.element_size())
             if data is not None:
                 buf.write(data)
             return buf
 
+        # A step writes its position of the KV cache before it attends, and the
+        # positions past it are masked: zeros, never NaNs, before the first.
+        if fp16:
+            self.args = decode_fp16.bundle_args(c, self.weights)
+            cos, sin = decode_fp16.rope_tables(c, max_pos)
+            kv = La * c.kv_heads * max_pos * HD * 2
+            self.conv_state = resident(nbytes=Lc * (c.conv_taps - 1) * D * 4)
+            # The workers' slices of a branch's input and output, of the FFN's
+            # hidden units, their sums of squares, and the head's proposals.
+            sizes = (D * 2, D * 4, F * 2, decode_fp16.NW * 4, decode_fp16.NW * 4 * 4)
+        else:
+            self.args = [self.weights[n] for n in BUNDLE_ARGS]
+            self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
+            cos, sin = rope_tables(c, max_pos)
+            kv = La * c.kv_heads * max_pos * HD * 4
+            self.conv_state = resident(nbytes=Lc * 2 * D * 4)
+            sizes = (D * 4, D * 4, F * 4, NW * 4 * 4)
         self.rope = [resident(cos), resident(sin)]
         self.kv_k, self.kv_v = resident(nbytes=kv), resident(nbytes=kv)
-        self.conv_state = resident(nbytes=Lc * 2 * c.dim * 4)
-        self.scratch = [resident(nbytes=c.dim * 4), resident(nbytes=c.dim * 4), resident(nbytes=c.ff * 4), resident(nbytes=NW * 4 * 4)]
+        self.scratch = [resident(nbytes=n) for n in sizes]
         self.tokens = resident(nbytes=max_tokens * 4)
-        # The prefill's table of layers: whether each is attention, and its
-        # index among the layers of its kind.
-        attn = [int(c.is_attention(i)) for i in range(c.layers)]
-        kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
-        self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
+        if not fp16:
+            # The prefill's table of layers: whether each is attention, and
+            # its index among the layers of its kind.
+            attn = [int(c.is_attention(i)) for i in range(c.layers)]
+            kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
+            self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
         self.logits = resident(nbytes=c.vocab * 4)
         self.scores = resident(nbytes=max_tokens * 4)
         self.sampling = resident(nbytes=2 * 4)
-        # A step writes its position of the KV cache before it attends, and the
-        # positions past it are masked: the cache needs zeros only once, so that
-        # no position ever holds a NaN.
-        for buf in (self.kv_k, self.kv_v):
-            buf.write(bytes(buf.nbytes))
         self.reset()
 
     def reset(self) -> None:

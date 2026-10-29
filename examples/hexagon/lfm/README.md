@@ -3,9 +3,9 @@
 LFM2-1.2B (`LiquidAI/LFM2-1.2B`; LFM2.5-1.2B has the same architecture) on the
 v79 cDSP, every operation a TileLang kernel, at batch 1. LFM3-1.7B
 (`LiquidAI/LFM3-1.7B`), unquantized, is on its way
-([#179](https://github.com/xwhzz/tilelang-hexagon/issues/179)): its reference
-and its fp16 bundle are here (see [LFM3](#lfm3)), its kernels not yet. The
-other sections are LFM2's.
+([#179](https://github.com/xwhzz/tilelang-hexagon/issues/179)): its reference,
+its fp16 bundle and its decode are here (see [LFM3](#lfm3)), its prefill not
+yet. The other sections are LFM2's.
 
 | File | |
 |---|---|
@@ -13,8 +13,9 @@ other sections are LFM2's.
 | `quantize.py` | LFM2's GPTQ, its 4-bit bundle, and the bundle's perplexity with the device's arithmetic. |
 | `convert.py` | The fp16 bundle of an LFM2 or LFM3 checkpoint: its projections in HMX's Crouton tiles. |
 | `bundle.py` | The bundle file: one header and every tensor the kernels read, in their layouts. |
-| `stream.py` | The weight streams of the kernels, and the decode's w4a16 GEMV blocks. |
-| `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds both kernels. |
+| `stream.py` | The weight streams of the kernels (4-bit panels or fp16 Crouton tiles), and the decode's w4a16 GEMV blocks. |
+| `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds a bundle's kernels. |
+| `decode_fp16.py` | The fp16 bundle's decode kernel, LFM2's or LFM3's. |
 | `prefill.py` | The prefill kernel: a prompt in chunks of 128 rows on HMX, in one call. |
 | `text.py` | The checkpoint's tokenizer and chat template, on the host, without transformers. |
 | `generate.py` | Chat on the device: the reply streams as it is generated. |
@@ -202,3 +203,23 @@ each, allocated the largest first (1440 MiB for the FFN's w1 and w3 down to
 137.5 MiB for the attention's projections), where seven buffers of 512 MiB
 are as many as map. On the phone, the 14 buffers are allocated in 0.4 s and
 read from the device's copy in 0.6 s.
+
+### LFM3's decode
+
+`decode_fp16.py` decodes the fp16 bundle as `decode.py` decodes the 4-bit one:
+4 workers, a token in four barriers a layer, each worker's share of every
+projection streaming by DMA a panel of 32 channels at a time and multiplied on
+HVX straight from the HMX weight layout (`T.gemm` of a weight-layout B). A
+worker owns one KV head of LFM3 with its four query heads and their gates.
+Every worker keeps the residual stream in fp32 and adds each branch's whole
+output, normed over all of it (the sandwich norm needs the workers' sums of
+squares, which they write beside their slices). Projections take their inputs
+in fp16, and the KV cache is fp16.
+
+On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
+call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a
+token at 57.7 GB/s, the DMA's top rate. After a chat prompt, its first 64
+greedy tokens match the checkpoint's own code (transformers 5.22, fp32) one
+for one. Prompts run through the decode until the HMX prefill lands.
+
+    python bench.py lfm3.head /data/local/tmp/lfm3.bundle --pp "" --tg 128

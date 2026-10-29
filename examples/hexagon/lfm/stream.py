@@ -7,12 +7,14 @@ one it multiplies, across phase boundaries: the first blocks of a phase
 arrive while the workers still finish the last one and meet at
 ``T.sync_grid()``.
 
-A block is ``block`` rows of one slice of a projection's columns, contiguous
-in the bundle with its scales (``bundle.py``), so one DMA each brings it. The
-schedule is planned in Python while the kernel is traced: a ``Stream`` knows
-every phase of the step, so the blocks a loop submits at its end are the next
-phase's. Blocks of one shape share a ring. A step that a loop repeats, a token
-of a generation, is a cycle: its last blocks submit the first ones of the next
+A block is ``block`` rows (output channels) of one slice of a projection's
+columns (its K), contiguous in the bundle (``bundle.py``), so one DMA brings
+it: a 4-bit ``Projection``'s codes in the panel layout and their scales (two
+DMA groups), or fp16 ``Weights`` in Crouton tiles (one). The schedule is
+planned in Python while the kernel is traced: a ``Stream`` knows every phase
+of the step, so the blocks a loop submits at its end are the next phase's.
+Blocks of one shape share a ring. A step that a loop repeats, a token of a
+generation, is a cycle: its last blocks submit the first ones of the next
 round. The prefill streams each layer's phases in two streams that share their
 rings, for the layer its loop is at.
 """
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 from tilelang.hexagon.intrinsics.panel import make_hvx_panel_layout
 
 
@@ -30,13 +33,16 @@ from tilelang.hexagon.intrinsics.panel import make_hvx_panel_layout
 class Projection:
     """A stacked projection of the bundle: codes [L, S, N, cols] in the panel
     layout, S slices of its columns, and their fp16 scales
-    [L, S, N / block, cols / group, block]."""
+    [L, S, N / block, cols / group, block]. A block's ring slots are its
+    codes' and its scales'."""
 
     w: object
     s: object
     group: int
     block: int
     bits: int = 4
+    # DMA groups a block takes.
+    groups = 2
 
     @property
     def cols(self) -> int:
@@ -45,6 +51,51 @@ class Projection:
     @property
     def slices(self) -> int:
         return int(self.w.shape[1])
+
+    def key(self):
+        return (self.bits, self.block, self.cols, self.group)
+
+    def rings(self, depth: int) -> tuple:
+        return (
+            T.alloc_shared((depth, self.block, self.cols), f"int{self.bits}"),
+            T.alloc_shared((depth, self.cols // self.group, self.block), "float16"),
+        )
+
+    def layouts(self, rings) -> dict:
+        """The codes keep the panel layout they stream in."""
+        return {self.w: make_hvx_panel_layout(self.w), rings[0]: make_hvx_panel_layout(rings[0])}
+
+    def submit(self, rings, layer, sl, row, k):
+        submit(self.w, self.s, *rings, layer, sl, row, k, self.block)
+
+
+@dataclass
+class Weights:
+    """An fp16 projection of the bundle as the HMX weight operand, w [K, N] in
+    Crouton tiles, or a stack of them [L, K, N]: a block is `block` of its N
+    (whole panels of 32) by a slice of `cols` of its K (whole tiles), in one
+    ring slot of that layout."""
+
+    w: object
+    block: int
+    cols: int
+    groups = 1
+
+    @property
+    def slices(self) -> int:
+        return int(self.w.shape[-2]) // self.cols
+
+    def key(self):
+        return ("float16", self.block, self.cols)
+
+    def rings(self, depth: int) -> tuple:
+        return (T.alloc_shared((depth, self.cols, self.block), "float16"),)
+
+    def layouts(self, rings) -> dict:
+        return {self.w: make_hmx_weight_layout(self.w), rings[0]: make_hmx_weight_layout(rings[0])}
+
+    def submit(self, rings, layer, sl, row, k):
+        submit_tiles(self.w, rings[0], layer, sl, row, k, self.cols, self.block, len(self.w.shape) == 3)
 
 
 @dataclass
@@ -76,21 +127,31 @@ def submit(w, s, ring_w, ring_s, layer, sl, row, k, rows: int):
 
 
 @T.macro
-def steady(ph: Phase, ring_w, ring_s, base, n: int, depth: int, consume):
+def submit_tiles(w, ring, layer, sl, row, k, cols: int, block: int, stacked: bool):
+    """Columns [row, row + block) of slice sl of w's K (of layer `layer` of a
+    stack), whole Crouton tiles: one DMA group."""
+    if stacked:
+        T.dma_copy(w[layer, sl * cols : (sl + 1) * cols, row : row + block], ring[k, :, :])
+    else:
+        T.dma_copy(w[sl * cols : (sl + 1) * cols, row : row + block], ring[k, :, :])
+
+
+@T.macro
+def steady(ph: Phase, rings, base, n: int, depth: int, consume):
     """Blocks [0, n) of phase ph, the first in ring position `base`: each waits
     for itself, is consumed, and submits the block `depth` later of the same
     phase."""
     p = ph.proj
     for b in T.serial(n):
-        T.dma_wait(2 * (depth - 1))
-        consume(b, ring_w, ring_s, (base + b) % depth)
-        submit(p.w, p.s, ring_w, ring_s, ph.layer, ph.slice(b + depth), ph.row(b + depth), (base + b + depth) % depth, p.block)
+        T.dma_wait(p.groups * (depth - 1))
+        consume(b, *rings, (base + b) % depth)
+        p.submit(rings, ph.layer, ph.slice(b + depth), ph.row(b + depth), (base + b + depth) % depth)
 
 
 @T.macro
-def last(b: int, ring_w, ring_s, k, pending: int, consume):
+def last(b: int, rings, k, pending: int, consume):
     T.dma_wait(pending)
-    consume(b, ring_w, ring_s, k)
+    consume(b, *rings, k)
 
 
 class Stream:
@@ -104,15 +165,12 @@ class Stream:
         self.phases = phases
         self.depth = depth
         self.cycle = cycle
-        # One ring per block shape: `depth` slots of codes and of scales.
+        # One ring per block shape, `depth` slots of each of its buffers.
         self.rings = {} if rings is None else rings
         for ph in phases:
             key = self._key(ph)
             if key not in self.rings:
-                p = ph.proj
-                w = T.alloc_shared((depth, p.block, p.cols), f"int{p.bits}")
-                s = T.alloc_shared((depth, p.cols // p.group, p.block), "float16")
-                self.rings[key] = (w, s)
+                self.rings[key] = ph.proj.rings(depth)
         # The ring position of each phase's first block in a round, and the
         # blocks of a round per ring.
         self.base, self.count = [], {}
@@ -123,19 +181,16 @@ class Stream:
         self.items = [(i, b) for i, ph in enumerate(phases) for b in range(ph.blocks)]
 
     def layouts(self) -> dict:
-        """The panel layouts of the projections and of their rings, for
-        T.annotate_layout: the codes keep the layout they stream in."""
+        """The layouts of the projections and of their rings, for
+        T.annotate_layout."""
         out = {}
         for ph in self.phases:
-            out[ph.proj.w] = make_hvx_panel_layout(ph.proj.w)
-        for w, _ in self.rings.values():
-            out[w] = make_hvx_panel_layout(w)
+            out.update(ph.proj.layouts(self.rings[self._key(ph)]))
         return out
 
     @staticmethod
     def _key(ph: Phase):
-        p = ph.proj
-        return (p.bits, p.block, p.cols, p.group)
+        return ph.proj.key()
 
     def _base(self, i: int, round_=None):
         """The ring position of phase i's first block, in round `round_` (the
@@ -147,9 +202,13 @@ class Stream:
 
     def _submit(self, i: int, b: int, round_=None):
         ph = self.phases[i]
-        p = ph.proj
-        ring_w, ring_s = self.rings[self._key(ph)]
-        submit(p.w, p.s, ring_w, ring_s, ph.layer, ph.slice(b), ph.row(b), (self._base(i, round_) + b) % self.depth, p.block)
+        ph.proj.submit(self.rings[self._key(ph)], ph.layer, ph.slice(b), ph.row(b), (self._base(i, round_) + b) % self.depth)
+
+    def _pending(self, item: int, in_flight: int) -> int:
+        """The DMA groups of the `in_flight - 1` blocks after `item`, which
+        may stay in flight while it is consumed."""
+        n = len(self.items)
+        return sum(self.phases[self.items[(item + j) % n][0]].proj.groups for j in range(1, in_flight))
 
     def prologue(self):
         """Submit the first `depth` blocks of the step (of round 0 of a cycle)."""
@@ -161,22 +220,23 @@ class Stream:
         self.cycle = cycle
 
     def run(self, i: int, consume):
-        """Phase i: `consume(b, ring_w, ring_s, k)` each block b, in slot k of
-        the rings, once it arrives, keeping `depth` blocks in flight."""
+        """Phase i: `consume(b, *rings, k)` each block b, in slot k of the
+        rings (a projection's codes and scales, or its weights), once it
+        arrives, keeping `depth` blocks in flight."""
         ph = self.phases[i]
         d = self.depth
         first = sum(q.blocks for q in self.phases[:i])
-        ring_w, ring_s = self.rings[self._key(ph)]
+        rings = self.rings[self._key(ph)]
         n = max(0, ph.blocks - d)
         if n > 0:
-            steady(ph, ring_w, ring_s, self._base(i), n, d, consume)
+            steady(ph, rings, self._base(i), n, d, consume)
         # The last blocks submit the next phases' first ones, of the next round
         # past the end of a cycle's.
         for b in range(n, ph.blocks):
             item = first + b
             ahead = item + d
             in_flight = d if self.cycle is not None else min(d, len(self.items) - item)
-            last(b, ring_w, ring_s, (self._base(i) + b) % d, 2 * (in_flight - 1), consume)
+            last(b, rings, (self._base(i) + b) % d, self._pending(item, in_flight), consume)
             if ahead < len(self.items):
                 self._submit(*self.items[ahead])
             elif self.cycle is not None:

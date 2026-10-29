@@ -7,7 +7,8 @@ FastRPC call (`Session.last_run_seconds`).
     python bench.py <bundle> <bundle on the device> --pp 512,1024 --tg 128
 
 The bundle is read on the host for its header and on the device for its
-tensors (push it there once).
+tensors (push it there once). Without a prefill kernel (the fp16 bundle's
+decoder, for now), ppN runs the prompt through the decode, a token a step.
 """
 
 import argparse
@@ -47,10 +48,16 @@ def main():
             times.append(decoder.session.last_run_seconds())
         return statistics.median(times)
 
+    def prefill(tokens):
+        if decoder.prefill_rows:
+            decoder.prefill(tokens)
+        else:
+            decoder.run(tokens, 0, len(tokens), len(tokens))
+
     print("| test | ms | t/s |\n|---|---:|---:|")
     try:
         for n in pp:
-            s = median(lambda n=n: decoder.prefill(prompt[:n]))
+            s = median(lambda n=n: prefill(prompt[:n]))
             print(f"| pp{n} | {s * 1e3:.1f} | {n / s:.1f} |", flush=True)
         for n in tg:
             s = median(lambda n=n: decoder.run([decoder.c.bos], 0, n, 1, args.temperature))
