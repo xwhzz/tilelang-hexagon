@@ -144,7 +144,7 @@ def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
     # the HMX GEMM, and the kernel's own pass configs give it fast math.
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm_blockscaled<" in source
-    assert "tl_hvx_exp_fast(" in source and "tl_hvx_exp(" not in source
+    assert "tl_hvx_exp2_fast(" in source and "tl_hvx_exp2(" not in source
 
 
 @DEVICE

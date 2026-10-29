@@ -54,6 +54,7 @@ DEPTH = 2  # blocks in flight per worker: a block multiplies far longer than it 
 BLOCK = 128  # rows per block of a 4-bit projection
 KEYS = 128  # KV positions per attention step
 NEG = -3.0e38
+LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 
 
 @T.macro
@@ -159,11 +160,12 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
     @T.macro
     def q_block(bf, b, rw, rs, k, ai, base):
         """Query block b: two heads, normalized, rotated and scaled by
-        1/8, into their KV head's stacked queries."""
+        log2(e) / 8, into their KV head's stacked queries: the scores are
+        then in base 2, which the softmax raises 2 to."""
         gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True)
         for hh in T.serial(BLOCK // HD):
             local = b * (BLOCK // HD) + hh  # the worker's query head
-            norm_rope(bf, hh * HD, lambda d, ai=ai: bf.q_norm[ai, d], base, T.float32(0.125))
+            norm_rope(bf, hh * HD, lambda d, ai=ai: bf.q_norm[ai, d], base, T.float32(LOG2E / 8))
             T.copy(bf.hsq, bf.q[local // group, (local % group) * R : (local % group + 1) * R, :])
 
     @T.macro
@@ -180,13 +182,26 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                 T.copy(bf.hsq, bf.kv_k[ai, kvh, base : base + R, :])
 
     @T.macro
+    def fetch(bf, ai, kvh, kb):
+        """Block kb of the KV head's keys and values into slot kb % 2, by DMA:
+        clamped, so that the copies are provably in the cache, as a block
+        past it is never used."""
+        at = T.min(kb, max_pos // KEYS - 1) * KEYS
+        T.dma_copy(bf.kv_k[ai, kvh, at : at + KEYS, :], bf.kst[kb % 2, :, :])
+        T.dma_copy(bf.kv_v[ai, kvh, at : at + KEYS, :], bf.vst[kb % 2, :, :])
+
+    @T.macro
     def attention(bf, ai, base):
         """The worker's query heads, by KV head: softmax(q K^T) V over the
-        cache's positions [0, base + i] for row i, into hid. A block of keys
+        cache's positions [0, base + i] for row i, into hid, in base 2 (the
+        queries carry log2 e). A block of keys
         and values packs once for the KV head's query heads, each of which
         keeps its own online softmax. The scores and the outputs are fp32
         rows, where the causal mask, the softmax and the rescaling are row
-        maps; P packs into fp16 tiles, and HMX adds P V into the outputs."""
+        maps; P packs into fp16 tiles, and HMX adds P V into the outputs.
+
+        The blocks of keys and values come into VTCM by DMA, a block ahead,
+        two slots each, so that their packs read VTCM rather than DDR."""
         for g in T.serial(KVH // NW):
             kvh = bf.w * (KVH // NW) + g
             for hq, i, d in T.Parallel(group, R, HD):
@@ -194,9 +209,16 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             for hq, i in T.Parallel(group, R):
                 bf.m[hq, i] = T.float32(NEG)
                 bf.ls[hq, i] = T.float32(0)
-            for kb in T.serial(T.ceildiv(base + R, KEYS)):
-                T.copy(bf.kv_k[ai, kvh, kb * KEYS : (kb + 1) * KEYS, :], bf.kblk)
-                T.copy(bf.kv_v[ai, kvh, kb * KEYS : (kb + 1) * KEYS, :], bf.vblk)
+            blocks = T.ceildiv(base + R, KEYS)
+            fetch(bf, ai, kvh, 0)
+            for kb in T.serial(blocks):
+                if kb + 1 < blocks:
+                    fetch(bf, ai, kvh, kb + 1)
+                    T.dma_wait(2)
+                else:
+                    T.dma_wait()
+                T.copy(bf.kst[kb % 2, :, :], bf.kblk)
+                T.copy(bf.vst[kb % 2, :, :], bf.vblk)
                 for hq in T.serial(group):
                     T.gemm(bf.q[g, hq * R : (hq + 1) * R, :], bf.kblk, bf.s, transpose_B=True, clear_accum=True)
                     # Causal: the chunk's own positions are visible to the
@@ -208,12 +230,12 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                     T.reduce_max(bf.s, bf.rmax, dim=1)
                     for i in T.Parallel(R):
                         bf.rmax[i] = T.max(bf.m[hq, i], bf.rmax[i])
-                        bf.alpha[i] = T.exp(bf.m[hq, i] - bf.rmax[i])
+                        bf.alpha[i] = T.exp2(bf.m[hq, i] - bf.rmax[i])
                         bf.m[hq, i] = bf.rmax[i]
-                    # P in fp16, as HMX takes it: exp then takes 64 lanes a
+                    # P in fp16, as HMX takes it: exp2 then takes 64 lanes a
                     # register; the row sums accumulate in fp32.
                     for i, j in T.Parallel(R, KEYS):
-                        bf.ph[i, j] = T.exp(T.Cast("float16", bf.s[i, j] - bf.m[hq, i]))
+                        bf.ph[i, j] = T.exp2(T.Cast("float16", bf.s[i, j] - bf.m[hq, i]))
                     T.reduce_sum(bf.ph, bf.rsum, dim=1)
                     for i in T.Parallel(R):
                         bf.ls[hq, i] = bf.ls[hq, i] * bf.alpha[i] + bf.rsum[i]
@@ -314,6 +336,8 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             q = T.alloc_shared((KVH // NW, group * R, HD), "float16")
             kblk = T.alloc_shared((KEYS, HD), "float16")
             vblk = T.alloc_shared((KEYS, HD), "float16")
+            kst = T.alloc_shared((2, KEYS, HD), "float32")
+            vst = T.alloc_shared((2, KEYS, HD), "float32")
             acc_o = T.alloc_shared((group, R, HD), "float32")
             m = T.alloc_shared((group, R), "float32")
             ls = T.alloc_shared((group, R), "float32")
@@ -329,7 +353,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             # What the macros below work on.
             bf = SimpleNamespace(
                 w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
-                q=q, kblk=kblk, vblk=vblk, s=s, ph=ph, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha, gl=gl,
+                q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, ph=ph, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha, gl=gl,
                 rope_cos=rope_cos, rope_sin=rope_sin, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,
             )  # fmt: skip
