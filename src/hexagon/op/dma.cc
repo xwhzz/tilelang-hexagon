@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 
+#include "hexagon/layout/crouton.h"
 #include "hexagon/layout/panel.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/target_utils.h"
@@ -203,19 +204,150 @@ Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
   return SeqStmt::Flatten(seq);
 }
 
+const CroutonLayoutNode *CroutonOf(const Buffer &buffer,
+                                   const LayoutMap &layout_map) {
+  Optional<Layout> layout = layout_map.Get(buffer);
+  return layout ? layout.value().as<CroutonLayoutNode>() : nullptr;
+}
+
+// Why the copy between Crouton buffers `op` cannot move whole tiles, or "": one
+// matrix on each side, of the same tile order, its rows and columns on tile
+// boundaries, in bounds.
+std::string CroutonRejection(const CopyNode &op, const LowerArgs &T,
+                             arith::Analyzer *analyzer) {
+  const CroutonLayoutNode *src = CroutonOf(op.src, T.layout_map);
+  const CroutonLayoutNode *dst = CroutonOf(op.dst, T.layout_map);
+  if (!src || !dst || src->column_tiles != dst->column_tiles ||
+      src->transposed != dst->transposed || op.src->dtype != op.dst->dtype)
+    return "the copy from " + op.src->name + " to " + op.dst->name +
+           " moves Crouton tiles, so both sides need the same Crouton layout "
+           "(tile order and transpose) and dtype";
+  const bool load = IsGlobalBuffer(op.src) && IsVTCMBuffer(op.dst);
+  const bool store = IsVTCMBuffer(op.src) && IsGlobalBuffer(op.dst);
+  if (!(load || store))
+    return "Crouton copies move tiles between DDR and VTCM";
+  for (const auto &[buffer, region] :
+       {std::pair{op.src, op.src_range}, std::pair{op.dst, op.dst_range}}) {
+    size_t n = region.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (i + 2 < n && !analyzer->CanProveEqual(region[i]->extent, 1))
+        return "a Crouton copy moves one matrix at a time";
+      if (!analyzer->CanProve(region[i]->min >= 0) ||
+          !analyzer->CanProve(region[i]->min + region[i]->extent <=
+                              buffer->shape[i]))
+        return "a Crouton copy needs provably in-bounds regions";
+      if (i + 2 >= n) {
+        PrimExpr tile = make_const(region[i]->min.dtype(), kCroutonTile);
+        if (!analyzer->CanProveEqual(floormod(region[i]->min, tile), 0) ||
+            !analyzer->CanProveEqual(floormod(region[i]->extent, tile), 0))
+          return "a Crouton copy covers whole tiles: rows and columns on "
+                 "multiples of 32";
+      }
+    }
+  }
+  size_t sn = op.src_range.size(), dn = op.dst_range.size();
+  for (size_t i = 1; i <= 2; ++i) {
+    if (!op.src_range[sn - i]->extent.as<IntImmNode>() ||
+        !analyzer->CanProveEqual(op.src_range[sn - i]->extent,
+                                 op.dst_range[dn - i]->extent))
+      return "a Crouton copy needs static, matching region shapes";
+  }
+  return "";
+}
+
+// The transfer of `op` between Crouton buffers. Tiles follow each other along
+// the matrix's rows (column tiles: an HMX weight's K) or its columns (row
+// tiles), so the region's tiles along that axis are one contiguous run, and
+// its runs along the other axis are the matrix's runs apart on each side.
+Stmt LowerCroutonTransfer(const CopyNode &op, const LowerArgs &T,
+                          arith::Analyzer *analyzer, bool commit) {
+  const CroutonLayoutNode *src = CroutonOf(op.src, T.layout_map);
+  const CroutonLayoutNode *dst = CroutonOf(op.dst, T.layout_map);
+  const bool load = IsGlobalBuffer(op.src);
+  // A buffer's axis along which its tiles run, and the one across its runs.
+  auto run_axis = [](const CroutonLayoutNode *layout) {
+    return layout->column_tiles ? layout->RowAxis() : layout->ColAxis();
+  };
+  auto across_axis = [](const CroutonLayoutNode *layout) {
+    return layout->column_tiles ? layout->ColAxis() : layout->RowAxis();
+  };
+  auto extent = [](const Array<Range> &region, int axis) {
+    return region[axis]->extent.as<IntImmNode>()->value;
+  };
+  int64_t tile_bytes = kCroutonTileElems * op.src->dtype.bytes();
+  int64_t runs = extent(op.src_range, across_axis(src)) / kCroutonTile;
+  int64_t run_bytes =
+      extent(op.src_range, run_axis(src)) / kCroutonTile * tile_bytes;
+  auto stride = [&](const CroutonLayoutNode *layout) {
+    return (layout->column_tiles ? layout->RowTiles() : layout->ColTiles()) *
+           tile_bytes;
+  };
+  int64_t ss = stride(src), ds = stride(dst);
+  ICHECK(run_bytes <= kField && ss <= kField && ds <= kField)
+      << "a Crouton copy's runs of tiles must fit the 24-bit DMA descriptor "
+         "fields";
+  int64_t bytes = op.src->dtype.bytes();
+  auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
+  // A pointer at the region's logical start, `first` runs in: LowerTileOp
+  // maps it through the layout to the tile's bytes.
+  auto at = [&](const Buffer &buffer, const CroutonLayoutNode *layout,
+                const Array<Range> &region, int rw, int64_t first,
+                int64_t count, int64_t run_stride) {
+    Array<Range> start = region;
+    int axis = across_axis(layout);
+    start.Set(axis, Range::FromMinExtent(region[axis]->min +
+                                             IntImm(region[axis]->min.dtype(),
+                                                    first * kCroutonTile),
+                                         region[axis]->extent));
+    int64_t span = (count - 1) * run_stride + run_bytes;
+    return MakeAccessPtrAtRegion(buffer, start, GetBufferStrides(buffer), rw,
+                                 IntImm(DataType::Int(32), span / bytes));
+  };
+  PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
+  Array<Stmt> seq;
+  // One run, or runs that follow each other on both sides, go in chunks of
+  // whole runs.
+  bool dense = runs == 1 || (ss == run_bytes && ds == run_bytes);
+  int64_t per = dense ? std::max<int64_t>(1, kChunk / run_bytes) : kRows;
+  for (int64_t first = 0; first < runs; first += per) {
+    int64_t count = std::min(per, runs - first);
+    PrimExpr sp = at(op.src, src, op.src_range, 1, first, count, ss);
+    PrimExpr dp = at(op.dst, dst, op.dst_range, 2, first, count, ds);
+    Array<PrimExpr> args =
+        dense ? Array<PrimExpr>{dp,
+                                sp,
+                                u32(count * run_bytes),
+                                u32(count * run_bytes),
+                                u32(count * run_bytes),
+                                u32(1),
+                                direction}
+              : Array<PrimExpr>{
+                    dp,         sp,       u32(ds), u32(ss), u32(run_bytes),
+                    u32(count), direction};
+    seq.push_back(
+        Evaluate(Call(DataType::Int(32), hexagon_dma_submit(), args)));
+  }
+  if (commit)
+    seq.push_back(Evaluate(Call(DataType::Int(32), hexagon_dma_commit(), {})));
+  return SeqStmt::Flatten(seq);
+}
+
 } // namespace
 
 std::string DMARejection(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer) {
   if (PanelOf(op.src, T.layout_map) || PanelOf(op.dst, T.layout_map))
     return PanelRejection(op, T, analyzer);
+  if (CroutonOf(op.src, T.layout_map) || CroutonOf(op.dst, T.layout_map))
+    return CroutonRejection(op, T, analyzer);
   const bool load = IsGlobalBuffer(op.src) && IsVTCMBuffer(op.dst);
   const bool store = IsVTCMBuffer(op.src) && IsGlobalBuffer(op.dst);
   if (!(load || store) || op.src->dtype != op.dst->dtype ||
       op.src->dtype.lanes() != 1 || op.src->dtype.bits() % 8 != 0 ||
       T.layout_map.count(op.src) || T.layout_map.count(op.dst))
     return "Hexagon T.dma_copy requires equal scalar byte-addressable dtypes "
-           "and row-major global <-> shared buffers (no Crouton layouts)";
+           "and row-major global <-> shared buffers, or panel or Crouton "
+           "layouts on both sides";
   if (op.annotations.count("parallel_loop_layout") ||
       op.annotations.count("coalesced_width"))
     return "Hexagon T.dma_copy does not support SIMT copy hints";
@@ -279,6 +411,8 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
   ICHECK(why.empty()) << why;
   if (PanelOf(op.src, T.layout_map))
     return LowerPanelTransfer(op, T, analyzer, commit);
+  if (CroutonOf(op.src, T.layout_map))
+    return LowerCroutonTransfer(op, T, analyzer, commit);
   const bool load = IsGlobalBuffer(op.src);
   std::string unused;
   Matrix src = *MatrixOf(op.src, op.src_range, analyzer, &unused);

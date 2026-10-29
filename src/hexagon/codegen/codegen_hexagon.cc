@@ -103,6 +103,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        "hmx_gemm.h", true, false, false, -1, 5},
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", "hvx_gemm.h", false, false, false,
        -1, 11},
+      {tl::hexagon_hvx_gemm_weight(), "tl_hvx_gemm_weight", "hvx_gemm.h", false,
+       false, false, -1, 7},
       {tl::hexagon_hvx_gemm_int(), "tl_hvx_gemm_int", "hvx_gemm.h", false,
        false, false, -1, 8},
       {tl::hexagon_hvx_gemm_int_scaled(), "tl_hvx_gemm_int_scaled",

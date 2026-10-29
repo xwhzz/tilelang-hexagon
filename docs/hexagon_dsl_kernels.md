@@ -154,6 +154,16 @@ denormals a chain of zero products converts to. A GEMM neither unit runs (both o
 transposed, other types, an operand another operator gave a layout that is not row-major)
 runs as a scalar loop, and the compiler logs why.
 
+A B in the HMX weight layout (`make_hmx_weight_layout`, transposed with `transpose_B`) runs
+on HVX too, as one `tl_hvx_gemm_weight` call, for an fp16 A [M, K] and a row-major C, B's
+region whole tiles: the copy of a model's weights that HMX multiplies in its prefill serves
+its decode's GEMVs. A register of a tile holds two rows of K for its 32 columns, interleaved,
+so A's two elements, broadcast as one word, multiply it into the even row's products and the
+odd row's, each in its column's lane: no reduction across lanes. Up to four panels of 32
+columns share each broadcast. On v79, for a [1, 2048] A from VTCM, a worker multiplies 10.3
+weights a cycle on one panel and 14.8 on four, against 10.9 for the dot products and 1.9
+and 13.7 for the outer products of a row-major B.
+
 An integer `T.gemm(A, B, C, transpose_B=True)` also runs on HVX, exactly: an int8, uint8 or
 int16 A times an 8- or 4-bit B (`int8`, `uint8`, `T.int4`, `T.uint4`) into an int32 C. It is
 one `tl_hvx_gemm_int` call (`hvx_gemm.h`). `vrmpy` multiplies the 4 bytes of each 32-bit lane
@@ -287,7 +297,10 @@ chains of generic fp32 vector adds, and of qf32 values kept across permutes and 
 in the Crouton row sums: a row lost one tile's sum, or turned to inf.
 
 DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
-permutation. `dma.h` exposes raw instructions, descriptor builders, synchronous
+permutation. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,
+which follow each other in the tile order (a weight's K, an activation's columns): each run
+of a region's tiles is a row of one 2D descriptor, or the runs are one 1D transfer when they
+follow each other on both sides, as one panel of weights does. `dma.h` exposes raw instructions, descriptor builders, synchronous
 copy helpers, and a caller-owned linked queue through explicit extern calls;
 `T.dma_copy` / `T.dma_wait` expose a managed per-callback FIFO for explicit
 manual DMA schedules. With `T.Kernel(num_workers=...)`, every tile program owns

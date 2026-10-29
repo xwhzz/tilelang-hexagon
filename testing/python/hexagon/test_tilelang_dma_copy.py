@@ -8,7 +8,7 @@ import tilelang
 from tilelang.hexagon import language as T
 from tilelang import tvm
 from tilelang.backend.target import determine_target
-from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout, make_hmx_weight_layout
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
@@ -195,7 +195,7 @@ def test_managed_worker_queue_is_local_and_drained():
     assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")
 
 
-def test_reject_crouton_async():
+def test_reject_crouton_from_row_major():
     @T.prim_func
     def probe(A: T.Tensor((32, 32), "float16")):
         with T.Kernel(1):
@@ -204,8 +204,42 @@ def test_reject_crouton_async():
             T.dma_copy(A, s)
             T.dma_wait()
 
-    with pytest.raises(Exception, match="no Crouton"):
+    with pytest.raises(Exception, match="both sides need the same Crouton layout"):
         lower(probe)
+
+
+def test_crouton_tiles_move_as_runs():
+    @T.prim_func
+    def probe(W: T.Tensor((2, 256, 128), "float16"), X: T.Tensor((64, 96), "float16")):
+        with T.Kernel(1):
+            w = T.alloc_shared((2, 128, 64), "float16")
+            x = T.alloc_shared((64, 96), "float16")
+            T.annotate_layout(
+                {
+                    W: make_hmx_weight_layout(W),
+                    w: make_hmx_weight_layout(w),
+                    X: make_hmx_activation_layout(X),
+                    x: make_hmx_activation_layout(x),
+                }
+            )
+            # Weights: tiles run along K. Two panels of four K tiles each, 8 KB
+            # runs, 16 KB apart in W and 8 KB in w.
+            T.dma_copy(W[1, 64:192, 32:96], w[1, :, :])
+            # A whole panel's tiles follow each other on both sides: one run.
+            T.dma_copy(W[0, 0:128, 64:96], w[0, :, 0:32])
+            # Activations: tiles run along the rows' K, two rows of three tiles.
+            T.dma_copy(X, x)
+            T.dma_wait()
+
+    calls = [line for line in lower(probe).splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert len(calls) == 3
+    # dst stride, src stride, run bytes, runs, direction. W[1, 64, 32] is
+    # tile (1, 2) of layer 1: 32768 + 10 * 1024 elements in.
+    assert "(uint32_t)8192, (uint32_t)16384, (uint32_t)8192, (uint32_t)2, 3)" in calls[0]
+    assert "(&(W[43008]))" in calls[0] and "((half*)w)[8192]" in calls[0]
+    assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[1]
+    assert "W[16384]" in calls[1]
+    assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[2]
 
 
 def test_reject_out_of_bounds():

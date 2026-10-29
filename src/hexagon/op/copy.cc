@@ -12,9 +12,10 @@
  *
  * A software pipeline's async copy (the injector marks it, and commits and
  * waits for its stage) becomes the descriptors of a User-DMA transfer when
- * DMA can make it and moves it faster than HVX (DMAOutpacesHVX); the
- * pipeline's commit makes a stage's transfers one group. Otherwise it is
- * copied right away, which the pipeline's waits allow.
+ * DMA can make it (DMARejection: row-major regions, or whole tiles between
+ * two buffers of one Crouton layout) and moves it faster than HVX
+ * (DMAOutpacesHVX); the pipeline's commit makes a stage's transfers one group.
+ * Otherwise it is copied right away, which the pipeline's waits allow.
  *
  * A copy between two buffers in the panel layout (integer GEMM operands)
  * moves whole panels by DMA, also outside a pipeline, where it waits for its

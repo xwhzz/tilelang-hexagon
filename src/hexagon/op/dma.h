@@ -26,7 +26,8 @@ const PanelLayoutNode *PanelOf(const tirx::Buffer &buffer,
  * an empty string: equal byte-addressable dtypes, row-major buffers, and a
  * static, in-bounds 1D or 2D region on each side. Between two buffers in the
  * panel layout, the region instead covers whole panels of one matrix, which
- * move as rows of their column blocks.
+ * move as rows of their column blocks; between two of one Crouton layout,
+ * whole tiles of one matrix, which move as runs of tiles in their order.
  */
 std::string DMARejection(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer);

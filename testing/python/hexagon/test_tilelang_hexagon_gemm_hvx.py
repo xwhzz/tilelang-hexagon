@@ -9,7 +9,7 @@ import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
-from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout, make_hmx_weight_layout
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 
@@ -75,8 +75,43 @@ def _sub_matrices():
     return kernel
 
 
-def _calls(source):
-    return [line.strip() for line in source.splitlines() if "tl_hvx_gemm<" in line]
+def _weight_gemm(M, N, K, BN, BK, c_dtype="float32", trans_b=False):
+    """C = A @ B for B the HMX weight operand in DDR ([K, N], or [N, K] with
+    trans_b, in Crouton tiles): blocks [BK, BN] of it into VTCM by DMA, each
+    multiplied on HVX into its columns of C, the first block of K clearing
+    them."""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((M, K), "float16"), B: T.Tensor((N, K) if trans_b else (K, N), "float16"), C: T.Tensor((M, N), c_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_fragment((M, K), "float16")
+            b = T.alloc_shared((BN, BK) if trans_b else (BK, BN), "float16")
+            c = T.alloc_fragment((M, N), c_dtype)
+            T.annotate_layout({B: make_hmx_weight_layout(B, transposed=trans_b), b: make_hmx_weight_layout(b, transposed=trans_b)})
+            T.copy(A, a)
+            for n in T.serial(N // BN):
+                for k in T.serial(K // BK):
+                    if trans_b:
+                        T.dma_copy(B[n * BN : (n + 1) * BN, k * BK : (k + 1) * BK], b)
+                    else:
+                        T.dma_copy(B[k * BK : (k + 1) * BK, n * BN : (n + 1) * BN], b)
+                    T.dma_wait()
+                    T.gemm(a[:, k * BK : (k + 1) * BK], b, c[:, n * BN : (n + 1) * BN], transpose_B=trans_b, clear_accum=(k == 0))
+            T.copy(c, C)
+
+    return kernel
+
+
+def _weight_tiles(b):
+    """The bytes of b [K, N] as the HMX weight operand: Crouton tiles by
+    columns ([nt, kt]), element (k, n) of a tile at (k % 32 // 2) * 64 +
+    n % 32 * 2 + k % 2."""
+    K, N = b.shape
+    return b.reshape(K // 32, 16, 2, N // 32, 32).permute(3, 0, 1, 4, 2).reshape(K, N).contiguous()
+
+
+def _calls(source, name="tl_hvx_gemm"):
+    return [line.strip() for line in source.splitlines() if f"{name}<" in line]
 
 
 def test_gemvs_run_on_hvx():
@@ -125,23 +160,46 @@ def test_gemms_neither_unit_runs_say_why(caplog):
     ) in caplog.text
 
 
-def test_operands_in_other_layouts_run_as_scalar_loops(caplog):
+def _laid_out_b(layout):
     @T.prim_func
     def kernel(A: T.Tensor((16, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((16, 64), "float32")):
         with T.Kernel(1):
             a = T.alloc_shared((16, 64), "float16")
             b = T.alloc_shared((64, 64), "float16")
             c = T.alloc_fragment((16, 64), "float32")
-            T.annotate_layout({b: make_hmx_weight_layout(b)})
+            T.annotate_layout({b: layout(b)})
             T.copy(A, a)
             T.copy(B, b)
             T.gemm(a, b, c, clear_accum=True)
             T.copy(c, C)
 
+    return kernel
+
+
+def test_a_weight_layout_b_runs_on_hvx():
+    (call,) = _calls(_source(_laid_out_b(make_hmx_weight_layout)), "tl_hvx_gemm_weight")
+    # M, N, K, A's and C's row strides, whether A starts on a register
+    # boundary, and the elements between B's panels (its matrix's K tiles).
+    assert call.startswith("tl_hvx_gemm_weight<16, 64, 64, 64, 64, true, 2048>(")
+
+
+def test_operands_in_other_layouts_run_as_scalar_loops(caplog):
     with caplog.at_level(logging.WARNING, logger="tilelang.hexagon.op.gemm"):
-        source = _source(kernel)
+        source = _source(_laid_out_b(make_hmx_activation_layout))
     assert "tl_hvx_gemm" not in source
-    assert "T.gemm(a, b, c) runs as a scalar loop, not on HVX: b not row-major" in caplog.text
+    assert "T.gemm(a, b, c) runs as a scalar loop, not on HVX: b is in a Crouton layout, not the HMX weight operand's" in caplog.text
+
+
+def test_weight_layout_gemvs_take_regions_of_whole_tiles():
+    source = _source(_weight_gemm(1, 256, 7680, 64, 1920))
+    (call,) = _calls(source, "tl_hvx_gemm_weight")
+    # A block of 60 K tiles, panels of the block 60 tiles apart; A's blocks of
+    # 1920 fp16 start on register boundaries.
+    assert call.startswith("tl_hvx_gemm_weight<1, 64, 1920, 7680, 256, true, 61440>(")
+    assert "(&(((float*)c)[(n * 64)]))" in call and "(&(((half*)a)[(k * 1920)]))" in call
+    assert call.endswith("(k == 0));")
+    (call,) = _calls(_source(_weight_gemm(2, 64, 128, 64, 64, trans_b=True)), "tl_hvx_gemm_weight")
+    assert call.startswith("tl_hvx_gemm_weight<2, 64, 64, 128, 64, true, 2048>(")
 
 
 def _run(func, *inputs):
@@ -237,3 +295,30 @@ def test_exact_zeros_stay_zero(clear, c_dtype, trans_a, trans_b):
     assert torch.all(out[4, 40:72] == 0)
     rounding = 3 * 2.0**-10 if c_dtype == "float16" else 1e-5
     torch.testing.assert_close(out, ref, atol=rounding * float(ref.abs().max()), rtol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize(
+    "M, N, K, BN, BK, c_dtype, trans_b",
+    [
+        (1, 128, 2048, 32, 2048, "float32", False),  # a decode's GEMV, a panel a block
+        (1, 256, 2048, 128, 1024, "float32", False),  # four panels, K in two blocks
+        (2, 160, 96, 160, 96, "float32", False),  # five panels; an odd number of K tiles
+        (1, 64, 7680, 64, 1920, "float32", False),  # an FFN's w2: K in slices
+        (1, 128, 1024, 64, 512, "float16", False),
+        (2, 96, 256, 96, 128, "float32", True),
+    ],
+)
+def test_weight_layout_gemms_match_torch(M, N, K, BN, BK, c_dtype, trans_b):
+    import torch
+
+    a = torch.randn(M, K).half()
+    b = (torch.randn(K, N) * 0.1).half()
+    # Columns of zeros, as in LFM3's panels of head gates, come out exact.
+    b[:, 3:32] = 0
+    ref = a.float() @ b.float()
+    tiles = _weight_tiles(b)
+    out = _run(_weight_gemm(M, N, K, BN, BK, c_dtype, trans_b), a, tiles.view(N, K) if trans_b else tiles).float()
+    assert torch.all(out[:, 3:32] == 0)
+    rounding = (K // BK) * 2.0**-10 if c_dtype == "float16" else 1e-5
+    torch.testing.assert_close(out, ref, atol=rounding * float(ref.abs().max()) + 1e-5, rtol=0)

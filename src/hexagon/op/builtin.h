@@ -170,6 +170,14 @@ TVM_DLL const Op &hexagon_hmx_gemm_blockscaled();
 // The eleven integers and booleans print as template arguments.
 TVM_DLL const Op &hexagon_hvx_gemm();
 
+// tl_hvx_gemm_weight<M, N, K, lda, ldc, align_a, panel_stride>(C, A, B, clear)
+// (hvx_gemm.h): C = A B, or C += A B unless clear, on HVX for an fp16 A with
+// rows lda elements apart and the fp16 B [K, N] of the HMX weight operand, in
+// Crouton tiles, its panels of 32 columns panel_stride elements apart; C is
+// fp32 or fp16 with rows ldc elements apart. align_a: A starts on a register
+// boundary. The seven integers and booleans print as template arguments.
+TVM_DLL const Op &hexagon_hvx_gemm_weight();
+
 // tl_hvx_gemm_int<M, N, K, b_bits, b_signed, lda, ldc, align_c>(C, A, B,
 // panel_bytes, clear) (hvx_gemm.h): C = A B^T exactly in int32, or C += A B^T
 // unless clear, on HVX: A int8, uint8 or int16 with rows lda elements apart, B

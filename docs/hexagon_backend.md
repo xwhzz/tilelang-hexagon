@@ -335,12 +335,13 @@ and explicit HMX atoms.
 tests, and the examples):
 
 - `T.gemm` on HMX: fp16 into fp16 or fp32, any tile-aligned shape, transposes, and K loops
-  accumulated across calls; on HVX: floating point, integer GEMMs of panel-layout weights,
-  and `T.gemm_blockscaled`; and `T.gemm_blockscaled` of fp16 activations on HMX, its
-  4-bit weights dequantized on HVX.
+  accumulated across calls; on HVX: floating point, fp16 GEMVs of HMX weight-layout
+  weights, integer GEMMs of panel-layout weights, and `T.gemm_blockscaled`; and
+  `T.gemm_blockscaled` of fp16 activations on HMX, its 4-bit weights dequantized on HVX.
 - Flash attention and gated FFNs composed on Crouton tiles; HVX maps and reductions with
   the HVX math library.
-- `T.Pipelined` loops whose copies stream by DMA, and explicit `T.dma_copy`/`T.dma_wait`.
+- `T.Pipelined` loops whose copies stream by DMA, and explicit `T.dma_copy`/`T.dma_wait`
+  of row-major regions, whole panels and whole Crouton tiles.
 - Worker pools (`T.Kernel(num_workers=N)`), and `T.sync_grid()` between programs that run
   together.
 - Sessions that keep weights and state resident across calls and kernels.

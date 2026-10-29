@@ -553,6 +553,111 @@ TL_GEMM void tl_hvx_gemm(TC *C, const TA *A, const TA *B, bool clear) {
 }
 
 // ---------------------------------------------------------------------------
+// B as an HMX weight operand: Crouton tiles (src/hexagon/layout/crouton.h).
+// ---------------------------------------------------------------------------
+//
+// tl_hvx_gemm_weight<M, N, K, LdA, LdC, AlignA, PanelStride>(C, A, B, clear)
+// computes, for i < M and j < N,
+//
+//   C[i * LdC + j] (+)= sum_k A[i * LdA + k] B(k, j)
+//
+// (adding unless clear) for an fp16 A and the fp16 B [K, N] of the HMX weight
+// operand: 32 x 32 Crouton tiles ordered by columns, the K / 32 tiles of each
+// panel of 32 columns contiguous, panel p at B + p * PanelStride, on a register
+// boundary. C is fp32 or fp16. A decode's GEMVs read the copy of the weights
+// that HMX multiplies in the prefill.
+//
+// Register r of a tile holds its rows 2r and 2r + 1 interleaved: lane 2j row
+// 2r of column j, lane 2j + 1 row 2r + 1. A's elements 2r and 2r + 1 of the
+// tile's K, one 32-bit word broadcast, multiply it into the even row's
+// products and the odd row's (tl_gemm_operand<half>::mac), each in its
+// column's lane: over a panel's tiles, the two sum to its 32 outputs, in
+// order, with no reduction across lanes.
+
+// Tiles [T0, T0 + NT) of K, NT of 1 or 2 (one register of A), of G panels of
+// B into their accumulators: U of them a panel, register r of a tile into
+// accumulator r % U, so that a call of one or two panels still spreads its
+// qf32 adds over eight chains.
+template <int G, int U, int NT, int PanelStride, bool AlignA>
+TL_DEVICE void tl_gemm_weight_tiles(tl_gemm_operand<half>::acc acc[G * U],
+                                    const half *__restrict__ a,
+                                    const half *__restrict__ B, int t0) {
+  using V = tl_gemm_operand<half>;
+  // A's pairs reach the broadcasts through the stack: scalar loads from VTCM
+  // are slow.
+  alignas(128) int32_t pairs[32];
+  HVX_Vector v = tl_gemm_load<2, AlignA>(a + t0 * 32, NT * 32);
+  __builtin_memcpy(pairs, &v, sizeof(v));
+#pragma clang loop unroll(full)
+  for (int t = 0; t < NT; ++t) {
+    const half *tile = B + (t0 + t) * 1024;
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 16; ++r) {
+      HVX_Vector x = Q6_V_vsplat_R(pairs[t * 16 + r]);
+#pragma clang loop unroll(full)
+      for (int p = 0; p < G; ++p)
+        V::mac(acc[p * U + r % U],
+               *(const HVX_Vector *)(tile + p * PanelStride + r * 64), x);
+    }
+  }
+}
+
+// Panels [0, G) of B times A's row a, each panel's 32 outputs into c.
+template <int G, int K, int PanelStride, bool AlignA, typename TC>
+TL_DEVICE void tl_gemm_weight_panels(TC *__restrict__ c,
+                                     const half *__restrict__ a,
+                                     const half *__restrict__ B, bool clear) {
+  using V = tl_gemm_operand<half>;
+  constexpr int KT = K / 32;
+  constexpr int U = 4 / G;
+  typename V::acc acc[G * U];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < G * U; ++i)
+    acc[i] = V::zero();
+#pragma clang loop unroll(disable)
+  for (int t = 0; t + 2 <= KT; t += 2)
+    tl_gemm_weight_tiles<G, U, 2, PanelStride, AlignA>(acc, a, B, t);
+  if constexpr (KT % 2 != 0)
+    tl_gemm_weight_tiles<G, U, 1, PanelStride, AlignA>(acc, a, B, KT - 1);
+  // A panel's accumulators meet as IEEE fp32: two qf32 zeros must not.
+#pragma clang loop unroll(full)
+  for (int p = 0; p < G; ++p) {
+    HVX_Vector sums = V::sums(acc[p * U]);
+#pragma clang loop unroll(full)
+    for (int u = 1; u < U; ++u)
+      sums = tl_gemm_add_sf(sums, V::sums(acc[p * U + u]));
+    tl_gemm_store_sums(c + p * 32, sums, 32, clear);
+  }
+}
+
+template <int M, int N, int K, int LdA, int LdC, bool AlignA, int PanelStride,
+          typename TC>
+TL_GEMM void tl_hvx_gemm_weight(TC *C, const half *A, const half *B,
+                                bool clear) {
+  static_assert(N % 32 == 0 && K % 32 == 0,
+                "a weight operand covers whole Crouton tiles");
+  // Four panels share each broadcast of A: their accumulators, loads and
+  // products fit the registers.
+  constexpr int P = N / 32;
+  constexpr int G = tl_gemm_min(4, P);
+  constexpr bool RowsA = AlignA && LdA * sizeof(half) % 128 == 0;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < M; ++i) {
+    const half *a = A + i * LdA;
+    TC *c = C + i * LdC;
+#pragma clang loop unroll(disable)
+    for (int p = 0; p + G <= P; p += G)
+      tl_gemm_weight_panels<G, K, PanelStride, RowsA>(
+          c + p * 32, a, B + p * PanelStride, clear);
+    if constexpr (P % G != 0) {
+      constexpr int p = P - P % G;
+      tl_gemm_weight_panels<P % G, K, PanelStride, RowsA>(
+          c + p * 32, a, B + p * PanelStride, clear);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Integer GEMM: B in the panel layout (src/hexagon/layout/panel.h).
 // ---------------------------------------------------------------------------
 //
