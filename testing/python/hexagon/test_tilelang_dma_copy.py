@@ -402,19 +402,6 @@ def test_reject_unsupported_region_or_dtype(shape, dtype):
         lower(probe)
 
 
-def test_reject_mixed_raw_dma_ownership():
-    @T.prim_func
-    def probe(A: T.Tensor((256,), "float16")):
-        with T.Kernel(1):
-            s = T.alloc_shared((256,), "float16")
-            T.dma_copy(A, s)
-            T.call_extern("uint32", "tl_hexagon_dma_poll")
-            T.dma_wait()
-
-    with pytest.raises(Exception, match="raw DMA calls"):
-        lower(probe)
-
-
 def test_async_copy_is_separate_from_dma_copy():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16")):

@@ -49,13 +49,6 @@ bool IsDMACall(const CallNode *call) {
          call->op.same_as(hexagon_dma_wait());
 }
 
-bool IsRawDMACall(const CallNode *call) {
-  if (!call->op.same_as(builtin::call_extern()) || call->args.empty())
-    return false;
-  const auto *name = call->args[0].as<StringImmNode>();
-  return name && std::string(name->value).rfind("tl_hexagon_dma_", 0) == 0;
-}
-
 bool UsesDMA(const Stmt &stmt) {
   bool found = false;
   PostOrderVisit(stmt, [&found](const ObjectRef &node) {
@@ -305,15 +298,10 @@ private:
   }
 };
 
-// Rejects DMA outside a tile program, and managed and raw DMA in one kernel.
+// Rejects DMA outside a tile program.
 class DMAOwnershipChecker : public StmtExprVisitor {
 public:
-  static void Check(const Stmt &body) {
-    DMAOwnershipChecker checker;
-    checker(body);
-    ICHECK(!(checker.managed_ && checker.raw_))
-        << "Hexagon async DMA cannot share a kernel with raw DMA calls";
-  }
+  static void Check(const Stmt &body) { DMAOwnershipChecker()(body); }
 
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -324,18 +312,12 @@ private:
   }
 
   void VisitExpr_(const CallNode *op) final {
-    if (IsDMACall(op)) {
-      managed_ = true;
-      ICHECK(programs_ > 0) << "Hexagon T.dma_copy must run inside a tile "
-                               "program";
-    }
-    raw_ |= IsRawDMACall(op);
+    ICHECK(!IsDMACall(op) || programs_ > 0)
+        << "Hexagon T.dma_copy must run inside a tile program";
     StmtExprVisitor::VisitExpr_(op);
   }
 
   int programs_ = 0;
-  bool managed_ = false;
-  bool raw_ = false;
 };
 
 } // namespace

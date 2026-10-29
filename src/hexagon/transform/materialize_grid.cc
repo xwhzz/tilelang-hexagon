@@ -156,10 +156,6 @@ void CheckWorkerBody(const Stmt &body) {
         << "`" << callee
         << "` is not worker-safe: inside T.Kernel(num_workers=...) only the "
            "T.hmx atoms may use HMX";
-    ICHECK(callee.rfind("tl_hexagon_dma_", 0) != 0)
-        << "`" << callee
-        << "` is not worker-safe: inside T.Kernel(num_workers=...) use "
-           "T.dma_copy and T.dma_wait, whose queue belongs to the program";
   });
 }
 

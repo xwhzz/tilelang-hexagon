@@ -203,12 +203,12 @@ and explicit HMX atoms.
   positive extents/strides, unit innermost stride, and provable bounds. Unsupported
   async copies fail lowering. Managed async kernels disable automatic VTCM
   allocation reuse and require a manual serial schedule and exclusive DMA0
-  ownership; compiler pipelines and mixing raw DMA calls are rejected. Scope-based
+  ownership; compiler pipelines are rejected. Scope-based
   cleanup drains DMA and releases an acquired HMX atom lock on errors; these DSP
   projects compile with `-fno-exceptions` to avoid unsupported unwinder symbols.
   `T.copy` has no DMA-specific lowering; a
   Crouton endpoint makes it a `tl_crouton_copy`. In a `num_workers` kernel every tile
-  program owns its DMA queue; raw DMA calls are rejected there.
+  program owns its DMA queue.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
   pipeline axis** — you reduce the whole inner-K for an output tile in one `mxclracc`

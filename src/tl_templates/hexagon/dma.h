@@ -1,14 +1,12 @@
 #pragma once
-// Hexagon User-DMA instruction, descriptor, queue, and managed async-copy
-// helpers.
+// The User-DMA queue of a tile program (T.dma_copy, T.dma_wait): descriptors,
+// cache maintenance of DDR endpoints, and the queue the codegen declares.
 //
 // Queues are thread-confined: submit, poll and drain from the same QuRT thread.
 // The managed codegen gives every tile program its own queue, and every worker
 // its own VTCM arena (validated on v79). This is not a claim of one physical
-// DMA engine per worker. A thread must not interleave raw/foreign DMA with its
-// managed queue. This header never resets DMA during initialization or borrows
-// another runtime's queue; callers of the raw layer supply descriptor/metadata
-// storage.
+// DMA engine per worker. This header never resets DMA during initialization or
+// borrows another runtime's queue.
 
 #include <hexagon_protos.h>
 #include <qurt_memory.h>
@@ -27,7 +25,7 @@
 enum tl_hexagon_dma_direction {
   TL_HEXAGON_DMA_DDR_TO_VTCM = 0,
   TL_HEXAGON_DMA_VTCM_TO_DDR = 1,
-  // Raw queues may use this when the caller handles cache maintenance.
+  // An empty slot, which needs no cache maintenance.
   TL_HEXAGON_DMA_NO_CACHE = 2,
   // DDR to VTCM from memory the DSP has not written since it was handed the
   // memory, such as a kernel's read-only argument: no dirty cache line can
@@ -121,15 +119,11 @@ struct tl_hexagon_dma_queue {
 };
 
 // ---------------------------------------------------------------------------
-// Raw User-DMA instructions
+// User-DMA instructions
 // ---------------------------------------------------------------------------
 
 TL_DMA_INLINE uint32_t tl_hexagon_dma_pause() {
   return static_cast<uint32_t>(Q6_R_dmpause());
-}
-
-TL_DMA_INLINE void tl_hexagon_dma_resume(uint32_t state) {
-  asm volatile("dmresume(%0)" : : "r"(state) : "memory");
 }
 
 TL_DMA_INLINE void tl_hexagon_dma_start(void *next) {
@@ -144,28 +138,6 @@ TL_DMA_INLINE void tl_hexagon_dma_link(void *tail, void *next) {
 
 TL_DMA_INLINE uint32_t tl_hexagon_dma_poll() {
   return static_cast<uint32_t>(Q6_R_dmpoll());
-}
-
-TL_DMA_INLINE uint32_t tl_hexagon_dma_wait() {
-  return static_cast<uint32_t>(Q6_R_dmwait());
-}
-
-TL_DMA_INLINE uint32_t tl_hexagon_dma_sync_thread() {
-  return static_cast<uint32_t>(Q6_R_dmsyncht());
-}
-
-TL_DMA_INLINE uint32_t tl_hexagon_dma_tlb_sync() {
-  return static_cast<uint32_t>(Q6_R_dmtlbsynch());
-}
-
-TL_DMA_INLINE uint32_t tl_hexagon_dma_config_read(uint32_t index) {
-  uint32_t value = 0;
-  asm volatile("%0 = dmcfgrd(%1)" : "=r"(value) : "r"(index) : "memory");
-  return value;
-}
-
-TL_DMA_INLINE void tl_hexagon_dma_config_write(uint32_t index, uint32_t value) {
-  asm volatile("dmcfgwr(%0, %1)" : : "r"(index), "r"(value) : "memory");
 }
 
 TL_DMA_INLINE uint32_t tl_hexagon_dma_engine_status() {
@@ -187,11 +159,6 @@ TL_DMA_INLINE int tl_hexagon_dma_engine_reset() {
 // ---------------------------------------------------------------------------
 // Descriptor construction and submission
 // ---------------------------------------------------------------------------
-
-TL_DMA_INLINE tl_hexagon_dma_options tl_hexagon_dma_make_options(
-    bool src_l2_bypass, bool dst_l2_bypass, bool ordered) {
-  return {src_l2_bypass, dst_l2_bypass, ordered};
-}
 
 TL_DMA_HOT tl_hexagon_dma_options
 tl_hexagon_dma_options_for_direction(int direction) {
@@ -330,32 +297,6 @@ TL_DMA_HOT int tl_hexagon_dma_descriptor_init_2d(
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_INLINE int
-tl_hexagon_dma_submit_one(tl_hexagon_dma_descriptor *descriptor) {
-  if (descriptor == nullptr)
-    return TL_HEXAGON_DMA_ERR_ARGUMENT;
-  if (tl_hexagon_dma_descriptor_done(descriptor))
-    return TL_HEXAGON_DMA_OK;
-  if (!tl_hexagon_dma_engine_idle())
-    return TL_HEXAGON_DMA_ERR_BUSY;
-  tl_hexagon_dma_start(descriptor);
-  return TL_HEXAGON_DMA_OK;
-}
-
-TL_DMA_INLINE int
-tl_hexagon_dma_start_and_wait(tl_hexagon_dma_descriptor *descriptor) {
-  int status = tl_hexagon_dma_submit_one(descriptor);
-  if (status != TL_HEXAGON_DMA_OK)
-    return status;
-  if (tl_hexagon_dma_descriptor_done(descriptor))
-    return TL_HEXAGON_DMA_OK;
-  uint32_t engine_status = tl_hexagon_dma_wait() & TL_HEXAGON_DMA_STATUS_MASK;
-  asm volatile("" : : : "memory");
-  return engine_status == TL_HEXAGON_DMA_STATUS_IDLE
-             ? TL_HEXAGON_DMA_OK
-             : TL_HEXAGON_DMA_ERR_ENGINE;
-}
-
 // ---------------------------------------------------------------------------
 // Cache maintenance for DDR endpoints
 // ---------------------------------------------------------------------------
@@ -488,7 +429,7 @@ tl_hexagon_dma_finish_transfer(const tl_hexagon_dma_transfer &transfer) {
 }
 
 // ---------------------------------------------------------------------------
-// Caller-owned descriptor queue
+// Descriptor queue
 // ---------------------------------------------------------------------------
 
 // The slot `offset` (at most the capacity) past the head. head + offset is
@@ -528,22 +469,8 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_init(
   return TL_HEXAGON_DMA_OK;
 }
 
-TL_DMA_HOT bool tl_hexagon_dma_queue_empty(const tl_hexagon_dma_queue *queue) {
-  return queue == nullptr || queue->count == 0;
-}
-
 TL_DMA_HOT bool tl_hexagon_dma_queue_full(const tl_hexagon_dma_queue *queue) {
   return queue != nullptr && queue->count == queue->capacity;
-}
-
-TL_DMA_INLINE uint32_t
-tl_hexagon_dma_queue_depth(const tl_hexagon_dma_queue *queue) {
-  return queue == nullptr ? 0 : queue->count;
-}
-
-TL_DMA_INLINE uint32_t
-tl_hexagon_dma_queue_capacity(const tl_hexagon_dma_queue *queue) {
-  return queue == nullptr ? 0 : queue->capacity;
 }
 
 TL_DMA_HOT tl_hexagon_dma_descriptor *
@@ -554,16 +481,8 @@ tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
   return &queue->descriptors[tl_hexagon_dma_queue_index(queue, queue->count)];
 }
 
-TL_DMA_INLINE const tl_hexagon_dma_transfer *
-tl_hexagon_dma_queue_front(const tl_hexagon_dma_queue *queue) {
-  if (tl_hexagon_dma_queue_empty(queue))
-    return nullptr;
-  return &queue->transfers[queue->head];
-}
-
-// Submit the descriptor in the next queue slot.  This is the raw extension
-// point for custom descriptor options: the caller initializes the descriptor,
-// performs any required cache maintenance, then supplies completion metadata.
+// Submits the descriptor in the next queue slot, which the caller initialized
+// and whose cache maintenance it performed, with its completion metadata.
 TL_DMA_HOT int
 tl_hexagon_dma_queue_submit_prepared(tl_hexagon_dma_queue *queue,
                                      const tl_hexagon_dma_transfer &transfer) {
@@ -658,60 +577,6 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push(tl_hexagon_dma_queue *queue, void *dst,
                                       row_bytes, rows, direction);
 }
 
-TL_DMA_INLINE int
-tl_hexagon_dma_queue_push_ddr_to_vtcm(tl_hexagon_dma_queue *queue,
-                                      void *vtcm_dst, const void *ddr_src,
-                                      uint32_t vtcm_stride, uint32_t ddr_stride,
-                                      uint32_t row_bytes, uint32_t rows) {
-  return tl_hexagon_dma_queue_push(queue, vtcm_dst, ddr_src, vtcm_stride,
-                                   ddr_stride, row_bytes, rows,
-                                   TL_HEXAGON_DMA_DDR_TO_VTCM);
-}
-
-TL_DMA_INLINE int
-tl_hexagon_dma_queue_push_vtcm_to_ddr(tl_hexagon_dma_queue *queue,
-                                      void *ddr_dst, const void *vtcm_src,
-                                      uint32_t ddr_stride, uint32_t vtcm_stride,
-                                      uint32_t row_bytes, uint32_t rows) {
-  return tl_hexagon_dma_queue_push(queue, ddr_dst, vtcm_src, ddr_stride,
-                                   vtcm_stride, row_bytes, rows,
-                                   TL_HEXAGON_DMA_VTCM_TO_DDR);
-}
-
-TL_DMA_INLINE uint32_t
-tl_hexagon_dma_queue_in_flight(tl_hexagon_dma_queue *queue) {
-  if (queue == nullptr || queue->count == 0)
-    return 0;
-  tl_hexagon_dma_poll();
-  uint32_t in_flight = 0;
-  for (uint32_t offset = 0; offset < queue->count; ++offset) {
-    uint32_t index = tl_hexagon_dma_queue_index(queue, offset);
-    if (!tl_hexagon_dma_descriptor_done(&queue->descriptors[index]))
-      ++in_flight;
-  }
-  return in_flight;
-}
-
-TL_DMA_INLINE int tl_hexagon_dma_queue_wait(tl_hexagon_dma_queue *queue,
-                                            uint32_t max_in_flight) {
-  if (queue == nullptr)
-    return TL_HEXAGON_DMA_ERR_ARGUMENT;
-  while (true) {
-    uint32_t engine_status = tl_hexagon_dma_engine_status();
-    if (engine_status == TL_HEXAGON_DMA_STATUS_ERROR)
-      return TL_HEXAGON_DMA_ERR_ENGINE;
-
-    uint32_t in_flight = 0;
-    for (uint32_t offset = 0; offset < queue->count; ++offset) {
-      uint32_t index = tl_hexagon_dma_queue_index(queue, offset);
-      if (!tl_hexagon_dma_descriptor_done(&queue->descriptors[index]))
-        ++in_flight;
-    }
-    if (in_flight <= max_in_flight)
-      return TL_HEXAGON_DMA_OK;
-  }
-}
-
 TL_DMA_HOT int
 tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
                              tl_hexagon_dma_transfer *completed) {
@@ -763,15 +628,6 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_flush(tl_hexagon_dma_queue *queue) {
       return status;
   }
   return TL_HEXAGON_DMA_OK;
-}
-
-TL_DMA_INLINE int tl_hexagon_dma_queue_reset(tl_hexagon_dma_queue *queue) {
-  if (queue == nullptr)
-    return TL_HEXAGON_DMA_ERR_ARGUMENT;
-  if (queue->count != 0 || !tl_hexagon_dma_engine_idle())
-    return TL_HEXAGON_DMA_ERR_BUSY;
-  return tl_hexagon_dma_queue_init(queue, queue->descriptors, queue->transfers,
-                                   queue->capacity);
 }
 
 // The queue of one tile program, used by explicit T.dma_copy/T.dma_wait. The

@@ -134,9 +134,6 @@ def skel_runtime(kernel_source: str) -> SkelRuntime:
         ("vtcm.h", uses_vtcm),
         ("worker.h", uses_worker),
         ("hmx.h", hmx),
-        # User-DMA primitives are header-only.  They use QuRT cache maintenance
-        # and Hexagon DMA instructions, and do not own the VTCM arena or DMA engine.
-        ("dma.h", "tl_hexagon_dma_" in kernel_source),
         # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in
         # when a kernel references the `tl_hvx` prefix (self-contained, needs
         # only -mhvx).
