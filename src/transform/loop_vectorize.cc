@@ -1437,6 +1437,17 @@ DetectVectorWindow(const PrimExpr &expr, const Var &var, const PrimExpr &extent,
     if (analyzer->CanProveEqual(offset, FloorDiv(lane_offset, p)))
       return VectorWindow{VectorWindowKind::kRepeat, period};
   }
+  // Two runs, interleaved: lane 1 starts the second, a constant stride on.
+  PrimExpr second = analyzer->Simplify(
+      Substitute(offset, {{lane, make_const(lane.dtype(), 1)}}));
+  const auto *stride = second.as<IntImmNode>();
+  PrimExpr two = make_const(offset.dtype(), 2);
+  if (stride && stride->value > 0 &&
+      analyzer->CanProveEqual(
+          offset, FloorMod(lane_offset, two) *
+                          make_const(offset.dtype(), stride->value) +
+                      FloorDiv(lane_offset, two)))
+    return VectorWindow{VectorWindowKind::kInterleave, 2, stride->value};
   return std::nullopt;
 }
 

@@ -118,6 +118,9 @@ TVM_DLL const Op &hexagon_broadcast_lane();
 TVM_DLL const Op &hexagon_load_replicate();
 // tl_hvx_load_repeat<period, lanes, aligned>(ptr): lane l is ptr[l / period].
 TVM_DLL const Op &hexagon_load_repeat();
+// tl_hvx_load_interleave<2, lanes, aligned>(ptr, stride): lane l is
+// ptr[(l % 2) * stride + l / 2], two runs interleaved; aligned: both runs.
+TVM_DLL const Op &hexagon_load_interleave();
 
 // tl_crouton_copy<pack, column_tiles>(crouton, row_tiles, col_tiles, r0, c0,
 // rows, cols, matrix, rs, cs) (crouton.h): copies the region [r0, r0 + rows) x

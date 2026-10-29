@@ -287,6 +287,60 @@ def test_maps_over_crouton_tiles_match_torch(kind, dtype):
         kernel.adapter.close()
 
 
+def _cross_map(kind, dtype):
+    """Crouton tiles of layout `kind` = X[i, j] * u[i] + v[j], X row-major in
+    VTCM: a map whose registers read row pairs of a buffer of another layout."""
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor((R, C), dtype),
+        U: T.Tensor((R,), "float32"),
+        V: T.Tensor((C,), "float32"),
+        Y: T.Tensor((R, C), "float16"),
+    ):
+        with T.Kernel(1):
+            x = T.alloc_shared((R, C), dtype)
+            u = T.alloc_shared((R,), "float32")
+            v = T.alloc_shared((C,), "float32")
+            tiles = T.alloc_shared((R, C), "float16")
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.copy(X, x)
+            T.copy(U, u)
+            T.copy(V, v)
+            for i, j in T.Parallel(R, C):
+                tiles[i, j] = T.cast(T.cast(x[i, j], "float32") * u[i] + v[j], "float16")
+            T.copy(tiles, Y)
+
+    return kernel
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_maps_over_crouton_tiles_read_row_major_buffers_in_registers(dtype):
+    source = _source(_cross_map("activation", dtype))
+    # A register's row pair: one load of each row's run, and a shuffle.
+    ctype = "half" if dtype == "float16" else "float"
+    assert re.search(rf"tl_hvx_load_interleave<2, (32|64), true>\(\(&\(\(\({ctype}\*\)x\)\[", source), source
+    assert not SCALAR_TILE_STORE.search(source)
+
+
+@DEVICE
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_maps_over_crouton_tiles_read_row_major_buffers(kind, dtype):
+    import torch
+
+    kernel = tilelang.compile(_cross_map(kind, dtype), out_idx=[3], target="hexagon")
+    try:
+        gen = torch.Generator().manual_seed(41)
+        x = torch.randn(R, C, generator=gen).to(getattr(torch, dtype))
+        u = torch.randn(R, generator=gen)
+        v = torch.randn(C, generator=gen)
+        expected = (x.float() * u[:, None] + v[None, :]).half()
+        torch.testing.assert_close(kernel(x, u, v), expected, rtol=1e-2, atol=1e-2)
+    finally:
+        kernel.adapter.close()
+
+
 def _masked(kind):
     """Y = X where j <= i + d, else 0, through Crouton tiles of layout `kind`:
     a map that computes with its indices, which a register's lanes take from

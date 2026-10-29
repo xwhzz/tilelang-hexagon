@@ -89,6 +89,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        false, false, false, -1, 3},
       {tl::hexagon_load_repeat(), "tl_hvx_load_repeat", "hvx_lanes.h", false,
        false, false, -1, 3},
+      {tl::hexagon_load_interleave(), "tl_hvx_load_interleave", "hvx_lanes.h",
+       false, false, false, -1, 3},
       {tl::hexagon_crouton_copy(), "tl_crouton_copy", "crouton.h", false, false,
        false, -1, 2},
       {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", "crouton.h",

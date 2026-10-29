@@ -212,3 +212,24 @@ TL_DEVICE vec_type<T, N> tl_hvx_load_repeat(const T *p) {
   __builtin_memcpy(&out, &w, N * B);
   return out;
 }
+
+// An N-lane vector (at most two registers) of two runs of N / 2 elements, at
+// p and stride elements on, interleaved: lane l is p[(l % 2) * stride + l / 2],
+// as a Crouton tile register's row pair reads two rows of a row-major matrix.
+// One load of each run, and a shuffle. Aligned: both runs start on multiples
+// of their size.
+template <int E, int N, bool Aligned, typename T>
+TL_DEVICE vec_type<T, N> tl_hvx_load_interleave(const T *p, int stride) {
+  constexpr int B = static_cast<int>(sizeof(T));
+  constexpr int run = N / 2 * B;
+  static_assert(E == 2 && N % 2 == 0 && run <= 128 && (run & (run - 1)) == 0,
+                "two runs of a power of two of at most one register");
+  HVX_Vector even = tl_hvx_load_window<run, Aligned>(p);
+  HVX_Vector odd = tl_hvx_load_window<run, Aligned>(p + stride);
+  // Not inside the intrinsic: it is a macro (see tl_hvx_load_replicate).
+  constexpr int lanes = -B;
+  HVX_VectorPair w = Q6_W_vshuff_VVR(odd, even, lanes);
+  vec_type<T, N> out;
+  __builtin_memcpy(&out, &w, N * B);
+  return out;
+}

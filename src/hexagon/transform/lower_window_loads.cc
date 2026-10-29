@@ -1,15 +1,19 @@
 /*!
  * \file tl/hexagon/transform/lower_window_loads.cc
- * \brief Lower vector loads of small windows to a load and a lane shuffle.
+ * \brief Lower vector loads of small windows, or of two interleaved runs, to
+ * loads and a lane shuffle.
  *
  * A map over a Crouton tile runs in the tile's physical order, where register
  * lane 2c + e holds row 2q + e and column c of a row pair. A vector of the
- * rows' values then reads [r0, r1, r0, r1, ...] and a vector of the columns'
- * values [c0, c0, c1, c1, ...]. The vectorizer accepts such loads on Hexagon
- * (DetectVectorWindow) and leaves them as per-lane gathers. This pass loads
- * the window and shuffles its lanes: tl_hvx_load_replicate copies the window
- * over the register with the delta network, and tl_hvx_load_repeat repeats
- * each element by shuffling the register with itself.
+ * rows' values then reads [r0, r1, r0, r1, ...], a vector of the columns'
+ * values [c0, c0, c1, c1, ...], and a vector of a row-major matrix's elements
+ * at the same rows and columns two runs, one of each row, interleaved. The
+ * vectorizer accepts such loads on Hexagon (DetectVectorWindow) and leaves
+ * them as per-lane gathers. This pass loads the window, or each run, and
+ * shuffles the lanes: tl_hvx_load_replicate copies the window over the
+ * register with the delta network, tl_hvx_load_repeat repeats each element by
+ * shuffling the register with itself, and tl_hvx_load_interleave shuffles the
+ * two runs together.
  *
  * Runs after VectorizeLoop, on flattened buffers.
  */
@@ -75,10 +79,12 @@ struct Window {
   const Op *op;
   int period;
   PrimExpr first;
+  int64_t stride = 0; // interleave: the elements between the runs
 };
 
 // The window a vector index reads: every lane's offset from lane 0 is a
-// constant, l % period (replicate) or l / period (repeat).
+// constant, l % period (replicate), l / period (repeat), or
+// (l % 2) * stride + l / 2 (interleave).
 std::optional<Window> WindowOf(const PrimExpr &index,
                                arith::Analyzer *analyzer) {
   int lanes = index.dtype().lanes();
@@ -110,6 +116,11 @@ std::optional<Window> WindowOf(const PrimExpr &index,
     if (repeat)
       return Window{&hexagon_load_repeat(), period, first};
   }
+  bool interleave = lanes > 2 && offsets[1] > 0;
+  for (int l = 0; interleave && l < lanes; ++l)
+    interleave = offsets[l] == l % 2 * offsets[1] + l / 2;
+  if (interleave)
+    return Window{&hexagon_load_interleave(), 2, first, offsets[1]};
   return std::nullopt;
 }
 
@@ -126,19 +137,22 @@ private:
     std::optional<Window> window = WindowOf(load->indices[0], &analyzer_);
     if (!window)
       return expr;
-    // A window that starts on a multiple of its size lies in one aligned
-    // block (buffers start on whole registers).
+    // A window, or a run, that starts on a multiple of its size lies in one
+    // aligned block (buffers start on whole registers).
     int elements = window->op == &hexagon_load_replicate()
                        ? window->period
                        : lanes / window->period;
     PrimExpr size = make_const(window->first.dtype(), elements);
-    bool aligned = analyzer_.CanProveEqual(floormod(window->first, size), 0);
+    bool aligned = analyzer_.CanProveEqual(floormod(window->first, size), 0) &&
+                   window->stride % elements == 0;
     PrimExpr ptr = Call(DataType::Handle(), builtin::address_of(),
                         {BufferLoad(load->buffer, {window->first})});
-    return Call(load->dtype, *window->op,
-                {StringImm(std::to_string(window->period)),
-                 StringImm(std::to_string(lanes)),
-                 StringImm(aligned ? "true" : "false"), ptr});
+    Array<PrimExpr> args = {StringImm(std::to_string(window->period)),
+                            StringImm(std::to_string(lanes)),
+                            StringImm(aligned ? "true" : "false"), ptr};
+    if (window->op == &hexagon_load_interleave())
+      args.push_back(make_const(DataType::Int(32), window->stride));
+    return Call(load->dtype, *window->op, args);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {

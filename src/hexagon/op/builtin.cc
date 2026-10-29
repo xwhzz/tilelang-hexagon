@@ -99,6 +99,11 @@ TIR_DEFINE_TL_BUILTIN(hexagon_load_repeat)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kReadState));
 
+TIR_DEFINE_TL_BUILTIN(hexagon_load_interleave)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kReadState));
+
 TIR_DEFINE_TL_BUILTIN(hexagon_crouton_copy)
     .set_num_inputs(12)
     .set_attr<TCallEffectKind>("TCallEffectKind",

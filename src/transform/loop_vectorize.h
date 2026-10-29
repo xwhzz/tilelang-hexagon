@@ -123,20 +123,24 @@ bool IndicesCanVectorize(const PrimExpr &expr, const Var &var,
 bool TargetHasUnalignedVectorAccess();
 
 /*!
- * \brief A vector load whose lanes read a small window of elements.
+ * \brief A vector load whose lanes read a small window of elements, or two
+ * interleaved runs of them.
  *
  * Every aligned group of the vector's lanes reads from the element its first
  * lane reads: lane l reads the element l % period after it (kReplicate, e.g.
- * the rows [r0, r1, r0, r1, ...] of a Crouton tile register) or l / period
- * after it (kRepeat, e.g. its columns [c0, c0, c1, c1, ...]). Targets that load
- * the window and shuffle its lanes declare the `vector_window_loads`
- * attribute; for them, IndicesCanVectorize accepts such loads with
- * allow_window.
+ * the rows [r0, r1, r0, r1, ...] of a Crouton tile register), l / period
+ * after it (kRepeat, e.g. its columns [c0, c0, c1, c1, ...]), or
+ * (l % period) * stride + l / period after it (kInterleave, period 2: e.g. a
+ * Crouton tile register's row pair from two rows of a row-major matrix,
+ * stride apart). Targets that load the windows or runs and shuffle their
+ * lanes declare the `vector_window_loads` attribute; for them,
+ * IndicesCanVectorize accepts such loads with allow_window.
  */
-enum class VectorWindowKind { kReplicate, kRepeat };
+enum class VectorWindowKind { kReplicate, kRepeat, kInterleave };
 struct VectorWindow {
   VectorWindowKind kind;
   int period;
+  int64_t stride = 0; // kInterleave: the elements between the runs
 };
 std::optional<VectorWindow>
 DetectVectorWindow(const PrimExpr &expr, const Var &var, const PrimExpr &extent,
