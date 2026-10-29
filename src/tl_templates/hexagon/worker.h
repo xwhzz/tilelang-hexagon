@@ -294,29 +294,3 @@ static inline int tl_parallel_for(int32_t extent, int max_workers,
       extent, max_workers, tl_worker_arenas{nullptr, 0u, TL_MAX_WORKERS},
       program);
 }
-
-// --- threading selftest: proves dispatch + worker count run on-device, in
-// isolation from VTCM/HMX.  Each worker stamps its own output slot; the caller
-// also writes the worker count to the last slot.  out must hold >= nw+1 floats.
-typedef struct {
-  float *out;
-  int n;
-} tl_worker_selftest_ctx_t;
-static int tl_worker_selftest_body(void *ctx, int wid, int nw) {
-  tl_worker_selftest_ctx_t *c = (tl_worker_selftest_ctx_t *)ctx;
-  if (wid < c->n)
-    c->out[wid] = (float)((wid + 1) * 100 + nw); // distinct slot per worker
-  return 0;
-}
-// out[0..nw-1] = (wid+1)*100+nw (each by a distinct worker); out[n-1] = nw; the
-// remaining slots stay -1, so the host can verify exactly nw workers ran.
-static inline int tl_hexagon_worker_selftest(float *out, int n) {
-  for (int i = 0; i < n; ++i)
-    out[i] = -1.0f;
-  int nw = tl_num_workers();
-  tl_worker_selftest_ctx_t c = {out, n};
-  tl_parallel(tl_worker_selftest_body, &c, nw);
-  if (n > 0)
-    out[n - 1] = (float)nw;
-  return 0;
-}

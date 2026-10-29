@@ -8,7 +8,6 @@ A normalized Hexagon target names its DSP architecture in ``mcpu``
   until its narrowest dtype fills them, or scalarizes it. Both are kind
   defaults (``src/hexagon/target.cc``), so every Hexagon target has them.
 * ``vtcm-capacity``: VTCM bytes available to a kernel.
-* ``num-cores``: hardware threads available to the worker pool.
 * ``fragment_scope``: ``shared.dyn``. A fragment is the tile of the one hardware
   thread that runs a tile program, so it lives in VTCM, the HVX working memory,
   in the tile program's arena with the shared buffers.
@@ -16,9 +15,9 @@ A normalized Hexagon target names its DSP architecture in ``mcpu``
   software pipeline's commit and wait (``supports_async_copy``, a kind default):
   groups of the tile program's DMA queue.
 
-``vtcm-capacity`` and ``num-cores`` default only for architectures measured on
-hardware. Elsewhere they stay unset unless given, and only the runtime checks
-the actual grant. The architecture comes from ``mcpu`` when the target has one,
+``vtcm-capacity`` defaults only for architectures measured on hardware.
+Elsewhere it stays unset unless given, and only the runtime checks the actual
+grant. The architecture comes from ``mcpu`` when the target has one,
 else from the ``HEXAGON_DSP_ARCH`` environment variable, else v79.
 """
 
@@ -37,7 +36,7 @@ DEFAULT_ARCH = "v79"
 # Capabilities measured on hardware, per architecture.
 _MEASURED_CAPABILITIES = {
     # SM8750 (OnePlus 13): HAP grants 8 MiB of VTCM, QuRT reports 6 hardware threads.
-    "v79": {"vtcm-capacity": 8 << 20, "num-cores": 6},
+    "v79": {"vtcm-capacity": 8 << 20},
 }
 
 _ARCH_PATTERN = re.compile(r"^(?:hexagon)?v?(\d+)$")

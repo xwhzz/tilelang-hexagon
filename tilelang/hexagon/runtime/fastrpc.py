@@ -128,8 +128,8 @@ def skel_runtime(kernel_source: str) -> SkelRuntime:
     hmx = "tl_hexagon_hmx" in kernel_source
     # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
     # the multithreaded HMX path; include it directly for a non-HMX worker kernel
-    # (keyed on the public symbol prefix or a tl_parallel / tl_parallel_for call).
-    uses_worker = ("tl_hexagon_worker" in kernel_source or "tl_parallel" in kernel_source) and not hmx
+    # (a tl_parallel_for call).
+    uses_worker = "tl_parallel" in kernel_source and not hmx
     headers = [
         ("vtcm.h", uses_vtcm),
         ("worker.h", uses_worker),

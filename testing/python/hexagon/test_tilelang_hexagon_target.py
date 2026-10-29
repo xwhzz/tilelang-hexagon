@@ -33,7 +33,6 @@ def test_plain_hexagon_normalizes_to_v79(spec):
     assert hexagon_arch(target) == "v79"
     assert int(target.attrs["max_vector_bits"]) == 1024
     assert int(target.attrs["vtcm-capacity"]) == V79_VTCM
-    assert int(target.attrs["num-cores"]) == 6
 
 
 @pytest.mark.parametrize("spec", [{"kind": "hexagon", "mcpu": "hexagonv73"}, Target({"kind": "hexagon", "mcpu": "hexagonv73"})])
@@ -43,7 +42,6 @@ def test_explicit_arch_wins_over_the_environment(spec, monkeypatch):
     assert target.attrs["mcpu"] == "hexagonv73"
     # Not measured on v73 hardware: left to the runtime.
     assert "vtcm-capacity" not in target.attrs
-    assert "num-cores" not in target.attrs
 
 
 @pytest.mark.parametrize("value", ["v75", "hexagonv75", "75"])

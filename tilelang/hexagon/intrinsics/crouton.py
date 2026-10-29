@@ -22,12 +22,10 @@ from tilelang.layout import Layout
 
 TILE = 32
 TILE_ELEMS = TILE * TILE
-TILE_BYTES = TILE_ELEMS * 2
 
 __all__ = [
     "TILE",
     "TILE_ELEMS",
-    "TILE_BYTES",
     "CroutonLayout",
     "make_hmx_crouton_layout",
     "make_hmx_activation_layout",
