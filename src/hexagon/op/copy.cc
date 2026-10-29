@@ -6,7 +6,9 @@
  * row-major one is one tl_crouton_copy call (crouton.h) per matrix of the
  * region, in the matrix's coordinates: any sub-region, a DDR or VTCM endpoint
  * with any strides, and fp32 <-> fp16 on the way. A region of a stack of
- * matrices loops over the stack's axes. Other copies reuse LowerNormalCopy.
+ * matrices loops over the stack's axes. A copy between two Crouton buffers of
+ * the same tile order, of whole tiles in both, is one tl_crouton_move_tiles
+ * call, a register at a time. Other copies reuse LowerNormalCopy.
  *
  * A software pipeline's async copy (the injector marks it, and commits and
  * waits for its stage) becomes the descriptors of a User-DMA transfer when
@@ -52,11 +54,70 @@ const CroutonLayoutNode *CroutonOf(const Buffer &buffer,
   return layout ? layout.value().as<CroutonLayoutNode>() : nullptr;
 }
 
+// The pointer to the matrix of `region` (on the axes before the last two, of
+// one element each) in a Crouton buffer, for `access` over the matrix.
+PrimExpr CroutonMatrixPtr(const Buffer &buffer, const Array<Range> &region,
+                          const CroutonLayoutNode *crouton, int access) {
+  Array<Range> matrix;
+  for (size_t i = 0; i < region.size(); ++i)
+    matrix.push_back(
+        i + 2 < region.size()
+            ? Range::FromMinExtent(region[i]->min, 1)
+            : Range::FromMinExtent(make_zero(DataType::Int(32)), 1));
+  return MakeAccessPtrAtRegion(
+      buffer, matrix, GetBufferStrides(buffer), access,
+      make_const(DataType::Int(32), crouton->Rows() * crouton->Cols()));
+}
+
+std::optional<Stmt> LowerCroutonMove(const CopyNode &op, const LowerArgs &T,
+                                     arith::Analyzer *analyzer) {
+  const CroutonLayoutNode *src = CroutonOf(op.src, T.layout_map);
+  const CroutonLayoutNode *dst = CroutonOf(op.dst, T.layout_map);
+  if (src == nullptr || dst == nullptr ||
+      src->column_tiles != dst->column_tiles ||
+      src->transposed != dst->transposed ||
+      op.src->dtype != DataType::Float(16) ||
+      op.dst->dtype != DataType::Float(16))
+    return std::nullopt;
+  const Array<Range> &sr = op.src_range, &dr = op.dst_range;
+  if (sr.size() < 2 || dr.size() < 2)
+    return std::nullopt;
+  // One matrix on each side.
+  for (const Array<Range> *region : {&sr, &dr}) {
+    for (size_t i = 0; i + 2 < region->size(); ++i) {
+      if (!is_one((*region)[i]->extent))
+        return std::nullopt;
+    }
+  }
+  const Range &s_rows = sr[src->RowAxis()], &s_cols = sr[src->ColAxis()];
+  const Range &d_rows = dr[dst->RowAxis()], &d_cols = dr[dst->ColAxis()];
+  if (!analyzer->CanProveEqual(s_rows->extent, d_rows->extent) ||
+      !analyzer->CanProveEqual(s_cols->extent, d_cols->extent))
+    return std::nullopt;
+  PrimExpr tile = make_const(DataType::Int(32), kCroutonTile);
+  for (const Range &r : {s_rows, s_cols, d_rows, d_cols}) {
+    if (!analyzer->CanProveEqual(floormod(r->min, tile), 0) ||
+        !analyzer->CanProveEqual(floormod(r->extent, tile), 0))
+      return std::nullopt;
+  }
+  auto i32 = [](const PrimExpr &e) { return cast(DataType::Int(32), e); };
+  auto tiles = [](int64_t n) { return make_const(DataType::Int(32), n); };
+  return Evaluate(
+      Call(DataType::Void(), hexagon_crouton_move_tiles(),
+           {StringImm(src->column_tiles ? "true" : "false"),
+            CroutonMatrixPtr(op.dst, dr, dst, 2), tiles(dst->RowTiles()),
+            tiles(dst->ColTiles()), i32(d_rows->min), i32(d_cols->min),
+            CroutonMatrixPtr(op.src, sr, src, 1), tiles(src->RowTiles()),
+            tiles(src->ColTiles()), i32(s_rows->min), i32(s_cols->min),
+            i32(s_rows->extent), i32(s_cols->extent)}));
+}
+
 std::optional<Stmt> LowerCroutonCopy(const CopyNode &op, const LowerArgs &T,
                                      arith::Analyzer *analyzer) {
   const CroutonLayoutNode *src_crouton = CroutonOf(op.src, T.layout_map);
   const CroutonLayoutNode *dst_crouton = CroutonOf(op.dst, T.layout_map);
-  // One Crouton endpoint; Crouton to Crouton copies go element by element.
+  // One Crouton endpoint; other Crouton to Crouton copies than of whole tiles
+  // (LowerCroutonMove) go element by element.
   if ((src_crouton == nullptr) == (dst_crouton == nullptr))
     return std::nullopt;
   const bool pack = dst_crouton != nullptr;
@@ -189,6 +250,8 @@ struct Copy {
     if (async && DMAOutpacesHVX(op, analyzer) &&
         DMARejection(op, T, analyzer).empty())
       return LowerDMATransfer(op, T, analyzer, /*commit=*/false);
+    if (auto move = LowerCroutonMove(op, T, analyzer))
+      return *move;
     if (auto crouton = LowerCroutonCopy(op, T, analyzer))
       return *crouton;
     return LowerNormalCopy(op, T, analyzer);

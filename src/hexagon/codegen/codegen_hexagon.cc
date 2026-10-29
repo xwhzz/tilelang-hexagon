@@ -93,6 +93,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        false, false, false, -1, 3},
       {tl::hexagon_crouton_copy(), "tl_crouton_copy", "crouton.h", false, false,
        false, -1, 2},
+      {tl::hexagon_crouton_move_tiles(), "tl_crouton_move_tiles", "crouton.h",
+       false, false, false, -1, 1},
       {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", "crouton.h",
        false, false, false, -1, 4},
       {tl::hexagon_hmx_gemm(), "tl_hexagon_hmx_gemm", "hmx_gemm.h", true, false,

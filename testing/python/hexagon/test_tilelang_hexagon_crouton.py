@@ -287,6 +287,51 @@ def test_maps_over_crouton_tiles_match_torch(kind, dtype):
         kernel.adapter.close()
 
 
+MOVES = {"tiles": ((0, 64, 32, 96), (0, 64, 64, 128)), "elements": ((3, 61, 5, 91), (3, 61, 7, 93))}
+
+
+def _move(kind, move):
+    """Y = zeros, then X's region moved into it through two Crouton buffers of
+    layout `kind`: X[sr0:sr1, sc0:sc1] lands at Y[dr0:dr1, dc0:dc1]."""
+    (sr0, sr1, sc0, sc1), (dr0, dr1, dc0, dc1) = MOVES[move]
+
+    @T.prim_func
+    def kernel(X: T.Tensor((R, C), "float16"), Y: T.Tensor((R, 128), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((R, C), "float16")
+            b = T.alloc_shared((R, 128), "float16")
+            T.annotate_layout({a: KINDS[kind](a), b: KINDS[kind](b)})
+            T.copy(X, a)
+            T.fill(b, 0)
+            T.copy(a[sr0:sr1, sc0:sc1], b[dr0:dr1, dc0:dc1])
+            T.copy(b, Y)
+
+    return kernel
+
+
+def test_copies_of_whole_tiles_between_crouton_buffers_move_registers():
+    source = _source(_move("activation", "tiles"))
+    assert "tl_crouton_move_tiles<false>(" in source
+    assert "tl_crouton_move_tiles" not in _source(_move("activation", "elements"))
+
+
+@DEVICE
+@pytest.mark.parametrize("move", sorted(MOVES))
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_copies_between_crouton_buffers_match_torch(kind, move):
+    import torch
+
+    (sr0, sr1, sc0, sc1), (dr0, dr1, dc0, dc1) = MOVES[move]
+    kernel = tilelang.compile(_move(kind, move), out_idx=[1], target="hexagon")
+    try:
+        x = torch.randn(R, C, generator=torch.Generator().manual_seed(43)).half()
+        expected = torch.zeros(R, 128, dtype=torch.float16)
+        expected[dr0:dr1, dc0:dc1] = x[sr0:sr1, sc0:sc1]
+        torch.testing.assert_close(kernel(x), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def _cross_map(kind, dtype):
     """Crouton tiles of layout `kind` = X[i, j] * u[i] + v[j], X row-major in
     VTCM: a map whose registers read row pairs of a buffer of another layout."""

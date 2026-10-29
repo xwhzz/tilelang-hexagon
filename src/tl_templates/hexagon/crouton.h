@@ -323,6 +323,29 @@ TL_DEVICE void tl_crouton_copy(half *crouton, int row_tiles, int col_tiles,
                                               c0, 0, rows, cols, m, rs, cs);
 }
 
+// Copies the region [sr0, sr0 + rows) x [sc0, sc0 + cols) of the Crouton
+// matrix src to dst from (dr0, dc0): matrices of the same tile order, and a
+// region of whole tiles in both, which move a register at a time.
+template <bool ColumnTiles>
+TL_DEVICE void tl_crouton_move_tiles(half *__restrict__ dst, int dst_row_tiles,
+                                     int dst_col_tiles, int dr0, int dc0,
+                                     const half *__restrict__ src,
+                                     int src_row_tiles, int src_col_tiles,
+                                     int sr0, int sc0, int rows, int cols) {
+  for (int r = 0; r < rows; r += 32)
+    for (int c = 0; c < cols; c += 32) {
+      HVX_Vector *d = reinterpret_cast<HVX_Vector *>(
+          dst + tl_crouton_offset<ColumnTiles>(dr0 + r, dc0 + c, dst_row_tiles,
+                                               dst_col_tiles));
+      const HVX_Vector *s = reinterpret_cast<const HVX_Vector *>(
+          src + tl_crouton_offset<ColumnTiles>(sr0 + r, sc0 + c, src_row_tiles,
+                                               src_col_tiles));
+#pragma clang loop unroll(full)
+      for (int q = 0; q < 16; ++q)
+        d[q] = s[q];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reductions (hvx_reduce.h's kinds and transpose tree).
 // ---------------------------------------------------------------------------

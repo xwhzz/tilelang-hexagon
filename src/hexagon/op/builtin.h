@@ -129,6 +129,13 @@ TVM_DLL const Op &hexagon_load_interleave();
 // `column_tiles` ("true" or "false") print as template arguments.
 TVM_DLL const Op &hexagon_crouton_copy();
 
+// tl_crouton_move_tiles<column_tiles>(dst, dst_row_tiles, dst_col_tiles, dr0,
+// dc0, src, src_row_tiles, src_col_tiles, sr0, sc0, rows, cols) (crouton.h):
+// copies a region of whole tiles between two Crouton matrices of the same tile
+// order, from (sr0, sc0) of src to (dr0, dc0) of dst. `column_tiles` ("true"
+// or "false") prints as a template argument.
+TVM_DLL const Op &hexagon_crouton_move_tiles();
+
 // tl_crouton_tile_store<accumulate, rows, aligned, scaled>(dst, ldc, tile[,
 // scale, ld]) (crouton.h): writes the fp16 Crouton tile `tile`, an HMX output,
 // into a 32 x 32 block of a matrix, or adds it to the block (accumulate): a
