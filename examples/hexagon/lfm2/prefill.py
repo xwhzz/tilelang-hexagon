@@ -127,9 +127,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             bf.head[i, d] = bf.cc[0, i, col + d] * bf.hss[i] * weight(d)
         for i, d in T.Parallel(R, HD):
             sign = T.if_then_else(d < 32, T.float32(-1), T.float32(1))
-            bf.hsq[i, d] = (
-                bf.head[i, d] * bf.cos_rows[i, d % 32] + sign * bf.head[i, (d + 32) % 64] * bf.sin_rows[i, d % 32]
-            ) * extra
+            bf.hsq[i, d] = (bf.head[i, d] * bf.cos_rows[i, d % 32] + sign * bf.head[i, (d + 32) % 64] * bf.sin_rows[i, d % 32]) * extra
 
     @T.macro
     def in_proj_block(bf, b, rw, rs, k, ci, base, valid):
