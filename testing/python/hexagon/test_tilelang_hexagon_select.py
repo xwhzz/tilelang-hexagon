@@ -111,10 +111,13 @@ def test_causal_masks_compare_a_lane_ramp():
     assert "tl_vec_ramp<int32_t, 64>(" in source
 
 
-def test_branches_that_may_load_out_of_bounds_stay_guarded():
+def test_loads_that_may_be_out_of_bounds_read_a_safe_address():
     source = _source(_map("shift_up", "float16"))
-    assert "tl_vec_select(" not in source
-    assert "condval" in source
+    # The last rows' loads would pass the end: they read the buffer's start
+    # instead, and the select drops what they read. No branch.
+    assert "half64 guarded = *(half64*)(((half*)a) + ((i_1 < 252) ? ((i_1 * 64) + 256) : 0));" in source
+    assert "((i_1 < 252) ? guarded : " in source
+    assert "condval" not in source
 
 
 @DEVICE

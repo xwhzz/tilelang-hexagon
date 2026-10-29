@@ -332,3 +332,46 @@ def test_shifted_maps_match_torch(dtype, load_shift, store_shift):
         torch.testing.assert_close(kernel(x), expected, rtol=0, atol=0)
     finally:
         kernel.adapter.close()
+
+
+def _table_rows(rows, positions):
+    """Y[i, d] = X[i, d] * table[base + i, d % 32]: rows of a table at a run-time
+    base, which the kernel cannot prove in bounds, as RoPE reads its tables."""
+
+    @T.prim_func
+    def kernel(
+        table: T.Tensor((positions, 32), "float32"), X: T.Tensor((rows, 64), "float32"), Y: T.Tensor((rows, 64), "float32"), base: T.int32
+    ):
+        with T.Kernel(1):
+            x = T.alloc_shared((rows, 64), "float32")
+            y = T.alloc_shared((rows, 64), "float32")
+            T.copy(X, x)
+            for i, d in T.Parallel(rows, 64):
+                y[i, d] = x[i, d] * table[base + i, d % 32]
+            T.copy(y, Y)
+
+    return kernel
+
+
+def test_guarded_vector_loads_select_instead_of_branching():
+    source = _source(_table_rows(128, 2048))
+    # The guard reads from the table's start when it fails, and selects: no
+    # branch around the load.
+    (load,) = [line.strip() for line in source.splitlines() if "guarded = " in line]
+    assert load.startswith("float32 guarded = *(float32*)(table + (((0 <= ((i_1 >> 1) + base)) && (((i_1 >> 1) + base) < 2048)) ? ")
+    assert load.endswith(": (int64_t)0));")
+    assert " ? guarded : " in source
+    assert "condval" not in source
+
+
+@pytest.mark.skipif(__import__("os").environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_guarded_loads_read_zeros_out_of_bounds():
+    import torch
+
+    kernel = tilelang.compile(_table_rows(128, 256), out_idx=[2], target="hexagon")
+    gen = torch.Generator().manual_seed(5)
+    table, x = torch.randn(256, 32, generator=gen), torch.randn(128, 64, generator=gen)
+    # Rows from 200 on: the last 72 are past the table's end, and read zeros.
+    out = kernel(table, x, 200)
+    ref = x * torch.cat([table, torch.zeros(72, 32)])[200:328].repeat(1, 2)
+    torch.testing.assert_close(out, ref)

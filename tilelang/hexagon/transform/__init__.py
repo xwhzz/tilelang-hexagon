@@ -121,6 +121,20 @@ def InterleaveMaps():
     return _ffi_api.InterleaveMaps()  # type: ignore
 
 
+def SelectGuardedLoads():
+    """Load the vectors a scalar condition guards from a safe address, and select.
+
+    LegalizeSafeMemoryAccess guards a load it cannot prove in bounds,
+    ``if_then_else(cond, load, 0)``, which C evaluates as a branch around the
+    load, and LLVM does not software-pipeline a loop with one. When the
+    condition is a scalar and the load one vector or element of a buffer at
+    least as long, the load reads the same address, or the buffer's start when
+    the condition fails, and a select picks the value. Runs after
+    ``UnrollLoop``.
+    """
+    return _ffi_api.SelectGuardedLoads()  # type: ignore
+
+
 def MarkExclusiveBuffers():
     """Give the VTCM buffers that share no memory pointers of their own.
 
