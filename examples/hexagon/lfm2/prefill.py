@@ -115,9 +115,9 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             T.copy(bf.rows, bf.a[r : r + 2, :])
 
     @T.macro
-    def norm_rope(bf, col, weight, base, extra):
+    def norm_rope(bf, col, weight, extra):
         """hsq = RoPE(RMSNorm(cc[0, :, col : col + 64]) * weight(d)) * extra, at
-        positions base + i."""
+        the chunk's positions, whose rows of the RoPE tables are in VTCM."""
         for i, d in T.Parallel(R, HD):
             bf.hsq[i, d] = bf.cc[0, i, col + d] * bf.cc[0, i, col + d]
         T.reduce_sum(bf.hsq, bf.hss, dim=1)
@@ -128,7 +128,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
         for i, d in T.Parallel(R, HD):
             sign = T.if_then_else(d < 32, T.float32(-1), T.float32(1))
             bf.hsq[i, d] = (
-                bf.head[i, d] * bf.rope_cos[base + i, d % 32] + sign * bf.head[i, (d + 32) % 64] * bf.rope_sin[base + i, d % 32]
+                bf.head[i, d] * bf.cos_rows[i, d % 32] + sign * bf.head[i, (d + 32) % 64] * bf.sin_rows[i, d % 32]
             ) * extra
 
     @T.macro
@@ -160,14 +160,14 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             T.copy(bf.cc[0, :, :], bf.hid[:, ch : ch + BLOCK])
 
     @T.macro
-    def q_block(bf, b, rw, rs, k, ai, base):
+    def q_block(bf, b, rw, rs, k, ai):
         """Query block b: two heads, normalized, rotated and scaled by
         log2(e) / 8, into their KV head's stacked queries: the scores are
         then in base 2, which the softmax raises 2 to."""
         gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True)
         for hh in T.serial(BLOCK // HD):
             local = b * (BLOCK // HD) + hh  # the worker's query head
-            norm_rope(bf, hh * HD, lambda d, ai=ai: bf.q_norm[ai, d], base, T.float32(LOG2E / 8))
+            norm_rope(bf, hh * HD, lambda d, ai=ai: bf.q_norm[ai, d], T.float32(LOG2E / 8))
             T.copy(bf.hsq, bf.q[local // group, (local % group) * R : (local % group + 1) * R, :])
 
     @T.macro
@@ -180,7 +180,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             if values:
                 T.copy(bf.cc[0, :, hh * HD : (hh + 1) * HD], bf.kv_v[ai, kvh, base : base + R, :])
             else:
-                norm_rope(bf, hh * HD, lambda d, ai=ai: bf.k_norm[ai, d], base, T.float32(1))
+                norm_rope(bf, hh * HD, lambda d, ai=ai: bf.k_norm[ai, d], T.float32(1))
                 T.copy(bf.hsq, bf.kv_k[ai, kvh, base : base + R, :])
 
     @T.macro
@@ -333,6 +333,9 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             head = T.alloc_shared((R, HD), "float32")
             hsq = T.alloc_shared((R, HD), "float32")
             hss = T.alloc_shared((R,), "float32")
+            # The chunk's rows of the RoPE tables.
+            cos_rows = T.alloc_shared((R, HD // 2), "float32")
+            sin_rows = T.alloc_shared((R, HD // 2), "float32")
             # Attention: the worker's queries, by KV head; a block of keys and
             # values; the KV head's query heads' softmax states and outputs;
             # and one query head's scores.
@@ -357,7 +360,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             bf = SimpleNamespace(
                 w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
                 q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, gl=gl,
-                rope_cos=rope_cos, rope_sin=rope_sin, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
+                cos_rows=cos_rows, sin_rows=sin_rows, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,
             )  # fmt: skip
 
@@ -372,6 +375,12 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             for chunk in T.serial(T.ceildiv(n, R)):
                 base = pos0 + chunk * R
                 valid = T.min(R, n - chunk * R)
+                # The chunk's rows of the RoPE tables, which every head's
+                # rotation reads, into VTCM (reads from DDR stall HVX loops).
+                # Rows past the tables, the padding's, take their last.
+                for i, d in T.Parallel(R, HD // 2):
+                    cos_rows[i, d] = rope_cos[T.min(base + i, max_pos - 1), d]
+                    sin_rows[i, d] = rope_sin[T.min(base + i, max_pos - 1), d]
 
                 # The chunk's embeddings: the worker's rows of x.
                 for r in T.serial(RW):
@@ -416,7 +425,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                     T.sync_grid()
                     if kinds[layer, 0] == 1:
                         st_attn.prologue()
-                        st_attn.run(0, lambda b, rw, rs, k, ai=ai, base=base: q_block(bf, b, rw, rs, k, ai, base))
+                        st_attn.run(0, lambda b, rw, rs, k, ai=ai: q_block(bf, b, rw, rs, k, ai))
                         st_attn.run(1, lambda b, rw, rs, k, ai=ai, base=base: kv_block(bf, b, rw, rs, k, ai, base, False))
                         st_attn.run(2, lambda b, rw, rs, k, ai=ai, base=base: kv_block(bf, b, rw, rs, k, ai, base, True))
                         attention(bf, ai, base)
