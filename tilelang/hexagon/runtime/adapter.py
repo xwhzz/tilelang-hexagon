@@ -14,13 +14,13 @@ runs the kernel's one-shot host driver (:class:`~.linux_runtime.OneShotKernel`).
 from __future__ import annotations
 
 import contextlib
-import os
 import re
 import weakref
 
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
+from .config import hlos
 from .env import HexagonSDK
 
 # The kernel entry is the generated function that returns its int32 status;
@@ -78,7 +78,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         """The callable that runs the kernel on the device, which it starts
         unless it is up."""
         if self._device is None:
-            if os.environ.get("TILELANG_HEXAGON_HLOS") == "linux":
+            if hlos() == "linux":
                 from .linux_runtime import OneShotKernel
 
                 self._device = OneShotKernel(

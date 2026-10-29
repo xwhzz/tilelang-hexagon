@@ -1,4 +1,5 @@
-"""Device selection and cache identity for live Hexagon deployments."""
+"""Device selection, the run's settings and cache identity for live Hexagon
+deployments: the one place the runtime reads its environment's settings."""
 
 from __future__ import annotations
 
@@ -7,6 +8,23 @@ import shutil
 
 from .device import AdbConnection, HexagonConnectionError
 from .env import HexagonSDK
+
+
+def hlos() -> str:
+    """The OS the device runs (TILELANG_HEXAGON_HLOS): "android", the default,
+    where kernels run in sessions over adb, or "linux", a BSP, where each call
+    runs one-shot."""
+    name = os.environ.get("TILELANG_HEXAGON_HLOS", "android")
+    if name not in ("android", "linux"):
+        raise ValueError(f"TILELANG_HEXAGON_HLOS is android or linux, not {name!r}")
+    return name
+
+
+def remote_dir(os_name: str) -> str:
+    """The directory under which runs on a device of `os_name` (see hlos) put
+    their files (TILELANG_HEXAGON_REMOTE_DIR)."""
+    default = "/tmp/tilelang_hexagon" if os_name == "linux" else "/data/local/tmp/tilelang_hexagon"
+    return os.environ.get("TILELANG_HEXAGON_REMOTE_DIR", default)
 
 
 def device_serial() -> str:
@@ -27,9 +45,8 @@ def cache_identity() -> dict:
     identify installations; replacing tools in place requires clearing the cache.
     """
     sdk = HexagonSDK()
-    hlos = os.environ.get("TILELANG_HEXAGON_HLOS", "android")
     identity = {
-        "hlos": hlos,
+        "hlos": hlos(),
         "dsp_arch": sdk.dsp_arch,
         "sdk_root": sdk.sdk_root,
         "ndk_root": sdk.ndk_root,
@@ -45,7 +62,7 @@ def cache_identity() -> dict:
             )
         },
     }
-    if hlos == "linux":
+    if identity["hlos"] == "linux":
         identity["linux"] = {
             name: os.environ.get(name)
             for name in (

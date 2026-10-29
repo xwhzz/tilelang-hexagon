@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
-from .config import device_serial
+from .config import device_serial, remote_dir
 
 
 def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
@@ -71,8 +71,7 @@ class LinuxConnection(AdbConnection):
 
     @classmethod
     def from_environment(cls):
-        parent = os.environ.get("TILELANG_HEXAGON_REMOTE_DIR", "/tmp/tilelang_hexagon")
-        return cls(serial=device_serial(), workdir=os.path.join(parent, uuid.uuid4().hex))
+        return cls(serial=device_serial(), workdir=os.path.join(remote_dir("linux"), uuid.uuid4().hex))
 
     def _run(self, argv, timeout=None):
         proc = subprocess.run(

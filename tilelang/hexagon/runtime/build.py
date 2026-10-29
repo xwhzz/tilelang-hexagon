@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 
+from . import config
 from .env import HexagonSDK
 
 
@@ -173,9 +174,7 @@ def build_cmake_fastrpc(
     """
     sdk = (sdk or HexagonSDK()).validate()
     dsp_arch = dsp_arch or sdk.dsp_arch
-    hlos = os.environ.get("TILELANG_HEXAGON_HLOS", "android")
-    if hlos not in {"android", "linux"}:
-        raise HexagonBuildError(f"Unsupported HLOS: {hlos}")
+    hlos = config.hlos()
     entry = _cache_entry(project_dir, name, sdk, dsp_arch, hlos)
     if entry:
         cached = _load_cached(entry)

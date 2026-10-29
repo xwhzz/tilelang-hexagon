@@ -619,11 +619,11 @@ class Session:
 
     def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float) -> None:
         from .build import build_cmake_fastrpc
-        from .config import device_serial
+        from .config import device_serial, hlos
         from .env import HexagonSDK
 
         self._closed = True
-        if os.environ.get("TILELANG_HEXAGON_HLOS") == "linux":
+        if hlos() == "linux":
             raise NotImplementedError(
                 "a session needs the Android agent; on a Linux BSP, tilelang.compile runs a kernel one call at a time"
             )
@@ -649,8 +649,9 @@ class Session:
     # ---- lifecycle --------------------------------------------------------
     def _start(self, ready_timeout: float) -> None:
         Session._port_seq += 1
-        root = os.environ.get("TILELANG_HEXAGON_REMOTE_DIR", "/data/local/tmp/tilelang_hexagon")
-        self._device_dir = f"{root}/session_{os.getpid()}_{Session._port_seq}"
+        from .config import remote_dir
+
+        self._device_dir = f"{remote_dir('android')}/session_{os.getpid()}_{Session._port_seq}"
         subprocess.run(self._base + ["shell", f"mkdir -p {self._device_dir}"], check=True, capture_output=True)
         for local in (self._artifacts.dsp_skel, self._artifacts.agent_exe):
             subprocess.run(self._base + ["push", local, f"{self._device_dir}/"], check=True, capture_output=True)
