@@ -30,8 +30,10 @@ the KV head serves. The chunk's keys and values go into the cache first.
 
 The FFN's hidden units run in parts, one per slice of w2 (the bundle stores
 w2 in slices of 2048 columns, so 8192 hidden units are four parts): a part's
-w1/w3 blocks fill the shared hidden buffer, and its w2 slice adds the part's
-share into x.
+w1/w3 blocks fill one of two slots of the shared hidden buffer, and its w2
+slice adds the part's share into x. A worker multiplies part p's w2 slice and
+then part p + 1's w1/w3 blocks, into the other slot, with no sync between:
+the workers meet once a part.
 
 The prompt's last token is left to the decode, whose first step runs it and
 the LM head (``Decoder.generate``).
@@ -82,7 +84,8 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
     assert D % (NW * BLOCK) == 0 and FQ % (NW * BLOCK) == 0 and (KVH // NW * HD) % BLOCK == 0
     assert PARTS * FQ == F
     eps = c.eps
-    HID = max(D, FQ)
+    # Two slots of the FFN's hidden units; the operators' outputs use the first.
+    HID = max(D, 2 * FQ)
 
     def clamped(index, count: int):
         return T.max(T.min(index, max(count, 1) - 1), 0)
@@ -227,9 +230,9 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                 T.copy(bf.acc_o[hq, :, :], bf.hid[:, col : col + HD])
 
     @T.macro
-    def glu_block(bf, b, rw, rs, k):
+    def glu_block(bf, b, rw, rs, k, slot):
         """w1 (even b) or w3 of hidden block b // 2 of the worker's part;
-        after w3, silu(w1 a) * (w3 a) into hid."""
+        after w3, silu(w1 a) * (w3 a) into hid's slot."""
         gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True)
         if b % 2 == 1:
             # In fp16, which hid holds: the sigmoid then takes 64 lanes a
@@ -237,14 +240,15 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             for i, j in T.Parallel(R, BLOCK):
                 g = T.Cast("float16", bf.cc[0, i, j])
                 bf.gl[i, j] = g * T.sigmoid(g) * T.Cast("float16", bf.cc[1, i, j])
-            T.copy(bf.gl, bf.hid[:, bf.w * FQW + b // 2 * BLOCK : bf.w * FQW + b // 2 * BLOCK + BLOCK])
+            col = slot * FQ + bf.w * FQW + b // 2 * BLOCK
+            T.copy(bf.gl, bf.hid[:, col : col + BLOCK])
 
     @T.macro
-    def residual_block(bf, b, rw, rs, k, cols: int):
-        """x[:, channels] += hid[:, :cols] @ block^T: the residual add in the
-        GEMM itself."""
+    def residual_block(bf, b, rw, rs, k, first: int, cols: int):
+        """x[:, channels] += hid[:, first:first + cols] @ block^T: the
+        residual add in the GEMM itself."""
         ch = bf.w * DW + b * BLOCK
-        gemm(bf.hid[:, 0:cols], cols, rw, rs, k, bf.x[:, ch : ch + BLOCK], bf.ones, False)
+        gemm(bf.hid[:, first : first + cols], cols, rw, rs, k, bf.x[:, ch : ch + BLOCK], bf.ones, False)
 
     @T.prim_func
     def prefill(
@@ -392,14 +396,16 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                         st_conv.run(0, lambda b, rw, rs, k, ci=ci, base=base, valid=valid: in_proj_block(bf, b, rw, rs, k, ci, base, valid))
                     T.sync_grid()
                     st_rest.prologue()
-                    st_rest.run(0, lambda b, rw, rs, k: residual_block(bf, b, rw, rs, k, D))
+                    st_rest.run(0, lambda b, rw, rs, k: residual_block(bf, b, rw, rs, k, 0, D))
                     T.sync_grid()
                     normalize(bf, ffn_norm[layer, :])
                     T.sync_grid()
+                    st_rest.run(1, lambda b, rw, rs, k: glu_block(bf, b, rw, rs, k, 0))
+                    T.sync_grid()
                     for part in list(range(PARTS)):
-                        st_rest.run(1 + 2 * part, lambda b, rw, rs, k: glu_block(bf, b, rw, rs, k))
-                        T.sync_grid()
-                        st_rest.run(2 + 2 * part, lambda b, rw, rs, k: residual_block(bf, b, rw, rs, k, FQ))
+                        st_rest.run(2 + 2 * part, lambda b, rw, rs, k, part=part: residual_block(bf, b, rw, rs, k, part % 2 * FQ, FQ))
+                        if part + 1 < PARTS:
+                            st_rest.run(3 + 2 * part, lambda b, rw, rs, k, part=part: glu_block(bf, b, rw, rs, k, (part + 1) % 2))
                         T.sync_grid()
 
     return prefill
