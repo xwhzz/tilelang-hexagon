@@ -114,61 +114,63 @@ def _c_layout(kind):
 
 def test_k_loops_accumulate_hmx_tiles_into_an_fp32_fragment():
     source = _source(_k_loop(64, 64, 128, 64))
-    assert "tl_hexagon_hmx_mma_atom(" in source
-    # Each tile goes through a staging tile into the row-major fp32 C: one
-    # store in the tile loop and the last tile's after it.
-    assert source.count("tl_crouton_tile_store<true, true, true, false>(") == 2
-    assert "(&(((float*)c)[2080])), 64, (&(((half*)stage)[1024])));" in source
-
-
-def test_each_tiles_epilogue_overlaps_the_next_tiles_macs():
-    lines = [line.strip() for line in _source(_k_loop(64, 64, 128, 64)).splitlines()]
-
-    def first(text, start=0):
-        return next(i for i in range(start, len(lines)) if text in lines[i])
-
-    mma = first("tl_hexagon_hmx_mma_atom(")
-    store = first("tl_crouton_tile_store<", mma)
-    assert lines[store - 1] == "if (0 < t) {"
-    convert = first("tl_hexagon_hmx_convert_acc(", mma)
-    assert mma < store < convert
-    # The last tile's epilogue runs after the accumulator is released.
-    release = first("tl_hexagon_hmx_acc_release(", convert)
-    assert first("tl_crouton_tile_store<", release) > release
+    # Each block is one call, which adds its tiles into the row-major fp32 C:
+    # A's row tiles and B's column tiles are their 2 K tiles apart.
+    assert (
+        "tl_hexagon_hmx_gemm<true, true, false, false>(64, 64, 64, (&(((float*)c)[0])), 64, "
+        "(&(((half*)a)[0])), 2048, (&(((half*)b)[0])), 2048, (bool)0, "
+    ) in source
 
 
 def test_fp16_c_accumulates_in_its_crouton_tiles():
     source = _source(_k_loop(64, 64, 128, 64, "float16"))
-    assert "tl_crouton_tile_store<true, false, true, false>((&(((half*)c)[((t * 1024) - 1024)]))" in source
+    # C's tiles, two a row.
+    assert "tl_hexagon_hmx_gemm<false, true, false, false>(64, 64, 64, (&(((half*)c)[0])), 2, " in source
 
 
 def test_a_dynamic_clear_writes_the_first_block_and_adds_the_others():
     for dtype, rows in (("float32", "true"), ("float16", "false")):
         source = _source(_k_loop(64, 64, 128, 64, dtype, "shared", "first"))
-        assert "if (k == 0) {" in source
-        assert f"tl_crouton_tile_store<false, {rows}, true, false>(" in source
-        assert f"tl_crouton_tile_store<true, {rows}, true, false>(" in source
+        (call,) = [line for line in source.splitlines() if f"tl_hexagon_hmx_gemm<{rows}," in line]
+        assert ", (k == 0), " in call
+
+
+def test_an_overwritten_crouton_c_takes_hmxs_tiles_directly():
+    @T.prim_func
+    def kernel(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((64, 64), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((64, 64), "float16")
+            b = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_shared((64, 64), "float16")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, c, clear_accum=True)
+            T.copy(c, C)
+
+    assert "tl_hexagon_hmx_gemm<false, true, false, true>(64, 64, 64, (&(((half*)c)[0])), 2, " in _source(kernel)
 
 
 def test_sub_matrices_start_at_their_tiles():
     source = _source(_sub_matrices("float32"))
-    # A's sub-matrix starts at tile 18: matrix 1 of 3 x 4 tiles, row tile 1,
-    # column tile 2. B's starts at tile 6: column tile 1 of 4 K tiles, K tile 2.
-    assert "a)[(((t >> 1) * 4096) + 18432)]" in source
-    assert "b)[(((t & 1) * 4096) + 6144)]" in source
-    # C's at row 64, column 96 of its 192 columns.
-    assert "c)[(((((t - 1) >> 1) * 6144) + (((t + 1) & 1) * 32)) + 12384)])), 192," in source
+    # C's sub-matrix starts at row 64, column 96 of its 192 columns. A's starts
+    # at tile 18: matrix 1 of 3 x 4 tiles, row tile 1, column tile 2, its row
+    # tiles 4 K tiles apart. B's starts at tile 6: column tile 1 of 4 K tiles,
+    # K tile 2.
+    assert (
+        "tl_hexagon_hmx_gemm<true, true, false, false>(64, 64, 64, (&(((float*)c)[12384])), 192, "
+        "(&(((half*)a)[18432])), 4096, (&(((half*)b)[6144])), 4096, "
+    ) in source
 
 
-def test_c_of_another_layout_is_written_element_by_element():
+def test_c_of_another_layout_takes_a_row_major_product_element_by_element():
     source = _source(_c_layout("columns16"))
-    assert "tl_hexagon_hmx_mma_atom(" in source
-    assert "tl_crouton_tile_store" not in source
+    assert "tl_hexagon_hmx_gemm<true, true, false, false>(64, 32, 64, (&(((half*)product)[0])), 32, " in source
+    assert "product)[" in source.split("tl_hexagon_hmx_gemm<", 2)[1]
 
 
 def test_rows_off_register_boundaries_are_unaligned_stores():
-    assert "tl_crouton_tile_store<true, true, false, false>(" in _source(_c_layout("rows32_odd"))
-    assert "tl_crouton_tile_store<true, true, true, false>(" in _source(_c_layout("rows16"))
+    assert "tl_hexagon_hmx_gemm<true, false, false, false>(" in _source(_c_layout("rows32_odd"))
+    assert "tl_hexagon_hmx_gemm<true, true, false, false>(" in _source(_c_layout("rows16"))
 
 
 def test_gemms_hmx_cannot_run_go_to_hvx_saying_why(caplog):
@@ -322,28 +324,11 @@ def _worker_k_loops(NB, M, N, K, BK, num_workers):
     return kernel
 
 
-def _hmx_sections(source):
-    """Lines of the HMX acquires and releases, and of the first output-tile loop."""
-    lines = [line.strip() for line in source.splitlines()]
-    acquire = [i for i, line in enumerate(lines) if "tl_hexagon_hmx_acc_acquire" in line]
-    release = [i for i, line in enumerate(lines) if "tl_hexagon_hmx_acc_release" in line]
-    tiles = next(i for i, line in enumerate(lines) if line.startswith("for (int32_t t"))
-    return acquire, release, tiles
-
-
 def test_workers_take_hmx_one_output_tile_at_a_time():
-    # One tile program holds HMX for its whole call, overlapping each tile's
-    # epilogue with the next tile's MACs.
-    acquire, release, tiles = _hmx_sections(_source(_worker_k_loops(6, 64, 64, 128, 64, 1)))
-    assert acquire[0] < tiles < release[0]
-    # A pool's workers share HMX: each takes it for one output tile and runs
-    # the tile's epilogue after releasing it.
-    source = _source(_worker_k_loops(6, 64, 64, 128, 64, 6))
-    acquire, release, tiles = _hmx_sections(source)
-    assert tiles < acquire[0] < release[0]
-    lines = [line.strip() for line in source.splitlines()]
-    assert "tl_hexagon_hmx_load_bias" in lines[acquire[0] + 1]
-    assert "tl_crouton_tile_store" in "\n".join(lines[release[0] : release[0] + 3])
+    # One tile program holds HMX for its whole call; a pool's workers share
+    # it, a tile at a time (Shared).
+    assert "tl_hexagon_hmx_gemm<true, true, false, false>(" in _source(_worker_k_loops(6, 64, 64, 128, 64, 1))
+    assert "tl_hexagon_hmx_gemm<true, true, true, false>(" in _source(_worker_k_loops(6, 64, 64, 128, 64, 6))
 
 
 @DEVICE

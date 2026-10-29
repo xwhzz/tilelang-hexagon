@@ -311,8 +311,8 @@ def test_global_vtcm_buffers_come_before_the_program_arenas():
     assert "half* A_w = (half*)tl_exclusive(A);" in source
     # Each program packs its rows of the shared HMX operand.
     assert "tl_crouton_copy<true, false>((&(a_w[0])), 4, 8, (bx * 32), 0, 32, 256, (&(A_w[(bx * 8192)])), 256, 1);" in source
-    # All of them multiply all of it.
-    assert "tl_hexagon_hmx_mma_atom((&(acc[0])), (&(a_w[((t >> 1) * 8192)]))" in source
+    # All of them multiply all of it, taking turns at HMX.
+    assert "tl_hexagon_hmx_gemm<true, true, true, false>(128, 64, 256, (&(((float*)c)[0])), 64, (&(a_w[0])), 8192, " in source
 
 
 def test_global_vtcm_buffers_must_fit_with_the_arenas():

@@ -8,7 +8,7 @@ import tilelang
 from tilelang.hexagon import language as T
 from tilelang import tvm
 from tilelang.backend.target import determine_target
-from tilelang.hexagon.intrinsics.hmx import HMXIntrinEmitter
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
@@ -69,7 +69,6 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
     """An HMX matmul over output blocks of BM x BN, whose A and B rows of the
     next blocks stream in by DMA, two blocks ahead, while HMX multiplies one."""
     assert M % BM == N % BN == K % 32 == BM % 32 == BN % 32 == 0
-    E = HMXIntrinEmitter(BM, BN, K)
     count = (M // BM) * (N // BN)
 
     @T.macro
@@ -87,14 +86,6 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
             an = T.alloc_shared((BM, K), "float16", align=2048)
             bn = T.alloc_shared((K, BN), "float16", align=2048)
             cn = T.alloc_shared((BM, BN), "float16", align=2048)
-            config = T.alloc_shared((64,), "uint32", align=256)
-            acc = T.hmx.alloc_accumulator()
-            cvt = T.hmx.alloc_convert_state()
-            bias = T.hmx.alloc_bias_state()
-            T.annotate_layout({an: E.activation_layout(an), bn: E.weight_layout(bn), cn: E.output_layout(cn)})
-            for i in T.serial(32):
-                config[i] = T.uint32(0x3C00)
-                config[32 + i] = T.uint32(0)
             # Each output block contributes two queue entries: A and B.
             for tile in T.serial(min(2, count)):
                 submit(A, B, ar, br, tile)
@@ -109,16 +100,7 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
                 # computes from the separate native Crouton buffers.
                 if tile + 2 < count:
                     submit(A, B, ar, br, tile + 2)
-                E.acquire(acc)
-                E.load_bias(bias, config)
-                for mt in T.serial(BM // 32):
-                    for nt in T.serial(BN // 32):
-                        E.clear(acc)
-                        for kt in T.serial(K // 32):
-                            E.mma_atom(acc, an, bn, mt, nt, kt)
-                        E.convert(cvt, acc, bias, config)
-                        E.store(cvt, acc, cn, bias, config, mt, nt)
-                E.release(acc)
+                T.gemm(an, bn, cn, clear_accum=True)
                 T.copy(
                     cn,
                     C[(tile // (N // BN)) * BM : ((tile // (N // BN)) + 1) * BM, (tile % (N // BN)) * BN : ((tile % (N // BN)) + 1) * BN],
@@ -177,7 +159,8 @@ def test_async_hmx_dsl_schedule():
     assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async;" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in source
     assert "tl_crouton_copy<true," in source
-    assert "tl_hexagon_hmx_mma_atom" in source
+    # The block multiplies in one call, which stores HMX's tiles into cn.
+    assert "tl_hexagon_hmx_gemm<false, true, false, true>(128, 128, 2048, " in source
     assert "tl_hexagon_dma_copy_hmx_matmul_double_buffer" not in source
 
 
@@ -213,13 +196,11 @@ def test_managed_worker_queue_is_local_and_drained():
 
 
 def test_reject_crouton_async():
-    e = HMXIntrinEmitter(32, 32, 32)
-
     @T.prim_func
     def probe(A: T.Tensor((32, 32), "float16")):
         with T.Kernel(1):
             s = T.alloc_shared((32, 32), "float16")
-            T.annotate_layout({s: e.activation_layout(s)})
+            T.annotate_layout({s: make_hmx_activation_layout(s)})
             T.dma_copy(A, s)
             T.dma_wait()
 
@@ -311,15 +292,7 @@ def test_dsp_build_avoids_exception_runtime():
     assert "-fno-exceptions" in fastrpc.gen_cmake("test", "/templates", agent=True)
 
 
-def test_async_hmx_error_cleanup_is_armed_and_disarmed():
-    source = lower(make_dma_hmx_matmul())
-    assert "tl_dma_async.release_hmx = tl_hmx_unit_release;" in source
-    assert "tl_dma_async.release_hmx = nullptr;" in source
-
-
 def make_hmx_probe():
-    e = HMXIntrinEmitter(32, 32, 64)
-
     @T.prim_func
     def dma_hmx_workers(
         A: T.Tensor((13 * 32, 64), "float16"),
@@ -333,33 +306,19 @@ def make_hmx_probe():
             an = T.alloc_shared((32, 64), "float16")
             bn = T.alloc_shared((64, 32), "float16")
             cn = T.alloc_shared((32, 32), "float16")
-            config = T.alloc_shared((64,), "uint32")
-            acc = T.hmx.alloc_accumulator()
-            cvt = T.hmx.alloc_convert_state()
-            bias = T.hmx.alloc_bias_state()
-            T.annotate_layout({an: e.activation_layout(an), bn: e.weight_layout(bn), cn: e.output_layout(cn)})
-            for i in T.serial(32):
-                config[i] = T.uint32(0x3C00)
-                config[i + 32] = T.uint32(0)
             T.dma_copy(A[group * 32 : (group + 1) * 32, :], ar)
             T.dma_copy(B, br)
             T.dma_wait()
             T.copy(ar, an)
             T.copy(br, bn)
-            e.acquire(acc)
             if Fail[0] != 0:
-                # Deliberate FIFO overflow while holding HMX. The two accepted
-                # transfers must finish, and unit/thread leases must be freed.
+                # Deliberate FIFO overflow in an HMX program. The two accepted
+                # transfers must finish, and the thread's HMX enable must be
+                # dropped.
                 T.dma_copy(A[group * 32 : (group + 1) * 32, :], ar)
                 T.dma_copy(B, br)
                 T.dma_copy(B, br)
-            e.load_bias(bias, config)
-            e.clear(acc)
-            for k in T.serial(2):
-                e.mma_atom(acc, an, bn, 0, 0, k)
-            e.convert(cvt, acc, bias, config)
-            e.store(cvt, acc, cn, bias, config, 0, 0)
-            e.release(acc)
+            T.gemm(an, bn, cn, clear_accum=True)
             T.copy(cn, C[group * 32 : (group + 1) * 32, :])
 
     return dma_hmx_workers
@@ -368,9 +327,9 @@ def make_hmx_probe():
 def test_worker_hmx_thread_cleanup_survives_dma_errors():
     source = lower(make_hmx_probe())
     # The worker scope holds the thread's HMX enable for all of its programs
-    # and drops it on any return; the DMA queue releases the HMX unit lock.
+    # and drops it on any return. The GEMM holds the HMX unit only inside its
+    # own function, which returns no errors.
     assert "tl_parallel_for<tl_hmx_worker_scope>(13, 6, " in source
-    assert "tl_dma_async.release_hmx = tl_hmx_unit_release;" in source
     assert "tl_hmx_enable" not in source
     assert "tl_hmx_disable" not in source
 

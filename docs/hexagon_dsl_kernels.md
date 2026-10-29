@@ -222,7 +222,8 @@ staging tile in VTCM, which `tl_crouton_tile_store` (`crouton.h`) writes or adds
 - an fp32 C stays row-major, where widening a row-pair register by 1.0 gives the pair's two
   rows as fp32 registers;
 - an fp16 C adds in its own Crouton tiles;
-- a C of another layout is written element by element.
+- a C of another layout takes the product from a row-major matrix of its own, element by
+  element.
 
 Two staging tiles alternate, so each tile's epilogue runs on HVX while HMX multiplies the
 next tile, and the call holds the HMX accumulator throughout. In a worker pool, whose
@@ -242,42 +243,21 @@ the K inside a call does not. On v79, one call over K = 1024 runs at 8.1 cycles 
 So give each call as much K as VTCM holds. Each call's product is rounded to fp16 before HVX
 adds it, so an fp32 C carries the error of a sum of K / BK fp16 numbers.
 
-For explicit scheduling, HMX is driven at **instruction-atom granularity** via
-`tilelang/hexagon/intrinsics/hmx.py`'s `HMXIntrinEmitter` — the Hexagon analog of tilelang's
-`TensorCoreIntrinEmitter` (`tilelang/cuda/intrinsics/macro/mma_macro_generator.py`). Like the
-tensor-core emitter, it turns the matmul's tiling config into `@T.macro` atoms so either an
-explicit kernel or `T.gemm` lowering can compose the operation:
+The call is one `tl_hexagon_hmx_gemm` (`hmx_gemm.h`), the driver `T.gemm_blockscaled`
+shares: its tile loop takes the weight tiles of an output column from a source, B's tiles
+in VTCM for `T.gemm` or the dequantized panels for `T.gemm_blockscaled`. HMX has no
+addressable accumulator, a single one per core that loading the activation and weight
+tiles feeds, so the driver completes each output tile (clear, multiply its K, convert,
+store) before the next. The 32x32 atom uses `cpos(r,c)=(r//2)*64+c*2+r%2`; `repeat`
+constructs the A/C `[mt,*t,cpos]` and B `[nt,kt,cpos]` tile orders. The shared-memory
+planner aligns the call's VTCM operands as HMX needs them, which the builtin declares:
+activation and output tiles on 2 KB, weight tiles on 128 B, and the scale/bias config on
+256 B.
 
-| tensor core | `HMXIntrinEmitter` | instruction |
-|---|---|---|
-| shared-memory fragment layout | `activation_layout` / `weight_layout` | A `[M,K]` / B `[K,N]` (including storage transposes) in VTCM Crouton |
-| `mma_atom(...,m,n,k)` | one 32x32x32 MAC atom | `{activation=mxmem; weight=mxmem}` |
-| one K step of `mma` | `mma_tile(...,m,n)` | the complete K-loop for one output tile |
-| accumulator store layout | `output_layout` / `store` | direct `mxmem=cvt` into a 2 KB-aligned native C `[M,N]` tile |
-| `T.clear(C_local)` | `clear` | `mxclracc` |
-
-**Honest divergence from tensor cores:** HMX has no `mma` instruction and NO addressable
-accumulator fragment — loading the a/b Crouton tiles is what triggers the MAC, into a single
-invisible per-core accumulator. Consequently `mma_tile()` reduces K for exactly one `(m,n)` tile;
-the caller must complete `clear -> mma_tile -> convert -> store` before selecting another output
-tile. The 32x32 atom uses `cpos(r,c)=(r//2)*64+c*2+r%2`; `repeat` constructs the A/C
-`[mt,*t,cpos]` and B `[nt,kt,cpos]` tile orders, while `expand` adds staging dimensions.
-`T.Layout` only rewrites addresses: packing, operand-specific allocation alignment, and the HMX
-protocol remain explicit. Whole-buffer A/B dependencies are carried to `store` because HMX may
-consume `mxmem` operands asynchronously. Session/power/VTCM ownership and cold-session
-accumulator-read setup stay with the embedding runtime.
-
-The shared-memory planner propagates each native VTCM requirement from its HMX operand:
-activation/output 2 KB, weight 128 B, and scale/bias config 256 B. Because every 32x32 FP16
-Crouton output tile is exactly 2 KB, `store` writes an output tile at its native address in
-C, and `store_at` at any other 2 KB boundary, such as a staging tile. Operand origins
-(`a_origin`, `b_origin`, `output_origin`) are the logical indices of each operand's first
-element, so the atoms address sub-matrices and stacked matrices.
-
-`GemmHMX.lower` takes only `T.gemm(A, B, C)`. Layout inference assigns native Crouton layouts
-to A and B (and to an fp16 C without a layout), and lowering checks that they have them,
-while it owns the dependency-only HMX states, the internal scale/bias block, the staging
-tiles and the loop over output tiles. It emits the same explicit atoms. Kernels may use one logical `T.copy` to move any
+`GemmHMX.lower` takes `T.gemm(A, B, C)`. Layout inference assigns native Crouton layouts to A
+and B (and to an fp16 C without a layout), and lowering checks that they have them. The call
+gets each operand's first tile and the tiles between A's rows or B's columns, so sub-matrices
+and stacked matrices need no copies. Kernels may use one logical `T.copy` to move any
 region of a strided matrix, in DDR or VTCM, fp16 or fp32, to or from a Crouton buffer: the
 lowering passes the region's origin and the matrix strides to one `tl_crouton_copy`, which
 converts fp32 on the way. Row pairs of a row-contiguous matrix move as HVX registers

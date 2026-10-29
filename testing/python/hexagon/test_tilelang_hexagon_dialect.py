@@ -7,21 +7,7 @@ import tilelang.language.common as T_comm
 from tilelang.backend import create_backend_context, get_backend
 from tilelang.hexagon import language as T
 
-HEXAGON_ONLY_NAMES = {"dma_copy", "dma_wait", "hmx"}
-
-HMX_ATOMS = {
-    "alloc_state",
-    "alloc_accumulator",
-    "alloc_convert_state",
-    "alloc_bias_state",
-    "acquire",
-    "release",
-    "load_bias",
-    "clear",
-    "mma",
-    "convert",
-    "store",
-}
+HEXAGON_ONLY_NAMES = {"dma_copy", "dma_wait"}
 
 
 def test_hexagon_language_composes_common_and_hexagon_symbols():
@@ -30,14 +16,13 @@ def test_hexagon_language_composes_common_and_hexagon_symbols():
     assert set(T.__all__) - set(T_comm.__all__) == HEXAGON_ONLY_NAMES
     # T.Kernel is shadowed by the Hexagon launch (num_workers=).
     assert T.Kernel is not T_comm.Kernel
-    assert set(T.hmx.__all__) - {"StateKind"} == HMX_ATOMS
 
 
 def test_hexagon_symbols_stay_out_of_other_dialects():
     assert HEXAGON_ONLY_NAMES.isdisjoint(T_comm.__all__)
     assert HEXAGON_ONLY_NAMES.isdisjoint(T_default.__all__)
     # The definitions live in the dialect, not in the shared language modules.
-    for name in ("dma_copy", "dma_wait", "alloc_hmx_accumulator", "hexagon_hmx_mma"):
+    for name in ("dma_copy", "dma_wait"):
         assert not hasattr(T_default, name)
         assert not hasattr(T_comm, name)
 

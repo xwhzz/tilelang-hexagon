@@ -4,9 +4,8 @@
 // C emitter that just calls into it. Distilled from the verified mini-htp /
 // htp-ops-lib recipes.
 //
-// T.gemm and explicit DSL kernels use stateful HMX instruction atoms.
-// Layout-copy helpers transform caller-owned buffers; the runtime owns
-// sessions.
+// The GEMMs on HMX (hmx_gemm.h) drive it through these instructions; the
+// runtime owns the session.
 //
 // Compiled into the FastRPC skel (.cc) with the Hexagon SDK on the include path
 // and -mhmx; it pulls in HAP headers, so it is only included by kernels that
@@ -179,62 +178,3 @@ struct tl_hmx_worker_scope {
   tl_hmx_worker_scope(const tl_hmx_worker_scope &) = delete;
   tl_hmx_worker_scope &operator=(const tl_hmx_worker_scope &) = delete;
 };
-
-// ---- explicit HMX atoms: the DSL owns the K-loop and Crouton storage
-// --------- These thin wrappers expose the accumulator protocol one instruction
-// at a time. A DSL kernel decides where dequantization sits relative to
-// clear/MAC/convert/ store and owns every Crouton buffer through alloc_shared.
-// TILE = 32; one tile is 1024 fp16 = 2 KB. On one Q6 thread, a source tile is
-// reusable after its final multiply packet; accumulator convert and output
-// store do not access A/W. `tl_hexagon_hmx` prefix so runtime/fastrpc.py pulls
-// in this header.
-//
-// The atom wrappers retain the dependency-only TIR state tokens as C
-// parameters. Hardware state remains implicit; the tokens only expose ordering
-// and ownership to compiler analyses.
-TL_HMX_INLINE void tl_hexagon_hmx_acc_acquire(void *acc_state) {
-  (void)acc_state;
-  tl_hmx_unit_acquire();
-}
-TL_HMX_INLINE void tl_hexagon_hmx_acc_release(void *acc_state) {
-  (void)acc_state;
-  tl_hmx_unit_release();
-}
-TL_HMX_INLINE void tl_hexagon_hmx_load_bias(void *bias_state,
-                                            const void *bias_vtcm) {
-  (void)bias_state;
-  tl_hmx_set_scales(bias_vtcm);
-}
-TL_HMX_INLINE void tl_hexagon_hmx_clear_acc(void *acc_state) {
-  (void)acc_state;
-  tl_hmx_clear_acc();
-}
-TL_HMX_INLINE void tl_hexagon_hmx_mma_atom(void *acc_state,
-                                           const __fp16 *activation,
-                                           const __fp16 *weight, size_t n = 1) {
-  (void)acc_state;
-  tl_hmx_mac_tiles(activation, weight, n);
-}
-TL_HMX_INLINE void tl_hexagon_hmx_convert_acc(void *cvt_state, void *acc_state,
-                                              void *bias_state,
-                                              const void *bias_source,
-                                              int mode) {
-  (void)cvt_state;
-  (void)acc_state;
-  (void)bias_state;
-  // The source address is carried through TIR until conversion so the shared
-  // memory planner cannot recycle it while mxmem2 is still in flight.
-  (void)bias_source;
-  tl_hmx_convert_acc(mode);
-}
-TL_HMX_INLINE void
-tl_hexagon_hmx_store_cvt_state(void *cvt_state, __fp16 *output, void *acc_state,
-                               void *bias_state, const void *bias_source) {
-  (void)cvt_state;
-  (void)acc_state;
-  (void)bias_state;
-  (void)bias_source;
-  // Conversion is a separate TileLang atom. This instruction only transfers
-  // the explicit HMX convert-state token to its Crouton VTCM destination.
-  tl_hmx_store_cvt(output);
-}

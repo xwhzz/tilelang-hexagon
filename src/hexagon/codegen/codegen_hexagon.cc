@@ -49,13 +49,6 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
   // Built on first use: the Ops are registered by static initializers in
   // other translation units.
   static const std::vector<HexagonBuiltin> builtins = {
-      {tl::hexagon_hmx_acquire(), "tl_hexagon_hmx_acc_acquire", true},
-      {tl::hexagon_hmx_release(), "tl_hexagon_hmx_acc_release", true},
-      {tl::hexagon_hmx_load_bias(), "tl_hexagon_hmx_load_bias", true},
-      {tl::hexagon_hmx_clear(), "tl_hexagon_hmx_clear_acc", true},
-      {tl::hexagon_hmx_mma(), "tl_hexagon_hmx_mma_atom", true},
-      {tl::hexagon_hmx_convert(), "tl_hexagon_hmx_convert_acc", true},
-      {tl::hexagon_hmx_store(), "tl_hexagon_hmx_store_cvt_state", true},
       {tl::hexagon_dma_submit(), "tl_hexagon_dma_async_submit", false, true,
        true},
       {tl::hexagon_dma_commit(), "tl_hexagon_dma_async_commit", false, true,
@@ -98,6 +91,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        2},
       {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", false, false,
        false, -1, 4},
+      {tl::hexagon_hmx_gemm(), "tl_hexagon_hmx_gemm", true, false, false, -1,
+       4},
       {tl::hexagon_hmx_gemm_blockscaled(), "tl_hexagon_hmx_gemm_blockscaled",
        true, false, false, -1, 5},
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", false, false, false, -1, 11},
@@ -618,18 +613,6 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
     dma_in_scope_ = true;
     uses_dma_async_ = true;
-    return;
-  }
-  if (dma_in_scope_ && call &&
-      (call->op.same_as(tl::hexagon_hmx_acquire()) ||
-       call->op.same_as(tl::hexagon_hmx_release()))) {
-    CodeGenC::VisitStmt_(op);
-    PrintIndent();
-    stream << "tl_dma_async.release_hmx = "
-           << (call->op.same_as(tl::hexagon_hmx_acquire())
-                   ? "tl_hmx_unit_release"
-                   : "nullptr")
-           << ";\n";
     return;
   }
   const HexagonBuiltin *builtin = call ? FindHexagonBuiltin(call) : nullptr;

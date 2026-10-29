@@ -9,7 +9,7 @@ import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
-from tilelang.hexagon.intrinsics.hmx import make_hmx_weight_layout
+from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 

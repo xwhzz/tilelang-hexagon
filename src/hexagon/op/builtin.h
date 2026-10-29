@@ -28,32 +28,6 @@ constexpr const char *kHexagonUnrollCount = "hexagon.unroll_count";
 
 } // namespace attr
 
-/*! \brief Acquire exclusive use of the implicit HMX accumulator state. */
-TVM_DLL const Op &hexagon_hmx_acquire();
-
-/*! \brief Release exclusive use of the implicit HMX accumulator state. */
-TVM_DLL const Op &hexagon_hmx_release();
-
-/*! \brief Load the HMX bias/scale register from a VTCM memory operand. */
-TVM_DLL const Op &hexagon_hmx_load_bias();
-
-/*! \brief Clear the implicit HMX accumulator. */
-TVM_DLL const Op &hexagon_hmx_clear();
-
-/*!
- * \brief Execute one HMX deep multiply packet for 1 to 32 contiguous K tiles.
- *
- * The memory operands are activation and weight Crouton tiles in VTCM.  The
- * result accumulates into the implicit accumulator state token.
- */
-TVM_DLL const Op &hexagon_hmx_mma();
-
-/*! \brief Convert the implicit HMX accumulator into convert state. */
-TVM_DLL const Op &hexagon_hmx_convert();
-
-/*! \brief Store HMX convert state to an output Crouton tile in VTCM. */
-TVM_DLL const Op &hexagon_hmx_store();
-
 // Hexagon User-DMA. A tile program owns one queue of descriptors, completed in
 // commit groups like cp.async groups: T.dma_copy is submits plus one commit,
 // and T.dma_wait(n) waits until at most n committed groups are pending.
@@ -161,6 +135,14 @@ TVM_DLL const Op &hexagon_crouton_copy();
 // multiplied by the fp32 scale[i * ld] first. The four print as template
 // arguments.
 TVM_DLL const Op &hexagon_crouton_tile_store();
+
+// tl_hexagon_hmx_gemm<rows, aligned, shared, direct>(M, N, K, c, ldc, a,
+// a_row_tile, b, b_column_tile, clear, stage, config) (hmx_gemm.h): C (+)= A
+// B^T on HMX for fp16 A and B in the HMX activation and weight layouts, column
+// tile nt of B at b + nt * b_column_tile; `stage` and `config` are its staging
+// tiles and conversion config. `direct`: an overwritten Crouton C takes HMX's
+// tiles without staging. The four flags print as template arguments.
+TVM_DLL const Op &hexagon_hmx_gemm();
 
 // tl_hexagon_hmx_gemm_blockscaled<signed, rows, aligned, scaled, shared>(M, N,
 // K, c, ldc, a, a_row_tile, b, panel_bytes, sfb, ld_sfb, gb, sfa, ld_sfa,

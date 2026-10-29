@@ -141,24 +141,6 @@ bool ContainsGridSync(const Stmt &stmt) {
   return found;
 }
 
-// Rejects runtime calls whose state is not per worker.
-void CheckWorkerBody(const Stmt &body) {
-  PostOrderVisit(body, [](const ObjectRef &node) {
-    const auto *call = node.as<CallNode>();
-    if (!call || !call->op.same_as(builtin::call_extern()) ||
-        call->args.empty())
-      return;
-    const auto *name = call->args[0].as<StringImmNode>();
-    if (!name)
-      return;
-    const std::string &callee = name->value;
-    ICHECK(callee.rfind("tl_hexagon_hmx", 0) != 0)
-        << "`" << callee
-        << "` is not worker-safe: inside T.Kernel(num_workers=...) only the "
-           "T.hmx atoms may use HMX";
-  });
-}
-
 class GridMaterializer : public StmtExprMutator {
 public:
   explicit GridMaterializer(const ProgramUseAnalysis &uses) : uses_(uses) {}
@@ -235,10 +217,6 @@ private:
       num_workers = value->cast<Integer>()->value;
     if (ContainsGridSync(body))
       CheckCoresident(chain, num_workers);
-    // The programs of a num_workers grid follow the worker rules even when the
-    // grid has only one, so legality does not depend on the grid size.
-    if (num_workers > 1)
-      CheckWorkerBody(body);
     if (num_workers > 1 && !HasSingleIteration(chain))
       return MakeParallel(chain, body, num_workers);
 

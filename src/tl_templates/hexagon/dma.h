@@ -659,10 +659,6 @@ struct tl_hexagon_dma_async_context {
   uint32_t submitted = 0;
   uint32_t retired = 0;
   int status;
-  // Releases the HMX unit lock on an early DMA error return. A function
-  // pointer keeps this header independent of the HMX runtime.
-  void (*release_hmx)() = nullptr;
-
   tl_hexagon_dma_async_context() {
     status = tl_hexagon_dma_engine_idle()
                  ? tl_hexagon_dma_queue_init(&queue, descriptors, transfers,
@@ -674,8 +670,6 @@ struct tl_hexagon_dma_async_context {
     // This stops DMA before descriptor storage and the VTCM lease can go away.
     if (queue.count && tl_hexagon_dma_queue_flush(&queue) != TL_HEXAGON_DMA_OK)
       tl_hexagon_dma_engine_reset();
-    if (release_hmx)
-      release_hmx();
   }
   tl_hexagon_dma_async_context(const tl_hexagon_dma_async_context &) = delete;
   tl_hexagon_dma_async_context &
