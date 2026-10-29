@@ -98,7 +98,9 @@ GEMMs, and their output or a part of the FFN's hidden units.
   which their results are.
 - **Attention.** Per KV head, against the KV cache in blocks of 128 positions with
   an online softmax: HMX multiplies the scores and P V, and a block of keys and
-  values packs once for the four query heads it serves.
+  values packs once for the four query heads it serves. The scores stay in the
+  fp16 tiles HMX stores them in, where the mask, the row maxima and exp2 work,
+  and P goes straight into the tiles P V reads.
 - **Layers.** One loop at run time, which reads each layer's kind from a table:
   the kernel's code does not grow with the depth.
 
@@ -106,17 +108,18 @@ On v79, in the DSP's time:
 
 | prompt | ms | t/s |
 |---:|---:|---:|
-| 40 | 24.6 | 1626 |
-| 128 | 23.9 | 5366 |
-| 256 | 44.3 | 5785 |
-| 512 | 90.1 | 5683 |
-| 1024 | 189.4 | 5407 |
-| 2048 | 422.5 | 4847 |
+| 40 | 23.2 | 1728 |
+| 128 | 21.0 | 6101 |
+| 256 | 41.6 | 6157 |
+| 512 | 86.6 | 5915 |
+| 1024 | 176.2 | 5813 |
+| 2048 | 373.6 | 5482 |
 
 nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
 1.1-1.5k t/s for a 40-token one on the same phone. The prefill's keys and
-values match the decode's, a token a step, to about 3e-3, and the tokens
-generated after it match the decode's.
+values match the decode's, a token a step, to 4.3e-3 at most (the last
+attention layer's keys), and the tokens generated after it match the
+decode's.
 
 ## On the device
 
@@ -135,7 +138,7 @@ Greedy, on v79:
     method or leverage the distributive property of multiplication over addition.
     ...
     Therefore, 17 times 23 is 391.
-    [prompt 17 tokens, prefill 25 ms; 105 tokens, decode 80.6 t/s; 1.59 s in all]
+    [prompt 17 tokens, prefill 21 ms; 105 tokens, decode 80.8 t/s; 1.59 s in all]
 
     > Translate to French: The weather is nice today.
     Le temps est agréable aujourd'hui.
@@ -145,10 +148,10 @@ Greedy, on v79:
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp128 | 23.9 | 5366 |
-| pp512 | 90.1 | 5683 |
-| pp1024 | 189.4 | 5407 |
-| tg128 | 1600.0 | 80.0 |
+| pp128 | 21.0 | 6101 |
+| pp512 | 86.6 | 5915 |
+| pp1024 | 176.2 | 5813 |
+| tg128 | 1597.1 | 80.1 |
 
 nexa on the same chip: pp1024 3618 t/s and tg128 69.5 t/s published, 65-68
 t/s measured on this phone.

@@ -39,9 +39,11 @@ These are the decisions that keep the adaptation small and the code navigable.
    which runs the grid's tile programs on the worker pool.)
 
 2. **The codegen is a thin C emitter; instruction details live in C templates.**
-   `CodeGenTileLangHexagon` emits plain C and maps HMX TIR intrinsics to wrappers in
-   `src/tl_templates/hexagon/hmx.h`. `GemmHMX` owns layout inference and composes the
-   explicit clear/MAC/convert/store sequence; codegen does not construct that protocol.
+   `CodeGenTileLangHexagon` emits plain C and prints each Hexagon builtin as a call of its
+   template function: the builtin's row in the codegen's table names the function and the
+   header that defines it, which the kernel then includes. `GemmHMX` owns layout
+   inference and lowers a `T.gemm` to one call of the HMX tile loop (`hmx_gemm.h`), which
+   owns the clear/MAC/convert/store protocol; codegen does not construct it.
 
 3. **Hexagon is a sibling of the CPU C backend, not a GPU codegen.** It emits C +
    HVX/HMX intrinsics, so `CodeGenTileLangHexagon` extends TVM's `CodeGenC` and reuses
@@ -344,7 +346,7 @@ Unrecoverable device conditions (a VTCM grant too small, a DMA error, too few wo
 a grid) reach the host as an error naming the kernel's status, not as silent wrong
 output. LFM2-1.2B ([`examples/hexagon/lfm2`](../examples/hexagon/lfm2/)) decodes at
 81 t/s on v79 in one kernel call per generation, 94% of the DMA roofline, and prefills a
-1024-token prompt in 189 ms (5407 t/s) on HMX, in one kernel call too. It chats from text
+1024-token prompt in 176 ms (5813 t/s) on HMX, in one kernel call too. It chats from text
 to text (`generate.py`), sampling on the device, and its WikiText-2 perplexity on the
 device (16.684) is that of the host reference with the device's arithmetic (16.683).
 
