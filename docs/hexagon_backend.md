@@ -280,9 +280,10 @@ and explicit HMX atoms.
   matching `TargetIsHexagon` (reuse the CPU lowering if it auto-vectorizes onto HVX);
   add it to the CMake GLOB (touch `CMakeLists.txt` to force re-glob).
 - **Add a hardware recipe** (e.g. a new HMX kernel): put the C in
-  `tl_templates/hexagon/*.h`, call it via `T.call_extern(...)` from an op's `lower`,
-  and make `fastrpc.gen_dsp` `#include` the header when the source mentions its name
-  (the lazy-include scheme). No compiler rebuild needed.
+  `tl_templates/hexagon/*.h`, declare a builtin for it (`src/hexagon/op/builtin.h`),
+  and give its codegen row the function and the header: a kernel that calls it
+  includes the header, and declares HMX use (`TL_HEXAGON_USES_HMX`) when the row
+  says so, which the skel's session then acquires.
 - **Make it idiomatic** (a tile-op instead of `call_extern`): register a
   `GemmBase`-style impl + `register_gemm_impl` (see `gemm_hmx.py`), so `T.gemm` lowers
   to it directly.

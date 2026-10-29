@@ -11,24 +11,29 @@ from tilelang.hexagon.runtime import fastrpc
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 
 
-def _session_lines(source):
+def _session(source):
+    """The skel's open and close of a kernel source."""
     skel = fastrpc.gen_dsp("tl_probe", "probe_kernel", source, [])
     assert "#include <tl_templates/hexagon/power.h>" in skel
-    open_line = next(line for line in skel.splitlines() if "tl_probe_open(" in line)
-    close_line = next(line for line in skel.splitlines() if "tl_probe_close(" in line)
-    return open_line, close_line
+
+    def body(name):
+        start = skel.index(f"AEEResult {name}(")
+        return skel[start : skel.index("\n}\n", start)]
+
+    return body("tl_probe_open"), body("tl_probe_close")
 
 
 def test_every_session_votes_for_clocks():
-    open_line, close_line = _session_lines("int32_t probe_kernel() { return 0; }")
-    assert "tl_power_vote();" in open_line
-    assert "tl_power_unvote();" in close_line
+    opening, closing = _session("int32_t probe_kernel() { return 0; }")
+    assert "tl_power_vote();" in opening
+    assert "tl_power_unvote();" in closing
 
 
 def test_hmx_sessions_start_after_the_vote_and_end_before_its_removal():
-    open_line, close_line = _session_lines("int32_t probe_kernel() { tl_hexagon_hmx_acc_release(0); return 0; }")
-    assert open_line.index("tl_power_vote();") < open_line.index("tl_hmx_session_init();")
-    assert close_line.index("tl_hmx_session_deinit();") < close_line.index("tl_power_unvote();")
+    # The kernel's source says that it uses HMX; the session then takes it.
+    opening, closing = _session("#define TL_HEXAGON_USES_HMX 1\nint32_t probe_kernel() { return 0; }")
+    assert opening.index("tl_power_vote();") < opening.index("#if defined(TL_HEXAGON_USES_HMX)") < opening.index("tl_hmx_session_init();")
+    assert closing.index("tl_hmx_session_deinit();") < closing.index("tl_power_unvote();")
 
 
 def _clock_probe(with_hmx):

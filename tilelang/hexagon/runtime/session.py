@@ -94,13 +94,11 @@ def gen_idl(iface: str) -> str:
 def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     """The skel of `kernels`, (name, source, plans) each: one translation unit,
     every kernel's entry renamed to its index."""
-    sources = "\n".join(source for _, source, _ in kernels)
-    rt = fastrpc.skel_runtime(sources)
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
         "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <type_traits>\n",
         f'#include "{iface}.h"\n\n',
-        rt.includes,
+        fastrpc.SKEL_INCLUDES,
     ]
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
@@ -135,7 +133,10 @@ static uint8_t* tl_session_address(int fd) {{
 extern "C" {{
 #endif
 
-AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {rt.open}return AEE_SUCCESS; }}
+AEEResult {iface}_open(const char* uri, remote_handle64* h) {{
+  (void)uri; *h = 0;
+{fastrpc.SKEL_OPEN}  return AEE_SUCCESS;
+}}
 
 AEEResult {iface}_release(remote_handle64 h, int32 fd) {{
   (void)h;
@@ -151,7 +152,7 @@ AEEResult {iface}_release(remote_handle64 h, int32 fd) {{
 AEEResult {iface}_close(remote_handle64 h) {{
   (void)h;
   while (tl_session_nmaps > 0) {{ HAP_mmap_put(tl_session_maps[tl_session_nmaps - 1].fd); --tl_session_nmaps; }}
-  {rt.close}return AEE_SUCCESS;
+{fastrpc.SKEL_CLOSE}  return AEE_SUCCESS;
 }}
 
 AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, int32 writeback) {{

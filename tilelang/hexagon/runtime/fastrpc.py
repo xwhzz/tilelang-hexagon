@@ -1,7 +1,7 @@
-"""The FastRPC pieces of a kernel's project: what its skel needs from the
-templates (:func:`skel_runtime`), the PD's setup, the kernel status, and the
-CMakeLists. A session's project (:mod:`.session`) builds its skel and agent
-with them.
+"""The FastRPC pieces of a kernel's project: what its skel adds around the
+kernels' sources (``SKEL_OPEN``, ``SKEL_CLOSE``), the PD's setup, the kernel
+status, and the CMakeLists. A session's project (:mod:`.session`) builds its
+skel and agent with them.
 
 On a Linux BSP, where there is no agent, a kernel's own project
 (:func:`write_project`) adds an IDL with the kernel's buffers and a one-shot
@@ -107,65 +107,30 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
     )
 
 
-@dataclass
-class SkelRuntime:
-    """What a skel needs around kernel sources: runtime headers, and the
-    resources its session acquires at ``_open`` and releases at ``_close``."""
-
-    includes: str
-    open: str
-    close: str
-
-
-def skel_runtime(kernel_source: str) -> SkelRuntime:
-    """The skel runtime of the kernels in ``kernel_source``."""
-    # Pull in the HMX matmul runtime only when the kernel calls into it (it
-    # depends on SDK/HAP headers + -mhmx, so non-HMX kernels stay light).
-    # alloc_shared buffers lower to `tl_vtcm_arena()` offsets, or to the per-worker
-    # arenas of `tl_vtcm_worker_arenas` — pull in the VTCM arena header when the
-    # kernel uses shared memory (same lazy-include scheme).
-    uses_vtcm = "tl_vtcm" in kernel_source
-    hmx = "tl_hexagon_hmx" in kernel_source
-    # The worker-pool header (qurt threads) is pulled in transitively by hmx.h for
-    # the multithreaded HMX path; include it directly for a non-HMX worker kernel
-    # (a tl_parallel_for call).
-    uses_worker = "tl_parallel" in kernel_source and not hmx
-    headers = [
-        ("vtcm.h", uses_vtcm),
-        ("worker.h", uses_worker),
-        ("hmx.h", hmx),
-        # HVX map/reduce math primitives (exp2/recip/rsqrt/reduce) — pulled in
-        # when a kernel references the `tl_hvx` prefix (self-contained, needs
-        # only -mhvx).
-        ("hvx_math.h", "tl_hvx" in kernel_source),
-        # T.gemm on HVX.
-        ("hvx_gemm.h", "tl_hvx_gemm" in kernel_source),
-        # Copies between Crouton matrices and strided matrices (T.copy).
-        ("crouton.h", "tl_crouton_" in kernel_source),
-        # T.gemm_blockscaled on HMX.
-        ("hmx_gemm.h", "tl_hexagon_hmx_gemm" in kernel_source),
-    ]
-    includes = "#include <tl_templates/hexagon/power.h>\n" + "".join(
-        f"#include <tl_templates/hexagon/{h}>\n" for h, used in headers if used
-    )
-    # Every session votes for clocks at _open and removes the vote at _close
-    # (power.h). Acquire/release the HMX session at _open/_close too: _close
-    # MUST deinit or VTCM/HMX leak for the agent's life.
-    # tl_hmx_session_deinit already releases VTCM, so the standalone vtcm_close /
-    # vtcm_check only apply to non-HMX shared kernels (avoids a double release).
-    # Fail _open loudly if HMX/VTCM couldn't be acquired (e.g. a leaked agent
-    # still holds VTCM) rather than running and returning silent zeros — the
-    # kernel discards return codes, so _open is the only place to surface it.
-    open_ = "tl_power_vote(); "
-    close = ""
-    if hmx:
-        open_ += "tl_hmx_session_init(); if (!tl_hmx_session_ok()) return AEE_EFAILED; "
-        close += "tl_hmx_session_deinit(); "
-    elif uses_vtcm:
-        open_ += "if (!tl_vtcm_base()) return AEE_EFAILED; "
-        close += "tl_vtcm_release(); "
-    close += "tl_power_unvote(); "
-    return SkelRuntime(includes, open_, close)
+# What a skel adds around its kernels' sources, which include the template
+# headers they call. Every session votes for clocks at _open and removes the
+# vote at _close (power.h). It acquires HMX, or the VTCM alone, for kernels
+# whose sources say they use them (the codegen defines TL_HEXAGON_USES_HMX and
+# TL_HEXAGON_USES_VTCM); _close must release them, or they leak for the agent's
+# life, and tl_hmx_session_deinit releases the VTCM too. _open fails loudly
+# when they cannot be acquired (e.g. a leaked agent still holds VTCM), rather
+# than running and returning silent zeros.
+SKEL_INCLUDES = "#include <tl_templates/hexagon/power.h>\n"
+SKEL_OPEN = """  tl_power_vote();
+#if defined(TL_HEXAGON_USES_HMX)
+  tl_hmx_session_init();
+  if (!tl_hmx_session_ok()) return AEE_EFAILED;
+#elif defined(TL_HEXAGON_USES_VTCM)
+  if (!tl_vtcm_base()) return AEE_EFAILED;
+#endif
+"""
+SKEL_CLOSE = """#if defined(TL_HEXAGON_USES_HMX)
+  tl_hmx_session_deinit();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  tl_vtcm_release();
+#endif
+  tl_power_unvote();
+"""
 
 
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
@@ -222,19 +187,18 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         else:
             skel_args.append(f"const uint8* {pl.name}, int {pl.name}Len")
             call_args.append(f"({pl.ctype}*){pl.name}")
-    rt = skel_runtime(kernel_source)
     return (
         "// Auto-generated FastRPC skel impl for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n"
         "#include <type_traits>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
-        f"{rt.includes}"
+        f"{SKEL_INCLUDES}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
         f"{FORWARD_KERNEL_STATUS}\n"
         '#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
-        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{ (void)uri; *h = 0; {rt.open}return AEE_SUCCESS; }}\n"
-        f"AEEResult {iface}_close(remote_handle64 h) {{ (void)h; {rt.close}return AEE_SUCCESS; }}\n\n"
+        f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{\n  (void)uri; *h = 0;\n{SKEL_OPEN}  return AEE_SUCCESS;\n}}\n\n"
+        f"AEEResult {iface}_close(remote_handle64 h) {{\n  (void)h;\n{SKEL_CLOSE}  return AEE_SUCCESS;\n}}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
         f"  return tl_hexagon_forward_kernel_status([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
         "}\n\n"

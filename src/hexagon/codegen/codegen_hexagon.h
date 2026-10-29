@@ -13,6 +13,7 @@
 
 #include "backend/common/codegen/codegen_c_base.h"
 #include "tvm/target/codegen.h"
+#include <set>
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
@@ -88,8 +89,14 @@ private:
   int64_t grid_bytes_ = 0;
   /*! \brief whether a tile program's DMA queue (tl_dma_async) is in scope */
   bool dma_in_scope_ = false;
-  /*! \brief whether any emitted kernel uses the managed DMA queue */
-  bool uses_dma_async_ = false;
+  /*!
+   * \brief the template headers whose code the module calls, which its
+   * preamble includes, and whether it uses HMX and VTCM, which the session
+   * that runs it acquires (TL_HEXAGON_USES_HMX, TL_HEXAGON_USES_VTCM)
+   */
+  std::set<std::string> headers_;
+  bool uses_hmx_ = false;
+  bool uses_vtcm_ = false;
   /*! \brief whether the emitter is inside a worker loop body */
   bool in_worker_ = false;
   /*! \brief the program index of the worker loop being emitted */

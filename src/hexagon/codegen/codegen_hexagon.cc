@@ -31,6 +31,8 @@ namespace {
 struct HexagonBuiltin {
   Op op;
   const char *function;
+  // The template header that defines the function, which the kernel includes.
+  const char *header;
   bool uses_hmx;
   // Takes the tile program's DMA queue (tl_dma_async) as the first argument.
   bool on_dma_queue = false;
@@ -49,58 +51,59 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
   // Built on first use: the Ops are registered by static initializers in
   // other translation units.
   static const std::vector<HexagonBuiltin> builtins = {
-      {tl::hexagon_dma_submit(), "tl_hexagon_dma_async_submit", false, true,
-       true},
-      {tl::hexagon_dma_commit(), "tl_hexagon_dma_async_commit", false, true,
-       true},
-      {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", false, true, true,
-       1},
-      {tl::hexagon_exp(), "tl_hvx_exp", false},
-      {tl::hexagon_exp2(), "tl_hvx_exp2", false},
-      {tl::hexagon_log(), "tl_hvx_log", false},
-      {tl::hexagon_log2(), "tl_hvx_log2", false},
-      {tl::hexagon_sqrt(), "tl_hvx_sqrt", false},
-      {tl::hexagon_rsqrt(), "tl_hvx_rsqrt", false},
-      {tl::hexagon_tanh(), "tl_hvx_tanh", false},
-      {tl::hexagon_sigmoid(), "tl_hvx_sigmoid", false},
-      {tl::hexagon_erf(), "tl_hvx_erf", false},
-      {tl::hexagon_fabs(), "tl_hvx_fabs", false},
-      {tl::hexagon_exp_fast(), "tl_hvx_exp_fast", false},
-      {tl::hexagon_exp2_fast(), "tl_hvx_exp2_fast", false},
-      {tl::hexagon_log_fast(), "tl_hvx_log_fast", false},
-      {tl::hexagon_log2_fast(), "tl_hvx_log2_fast", false},
-      {tl::hexagon_sqrt_fast(), "tl_hvx_sqrt_fast", false},
-      {tl::hexagon_rsqrt_fast(), "tl_hvx_rsqrt_fast", false},
-      {tl::hexagon_tanh_fast(), "tl_hvx_tanh_fast", false},
-      {tl::hexagon_sigmoid_fast(), "tl_hvx_sigmoid_fast", false},
-      {tl::hexagon_erf_fast(), "tl_hvx_erf_fast", false},
-      {tl::hexagon_div_fast(), "tl_hvx_div_fast", false},
-      {tl::hexagon_reduce_rows(), "tl_hvx_reduce_rows", false, false, false, -1,
-       3},
-      {tl::hexagon_crouton_reduce(), "tl_crouton_reduce", false, false, false,
-       -1, 4},
-      {tl::hexagon_load_lanes(), "tl_hvx_load_lanes", false, false, false, -1,
-       1},
-      {tl::hexagon_broadcast_lane(), "tl_hvx_broadcast_lane", false, false,
+      {tl::hexagon_dma_submit(), "tl_hexagon_dma_async_submit", "dma.h", false,
+       true, true},
+      {tl::hexagon_dma_commit(), "tl_hexagon_dma_async_commit", "dma.h", false,
+       true, true},
+      {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", "dma.h", false,
+       true, true, 1},
+      {tl::hexagon_exp(), "tl_hvx_exp", "hvx_math.h", false},
+      {tl::hexagon_exp2(), "tl_hvx_exp2", "hvx_math.h", false},
+      {tl::hexagon_log(), "tl_hvx_log", "hvx_math.h", false},
+      {tl::hexagon_log2(), "tl_hvx_log2", "hvx_math.h", false},
+      {tl::hexagon_sqrt(), "tl_hvx_sqrt", "hvx_math.h", false},
+      {tl::hexagon_rsqrt(), "tl_hvx_rsqrt", "hvx_math.h", false},
+      {tl::hexagon_tanh(), "tl_hvx_tanh", "hvx_math.h", false},
+      {tl::hexagon_sigmoid(), "tl_hvx_sigmoid", "hvx_math.h", false},
+      {tl::hexagon_erf(), "tl_hvx_erf", "hvx_math.h", false},
+      {tl::hexagon_fabs(), "tl_hvx_fabs", "hvx_math.h", false},
+      {tl::hexagon_exp_fast(), "tl_hvx_exp_fast", "hvx_math.h", false},
+      {tl::hexagon_exp2_fast(), "tl_hvx_exp2_fast", "hvx_math.h", false},
+      {tl::hexagon_log_fast(), "tl_hvx_log_fast", "hvx_math.h", false},
+      {tl::hexagon_log2_fast(), "tl_hvx_log2_fast", "hvx_math.h", false},
+      {tl::hexagon_sqrt_fast(), "tl_hvx_sqrt_fast", "hvx_math.h", false},
+      {tl::hexagon_rsqrt_fast(), "tl_hvx_rsqrt_fast", "hvx_math.h", false},
+      {tl::hexagon_tanh_fast(), "tl_hvx_tanh_fast", "hvx_math.h", false},
+      {tl::hexagon_sigmoid_fast(), "tl_hvx_sigmoid_fast", "hvx_math.h", false},
+      {tl::hexagon_erf_fast(), "tl_hvx_erf_fast", "hvx_math.h", false},
+      {tl::hexagon_div_fast(), "tl_hvx_div_fast", "hvx_math.h", false},
+      {tl::hexagon_reduce_rows(), "tl_hvx_reduce_rows", "hvx_reduce.h", false,
+       false, false, -1, 3},
+      {tl::hexagon_crouton_reduce(), "tl_crouton_reduce", "crouton.h", false,
+       false, false, -1, 4},
+      {tl::hexagon_load_lanes(), "tl_hvx_load_lanes", "hvx_lanes.h", false,
+       false, false, -1, 1},
+      {tl::hexagon_broadcast_lane(), "tl_hvx_broadcast_lane", "hvx_lanes.h",
+       false, false, false, -1, 2},
+      {tl::hexagon_load_replicate(), "tl_hvx_load_replicate", "hvx_lanes.h",
+       false, false, false, -1, 3},
+      {tl::hexagon_load_repeat(), "tl_hvx_load_repeat", "hvx_lanes.h", false,
+       false, false, -1, 3},
+      {tl::hexagon_crouton_copy(), "tl_crouton_copy", "crouton.h", false, false,
        false, -1, 2},
-      {tl::hexagon_load_replicate(), "tl_hvx_load_replicate", false, false,
-       false, -1, 3},
-      {tl::hexagon_load_repeat(), "tl_hvx_load_repeat", false, false, false, -1,
-       3},
-      {tl::hexagon_crouton_copy(), "tl_crouton_copy", false, false, false, -1,
-       2},
-      {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", false, false,
+      {tl::hexagon_crouton_tile_store(), "tl_crouton_tile_store", "crouton.h",
+       false, false, false, -1, 4},
+      {tl::hexagon_hmx_gemm(), "tl_hexagon_hmx_gemm", "hmx_gemm.h", true, false,
        false, -1, 4},
-      {tl::hexagon_hmx_gemm(), "tl_hexagon_hmx_gemm", true, false, false, -1,
-       4},
       {tl::hexagon_hmx_gemm_blockscaled(), "tl_hexagon_hmx_gemm_blockscaled",
-       true, false, false, -1, 5},
-      {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", false, false, false, -1, 11},
-      {tl::hexagon_hvx_gemm_int(), "tl_hvx_gemm_int", false, false, false, -1,
-       8},
-      {tl::hexagon_hvx_gemm_int_scaled(), "tl_hvx_gemm_int_scaled", false,
-       false, false, -1, 10},
-      {tl::hexagon_exclusive_pointer(), "tl_exclusive", false},
+       "hmx_gemm.h", true, false, false, -1, 5},
+      {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", "hvx_gemm.h", false, false, false,
+       -1, 11},
+      {tl::hexagon_hvx_gemm_int(), "tl_hvx_gemm_int", "hvx_gemm.h", false,
+       false, false, -1, 8},
+      {tl::hexagon_hvx_gemm_int_scaled(), "tl_hvx_gemm_int_scaled",
+       "hvx_gemm.h", false, false, false, -1, 10},
+      {tl::hexagon_exclusive_pointer(), "tl_exclusive", "common.h", false},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))
@@ -180,14 +183,20 @@ CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
   preamble_stream_ << "// tilelang Hexagon (cDSP) kernel\n";
-  preamble_stream_ << "#include <tl_templates/hexagon/common.h>\n";
-  preamble_stream_ << "\n";
+  headers_.insert("common.h");
   CodeGenC::Init(output_ssa);
 }
 
 void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
-  if (uses_dma_async_)
-    os << "#include <tl_templates/hexagon/dma.h>\n";
+  // What the session that runs the kernel acquires for it (the skel's open,
+  // runtime/fastrpc.py): HMX, or the VTCM alone.
+  if (uses_hmx_)
+    os << "#define TL_HEXAGON_USES_HMX 1\n";
+  if (uses_vtcm_)
+    os << "#define TL_HEXAGON_USES_VTCM 1\n";
+  for (const std::string &header : headers_)
+    os << "#include <tl_templates/hexagon/" << header << ">\n";
+  os << "\n";
 }
 
 void CodeGenTileLangHexagon::PrintFuncPrefix(std::ostream &os) { // NOLINT(*)
@@ -378,6 +387,7 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   std::string extent = PrintExpr(op->extent);
   bool hmx = UsesHMX(op->body);
   bool grid_sync = UsesGridSync(op->body);
+  headers_.insert(hmx ? "hmx.h" : "worker.h");
   // The status is a declaration, not an if condition: hexagon-clang 19
   // asserts on a #pragma (InterleaveMaps' unroll counts) inside a lambda that
   // the tentative parse of a condition caches.
@@ -463,6 +473,8 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     // arenas or the other grid buffers.
     ICHECK(!in_worker_) << "global.vtcm buffer `" << op->buffer->name
                         << "` is allocated inside a tile program";
+    headers_.insert("vtcm.h");
+    uses_vtcm_ = true;
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
@@ -475,6 +487,8 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     // worker, at the worker's slice (tl_arena).
     ICHECK(!arena_bound_) << "A Hexagon tile program has one VTCM arena";
     arena_bound_ = true;
+    headers_.insert("vtcm.h");
+    uses_vtcm_ = true;
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
@@ -546,6 +560,8 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
   if (const HexagonBuiltin *builtin = FindHexagonBuiltin(op)) {
     ICHECK(!builtin->on_dma_queue || dma_in_scope_)
         << builtin->function << " needs the tile program's DMA queue";
+    headers_.insert(builtin->header);
+    uses_hmx_ |= builtin->uses_hmx;
     os << builtin->function;
     size_t first = static_cast<size_t>(builtin->template_args);
     for (size_t i = 0; i < first; ++i) {
@@ -612,7 +628,7 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     PrintIndent();
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
     dma_in_scope_ = true;
-    uses_dma_async_ = true;
+    headers_.insert("dma.h");
     return;
   }
   const HexagonBuiltin *builtin = call ? FindHexagonBuiltin(call) : nullptr;
@@ -663,6 +679,7 @@ void CodeGenTileLangHexagon::VisitExpr_(const MaxNode *op,
 void CodeGenTileLangHexagon::VisitExpr_(const DivNode *op,
                                         std::ostream &os) { // NOLINT(*)
   if (op->dtype.is_float() && op->dtype.lanes() > 1) {
+    headers_.insert("hvx_math.h");
     os << "tl_hvx_div(" << PrintExpr(op->a) << ", " << PrintExpr(op->b) << ")";
     return;
   }
@@ -725,6 +742,7 @@ std::string CodeGenTileLangHexagon::GetVecLoad(DataType t,
   if (VectorAligned(t, base))
     return CodeGenTileLangCBase::GetVecLoad(t, buffer, base);
   std::ostringstream os;
+  headers_.insert("hvx_lanes.h");
   os << "tl_hvx_vec_loadu<";
   PrintType(t, os);
   os << ">(";
@@ -744,6 +762,7 @@ void CodeGenTileLangHexagon::PrintVecStore(const BufferNode *buffer, DataType t,
     return;
   }
   PrintIndent();
+  headers_.insert("hvx_lanes.h");
   stream << "tl_hvx_vec_storeu(";
   if (buffer->dtype.bits() == 4)
     stream << SubByteAddress(buffer, base);

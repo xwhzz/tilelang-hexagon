@@ -57,3 +57,25 @@ def test_line_directives_follow_the_pass_config():
     source = _source(_copy_kernel(), **{tilelang.PassConfigKey.TL_EMIT_LINE_DIRECTIVES: True})
     files = set(re.findall(r'^#line \d+ "(.*)"$', source, re.M))
     assert __file__ in files, source
+
+
+def test_kernels_include_what_they_call_and_declare_what_they_use():
+    @T.prim_func
+    def gemm(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((64, 64), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((64, 64), "float16")
+            b = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_shared((64, 64), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, c, clear_accum=True)
+            T.copy(c, C)
+
+    source = _source(gemm)
+    assert "#define TL_HEXAGON_USES_HMX 1" in source and "#define TL_HEXAGON_USES_VTCM 1" in source
+    for header in ("crouton.h", "hmx_gemm.h", "vtcm.h"):
+        assert f"#include <tl_templates/hexagon/{header}>" in source
+    # A kernel of VTCM buffers and copies alone: no HMX, no HMX headers.
+    source = _source(_copy_kernel(dma=False))
+    assert "#define TL_HEXAGON_USES_VTCM 1" in source and "TL_HEXAGON_USES_HMX" not in source
+    assert "hmx" not in "".join(line for line in source.splitlines() if line.startswith("#include"))

@@ -11,8 +11,7 @@
 // hvx_gemm.h), the calls of one configuration share one copy of the code, so
 // a megakernel that multiplies in hundreds of places, a prefill's every
 // block, stays small enough to compile and to run from the instruction cache.
-//
-// The `tl_hexagon_hmx` prefix makes runtime/fastrpc.py set up the HMX session.
+
 #include <tl_templates/hexagon/crouton.h>
 #include <tl_templates/hexagon/hmx.h>
 
