@@ -14,7 +14,7 @@ for what makes a kernel fast.
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) |
 | `example_gemv_w4a16.py` | a w4a16 decode GEMV: `T.gemm_blockscaled` of int16 activations by 4-bit panel-layout weights on HVX, streamed by DMA across `num_workers` workers |
-| [`lfm2/`](lfm2/) | LFM2-1.2B end to end: GPTQ weights, a decode megakernel that runs every token of a generation in one call, and an HMX prefill of a whole prompt in one call |
+| [`lfm/`](lfm/) | LFM2-1.2B end to end: GPTQ weights, a decode megakernel that runs every token of a generation in one call, and an HMX prefill of a whole prompt in one call; LFM3-1.7B's reference and fp16 bundle |
 
 ## Prerequisites
 
@@ -46,8 +46,8 @@ python example_rmsnorm.py --m 64 --n 256
 python example_gemv_w4a16.py --k 2048 --n 8192
 ```
 
-Each prints its error against a torch reference and `PASS` or `FAIL`. The LFM2 example
-has its own [README](lfm2/README.md).
+Each prints its error against a torch reference and `PASS` or `FAIL`. The LFM example
+has its own [README](lfm/README.md).
 
 ## Device tests
 

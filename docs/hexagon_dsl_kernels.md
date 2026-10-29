@@ -4,7 +4,7 @@ How DSL constructs lower on Hexagon and what makes them fast: the HVX register r
 on HMX and HVX (floating point, integer and block-scaled), pipelines that stream by DMA, and
 programs that meet at `T.sync_grid()`. Companion to [`hexagon_backend.md`](hexagon_backend.md),
 the backend's architecture. The kernels of `examples/hexagon/` use what is described here;
-`examples/hexagon/lfm2/` composes it into a whole model.
+`examples/hexagon/lfm/` composes it into whole models.
 
 ## 1. The essential HVX rule: the narrowest dtype must fill a whole register
 

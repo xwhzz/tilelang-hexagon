@@ -25,14 +25,14 @@ Tile Language (**tile-lang**) is a concise domain-specific language designed to 
 
 This fork adds a TileLang backend for Qualcomm's Hexagon NPU, developed and tested on the v79 cDSP of a Snapdragon 8 Elite phone. Kernels written with TileLang's tile operations (`T.copy`, `T.gemm`, `T.Parallel`, `T.reduce_*`, `T.Pipelined`) compile to HVX vector code, HMX matrix multiplies, VTCM buffers and DMA streams, and run on the NPU through FastRPC. See the [backend guide](docs/hexagon_backend.md) and the [operator examples](examples/hexagon/README.md).
 
-On it, [LFM2-1.2B](examples/hexagon/lfm2/README.md) runs end to end at batch 1, with every operation written in TileLang: the prefill, the decode and the sampling all run on the NPU. Its projections are 4-bit (GPTQ, an fp16 scale per 64 columns) and its tied embedding and head 8-bit; its WikiText-2 perplexity on the device is 16.68, against 16.29 in bf16. On the phone:
+On it, [LFM2-1.2B](examples/hexagon/lfm/README.md) runs end to end at batch 1, with every operation written in TileLang: the prefill, the decode and the sampling all run on the NPU. Its projections are 4-bit (GPTQ, an fp16 scale per 64 columns) and its tied embedding and head 8-bit; its WikiText-2 perplexity on the device is 16.68, against 16.29 in bf16. On the phone:
 
 | | Measured | Bound | Of the bound |
 | --- | --- | --- | --- |
 | Decode, 128 tokens | 80.1 tokens/s | 83 tokens/s: 685 MB of weights a token at 57 GB/s, the DSP's measured DMA peak | 96% |
 | Prefill, 1024 tokens | 176.2 ms (5813 tokens/s) | 129 ms: the time HMX alone needs for the prefill's matrix multiplies | 73% |
 
-Each number is the median of 5 runs of `bench.py`. A run is one kernel call, timed on the phone around its FastRPC call: the call's overhead is included; tokenization and the round trip to the PC that drives the phone are not. The [optimization record](examples/hexagon/lfm2/OPTIMIZATION.md) gives each step's measured gain, what did not help, and where the time goes.
+Each number is the median of 5 runs of `bench.py`. A run is one kernel call, timed on the phone around its FastRPC call: the call's overhead is included; tokenization and the round trip to the PC that drives the phone are not. The [optimization record](examples/hexagon/lfm/OPTIMIZATION.md) gives each step's measured gain, what did not help, and where the time goes.
 
 An AI coding agent, under the maintainer's direction, rewrote the backend and built the LFM2 model: 75 pull requests between 2026-10-26 and 2026-10-29, which account for more than 80% of the backend's current lines of code, tests and docs.
 

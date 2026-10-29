@@ -32,7 +32,7 @@ from tilelang.hexagon import language as T
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bundle  # noqa: E402
-from model import Config  # noqa: E402
+from model import Config, is_lfm2  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from stream import Phase, Projection, Stream, gemv_block, quantize  # noqa: E402
 
@@ -186,6 +186,7 @@ def add_gumbel(logit, scale, seed, pos, first, hx, hy):
 
 def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
     """The decode kernel for config c and the bundle's tensor `shapes`."""
+    assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
     H, KVH = c.heads, c.kv_heads
     conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]
@@ -462,7 +463,9 @@ BUNDLE_ARGS = (
 def rope_tables(c: Config, max_pos: int) -> tuple:
     """cos and sin [max_pos, head_dim / 2] of RoPE's angles, as model.rope computes them."""
     d = c.head_dim
-    inv = 1.0 / (c.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float64) / d))
+    ((theta, fraction),) = c.rope.values()
+    assert fraction == 1.0
+    inv = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64) / d))
     angles = torch.arange(max_pos, dtype=torch.float64)[:, None] * inv[None, :]
     return angles.cos().float().contiguous(), angles.sin().float().contiguous()
 
@@ -481,7 +484,7 @@ class Decoder:
         from tilelang.hexagon.runtime.session import Session
 
         header = bundle.read_header(bundle_path)
-        c = Config(**{k: tuple(v) if isinstance(v, list) else v for k, v in header["config"].items()})
+        c = Config.from_dict(header["config"])
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
         self.prefill_rows = prefill_rows
         assert max_pos % POS_BLOCK == 0

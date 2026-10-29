@@ -1,12 +1,17 @@
-# LFM2 on Hexagon
+# LFM2 and LFM3 on Hexagon
 
 LFM2-1.2B (`LiquidAI/LFM2-1.2B`; LFM2.5-1.2B has the same architecture) on the
-v79 cDSP, every operation a TileLang kernel, at batch 1.
+v79 cDSP, every operation a TileLang kernel, at batch 1. LFM3-1.7B
+(`LiquidAI/LFM3-1.7B`), unquantized, is on its way
+([#179](https://github.com/xwhzz/tilelang-hexagon/issues/179)): its reference
+and its fp16 bundle are here (see [LFM3](#lfm3)), its kernels not yet. The
+other sections are LFM2's.
 
 | File | |
 |---|---|
-| `model.py` | The model in plain PyTorch, on explicit decode state: the reference. |
-| `quantize.py` | GPTQ, the device bundle, and the bundle's perplexity with the device's arithmetic. |
+| `model.py` | LFM2 and LFM3 in plain PyTorch, on explicit decode state: the reference. |
+| `quantize.py` | LFM2's GPTQ, its 4-bit bundle, and the bundle's perplexity with the device's arithmetic. |
+| `convert.py` | The fp16 bundle of an LFM2 or LFM3 checkpoint: its projections in HMX's Crouton tiles. |
 | `bundle.py` | The bundle file: one header and every tensor the kernels read, in their layouts. |
 | `stream.py` | The weight streams of the kernels, and the decode's w4a16 GEMV blocks. |
 | `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds both kernels. |
@@ -15,7 +20,7 @@ v79 cDSP, every operation a TileLang kernel, at batch 1.
 | `generate.py` | Chat on the device: the reply streams as it is generated. |
 | `bench.py` | Prompt processing and token generation on the device, in the style of llama-bench. |
 | `ppl.py` | The bundle's perplexity on the device. |
-| `tiny.py` | A small random LFM2 with the same structure, for tests. |
+| `tiny.py` | Small random LFM2 and LFM3 models with the real ones' structures, for tests. |
 | `OPTIMIZATION.md` | How the decode and the prefill got fast: each step's measured gain, what did not help, where the time goes, and what is left. |
 
 ## Weights
@@ -163,3 +168,26 @@ without saying how they are timed. On this phone, nexa's demo app decodes at
 65-68 t/s and prefills a 40-token prompt at 1.1-1.5k t/s, and llama.cpp's
 Hexagon backend (Q4_0, `llama-bench -p 1024 -n 128`) runs pp1024 at 3175 t/s
 and tg128 at 35.6 t/s.
+
+## LFM3
+
+LFM3-1.7B has 24 layers: 13 short convs of 7 taps, 6 of full attention and 5
+of sliding attention over the last 256 positions, each followed by a SwiGLU
+FFN of 7680 hidden units. Each branch's output is normed too (sandwich norm),
+and each head's attention output is gated by a sigmoid of the layer's input.
+`model.py` matches Liquid AI's implementation (the checkpoint's own code, on
+transformers 5): on a 700-token prompt, which spans the sliding window, its
+logits are within 1.5e-4 of it (relative 4.5e-6), and every argmax agrees.
+
+Its weights stay unquantized. `convert.py` writes them in fp16, which moves
+0.029 % of them, by at most 3e-8; on the bundle's weights, the reference's
+logits are within 1.7e-4 of the official ones (relative 5.0e-6).
+
+    python convert.py --model LFM3-1.7B --out lfm3.bundle
+
+Each projection is stored as the HMX weight operand it is, in Crouton tiles,
+so that the prefill's HMX and the decode's HVX multiply the same copy, and
+the parts that one phase multiplies (B, C and x; w1 and w3; a KV head's
+queries, key, value and gates) interleave by panels of 32 channels. The
+bundle is 3463.4 MB, and a decoded token reads 3461.9 MB of it: at the DMA's
+57 GB/s, 16.5 tokens/s at most.

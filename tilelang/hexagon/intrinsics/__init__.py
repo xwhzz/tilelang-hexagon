@@ -5,5 +5,5 @@
   reads, and the host packing of weights into them.
 
 Quantized weight formats are model-level, not hardware primitives: a model
-packs its codes into a panel layout itself (``examples/hexagon/lfm2``).
+packs its codes into a panel layout itself (``examples/hexagon/lfm``).
 """

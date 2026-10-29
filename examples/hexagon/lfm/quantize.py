@@ -226,7 +226,7 @@ class BundleModel(Model):
 
     def __init__(self, path: str):
         header = bundle.read_header(path)
-        c = Config(**{k: tuple(v) if isinstance(v, list) else v for k, v in header["config"].items()})
+        c = Config.from_dict(header["config"])
         self.header = header
         w = {}
         conv = [i for i in range(c.layers) if not c.is_attention(i)]
@@ -301,7 +301,7 @@ def main():
         c = Config.from_hf(args.model)
         q = calibrate(args.model, args.calib or _wikitext("train"), args.samples, args.bits, args.group, args.head_bits, args.device)
         tensors, quant = build_tensors(c, load_hf_weights(args.model), q)
-        config = {k: list(v) if isinstance(v, tuple) else v for k, v in vars(c).items()}
+        config = c.to_dict()
         bundle.write(args.out, config, tensors, quant)
         print(f"wrote {args.out}: {os.path.getsize(args.out) / 1e6:.0f} MB")
     if args.eval:

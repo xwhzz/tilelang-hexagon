@@ -47,7 +47,7 @@ from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import Config  # noqa: E402
+from model import Config, is_lfm2  # noqa: E402
 from stream import Phase, Projection, Stream  # noqa: E402
 
 NW = 4  # workers, as the decode's
@@ -70,6 +70,7 @@ def gemm(A, K: int, rw, rs, k, C, ones, clear):
 def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int):
     """The prefill kernel for config c, the bundle's tensor `shapes`, and
     chunks of R rows."""
+    assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, HD = c.dim, c.ff, c.head_dim
     H, KVH = c.heads, c.kv_heads
     conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]

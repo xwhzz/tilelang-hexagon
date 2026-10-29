@@ -1,6 +1,6 @@
-"""LFM2 on Hexagon (examples/hexagon/lfm2): the bundle, and the decode and the
-prefill kernels, on a small random model with the real one's structure
-(tiny.py)."""
+"""LFM2 and LFM3 on Hexagon (examples/hexagon/lfm): the reference, the
+bundles, and the 4-bit decode and prefill kernels, on small random models
+with the real ones' structures (tiny.py)."""
 
 import os
 import sys
@@ -14,14 +14,15 @@ from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tilelang.hexagon.runtime.session import lower_kernels
 
-LFM2 = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm2"
-sys.path.insert(0, str(LFM2))
+LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
+sys.path.insert(0, str(LFM))
 import bundle  # noqa: E402
+import convert  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
-from model import Model  # noqa: E402
+from model import Config, Model, load_hf_weights  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
-from tiny import tiny  # noqa: E402
+from tiny import tiny, tiny_lfm3  # noqa: E402
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 
@@ -31,7 +32,7 @@ def tiny_bundle(tmp_path_factory):
     c, w, q = tiny()
     tensors, quant = build_tensors(c, w, q)
     path = str(tmp_path_factory.mktemp("lfm2") / "tiny.bundle")
-    config = {k: list(v) if isinstance(v, tuple) else v for k, v in vars(c).items()}
+    config = c.to_dict()
     bundle.write(path, config, tensors, quant)
     return c, w, q, path
 
@@ -51,22 +52,78 @@ def test_bundle_holds_the_quantized_weights(tiny_bundle):
     torch.testing.assert_close(model.w["model.layers.0.conv.conv.weight"], w["model.layers.0.conv.conv.weight"])
 
 
-@pytest.mark.skipif(not os.environ.get("LFM2_CHECKPOINT"), reason="set LFM2_CHECKPOINT to a LiquidAI/LFM2-1.2B checkout")
-def test_reference_matches_transformers():
-    transformers = pytest.importorskip("transformers")
-    from model import Config, Model, load_hf_weights
+@pytest.fixture(scope="module")
+def tiny_lfm3_bundle(tmp_path_factory):
+    c, w = tiny_lfm3()
+    path = str(tmp_path_factory.mktemp("lfm3") / "tiny.bundle")
+    bundle.write(path, c.to_dict(), convert.build_tensors(c, w), {})
+    return c, w, path
 
-    path = os.environ["LFM2_CHECKPOINT"]
-    hf = transformers.AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).eval()
+
+@pytest.mark.parametrize("checkpoint", ["LFM2_CHECKPOINT", "LFM3_CHECKPOINT"])
+def test_reference_matches_transformers(checkpoint):
+    """Set LFM2_CHECKPOINT to a LiquidAI/LFM2-1.2B checkout, LFM3_CHECKPOINT
+    to a LiquidAI/LFM3-1.7B one (its own modeling code: transformers 5)."""
+    if not os.environ.get(checkpoint):
+        pytest.skip(f"set {checkpoint}")
+    transformers = pytest.importorskip("transformers")
+    path = os.environ[checkpoint]
+    hf = transformers.AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32, trust_remote_code=True).eval()
     ref = Model(Config.from_hf(path), load_hf_weights(path))
-    ids = transformers.AutoTokenizer.from_pretrained(path)(
-        "The capital of France is Paris. The capital of Germany is", return_tensors="pt"
-    ).input_ids[0]
+    tok = transformers.AutoTokenizer.from_pretrained(path)
+    # Past LFM3's sliding window of 256 positions.
+    text = "The capital of France is Paris. The capital of Germany is Berlin. " * 24 + "The capital of Italy is"
+    ids = torch.tensor([ref.c.bos] + tok(text, add_special_tokens=False).input_ids)
     with torch.no_grad():
-        want = hf(ids[None]).logits[0, -1]
-        got, _ = ref.prefill(ids)
+        want = hf(ids[None]).logits[0]
+        got = ref.logits(ref.run(ids, ref.new_state()))
         torch.testing.assert_close(got, want, rtol=0, atol=1e-4 * want.abs().max().item())
-        assert ref.generate(ids, 12) == hf.generate(ids[None], max_new_tokens=12, do_sample=False)[0, len(ids) :].tolist()
+        # Greedy: LFM3's generation config has a repetition penalty.
+        greedy = hf.generate(ids[None], max_new_tokens=12, do_sample=False, repetition_penalty=1.0)
+        assert ref.generate(ids, 12) == greedy[0, len(ids) :].tolist()
+
+
+def test_reference_decodes_past_the_window():
+    """Decode steps after a prefill give the logits of one prefill of them
+    all, across the sliding window (48 positions in the tiny LFM3)."""
+    c, w = tiny_lfm3()
+    model = Model(c, w)
+    torch.manual_seed(1)
+    ids = torch.randint(0, c.vocab, (120,))
+    with torch.no_grad():
+        want = model.logits(model.run(ids, model.new_state()))
+        logits, state = model.prefill(ids[:90])
+        got = [logits] + [model.decode(int(t), state) for t in ids[90:119]]
+    torch.testing.assert_close(torch.stack(got), want[89:119], rtol=0, atol=1e-5 * want.abs().max().item())
+
+
+def test_crouton_weight_is_the_hmx_weight_layout():
+    from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
+
+    L, K, N = 2, 64, 96
+    layout = make_hmx_weight_layout((L, K, N))
+    shape = [int(s) for s in layout.get_output_shape()]
+    w = torch.arange(L * N * K, dtype=torch.float32).reshape(L, N, K)  # projections [N, K]
+    tiles = convert.crouton_weight(w).reshape(-1)
+    torch.testing.assert_close(convert.from_crouton_weight(tiles, (L, K, N)), w, rtol=0, atol=0)
+    for i, k, n in ((0, 0, 0), (0, 1, 0), (0, 0, 1), (0, 31, 31), (0, 32, 5), (1, 33, 40), (1, 2, 64), (1, 63, 95)):
+        flat = 0
+        for index, extent in zip(layout.map_forward_index([i, k, n]), shape):
+            flat = flat * extent + int(index)
+        assert tiles[flat] == w[i, n, k]
+
+
+def test_fp16_bundle_holds_the_weights(tiny_lfm3_bundle):
+    c, w, path = tiny_lfm3_bundle
+    c2, w2 = convert.read_weights(path)
+    assert c2 == c and w2.keys() == w.keys()
+    for name, t in w.items():
+        # Projections and the embedding in fp16, the rest in fp32.
+        want = t.half().float() if t.dim() == 2 else t
+        torch.testing.assert_close(w2[name], want, rtol=0, atol=0, msg=name)
+    head = bundle.read_tensor(path, bundle.read_header(path), "head")
+    for token in (0, 1, 31, 32, 1234, c.vocab - 1):
+        assert torch.equal(convert.embedding(head, token, c.dim), w["model.embed_tokens.weight"][token].half())
 
 
 def test_decode_is_one_cycle_of_phases(tiny_bundle):
