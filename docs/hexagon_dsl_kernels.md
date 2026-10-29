@@ -63,6 +63,21 @@ over the inputs (relative, or absolute for log, tanh, sigmoid and erf):
 | erf | 176.1 | 1.5e-6 | 44.1 | 1.1e-4 |
 | a / b | 26.1 | 2.4e-7 | 16.0 | 1.1e-5 |
 
+On fp16 lanes the fast exp, exp2 and sigmoid compute in qf16, 64 lanes a register,
+instead of two fp32 registers: in cycles per fp16 register, with the error of the fp16
+results (relative, absolute for sigmoid), against the fp32 kernels on the same lanes:
+
+| function | in fp32 | qf16 | error |
+|---|---|---|---|
+| exp | 46.1 | 20.4 | 6.2e-4 |
+| exp2 | 42.1 | 14.2 | 6.7e-4 |
+| sigmoid | 67.2 | 28.7 | 9.2e-4 |
+
+exp reduces x - k ln 2 in two parts, so that rounding x / ln 2 to fp16 costs nothing, and
+exp and exp2 give 0 below their range (a softmax masks with -inf). A map that rounds its
+result to fp16 anyway, a SwiGLU into an fp16 activation or a softmax into an fp16 P,
+computes in fp16 to take them (`T.Cast("float16", ...)`).
+
 Comparisons of vectors give lane masks, integers of the compared lanes' width, and a vector
 `T.Select` prints as `tl_vec_select` (`common.h`), one `vcmp` and one `vmux`; `vec_type` also
 has `-`, `~` and `!`, and `&&`/`||` on masks. The target declares `supports_vector_predicate`,

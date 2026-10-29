@@ -94,7 +94,8 @@ GEMMs, and their output or a part of the FFN's hidden units.
   dequantizing and running its epilogues while another multiplies.
 - **Epilogues.** They fuse the short conv's gates and its causal conv over time,
   SwiGLU, the q/k norms and RoPE, and the residual adds, into the residual
-  itself.
+  itself. The kernel has fast math, and SwiGLU and the softmax compute in fp16,
+  which their results are.
 - **Attention.** Per KV head, against the KV cache in blocks of 128 positions with
   an online softmax: HMX multiplies the scores and P V, and a block of keys and
   values packs once for the four query heads it serves.
@@ -105,12 +106,12 @@ On v79, in the DSP's time:
 
 | prompt | ms | t/s |
 |---:|---:|---:|
-| 40 | 24.5 | 1633 |
-| 128 | 22.6 | 5657 |
-| 256 | 45.5 | 5622 |
-| 512 | 95.2 | 5379 |
-| 1024 | 198.9 | 5147 |
-| 2048 | 443.0 | 4624 |
+| 40 | 24.6 | 1626 |
+| 128 | 23.9 | 5366 |
+| 256 | 44.3 | 5785 |
+| 512 | 90.1 | 5683 |
+| 1024 | 189.4 | 5407 |
+| 2048 | 422.5 | 4847 |
 
 nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
 1.1-1.5k t/s for a 40-token one on the same phone. The prefill's keys and
@@ -144,10 +145,10 @@ Greedy, on v79:
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp128 | 22.6 | 5657 |
-| pp512 | 95.2 | 5379 |
-| pp1024 | 198.9 | 5147 |
-| tg128 | 1594.2 | 80.3 |
+| pp128 | 23.9 | 5366 |
+| pp512 | 90.1 | 5683 |
+| pp1024 | 189.4 | 5407 |
+| tg128 | 1600.0 | 80.0 |
 
 nexa on the same chip: pp1024 3618 t/s and tg128 69.5 t/s published, 65-68
 t/s measured on this phone.

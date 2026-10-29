@@ -437,6 +437,107 @@ TL_DEVICE HVX_Vector tl_hvx_erf_fast_vsf(HVX_Vector x) {
   return Q6_V_vor_VV(y, sign);
 }
 
+// ---------------------------------------------------------------------------
+// Fast variants on 64 fp16 lanes, in qf16: exp, exp2 and sigmoid, which the
+// fp16 fast functions take (the others compute in fp32). About 1.5 fp16 ulps
+// relative for exp and exp2 and 2 ulps absolute for sigmoid, at a third to a
+// half of the cycles of two fp32 registers.
+// ---------------------------------------------------------------------------
+TL_DEVICE HVX_Vector tl_hvx_splat_hf(float c) {
+  __fp16 h = static_cast<__fp16>(c);
+  short bits;
+  __builtin_memcpy(&bits, &h, 2);
+  return Q6_Vh_vsplat_R(bits);
+}
+
+// 2^x for x clamped to [-14, 15], and 0 below -14 (softmax masks with -inf):
+// k = round(x) from the truncation of x + 16.5, f = x - k in [-0.5, 0.5], 2^f
+// a degree-3 polynomial, and k added to the exponent field.
+TL_DEVICE HVX_Vector tl_hvx_exp2_fast_vhf(HVX_Vector x) {
+  HVX_VectorPred under = Q6_Q_vcmp_gt_VhfVhf(tl_hvx_splat_hf(-14.0f), x);
+  x = Q6_Vhf_vmin_VhfVhf(Q6_Vhf_vmax_VhfVhf(x, tl_hvx_splat_hf(-14.0f)),
+                         tl_hvx_splat_hf(15.0f));
+  HVX_Vector k =
+      Q6_Vh_vsub_VhVh(Q6_Vh_equals_Vhf(Q6_Vhf_equals_Vqf16(
+                          Q6_Vqf16_vadd_VhfVhf(x, tl_hvx_splat_hf(16.5f)))),
+                      Q6_Vh_vsplat_R(16));
+  HVX_Vector f =
+      Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(x, Q6_Vhf_equals_Vh(k)));
+  HVX_Vector p = Q6_Vqf16_vadd_Vqf16Vhf(
+      Q6_Vqf16_vmpy_VhfVhf(f, tl_hvx_splat_hf(0.0551716045f)),
+      tl_hvx_splat_hf(0.2426111173f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(p, f),
+                             tl_hvx_splat_hf(0.6932609974f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(p, f),
+                             tl_hvx_splat_hf(0.9999280741f));
+  return Q6_V_vmux_QVV(
+      under, Q6_V_vzero(),
+      Q6_Vh_vadd_VhVh(Q6_Vhf_equals_Vqf16(p), Q6_Vh_vasl_VhR(k, 10)));
+}
+
+// e^x for x clamped to [-9.7, 11], and 0 below -9.7: k = round(x / ln 2),
+// and r = x - k ln 2 in two parts, 0.6875 (k times it is exact) and the rest,
+// so that rounding x / ln 2 to fp16 costs nothing; e^r for |r| <= 0.35 a
+// degree-4 polynomial.
+TL_DEVICE HVX_Vector tl_hvx_exp_fast_vhf(HVX_Vector x) {
+  HVX_VectorPred under = Q6_Q_vcmp_gt_VhfVhf(tl_hvx_splat_hf(-9.7f), x);
+  x = Q6_Vhf_vmin_VhfVhf(Q6_Vhf_vmax_VhfVhf(x, tl_hvx_splat_hf(-9.7f)),
+                         tl_hvx_splat_hf(11.0f));
+  HVX_Vector t = Q6_Vhf_equals_Vqf16(
+      Q6_Vqf16_vmpy_VhfVhf(x, tl_hvx_splat_hf(1.4426950408889634f)));
+  HVX_Vector k =
+      Q6_Vh_vsub_VhVh(Q6_Vh_equals_Vhf(Q6_Vhf_equals_Vqf16(
+                          Q6_Vqf16_vadd_VhfVhf(t, tl_hvx_splat_hf(16.5f)))),
+                      Q6_Vh_vsplat_R(16));
+  HVX_Vector kf = Q6_Vhf_equals_Vh(k);
+  HVX_Vector r = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(
+      x,
+      Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(kf, tl_hvx_splat_hf(0.6875f)))));
+  r = Q6_Vhf_equals_Vqf16(
+      Q6_Vqf16_vsub_VhfVhf(r, Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(
+                                  kf, tl_hvx_splat_hf(0.0056471805599453f)))));
+  HVX_Vector one = tl_hvx_splat_hf(1.0f);
+  HVX_Vector p = Q6_Vqf16_vadd_Vqf16Vhf(
+      Q6_Vqf16_vmpy_VhfVhf(r, tl_hvx_splat_hf(1.0f / 24)),
+      tl_hvx_splat_hf(1.0f / 6));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(p, r),
+                             tl_hvx_splat_hf(0.5f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(p, r), one);
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(p, r), one);
+  return Q6_V_vmux_QVV(
+      under, Q6_V_vzero(),
+      Q6_Vh_vadd_VhVh(Q6_Vhf_equals_Vqf16(p), Q6_Vh_vasl_VhR(k, 10)));
+}
+
+// 1/y for y in [1, 2^14]: two Newton steps from the bit-pattern seed, each
+// r - r (y r - 1), whose correction is small and so rounds finely. v79 has no
+// hf - qf16, so a step negates (r (y r - 1) - r).
+TL_DEVICE HVX_Vector tl_hvx_recip_fast_vhf(HVX_Vector y) {
+  HVX_Vector r = Q6_Vh_vsub_VhVh(Q6_Vh_vsplat_R(0x77A0), y);
+  HVX_Vector one = tl_hvx_splat_hf(1.0f);
+  HVX_Vector sign = Q6_Vh_vsplat_R(static_cast<short>(0x8000));
+#pragma clang loop unroll(full)
+  for (int i = 0; i < 2; ++i) {
+    HVX_Vector d = Q6_Vqf16_vsub_Vqf16Vhf(Q6_Vqf16_vmpy_VhfVhf(y, r), one);
+    HVX_Vector c = Q6_Vqf16_vmpy_Vqf16Vhf(d, r);
+    r = Q6_V_vxor_VV(Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_Vqf16Vhf(c, r)), sign);
+  }
+  return r;
+}
+
+// 1 / (1 + e^-x) for x clamped to [-9.7, 9.7], so that 1 + e^-x stays below
+// 2^14 and the reciprocal's seed positive (below -9.7 the sigmoid is 6e-5 or
+// less). e^-x is 2^(-x log2 e) with the product rounded to fp16: its error
+// grows with |x|, where the sigmoid no longer depends on it.
+TL_DEVICE HVX_Vector tl_hvx_sigmoid_fast_vhf(HVX_Vector x) {
+  x = Q6_Vhf_vmin_VhfVhf(Q6_Vhf_vmax_VhfVhf(x, tl_hvx_splat_hf(-9.7f)),
+                         tl_hvx_splat_hf(9.7f));
+  HVX_Vector e = tl_hvx_exp2_fast_vhf(Q6_Vhf_equals_Vqf16(
+      Q6_Vqf16_vmpy_VhfVhf(x, tl_hvx_splat_hf(-1.4426950408889634f))));
+  return tl_hvx_recip_fast_vhf(
+      Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(e, tl_hvx_splat_hf(1.0f))));
+}
+
 // Applies a register kernel to every register of a vector. This loop and the
 // division's unroll in full: rolled, they pass every register through the stack
 // and run the registers' dependency chains one after another, which made exp
@@ -477,6 +578,31 @@ template <HVX_Vector (*F)(HVX_Vector)> TL_DEVICE float tl_hvx_apply(float x) {
   return r;
 }
 
+// An fp16 register kernel on every register of an fp16 vector, and on a
+// splat of an fp16 scalar, so that a scalar's result is a lane's.
+template <HVX_Vector (*F)(HVX_Vector), int N>
+TL_DEVICE vec_type<half, N> tl_hvx_apply_hf(const vec_type<half, N> &x) {
+  static_assert(N % TL_HVX_F16_LANES == 0, "HVX math needs whole registers");
+  vec_type<half, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F16_LANES; ++i) {
+    HVX_Vector v;
+    __builtin_memcpy(&v, (const char *)&x.v + 128 * i, 128);
+    v = F(v);
+    __builtin_memcpy((char *)&out.v + 128 * i, &v, 128);
+  }
+  return out;
+}
+template <HVX_Vector (*F)(HVX_Vector)>
+TL_DEVICE float tl_hvx_apply_hf(const half &x) {
+  short bits;
+  __builtin_memcpy(&bits, &x, 2);
+  HVX_Vector v = F(Q6_Vh_vsplat_R(bits));
+  half r;
+  __builtin_memcpy(&r, &v, 2);
+  return static_cast<float>(r);
+}
+
 #define TL_HVX_MATH(name, kernel)                                              \
   template <int N>                                                             \
   TL_DEVICE vec_type<float, N> tl_hvx_##name(const vec_type<float, N> &x) {    \
@@ -502,16 +628,32 @@ TL_HVX_MATH(rsqrt, tl_hvx_rsqrt_ieee_vsf)
 TL_HVX_MATH(tanh, tl_hvx_tanh_vsf)
 TL_HVX_MATH(sigmoid, tl_hvx_sigmoid_vsf)
 TL_HVX_MATH(erf, tl_hvx_erf_vsf)
-TL_HVX_MATH(exp_fast, tl_hvx_exp_fast_vsf)
-TL_HVX_MATH(exp2_fast, tl_hvx_exp2_fast_vsf)
+// fp32 lanes by the first kernel, fp16 lanes by the second (in qf16).
+#define TL_HVX_MATH_HF(name, kernel, kernel16)                                 \
+  template <int N>                                                             \
+  TL_DEVICE vec_type<float, N> tl_hvx_##name(const vec_type<float, N> &x) {    \
+    return tl_hvx_apply<kernel>(x);                                            \
+  }                                                                            \
+  template <int N>                                                             \
+  TL_DEVICE vec_type<half, N> tl_hvx_##name(const vec_type<half, N> &x) {      \
+    return tl_hvx_apply_hf<kernel16>(x);                                       \
+  }                                                                            \
+  TL_DEVICE float tl_hvx_##name(float x) { return tl_hvx_apply<kernel>(x); }   \
+  TL_DEVICE float tl_hvx_##name(const half &x) {                               \
+    return tl_hvx_apply_hf<kernel16>(x);                                       \
+  }
+
+TL_HVX_MATH_HF(exp_fast, tl_hvx_exp_fast_vsf, tl_hvx_exp_fast_vhf)
+TL_HVX_MATH_HF(exp2_fast, tl_hvx_exp2_fast_vsf, tl_hvx_exp2_fast_vhf)
 TL_HVX_MATH(log_fast, tl_hvx_log_fast_vsf)
 TL_HVX_MATH(log2_fast, tl_hvx_log2_fast_vsf)
 TL_HVX_MATH(sqrt_fast, tl_hvx_sqrt_fast_vsf)
 TL_HVX_MATH(rsqrt_fast, tl_hvx_rsqrt_fast_vsf)
 TL_HVX_MATH(tanh_fast, tl_hvx_tanh_fast_vsf)
-TL_HVX_MATH(sigmoid_fast, tl_hvx_sigmoid_fast_vsf)
+TL_HVX_MATH_HF(sigmoid_fast, tl_hvx_sigmoid_fast_vsf, tl_hvx_sigmoid_fast_vhf)
 TL_HVX_MATH(erf_fast, tl_hvx_erf_fast_vsf)
 #undef TL_HVX_MATH
+#undef TL_HVX_MATH_HF
 
 // |x| is one vector and that clears the sign bit; clang scalarizes a float
 // vector fabs on HVX.

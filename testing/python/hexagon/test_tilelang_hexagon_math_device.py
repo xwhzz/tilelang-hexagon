@@ -84,6 +84,13 @@ FAST = {
     "sigmoid": ("rel", 2e-4),
     "erf": ("abs", 2e-4),
 }
+# Where fp16 lanes compute in qf16 (hvx_math.h): bounds of the fp16 results,
+# their rounding included.
+FAST_FP16 = {
+    "exp": ("rel", 8e-4),
+    "exp2": ("rel", 8e-4),
+    "sigmoid": ("abs", 1.2e-3),
+}
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16"])
@@ -93,6 +100,9 @@ def test_fast_math_matches_torch(fn, dtype):
 
     ref, _, fp32_range, fp16_range = CASES[fn]
     kind, bound = FAST[fn]
+    qf16 = dtype == "float16" and fn in FAST_FP16
+    if qf16:
+        kind, bound = FAST_FP16[fn]
     op = getattr(T, fn)
 
     @T.prim_func
@@ -106,8 +116,8 @@ def test_fast_math_matches_torch(fn, dtype):
         x = _inputs(torch, *(fp32_range if dtype == "float32" else fp16_range)).to(getattr(torch, dtype))
         expected = getattr(torch, ref)(x.double())
         absolute = (kernel(x).double() - expected).abs()
-        # fp16 results round once: half an fp16 ulp more.
-        rounding = 0.0 if dtype == "float32" else 2.0**-11
+        # fp16 results computed in fp32 round once: half an fp16 ulp more.
+        rounding = 0.0 if dtype == "float32" or qf16 else 2.0**-11
         if kind == "abs":
             error = absolute.max().item()
             limit = bound + rounding

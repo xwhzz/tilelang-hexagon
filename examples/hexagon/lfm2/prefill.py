@@ -206,12 +206,14 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                         bf.rmax[i] = T.max(bf.m[hq, i], bf.rmax[i])
                         bf.alpha[i] = T.exp(bf.m[hq, i] - bf.rmax[i])
                         bf.m[hq, i] = bf.rmax[i]
+                    # P in fp16, as HMX takes it: exp then takes 64 lanes a
+                    # register; the row sums accumulate in fp32.
                     for i, j in T.Parallel(R, KEYS):
-                        bf.s[i, j] = T.exp(bf.s[i, j] - bf.m[hq, i])
-                    T.reduce_sum(bf.s, bf.rsum, dim=1)
+                        bf.ph[i, j] = T.exp(T.Cast("float16", bf.s[i, j] - bf.m[hq, i]))
+                    T.reduce_sum(bf.ph, bf.rsum, dim=1)
                     for i in T.Parallel(R):
                         bf.ls[hq, i] = bf.ls[hq, i] * bf.alpha[i] + bf.rsum[i]
-                    T.copy(bf.s, bf.p)
+                    T.copy(bf.ph, bf.p)
                     for i, d in T.Parallel(R, HD):
                         bf.acc_o[hq, i, d] = bf.acc_o[hq, i, d] * bf.alpha[i]
                     T.gemm(bf.p, bf.vblk, bf.acc_o[hq, :, :], clear_accum=False)
@@ -229,9 +231,12 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
         after w3, silu(w1 a) * (w3 a) into hid."""
         gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True)
         if b % 2 == 1:
+            # In fp16, which hid holds: the sigmoid then takes 64 lanes a
+            # register.
             for i, j in T.Parallel(R, BLOCK):
-                bf.cc[0, i, j] = bf.cc[0, i, j] * T.sigmoid(bf.cc[0, i, j]) * bf.cc[1, i, j]
-            T.copy(bf.cc[0, :, :], bf.hid[:, bf.w * FQW + b // 2 * BLOCK : bf.w * FQW + b // 2 * BLOCK + BLOCK])
+                g = T.Cast("float16", bf.cc[0, i, j])
+                bf.gl[i, j] = g * T.sigmoid(g) * T.Cast("float16", bf.cc[1, i, j])
+            T.copy(bf.gl, bf.hid[:, bf.w * FQW + b // 2 * BLOCK : bf.w * FQW + b // 2 * BLOCK + BLOCK])
 
     @T.macro
     def residual_block(bf, b, rw, rs, k, cols: int):
@@ -288,6 +293,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             # normalizes or embeds two at a time.
             ones = T.alloc_shared((R, 1), "float32")
             cc = T.alloc_shared((2, R, BLOCK), "float32")
+            gl = T.alloc_shared((R, BLOCK), "float16")
             rows = T.alloc_fragment((2, D), "float32")
             sq = T.alloc_fragment((2, D), "float32")
             ss = T.alloc_fragment((2,), "float32")
@@ -306,6 +312,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             m = T.alloc_shared((group, R), "float32")
             ls = T.alloc_shared((group, R), "float32")
             s = T.alloc_shared((R, KEYS), "float32")
+            ph = T.alloc_shared((R, KEYS), "float16")
             p = T.alloc_shared((R, KEYS), "float16")
             rmax = T.alloc_shared((R,), "float32")
             rsum = T.alloc_shared((R,), "float32")
@@ -316,7 +323,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             # What the macros below work on.
             bf = SimpleNamespace(
                 w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, head=head, hsq=hsq, hss=hss,
-                q=q, kblk=kblk, vblk=vblk, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha,
+                q=q, kblk=kblk, vblk=vblk, s=s, ph=ph, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha, gl=gl,
                 rope_cos=rope_cos, rope_sin=rope_sin, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,
             )  # fmt: skip
