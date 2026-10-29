@@ -275,7 +275,7 @@ def test_programs_share_global_vtcm_buffers():
     source = _lower(_grid_rotate(4, 3)).kernel_source
     # One buffer at the VTCM base, bound outside the programs, which capture it.
     head = source[: source.index("tl_parallel_for")]
-    assert "float* rows = (float*)tl_vtcm_exclusive(tl_vtcm_arena() + 0);" in head
+    assert "float* rows = (float*)tl_exclusive(tl_vtcm_arena() + 0);" in head
     assert "tl_vtcm_worker_arenas" not in source
 
 
@@ -303,12 +303,16 @@ def test_global_vtcm_buffers_come_before_the_program_arenas():
     source = _lower(_grid_gemm(4, 128, 64, 256)).kernel_source
     head = source[: source.index("tl_parallel_for")]
     # A, 64 KB, then the programs' arenas after it.
-    assert "half* a = (half*)tl_vtcm_exclusive(tl_vtcm_arena() + 0);" in head
+    assert "half* a = (half*)tl_exclusive(tl_vtcm_arena() + 0);" in head
     assert "tl_vtcm_worker_arenas(" in source and ", 65536u), [&](int32_t bx, uint8_t *tl_arena)" in source
+    # A program takes the buffer and the arguments it reaches as objects of
+    # their own.
+    assert "half* a_w = (half*)tl_exclusive(a);" in source and "tl_escape(a_w);" in source
+    assert "half* A_w = (half*)tl_exclusive(A);" in source
     # Each program packs its rows of the shared HMX operand.
-    assert "tl_crouton_copy<true, false>((&(a[0])), 4, 8, (bx * 32), 0, 32, 256, (&(A[(bx * 8192)])), 256, 1);" in source
+    assert "tl_crouton_copy<true, false>((&(a_w[0])), 4, 8, (bx * 32), 0, 32, 256, (&(A_w[(bx * 8192)])), 256, 1);" in source
     # All of them multiply all of it.
-    assert "tl_hexagon_hmx_mma_atom((&(acc[0])), (&(a[((t >> 1) * 8192)]))" in source
+    assert "tl_hexagon_hmx_mma_atom((&(acc[0])), (&(a_w[((t >> 1) * 8192)]))" in source
 
 
 def test_global_vtcm_buffers_must_fit_with_the_arenas():

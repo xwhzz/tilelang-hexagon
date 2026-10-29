@@ -38,8 +38,8 @@ def test_fragments_live_in_the_vtcm_arena():
     source = _source(_copy_map_fill())
     # Both fragments share the tile program's arena, laid out row-major.
     assert "uint8_t* buf_dyn_shmem = (uint8_t*)tl_vtcm_arena();" in source
-    assert "void* x = tl_vtcm_exclusive(((void*)((char*)buf_dyn_shmem + 0)));" in source
-    assert "void* z = tl_vtcm_exclusive(((void*)((char*)buf_dyn_shmem + 65536)));" in source
+    assert "void* x = tl_exclusive(((void*)((char*)buf_dyn_shmem + 0)));" in source
+    assert "void* z = tl_exclusive(((void*)((char*)buf_dyn_shmem + 65536)));" in source
     assert "float x[" not in source
 
 

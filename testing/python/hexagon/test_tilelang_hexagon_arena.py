@@ -21,7 +21,7 @@ def _source(func):
 def _offsets(source, *names):
     offsets = {}
     for name in names:
-        match = re.search(rf"void\* {name} = (?:tl_vtcm_exclusive\()?\(\(void\*\)\(\(char\*\)buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
+        match = re.search(rf"void\* {name} = (?:tl_exclusive\()?\(\(void\*\)\(\(char\*\)buf_dyn_shmem \+ (\d+)\)\)\)?;", source)
         assert match is not None, source
         offsets[name] = int(match.group(1))
     return offsets
@@ -105,7 +105,7 @@ def test_buffers_alone_in_their_memory_get_their_own_pointer():
     assert _offsets(source, "s", "t")["s"] == _offsets(source, "s", "t")["t"]
     assert re.search(r"void\* s = \(\(void\*\)", source)
     assert re.search(r"void\* t = \(\(void\*\)", source)
-    assert re.search(r"void\* u = tl_vtcm_exclusive\(\(\(void\*\)", source)
+    assert re.search(r"void\* u = tl_exclusive\(\(\(void\*\)", source)
 
 
 def test_dma_destination_stays_live_until_its_wait():

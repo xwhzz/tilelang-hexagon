@@ -12,7 +12,7 @@
  *
  * Runs after MergeSharedMemoryAllocations. A buffer whose bytes no other
  * buffer of its arena overlaps gets its pointer through
- * tl_vtcm_exclusive (vtcm.h), a call LLVM treats as a fresh allocation; a
+ * tl_exclusive (common.h), a call LLVM treats as a fresh allocation; a
  * buffer that reuses memory keeps the plain offset.
  */
 

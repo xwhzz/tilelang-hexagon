@@ -12,6 +12,7 @@
 
 #include <tvm/ir/op.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 
 #include <string>
@@ -104,7 +105,7 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        8},
       {tl::hexagon_hvx_gemm_int_scaled(), "tl_hvx_gemm_int_scaled", false,
        false, false, -1, 10},
-      {tl::hexagon_exclusive_pointer(), "tl_vtcm_exclusive", false},
+      {tl::hexagon_exclusive_pointer(), "tl_exclusive", false},
   };
   for (const auto &builtin : builtins) {
     if (call->op.same_as(builtin.op))
@@ -307,6 +308,9 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   function_names_.push_back(global_symbol.value());
 
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
+  // A worker's lambda takes the arguments' pointers as objects of their own
+  // only when they do not alias (BindOuterVars).
+  exclusive_params_.clear();
 
   dma_in_scope_ = false;
   // Names the runtime calls bind; reserve them before the parameters so no
@@ -317,6 +321,8 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   for (size_t i = 0; i < f->params.size(); ++i) {
     tirx::Var v = f->params[i];
     AllocVarID(v.get());
+    if (no_alias && v.dtype().is_handle())
+      exclusive_params_.insert(v.get());
     if (v.dtype().is_handle()) {
       if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
         if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
@@ -405,9 +411,12 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   int scope = BeginScope();
   in_worker_ = true;
   worker_program_ = op->loop_var;
+  auto outer = BindOuterVars(op);
   PrintStmt(op->body);
   PrintIndent();
   stream << "return TL_OK;\n";
+  for (const auto &[var, id] : outer)
+    var_idmap_[var] = id;
   in_worker_ = false;
   worker_program_ = std::nullopt;
   EndScope(scope);
@@ -420,6 +429,31 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   EndScope(block);
   PrintIndent();
   stream << "}\n";
+}
+
+std::vector<std::pair<const tirx::VarNode *, std::string>>
+CodeGenTileLangHexagon::BindOuterVars(const ForNode *op) {
+  std::vector<std::pair<const tirx::VarNode *, std::string>> outer;
+  for (const tirx::Var &var : tirx::UndefinedVars(op->body, {op->loop_var})) {
+    auto it = var_idmap_.find(var.get());
+    if (it == var_idmap_.end())
+      continue;
+    std::string id = name_supply_->FreshName(it->second + "_w");
+    PrintIndent();
+    PrintType(GetType(var), stream);
+    if (exclusive_params_.count(var.get()) || grid_offsets_.count(var.get())) {
+      stream << ' ' << id << " = (";
+      PrintType(GetType(var), stream);
+      stream << ")tl_exclusive(" << it->second << ");\n";
+      PrintIndent();
+      stream << "tl_escape(" << id << ");\n";
+    } else {
+      stream << " const " << id << " = " << it->second << ";\n";
+    }
+    outer.emplace_back(var.get(), it->second);
+    it->second = id;
+  }
+  return outer;
 }
 
 void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
@@ -437,8 +471,7 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
     PrintType(op->buffer->dtype, stream);
     stream << "* " << vid << " = (";
     PrintType(op->buffer->dtype, stream);
-    stream << "*)tl_vtcm_exclusive(tl_vtcm_arena() + " << grid->second
-           << ");\n";
+    stream << "*)tl_exclusive(tl_vtcm_arena() + " << grid->second << ");\n";
   } else if (IsSharedScope(GetPtrStorageScope(op->buffer->data))) {
     // VTCM-backed: the HMX matrix engine reads operands from VTCM (mxmem) and
     // HVX wants its scratch there, so a `shared` tile cannot live on the stack.

@@ -124,13 +124,3 @@ TL_VTCM_INLINE unsigned int tl_vtcm_arena_bytes(void) {
   tl_vtcm_acquire();
   return tl_vtcm_total;
 }
-
-// A pointer to a VTCM buffer that shares no memory with the arena's other
-// buffers (MarkExclusiveBuffers), which LLVM then treats as its own
-// allocation: noalias by `malloc`, and opaque, as the asm hides that it returns
-// its argument. Loops that read one buffer and write another can then overlap
-// their iterations in the software pipeliner.
-__attribute__((noinline, malloc)) static void *tl_vtcm_exclusive(void *p) {
-  asm volatile("" : "+r"(p));
-  return p;
-}

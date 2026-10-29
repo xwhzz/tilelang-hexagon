@@ -127,7 +127,7 @@ def MarkExclusiveBuffers():
     Runs after ``MergeSharedMemoryAllocations``. LLVM sees every buffer of an
     arena as one object, so its software pipeliner serializes maps that read
     one buffer and write another. A buffer no other buffer overlaps gets its
-    pointer through ``tl_vtcm_exclusive``, which LLVM treats as a separate
+    pointer through ``tl_exclusive``, which LLVM treats as a separate
     allocation.
     """
     return _ffi_api.MarkExclusiveBuffers()  # type: ignore

@@ -195,7 +195,7 @@ TVM_DLL const Op &hexagon_hvx_gemm_int();
 // apart). The ten integers and booleans print as template arguments.
 TVM_DLL const Op &hexagon_hvx_gemm_int_scaled();
 
-// tl_vtcm_exclusive(ptr) (vtcm.h): the pointer of a VTCM buffer that shares no
+// tl_exclusive(ptr) (common.h): the pointer of a VTCM buffer that shares no
 // memory with its arena's other buffers, as its own allocation to LLVM.
 TVM_DLL const Op &hexagon_exclusive_pointer();
 

@@ -247,8 +247,9 @@ and explicit HMX atoms.
   which every worker multiplies.
   - **Placement.** `MaterializeGrid` keeps the allocation outside the programs.
     The codegen lays the kernel's `global.vtcm` buffers out from the VTCM base,
-    whole HMX tiles each, and binds them before the worker loop, whose lambda
-    captures them.
+    whole HMX tiles each, and binds them before the worker loop. Its lambda binds
+    them again at its entry, each a pointer of its own (`tl_exclusive`), as it does
+    the kernel's arguments.
   - **Arenas.** The programs' arenas start after these buffers.
   - **Capacity.** `VerifyVTCMArena` counts the buffers with the arenas.
 

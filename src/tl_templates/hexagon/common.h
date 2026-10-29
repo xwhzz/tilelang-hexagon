@@ -70,6 +70,24 @@ template <> struct tl_mask_lane<8> {
   using type = int64_t;
 };
 
+// The pointer of a buffer that shares no memory with the others a function
+// reaches (MarkExclusiveBuffers, and a worker's kernel arguments), which LLVM
+// then treats as its own allocation: noalias by `malloc`, and opaque, as the
+// asm hides that it returns its argument. Two such objects never alias, however
+// their pointers are used, so that loops that read one buffer and write another
+// can overlap their iterations in the software pipeliner.
+__attribute__((noinline, malloc)) static void *tl_exclusive(void *p) {
+  asm volatile("" : "+r"(p));
+  return p;
+}
+
+// Lets `p` escape: LLVM then assumes that any call reads and writes through it,
+// so that a program's syncs, DMA and HMX calls order the accesses to a buffer
+// that other workers or the caller also reach.
+TL_DEVICE void tl_escape(const void *p) {
+  asm volatile("" : : "r"(p) : "memory");
+}
+
 // Hides a register or register pair of lanes from the optimizer at no cost.
 // LLVM folds a symmetric range check of float lanes (x > -c && x < c), or a
 // select that negates the negative ones, into llvm.fabs, which hexagon-clang

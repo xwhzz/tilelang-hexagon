@@ -103,9 +103,14 @@ runs one chain of dependent instructions at a time, about one instruction per pa
   (`inv[i] = T.rsqrt(ss[i] * (1 / D) + eps)`), rather than in the map, where each vector
   recomputes it: an RMSNorm's scaling went from 155 to 22 cycles a vector.
 - `MarkExclusiveBuffers` gives each VTCM buffer that shares no memory with another a
-  pointer of its own (`tl_vtcm_exclusive`, which LLVM treats as a fresh allocation): the
+  pointer of its own (`tl_exclusive`, which LLVM treats as a fresh allocation): the
   buffers of an arena are otherwise one object to LLVM, so a map that reads one buffer
-  and writes another runs one iteration at a time.
+  and writes another runs one iteration at a time. A worker program's lambda takes the
+  kernel's arguments (when they do not alias) and its `global.vtcm` buffers the same
+  way, bound at its entry: read through the lambda's captures, LLVM loads them again
+  after a store to any buffer whose pointer a call or an alignment test has seen, and
+  the loop does not pipeline. The LFM2 prefill's RMSNorm scaling went from 12.4M to
+  8.2M cycles at 1024 tokens.
 - `InterleaveMaps`: a map that computes an HVX math function runs a chain of a few dozen
   instructions per vector, which can exceed the initiation interval LLVM pipelines
   (`-pipeliner-max-mii`). Its loop prints unrolled by two (`#pragma clang loop

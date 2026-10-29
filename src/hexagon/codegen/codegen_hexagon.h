@@ -17,6 +17,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/expr.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tvm {
@@ -96,6 +97,20 @@ private:
   // Print a T.Kernel(num_workers=) grid loop as a tl_parallel_for call whose
   // lambda runs one tile program.
   void PrintWorkerLoop(const ForNode *op);
+  // Binds what a worker loop's body uses from outside its lambda to locals of
+  // the lambda, at its entry, and returns their outer names, to restore. Read
+  // through the lambda's captures, a pointer or a scalar would load again
+  // after every store LLVM cannot tell apart from the closure, and a loop's
+  // iterations would stay apart. The arguments' pointers (exclusive_params_)
+  // and the global.vtcm buffers' become objects of their own (tl_exclusive),
+  // escaped (tl_escape) so that the program's calls (its syncs, DMA and HMX)
+  // still order its accesses: LLVM then tells every two buffers apart however
+  // their pointers are used, where a pointer read through the closure stays
+  // apart only from a buffer that no call or alignment test has captured.
+  std::vector<std::pair<const tirx::VarNode *, std::string>>
+  BindOuterVars(const ForNode *op);
+  /*! \brief the kernel's pointer arguments, when they do not alias */
+  std::unordered_set<const tirx::VarNode *> exclusive_params_;
   // Whether a vector of `t` at element `base` provably starts on a multiple of
   // its natural alignment, the smaller of its size and a register.
   bool VectorAligned(DataType t, const PrimExpr &base);
