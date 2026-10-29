@@ -303,7 +303,7 @@ def main():
         tensors, quant = build_tensors(c, load_hf_weights(args.model), q)
         config = {k: list(v) if isinstance(v, tuple) else v for k, v in vars(c).items()}
         bundle.write(args.out, config, tensors, quant)
-        print(f"wrote {args.out}: {os.path.getsize(args.out) / 2**20:.0f} MB")
+        print(f"wrote {args.out}: {os.path.getsize(args.out) / 1e6:.0f} MB")
     if args.eval:
         from transformers import AutoTokenizer
 

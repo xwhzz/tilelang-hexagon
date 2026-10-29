@@ -345,7 +345,7 @@ tests, and the examples):
 Unrecoverable device conditions (a VTCM grant too small, a DMA error, too few workers for
 a grid) reach the host as an error naming the kernel's status, not as silent wrong
 output. LFM2-1.2B ([`examples/hexagon/lfm2`](../examples/hexagon/lfm2/)) decodes at
-81 t/s on v79 in one kernel call per generation, 94% of the DMA roofline, and prefills a
+80-81 t/s on v79 in one kernel call per generation, 96-98% of the DMA roofline, and prefills a
 1024-token prompt in 176 ms (5813 t/s) on HMX, in one kernel call too (how they got there:
 [`OPTIMIZATION.md`](../examples/hexagon/lfm2/OPTIMIZATION.md)). It chats from text
 to text (`generate.py`), sampling on the device, and its WikiText-2 perplexity on the

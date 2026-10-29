@@ -7,23 +7,27 @@ kernels as they are.
 
 All numbers are from the v79 cDSP of a Snapdragon 8 Elite (SM8750) phone,
 batch 1, with the bundle of #106 (4-bit projections with an fp16 scale per 64
-columns, an 8-bit tied head: 653.5 MB streamed a token). The DSP runs at about
-2.06 GHz under a session's clock vote. "#N" is a pull request of this
-repository.
+columns, an 8-bit tied head: 685.2 MB streamed a token). The DSP runs at about
+2.06 GHz under a session's clock vote. MB and GB are 10^6 and 10^9 bytes.
+"#N" is a pull request of this repository.
 
 ## Where it stands
 
 | | decode, tg128 | prefill, pp1024 |
 |---|---:|---:|
 | **this example** | **80.1-81.2 t/s** (12.3-12.5 ms a token) | **176.2 ms, 5813 t/s** |
-| roofline | 87 t/s (DMA, 57 GB/s) | about 129 ms (the HMX work alone) |
-| nexa (NexaSDK, QNN NPU), measured on this phone | 65-68 t/s | 1.1-1.5k t/s (40 tokens) |
-| nexa, published | 69.5 t/s | 3618 t/s |
-| llama.cpp ggml-hexagon Q4_0, measured | 35.6 t/s | 3175 t/s |
+| roofline | 83 t/s (DMA, 57 GB/s) | about 129 ms (the HMX work alone) |
+| NexaML on the NPU, LFM2.5-1.2B, in [Liquid AI's model card](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct) | 82 t/s | 4391 t/s (1K tokens) |
+| nexa's demo app (NexaSDK, QNN NPU), measured on this phone | 65-68 t/s | 1.1-1.5k t/s (40 tokens) |
+| llama.cpp ggml-hexagon Q4_0, measured on this phone | 35.6 t/s | 3175 t/s |
 
-The decode runs at 94% of the DMA roofline. The prefill is 1.6x nexa's
-published rate. Its GEMM phases are close to the HMX limit; most of what
-remains is HVX work that HMX waits for.
+The decode runs at 96-98% of the DMA roofline. The prefill's GEMM phases are
+close to the HMX limit; most of what remains is HVX work that HMX waits for.
+
+The model card measures NexaML on a ROG Phone 9 Pro, which has the same chip,
+with a 1K-token prompt and 100 new tokens, and does not say how it times
+them. LFM2.5-1.2B has LFM2-1.2B's architecture and other weights. Against
+those numbers, this example decodes 1-2% slower and prefills 1.3x faster.
 
 Quality: WikiText-2 perplexity on the device is 16.684, against 16.683 for
 the host reference with the device's arithmetic and 16.29 for bf16; the gap
@@ -33,10 +37,12 @@ prefill equal the decode's.
 
 ## How it was measured
 
-- **Benchmarks.** `bench.py`: the median of 5 runs, in the DSP's time (the
-  kernel's own clock, without the host's overhead). Two runs of the same
-  kernels differ by about 1.5% on the phone: pp1024 measured 176.2 ms in one
-  and 173.5 ms in another.
+- **Benchmarks.** `bench.py`: the median of 5 runs. A run is one kernel
+  call, timed on the phone around its FastRPC call
+  (`Session.last_run_seconds`): the call's overhead is included; tokenization
+  and the round trip to the PC that drives the phone are not. Two runs of the
+  same kernels differ by about 1.5% on the phone: pp1024 measured 176.2 ms in
+  one and 173.5 ms in another.
 - **A/B in one session.** For a change of a few percent, the old and the new
   kernel run in one session, alternating, and the median of 7 or 9 runs
   compares them. Two identical kernels differ by up to 2 ms (1%) at pp1024
@@ -53,9 +59,9 @@ prefill equal the decode's.
 
 ## Decode: at the memory roofline
 
-A decode step reads every weight once: at 653.5 MB a token, it is bound by
+A decode step reads every weight once: at 685.2 MB a token, it is bound by
 how fast weights reach the DSP. DMA tops out near 57 GB/s from 3 workers on,
-whatever the block size or depth (87 t/s for this bundle). HVX loads alone reach about
+whatever the block size or depth (83 t/s for this bundle). HVX loads alone reach about
 37 GB/s, and DMA and HVX together 58-63. So the decode streams the weights by
 DMA and keeps everything else out of the stream's way.
 
@@ -82,8 +88,8 @@ DMA and keeps everything else out of the stream's way.
   session now starts from the cached lowered source: 36.5 -> 2.0 s (#130).
 
 The result, unchanged since #107 within noise: 81.2 t/s (12.3 ms a token),
-94% of the DMA roofline. What is left is in the bundle's size, not the kernel
-(see [What is next](#what-is-next)).
+55.6 GB/s of weights, 98% of the DMA roofline. What is left is in the
+bundle's size, not the kernel (see [What is next](#what-is-next)).
 
 ## Prefill: from 12.6 s to 176 ms
 

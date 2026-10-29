@@ -1,7 +1,8 @@
 """LFM2 on the device in the style of llama-bench: prompt processing (ppN, a
 random prompt of N tokens through the prefill) and token generation (tgN, N
 tokens after a one-token prompt, greedy or sampled at `--temperature`), each
-the median of `--runs` runs, timed on the DSP.
+the median of `--runs` runs. A run is timed on the phone around the kernel's
+FastRPC call (`Session.last_run_seconds`).
 
     python bench.py <bundle> <bundle on the device> --pp 512,1024 --tg 128
 

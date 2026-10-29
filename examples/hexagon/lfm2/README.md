@@ -34,8 +34,8 @@ device. WikiText-2 perplexity (40 windows of 1024 tokens):
 `ppl.py` scores the same windows on the device, with the decode, every token
 forced (`Decoder.score`).
 
-The bundle streams 653.5 MB per token, of 781.8 MB on disk (the embedding is
-read one row a token).
+The bundle streams 685.2 MB (10^6 bytes) per token, of 819.8 MB on disk (the
+embedding is read one row a token).
 
     python quantize.py --model LFM2-1.2B --out lfm2.bundle
     python quantize.py --model LFM2-1.2B --eval lfm2.bundle
@@ -67,11 +67,11 @@ fp32.
 The bundle, the KV cache and the conv state stay on the device in one session
 (`tilelang.hexagon.runtime.session`).
 
-On v79, with the bundle above (653.5 MB a token), decode runs at **81 t/s,
-12.3 ms a token** over 140 steps (a 13-token prompt and 128 new tokens), 94%
-of the DMA roofline (57 GB/s); nexa measured 65-68 t/s on the same phone. Its
-greedy tokens match `BundleModel`'s, the reference with the device's
-arithmetic, token for token.
+On v79, with the bundle above (685.2 MB a token), decode runs at **81 t/s,
+12.3 ms a token** over 140 steps (a 13-token prompt and 128 new tokens): it
+streams 55.7 GB/s, 98% of the 57 GB/s that DMA reaches on the DSP. Its greedy
+tokens match `BundleModel`'s, the reference with the device's arithmetic,
+token for token.
 
 The head also samples on the device: at a temperature, a sample is the argmax
 of the logits over the temperature plus Gumbel noise, from a hash of (seed,
@@ -105,7 +105,8 @@ GEMMs, and their output or a part of the FFN's hidden units.
 - **Layers.** One loop at run time, which reads each layer's kind from a table:
   the kernel's code does not grow with the depth.
 
-On v79, in the DSP's time:
+On v79, each prompt one kernel call, timed on the phone around its FastRPC
+call:
 
 | prompt | ms | t/s |
 |---:|---:|---:|
@@ -116,11 +117,9 @@ On v79, in the DSP's time:
 | 1024 | 176.2 | 5813 |
 | 2048 | 373.6 | 5482 |
 
-nexa publishes 3618 t/s for a 1024-token prompt on this chip, and measured
-1.1-1.5k t/s for a 40-token one on the same phone. The prefill's keys and
-values match the decode's, a token a step, to 4.3e-3 at most (the last
-attention layer's keys), and the tokens generated after it match the
-decode's.
+The prefill's keys and values match the decode's, a token a step, to 4.3e-3
+at most (the last attention layer's keys), and the tokens generated after it
+match the decode's.
 
 ## On the device
 
@@ -145,7 +144,9 @@ Greedy, on v79:
     Le temps est agréable aujourd'hui.
     ...
 
-`bench.py`, the median of 5 runs in the DSP's time:
+`bench.py` reports the median of 5 runs. A run is one kernel call, timed on
+the phone around its FastRPC call: the call's overhead is included;
+tokenization and the round trip to the PC that drives the phone are not.
 
 | test | ms | t/s |
 |---|---:|---:|
@@ -154,5 +155,11 @@ Greedy, on v79:
 | pp1024 | 176.2 | 5813 |
 | tg128 | 1597.1 | 80.1 |
 
-nexa on the same chip: pp1024 3618 t/s and tg128 69.5 t/s published, 65-68
-t/s measured on this phone.
+For reference, on the same chip: [Liquid AI's model
+card](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct) gives NexaML on
+the NPU 4391 t/s prefill and 82 t/s decode for LFM2.5-1.2B (LFM2-1.2B's
+architecture, other weights), with a 1K-token prompt and 100 new tokens,
+without saying how they are timed. On this phone, nexa's demo app decodes at
+65-68 t/s and prefills a 40-token prompt at 1.1-1.5k t/s, and llama.cpp's
+Hexagon backend (Q4_0, `llama-bench -p 1024 -n 128`) runs pp1024 at 3175 t/s
+and tg128 at 35.6 t/s.
