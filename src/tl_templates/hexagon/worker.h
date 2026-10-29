@@ -216,9 +216,11 @@ static struct {
 // Program `program` of the running coresident grid waits until all its
 // programs reach this call. Memory written before the call, including HVX
 // stores, is visible to every program after it. The waiting workers spin and
-// keep their threads, so the barrier costs cache-line transfers, not a wake-up.
-// A program that fails never arrives, so the others leave with TL_ERR_GRID
-// instead of waiting for it.
+// keep their threads, so the barrier costs cache-line transfers, not a
+// wake-up; they pause between polls, as the HMX lock's waiters do, so that the
+// threads still working get the core's issue slots. A program that fails
+// never arrives, so the others leave with TL_ERR_GRID instead of waiting for
+// it.
 static inline int32_t tl_grid_sync(int32_t program) {
   int32_t barrier = ++tl_grid.passed[program];
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -232,6 +234,7 @@ static inline int32_t tl_grid_sync(int32_t program) {
   while (__atomic_load_n(&tl_grid.completed, __ATOMIC_ACQUIRE) != barrier) {
     if (__atomic_load_n(&tl_grid.failed, __ATOMIC_RELAXED))
       return TL_ERR_GRID;
+    asm volatile("pause(#8)");
   }
   return TL_OK;
 }
