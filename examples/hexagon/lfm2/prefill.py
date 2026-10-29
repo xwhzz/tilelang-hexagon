@@ -44,6 +44,7 @@ import sys
 from types import SimpleNamespace
 
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import Config  # noqa: E402
@@ -54,6 +55,7 @@ DEPTH = 2  # blocks in flight per worker: a block multiplies far longer than it 
 BLOCK = 128  # rows per block of a 4-bit projection
 KEYS = 128  # KV positions per attention step
 NEG = -3.0e38
+NEG16 = -65504.0  # the scores' mask, in fp16
 LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 
 
@@ -194,11 +196,14 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
     def attention(bf, ai, base):
         """The worker's query heads, by KV head: softmax(q K^T) V over the
         cache's positions [0, base + i] for row i, into hid, in base 2 (the
-        queries carry log2 e). A block of keys
-        and values packs once for the KV head's query heads, each of which
-        keeps its own online softmax. The scores and the outputs are fp32
-        rows, where the causal mask, the softmax and the rescaling are row
-        maps; P packs into fp16 tiles, and HMX adds P V into the outputs.
+        queries carry log2 e). A block of keys and values packs once for the
+        KV head's query heads, each of which keeps its own online softmax.
+
+        A head's scores stay in the fp16 tiles HMX stores them in: the causal
+        mask and the row maxima work there, and exp2 writes P into the tiles
+        of another buffer (in place, a map over VTCM costs more), which HMX
+        multiplies by V and whose rows sum in fp32. The outputs are fp32
+        rows, which the rescaling scales.
 
         The blocks of keys and values come into VTCM by DMA, a block ahead,
         two slots each, so that their packs read VTCM rather than DDR."""
@@ -224,22 +229,20 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                     # Causal: the chunk's own positions are visible to the
                     # rows at or after them.
                     if kb * KEYS + KEYS - 1 > base:
-                        for i in T.serial(R):
-                            for j in T.vectorized(KEYS):
-                                bf.s[i, j] = T.if_then_else(kb * KEYS + j <= base + i, bf.s[i, j], T.float32(NEG))
+                        for i, j in T.Parallel(R, KEYS):
+                            bf.s[i, j] = T.if_then_else(kb * KEYS + j <= base + i, bf.s[i, j], T.float16(NEG16))
                     T.reduce_max(bf.s, bf.rmax, dim=1)
                     for i in T.Parallel(R):
                         bf.rmax[i] = T.max(bf.m[hq, i], bf.rmax[i])
                         bf.alpha[i] = T.exp2(bf.m[hq, i] - bf.rmax[i])
                         bf.m[hq, i] = bf.rmax[i]
-                    # P in fp16, as HMX takes it: exp2 then takes 64 lanes a
-                    # register; the row sums accumulate in fp32.
+                        # The maxima of fp16 scores are fp16.
+                        bf.mh[i] = T.Cast("float16", bf.rmax[i])
                     for i, j in T.Parallel(R, KEYS):
-                        bf.ph[i, j] = T.exp2(T.Cast("float16", bf.s[i, j] - bf.m[hq, i]))
-                    T.reduce_sum(bf.ph, bf.rsum, dim=1)
+                        bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
+                    T.reduce_sum(bf.p, bf.rsum, dim=1)
                     for i in T.Parallel(R):
                         bf.ls[hq, i] = bf.ls[hq, i] * bf.alpha[i] + bf.rsum[i]
-                    T.copy(bf.ph, bf.p)
                     for i, d in T.Parallel(R, HD):
                         bf.acc_o[hq, i, d] = bf.acc_o[hq, i, d] * bf.alpha[i]
                     T.gemm(bf.p, bf.vblk, bf.acc_o[hq, :, :], clear_accum=False)
@@ -341,10 +344,10 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             acc_o = T.alloc_shared((group, R, HD), "float32")
             m = T.alloc_shared((group, R), "float32")
             ls = T.alloc_shared((group, R), "float32")
-            s = T.alloc_shared((R, KEYS), "float32")
-            ph = T.alloc_shared((R, KEYS), "float16")
+            s = T.alloc_shared((R, KEYS), "float16")
             p = T.alloc_shared((R, KEYS), "float16")
             rmax = T.alloc_shared((R,), "float32")
+            mh = T.alloc_shared((R,), "float16")
             rsum = T.alloc_shared((R,), "float32")
             alpha = T.alloc_shared((R,), "float32")
 
@@ -353,7 +356,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             # What the macros below work on.
             bf = SimpleNamespace(
                 w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
-                q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, ph=ph, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha, gl=gl,
+                q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, gl=gl,
                 rope_cos=rope_cos, rope_sin=rope_sin, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,
             )  # fmt: skip
@@ -362,6 +365,8 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             rings = {}
             projections = (p_in, p_qkv, p_out, p_13, p_2)
             layouts = Stream([Phase(p, 0, 1, lambda b: 0) for p in projections], DEPTH, rings=rings).layouts()
+            # The scores: HMX's output tiles.
+            layouts[s] = make_hmx_activation_layout(s)
             T.annotate_layout(layouts)
 
             for chunk in T.serial(T.ceildiv(n, R)):
