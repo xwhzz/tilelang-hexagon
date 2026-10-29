@@ -379,15 +379,18 @@ static int serve(int cli, unsigned char op, int* running) {{
 }}
 
 int main(int argc, char** argv) {{
-  int port = (argc > 1) ? atoi(argv[1]) : 9777;
+  // The port to listen on, 0 for one the kernel picks, which it reports.
+  int port = (argc > 1) ? atoi(argv[1]) : 0;
   if (open_session(CDSP_DOMAIN_ID) != 0) return 1;
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((unsigned short)port);
   if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {{ perror("bind"); return 2; }}
+  socklen_t len = sizeof(addr);
+  getsockname(srv, (struct sockaddr*)&addr, &len);
   listen(srv, 1);
-  printf("AGENT_READY port=%d\\n", port); fflush(stdout);
+  printf("AGENT_READY port=%d\\n", ntohs(addr.sin_port)); fflush(stdout);
   int running = 1;
   while (running) {{
     int cli = accept(srv, 0, 0);
@@ -646,19 +649,21 @@ class Session:
     # ---- lifecycle --------------------------------------------------------
     def _start(self, ready_timeout: float) -> None:
         Session._port_seq += 1
-        self._device_port = 10000 + (os.getpid() * 17 + Session._port_seq) % 40000
         root = os.environ.get("TILELANG_HEXAGON_REMOTE_DIR", "/data/local/tmp/tilelang_hexagon")
         self._device_dir = f"{root}/session_{os.getpid()}_{Session._port_seq}"
         subprocess.run(self._base + ["shell", f"mkdir -p {self._device_dir}"], check=True, capture_output=True)
         for local in (self._artifacts.dsp_skel, self._artifacts.agent_exe):
             subprocess.run(self._base + ["push", local, f"{self._device_dir}/"], check=True, capture_output=True)
         exe = os.path.basename(self._artifacts.agent_exe)
-        done = subprocess.run(self._base + ["forward", "tcp:0", f"tcp:{self._device_port}"], check=True, capture_output=True, text=True)
-        self._host_port = int(done.stdout.split()[-1])
         adsp = os.pathsep.join([self._device_dir, *_DEFAULT_ADSP_DIRS])
+        # The agent listens on a port the kernel picks, which it reports: the
+        # device refused a port the host had picked now and then ("bind:
+        # Operation not permitted", 3 of some 700 sessions in a regression),
+        # and another session may hold it. The command exits with the agent's
+        # status.
         cmd = (
             f"cd {self._device_dir} && chmod 755 {exe} && LD_LIBRARY_PATH={self._device_dir} ADSP_LIBRARY_PATH={adsp} "
-            f"./{exe} {self._device_port}; rm -rf {self._device_dir}"
+            f"./{exe} 0; status=$?; rm -rf {self._device_dir}; exit $status"
         )
         self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         # select() keeps a silent agent from blocking past the deadline, and
@@ -668,7 +673,7 @@ class Session:
         # there.
         deadline = time.time() + ready_timeout
         printed = b""
-        while b"AGENT_READY" not in printed:
+        while (ready_line := re.search(rb"AGENT_READY port=(\d+)\n", printed)) is None:
             if self._proc.poll() is not None:
                 printed += self._proc.stdout.read()
                 raise RuntimeError(
@@ -680,6 +685,10 @@ class Session:
             ready, _, _ = select.select([self._proc.stdout], [], [], min(0.2, remaining))
             if ready:
                 printed += os.read(self._proc.stdout.fileno(), 4096)
+        done = subprocess.run(
+            self._base + ["forward", "tcp:0", f"tcp:{int(ready_line.group(1))}"], check=True, capture_output=True, text=True
+        )
+        self._host_port = int(done.stdout.split()[-1])
         for _ in range(100):
             try:
                 self._sock = socket.create_connection(("127.0.0.1", self._host_port), timeout=2.0)
