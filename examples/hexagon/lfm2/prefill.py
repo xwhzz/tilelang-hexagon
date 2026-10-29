@@ -93,9 +93,10 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
 
     @T.macro
     def normalize(bf, weight):
-        """a = x * rsqrt(mean(x^2) + eps) * weight(k), the worker's rows, two
+        """a = x * rsqrt(mean(x^2) + eps) * weight[k], the worker's rows, two
         at a time. Each row's factor is computed once, so that the scaling
-        broadcasts it from a register."""
+        broadcasts it from a register; the weights are read from VTCM."""
+        T.copy(weight, bf.nw)
         for r2 in T.serial(RW // 2):
             r = bf.w * RW + r2 * 2
             for i, k in T.Parallel(2, D):
@@ -104,7 +105,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             for i in T.Parallel(2):
                 bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
             for i, k in T.Parallel(2, D):
-                bf.rows[i, k] = bf.x[r + i, k] * bf.ss[i] * weight(k)
+                bf.rows[i, k] = bf.x[r + i, k] * bf.ss[i] * bf.nw[k]
             T.copy(bf.rows, bf.a[r : r + 2, :])
 
     @T.macro
@@ -297,6 +298,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
             rows = T.alloc_fragment((2, D), "float32")
             sq = T.alloc_fragment((2, D), "float32")
             ss = T.alloc_fragment((2,), "float32")
+            nw = T.alloc_shared((D,), "float32")
             erow = T.alloc_fragment((1, D), "int8")
             # q/k norms: one head of the block's rows at a time.
             head = T.alloc_shared((R, HD), "float32")
@@ -322,7 +324,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                 ones[i, 0] = T.float32(1)
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, head=head, hsq=hsq, hss=hss,
+                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
                 q=q, kblk=kblk, vblk=vblk, s=s, ph=ph, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, rsum=rsum, alpha=alpha, gl=gl,
                 rope_cos=rope_cos, rope_sin=rope_sin, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,
@@ -377,7 +379,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                         )
                         rest.append(Phase(p_2, layer, DW // BLOCK, lambda b: w * DW + b * BLOCK, lambda b, part=part: part))
                     st_rest = Stream(rest, DEPTH, rings=rings)
-                    normalize(bf, lambda k, layer=layer: op_norm[layer, k])
+                    normalize(bf, op_norm[layer, :])
                     T.sync_grid()
                     if kinds[layer, 0] == 1:
                         st_attn.prologue()
@@ -392,7 +394,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
                     st_rest.prologue()
                     st_rest.run(0, lambda b, rw, rs, k: residual_block(bf, b, rw, rs, k, D))
                     T.sync_grid()
-                    normalize(bf, lambda k, layer=layer: ffn_norm[layer, k])
+                    normalize(bf, ffn_norm[layer, :])
                     T.sync_grid()
                     for part in list(range(PARTS)):
                         st_rest.run(1 + 2 * part, lambda b, rw, rs, k: glu_block(bf, b, rw, rs, k))
