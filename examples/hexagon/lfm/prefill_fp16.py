@@ -27,7 +27,8 @@ rest: the short conv's gates and its causal conv over time, q/k norms and
 RoPE, the KV cache's writes, the head gates and SwiGLU.
 
 Attention runs per query head, in blocks of ROWS rows against the KV cache in
-blocks of KEYS positions with an online softmax in base 2, on HMX. The FFN's
+blocks of KEYS positions with an online softmax in base 2, on HMX; the cache
+keeps HMX's tiles, so a block of it comes into HMX's operands by DMA. The FFN's
 hidden units run in parts of FQ (of at most 64 tiles): a part's w1/w3 panels
 fill hid, and its w2 slab adds the part's product into f.
 
@@ -44,14 +45,14 @@ from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert import TILE, qkv_group  # noqa: E402
-from decode_fp16 import NW, slice_cols  # noqa: E402
+from decode_fp16 import NW, kv_layouts, slice_cols  # noqa: E402
 from model import SLIDING, Config  # noqa: E402
 from stream import Phase, Stream, Weights  # noqa: E402
 
 DEPTH = 2  # blocks in flight per worker: a block multiplies longer than it streams
 RB = 4  # rows a worker's row phases (residual adds, norms) move at once
-ROWS = 128  # rows of an attention block
-KEYS = 64  # KV positions per attention step
+ROWS = 64  # rows of an attention block
+KEYS = 128  # KV positions per attention step
 NEG = -3.0e38
 NEG16 = -65504.0  # the scores' mask, in fp16
 LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
@@ -102,10 +103,12 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
         T.gemm(A, ring[k, 0:K, :], C, clear_accum=clear)
 
     @T.macro
-    def normalize(bf, s):
-        """rows = xr[s] * rsqrt(mean(xr[s]^2) + eps) * nw[k], RB rows."""
-        for i, k in T.Parallel(RB, D):
-            bf.sq[i, k] = bf.xr[s, i, k] * bf.xr[s, i, k]
+    def normalize(bf, s, squared: bool = False):
+        """rows = xr[s] * rsqrt(mean(xr[s]^2) + eps) * nw[k], RB rows; sq
+        already holds xr[s]^2 when `squared`."""
+        if not squared:
+            for i, k in T.Parallel(RB, D):
+                bf.sq[i, k] = bf.xr[s, i, k] * bf.xr[s, i, k]
         T.reduce_sum(bf.sq, bf.ss, dim=1)
         for i in T.Parallel(RB):
             bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
@@ -146,19 +149,26 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                 nxt = bf.w * RW + T.min(rb + 1, nb - 1) * RB
                 T.dma_copy(bf.x[nxt : nxt + RB, :], bf.xr[1 - s, :, :])
             if sandwich:
-                for i, k in T.Parallel(RB, D):
-                    bf.sq[i, k] = bf.f[r + i, k] * bf.f[r + i, k]
-                T.reduce_sum(bf.sq, bf.ss, dim=1)
+                # The branch's rows' sums of squares: the workers' parts of
+                # them, which the GEMMs' epilogues made.
                 for i in T.Parallel(RB):
-                    bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
+                    total = bf.psum[0, r + i]
+                    for v in list(range(1, NW)):
+                        total = total + bf.psum[v, r + i]
+                    bf.ss[i] = T.rsqrt(total * T.float32(1 / D) + T.float32(eps))
+                # The new rows, and their squares for the next norm.
                 for i, k in T.Parallel(RB, D):
-                    bf.xr[s, i, k] = bf.xr[s, i, k] + bf.f[r + i, k] * bf.ss[i] * bf.pw[k]
+                    v = bf.xr[s, i, k] + bf.f[r + i, k] * bf.ss[i] * bf.pw[k]
+                    bf.xr[s, i, k] = v
+                    bf.sq[i, k] = v * v
             else:
                 for i, k in T.Parallel(RB, D):
-                    bf.xr[s, i, k] = bf.xr[s, i, k] + bf.f[r + i, k]
+                    v = bf.xr[s, i, k] + bf.f[r + i, k]
+                    bf.xr[s, i, k] = v
+                    bf.sq[i, k] = v * v
             T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
             if normed:
-                normalize(bf, s)
+                normalize(bf, s, True)
                 T.copy(bf.rows, bf.a[r : r + RB, :])
         T.dma_wait(0)
 
@@ -248,16 +258,16 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
         else:
             gemm(bf, bf.a, D, ring, k, bf.cc[0, :, :], True)
             for i, q in T.Parallel(R, group):
-                bf.gates[kvh % KH, i, q] = T.sigmoid(bf.cc[0, i, q])
+                bf.gates[kvh % KH, q, i] = T.sigmoid(bf.cc[0, i, q])
 
     @T.macro
     def fetch(bf, ai, kvh, kb, slot):
-        """Block kb of the KV head's keys and values into a slot, by DMA:
-        clamped, so that the copies are provably in the cache, as a block
-        past it is never used."""
+        """Block kb of the KV head's keys and values into a slot of HMX's
+        operands, by DMA, the cache's tiles as they are: clamped, so that the
+        copies are provably in the cache, as a block past it is never used."""
         at = T.max(T.min(kb, max_pos // KEYS - 1), 0) * KEYS
-        T.dma_copy(bf.kv_k[ai, kvh, at : at + KEYS, :], bf.kst[slot, :, :])
-        T.dma_copy(bf.kv_v[ai, kvh, at : at + KEYS, :], bf.vst[slot, :, :])
+        T.dma_copy(bf.kv_k[ai, kvh, at : at + KEYS, :], bf.kblk[slot, :, :])
+        T.dma_copy(bf.kv_v[ai, kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
 
     @T.macro
     def attention(bf, ai, base, window):
@@ -268,7 +278,8 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
         A head's scores stay in the fp16 tiles HMX stores them in, where the
         mask and the row maxima work; exp2 writes P into another buffer's
         tiles, which HMX multiplies by V and whose rows sum in fp32. The
-        blocks of keys and values come into VTCM by DMA, a block ahead."""
+        blocks of keys and values come by DMA, a block ahead, straight into
+        HMX's operands: the cache keeps them in its tiles."""
         for h in T.serial(KH):
             kvh = bf.w * KH + h
             for hq in T.serial(group):
@@ -292,9 +303,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                             T.dma_wait(2)
                         else:
                             T.dma_wait()
-                        T.copy(bf.kst[slot, :, :], bf.kblk)
-                        T.copy(bf.vst[slot, :, :], bf.vblk)
-                        T.gemm(bf.qb, bf.kblk, bf.s, transpose_B=True, clear_accum=True)
+                        T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
                         # Causal, and within the window: key kb * KEYS + j is
                         # visible to row i when row0 + i - span < key <= row0 + i,
                         # every key of the block to every row away from the
@@ -318,7 +327,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                             bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
                         for i, d in T.Parallel(ROWS, HD):
                             bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
-                        T.gemm(bf.p, bf.vblk, bf.acc_o, clear_accum=False)
+                        T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
                     for i in T.Parallel(ROWS):
                         bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
                     for i, d in T.Parallel(ROWS, HD):
@@ -327,11 +336,20 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
 
     @T.macro
-    def branch_block(bf, b, ring, k, A, K: int, first):
+    def branch_block(bf, b, ring, k, A, K: int, first, sums):
         """f[:, the worker's channels of panel b] = A @ block, or += past the
-        FFN's first part: in the GEMM."""
+        FFN's first part: in the GEMM. With `sums` (f's channels final), the
+        panel's rows' sums of squares into the worker's part of the branch's,
+        which LFM3's sandwich norm reads: in the GEMM phase, where HVX has
+        time the weights' stream gives it."""
         ch = bf.w * DW + b * TILE
         gemm(bf, A, K, ring, k, bf.f[:, ch : ch + TILE], first)
+        if sums:
+            for i, j in T.Parallel(R, TILE):
+                bf.sq32[i, j] = bf.f[i, ch + j] * bf.f[i, ch + j]
+            T.reduce_sum(bf.sq32, bf.hs32, dim=1)
+            for i in T.Parallel(R):
+                bf.psum[bf.w, i] = T.if_then_else(b == 0, bf.hs32[i], bf.psum[bf.w, i] + bf.hs32[i])
 
     @T.macro
     def glu_block(bf, b, ring, k):
@@ -387,6 +405,8 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             a = T.alloc_global((R, D), "float16", scope="global.vtcm")
             hid = T.alloc_global((R, HID), "float16", scope="global.vtcm")
             f = T.alloc_global((R, D), "float32", scope="global.vtcm")
+            # The workers' parts of f's rows' sums of squares.
+            psum = T.alloc_global((NW, R), "float32", scope="global.vtcm")
             cos_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
             sin_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
 
@@ -409,15 +429,12 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             hss = T.alloc_shared((R,), "float32")
             sq32 = T.alloc_shared((R, TILE), "float32")
             hs32 = T.alloc_shared((R,), "float32")
-            gates = T.alloc_shared((KH, R, group), "float32")
-            # Attention: a block of a head's queries, a block of keys and
-            # values (and their DMA slots), the softmax state and output, and
-            # the scores.
+            gates = T.alloc_shared((KH, group, R), "float32")
+            # Attention: a block of a head's queries, two slots of a block of
+            # keys and values, the softmax state and output, and the scores.
             qb = T.alloc_shared((ROWS, HD), "float16")
-            kblk = T.alloc_shared((KEYS, HD), "float16")
-            vblk = T.alloc_shared((KEYS, HD), "float16")
-            kst = T.alloc_shared((2, KEYS, HD), "float16")
-            vst = T.alloc_shared((2, KEYS, HD), "float16")
+            kblk = T.alloc_shared((2, KEYS, HD), "float16")
+            vblk = T.alloc_shared((2, KEYS, HD), "float16")
             acc_o = T.alloc_shared((ROWS, HD), "float32")
             m = T.alloc_shared((ROWS,), "float32")
             ls = T.alloc_shared((ROWS,), "float32")
@@ -430,11 +447,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
 
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, a=a, hid=hid, x=x, f=f, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, nw=nw, pw=pw, hd=hd, rot=rot,
-                hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk, kst=kst, vst=vst,
+                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, nw=nw, pw=pw, hd=hd, rot=rot,
+                hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
                 acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,
-                gate=(lambda h, i, q: gates[h, i, q]) if c.head_gate else (lambda h, i, q: T.float32(1)),
+                gate=(lambda h, i, q: gates[h, q, i]) if c.head_gate else (lambda h, i, q: T.float32(1)),
             )  # fmt: skip
 
             # Every projection streams blocks of one shape through one ring.
@@ -446,6 +463,8 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             layouts[s] = make_hmx_activation_layout(s)
             layouts[qs] = make_hmx_activation_layout(qs)
             layouts[qb] = make_hmx_activation_layout(qb)
+            layouts.update(kv_layouts(kv_k, kv_v))
+            layouts.update(kv_layouts(kblk, vblk))
             T.annotate_layout(layouts)
 
             for chunk in T.serial(T.ceildiv(n, R)):
@@ -511,7 +530,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     # prefill leaves: the decode runs the prompt's last token.
                     if layer < L - 1:
                         st_rest.prologue()
-                        st_rest.run(0, lambda b, ring, k: branch_block(bf, b, ring, k, hid[:, 0:D], D, True))
+                        st_rest.run(0, lambda b, ring, k: branch_block(bf, b, ring, k, hid[:, 0:D], D, True, c.sandwich_norm))
                         T.sync_grid()
                         add_branch(bf, post_op_norm[layer, :], c.sandwich_norm, ffn_norm[layer, :], True)
                         T.sync_grid()
@@ -519,7 +538,10 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                             st_rest.run(1 + 2 * part, lambda b, ring, k: glu_block(bf, b, ring, k))
                             T.sync_grid()
                             st_rest.run(
-                                2 + 2 * part, lambda b, ring, k, part=part: branch_block(bf, b, ring, k, hid[:, 0:FQ], FQ, part == 0)
+                                2 + 2 * part,
+                                lambda b, ring, k, part=part: branch_block(
+                                    bf, b, ring, k, hid[:, 0:FQ], FQ, part == 0, c.sandwich_norm and part == PARTS - 1
+                                ),
                             )
                             T.sync_grid()
                         # The residual, and the next layer's normalized input.

@@ -299,8 +299,12 @@ def test_fp16_prefill_matches_the_reference(model, tmp_path):
         def rel(a, b):
             return ((a - b).abs().max() / b.abs().max()).item()
 
-        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16).view(La, KVH, max_pos, HD).float()
-        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16).view(La, KVH, max_pos, HD).float()
+        # The cache's tiles (decode_fp16.kv_layouts): keys as the weight
+        # operand [head_dim, positions] of q K^T, values as that of P V.
+        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16)
+        k = convert.from_crouton_weight(k, (La, KVH, HD, max_pos)).float()
+        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16)
+        v = convert.from_crouton_weight(v, (La, KVH, max_pos, HD)).transpose(-1, -2).float()
         conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, c.conv_taps - 1, c.dim)
         errors = [rel(k[ai, :, :n], state.k[ai]) for ai in range(La)] + [rel(v[ai, :, :n], state.v[ai]) for ai in range(La)]
         errors += [rel(conv[ci], state.conv[ci]) for ci in range(conv.shape[0])]

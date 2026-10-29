@@ -215,7 +215,10 @@ worker owns one KV head of LFM3 with its four query heads and their gates.
 Every worker keeps the residual stream in fp32 and adds each branch's whole
 output, normed over all of it (the sandwich norm needs the workers' sums of
 squares, which they write beside their slices). Projections take their inputs
-in fp16, and the KV cache is fp16.
+in fp16. The KV cache is fp16, in HMX's tiles (keys as the transposed weight
+operand of q K^T, values as the weight operand of P V), which the decode's
+attention multiplies on HVX as they are and the prefill's moves into HMX's
+operands by DMA.
 
 On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
 call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a
@@ -238,10 +241,14 @@ with nothing to dequantize.
     row before the residual add.
 
   The residual itself is in DDR, a worker's rows moving by DMA two slots deep.
-- **Attention** runs per query head, in blocks of 128 rows against 64 keys at a
-  time, with an online softmax in base 2. The queries go to DDR in HMX's
-  activation tiles, so that a block of them comes back into HMX's operand by
-  one DMA.
+- **Attention** runs per query head, in blocks of 64 rows against 128 keys at a
+  time, with an online softmax in base 2. Blocks of keys and values come from
+  the cache into HMX's operands by DMA, a block ahead, with no pack; so do the
+  queries, which go to DDR in HMX's activation tiles.
+- **The sandwich norm's** row sums of squares come from the output
+  projections' GEMMs: each panel's epilogue adds its share, while HVX waits
+  for the weights anyway. The residual add then reads each branch output once,
+  and squares the new rows for the next norm as it makes them.
 - **The last layer's** output projection and FFN feed nothing a prefill leaves
   (the decode runs the prompt's last token), so it skips them.
 
@@ -250,17 +257,17 @@ call):
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp256 | 67.4 | 3799 |
-| pp512 | 133.4 | 3838 |
-| pp1024 | 270.9 | 3780 |
-| pp2048 | 570.6 | 3590 |
+| pp256 | 65.1 | 3932 |
+| pp512 | 129.2 | 3964 |
+| pp1024 | 259.2 | 3951 |
+| pp2048 | 543.2 | 3770 |
 
 A chunk streams 2835 MB of weights: for 1024 tokens, 201 ms of GEMM phases at
 56 GB/s, the DMA's rate, while HMX's multiplies alone take 180 ms at 8.1
 cycles a 32 x 32 x 32 op. A cycle profile puts the rest of pp1024 in three
 places:
-- attention, mostly HVX: its packs, exp2 and rescaling (28 ms);
-- the residual adds and norms (30 ms);
+- attention, mostly HVX: exp2, the row sums and the output's rescaling (21 ms);
+- the residual adds and norms, mostly moving the residual's rows (26 ms);
 - the barriers (8 ms).
 
 After a chat prompt, prefilled, the first 64 greedy tokens still match the

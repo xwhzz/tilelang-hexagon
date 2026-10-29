@@ -23,8 +23,9 @@ writes its slice's sum of squares beside the slice. A layer takes four
 barriers: after the operator's output, its projection, the FFN's hidden
 units and their projection.
 
-The KV cache is fp16, as the weights; attention multiplies on HVX with fp32
-sums. The LM head proposes, from each block of 32 logits as it arrives, the
+The KV cache is fp16, as the weights, in HMX's tiles (``kv_layouts``), which
+the prefill's attention reads by DMA into its operands; the decode's attention
+multiplies them on HVX with fp32 sums. The LM head proposes, from each block of 32 logits as it arrives, the
 running argmax (or the sample, at a temperature) and the running sum of
 exponentials, writing the logits to DDR.
 """
@@ -35,6 +36,7 @@ import sys
 import torch
 
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert import TILE, qkv_group  # noqa: E402
@@ -59,6 +61,14 @@ def rope_tables(c: Config, max_pos: int) -> tuple:
     positions = torch.arange(max_pos)
     angles = torch.stack([rope_angles(positions, c.head_dim, *c.rope[k]) for k in kinds(c)])
     return angles.cos().float().contiguous(), angles.sin().float().contiguous()
+
+
+def kv_layouts(kv_k, kv_v) -> dict:
+    """The KV cache's layouts, [..., positions, head_dim] each: keys as the
+    weight operand of q K^T (transposed: a block of positions is its tiles of
+    every head dimension, contiguous), values as that of P V (a block of
+    positions is a run of tiles for each 32 head dimensions)."""
+    return {kv_k: make_hmx_weight_layout(kv_k, transposed=True), kv_v: make_hmx_weight_layout(kv_v)}
 
 
 def slice_cols(K: int) -> int:
@@ -338,8 +348,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             t_hd = T.alloc_shared((1, HD), "float32")
             sq_hd = T.alloc_fragment((1, HD), "float32")
             qg = T.alloc_fragment((group, HD), "float16")
-            kb = T.alloc_fragment((POS_BLOCK, HD), "float16")
-            vb = T.alloc_fragment((POS_BLOCK, HD), "float16")
+            kb = T.alloc_shared((POS_BLOCK, HD), "float16")
+            vb = T.alloc_shared((POS_BLOCK, HD), "float16")
             sc = T.alloc_fragment((group, POS_BLOCK), "float32")
             pr = T.alloc_fragment((group, POS_BLOCK), "float32")
             pr16 = T.alloc_fragment((group, POS_BLOCK), "float16")
@@ -382,7 +392,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                 phases.append(Phase.rows(p_2, layer, w * DW, DW // TILE))
             phases.append(Phase.rows(p_head, 0, w * VW, VW // TILE))
             st = Stream(phases, DEPTH)
-            T.annotate_layout(st.layouts())
+            T.annotate_layout({**st.layouts(), **kv_layouts(kv_k, kv_v), **kv_layouts(kb, vb)})
             st.prologue()
 
             for t in T.serial(n):
