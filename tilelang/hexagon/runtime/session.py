@@ -50,8 +50,10 @@ import numpy as np
 import torch
 
 from . import fastrpc
-from .agent import CALL_TIMEOUT
 from .device import _DEFAULT_ADSP_DIRS, DEVICE_LOCK
+
+# Seconds one call to the agent may take, its transfers included.
+CALL_TIMEOUT = 600.0
 
 # Parameter kinds of a run, with their two values.
 _RESIDENT = 0  # (fd, byte offset)
@@ -194,11 +196,6 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
 #endif
 """)
     return "".join(parts)
-
-
-def gen_host(iface: str) -> str:
-    # The project's one-shot driver target; sessions use the agent.
-    return "int main(void) { return 0; }\n"
 
 
 def gen_agent(iface: str) -> str:
@@ -420,9 +417,8 @@ def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tup
     files = {
         f"{iface}.idl": gen_idl(iface),
         f"{iface}_dsp.cc": gen_dsp(iface, kernels),
-        f"{iface}_host.c": gen_host(iface),
         f"{iface}_agent.c": gen_agent(iface),
-        "CMakeLists.txt": fastrpc.gen_cmake(iface, TILELANG_TEMPLATE_PATH, with_agent=True),
+        "CMakeLists.txt": fastrpc.gen_cmake(iface, TILELANG_TEMPLATE_PATH, agent=True),
     }
     for fn, content in files.items():
         with open(os.path.join(workdir, fn), "w") as f:
@@ -497,7 +493,8 @@ class SessionKernel:
 
     def __call__(self, *args):
         """``args`` fill the parameters outside ``out_idx`` in order, and the
-        ``out_idx`` ones come back as tensors. Passing every parameter instead
+        ``out_idx`` ones come back as tensors, in ``out_idx`` order (one
+        output alone, not in a list). Passing every parameter instead
         decides each one: an ``out_idx`` parameter given a DeviceBuffer is
         written there, one given None comes back."""
         if len(args) == len(self.params):
@@ -590,19 +587,49 @@ class Session:
     _port_seq = 0
 
     def __init__(self, kernels, *, target="hexagon", serial: str | None = None, verbose: bool = False, ready_timeout: float = 30.0):
-        """``kernels``: (prim_func, out_idx) pairs, compiled into one skel."""
+        """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
+        the DSP the target names."""
+        from tilelang.backend.target import determine_target
+        from tilelang.hexagon.target import hexagon_arch
+
+        target = determine_target(target, return_object=True)
+        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout)
+
+    @classmethod
+    def of_lowered(
+        cls,
+        lowered,
+        *,
+        sdk=None,
+        dsp_arch: str | None = None,
+        serial: str | None = None,
+        verbose: bool = False,
+        ready_timeout: float = 30.0,
+    ) -> Session:
+        """A session of kernels lowered already, (name, source, params,
+        out_idx) each as :func:`lower_kernels` gives them: a compiled kernel
+        (tilelang.compile) is a session of one."""
+        session = cls.__new__(cls)
+        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout)
+        return session
+
+    def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float) -> None:
         from .build import build_cmake_fastrpc
         from .config import device_serial
         from .env import HexagonSDK
 
-        lowered = lower_kernels(kernels, target)
+        self._closed = True
+        if os.environ.get("TILELANG_HEXAGON_HLOS") == "linux":
+            raise NotImplementedError(
+                "a session needs the Android agent; on a Linux BSP, tilelang.compile runs a kernel one call at a time"
+            )
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")
         weakref.finalize(self, shutil.rmtree, self._workdir, True)
         project, iface = write_project(self._workdir, [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered])
-        sdk = HexagonSDK().validate()
-        self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, verbose=verbose)
+        sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
+        self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, dsp_arch=dsp_arch, verbose=verbose)
         self.kernels = [SessionKernel(self, i, name, params, out) for i, (name, _, params, out) in enumerate(lowered)]
         self._serial = serial or device_serial()
         self._base = ["adb"] + (["-s", self._serial] if self._serial else [])
@@ -619,7 +646,7 @@ class Session:
     def _start(self, ready_timeout: float) -> None:
         Session._port_seq += 1
         self._device_port = 10000 + (os.getpid() * 17 + Session._port_seq) % 40000
-        root = os.environ.get("TL_V2_DEVICE_ROOT", "/data/local/tmp/tilelang_hexagon")
+        root = os.environ.get("TILELANG_HEXAGON_REMOTE_DIR", "/data/local/tmp/tilelang_hexagon")
         self._device_dir = f"{root}/session_{os.getpid()}_{Session._port_seq}"
         subprocess.run(self._base + ["shell", f"mkdir -p {self._device_dir}"], check=True, capture_output=True)
         for local in (self._artifacts.dsp_skel, self._artifacts.agent_exe):
@@ -765,6 +792,10 @@ class Session:
                     raise ValueError(f"argument {i} of {kernel.name} has {len(raw)} bytes, the kernel takes {plan.nbytes}")
                 args += [_INPUT, len(inputs), 0]
                 inputs += raw + bytes(_align(len(raw)) - len(raw))
+        # The outputs come back in out_idx order, as a compiled kernel's do;
+        # any other parameter given None after them.
+        rank = {i: k for k, i in enumerate(kernel.out_idx)}
+        outputs.sort(key=lambda output: rank.get(output[0], len(rank) + output[0]))
         head = struct.pack("<iii", kernel.index, len(args) // 3, out_bytes)
         # One write: adb relays each as a packet (see the agent's reply()).
         self._sock.sendall(b"".join([bytes([_OP_RUN]), head, struct.pack(f"<{len(args)}i", *args), struct.pack("<I", len(inputs)), inputs]))

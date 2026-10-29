@@ -86,11 +86,13 @@ These are the decisions that keep the adaptation small and the code navigable.
   arena), `hmx.h` (the HMX atoms + session), `crouton.h` (copies to and from
   Crouton matrices), `hvx_gemm.h` and `hmx_gemm.h` (the GEMMs that are functions of
   their own), `worker.h` (the HW-thread pool).
-- **Layer 5** — `tilelang/hexagon/runtime/`: `fastrpc.py` generates the IDL + skel +
-  host + CMake from the kernel params; `build.py`/`env.py` drive the Hexagon SDK
-  build; `agent.py` runs a persistent on-DSP agent over a socket (`adb forward`);
-  `adapter.py` marshals torch tensors and invokes. `session.py` holds several
-  kernels in one FastRPC session with device-resident buffers (below).
+- **Layer 5** — `tilelang/hexagon/runtime/`: `session.py` builds kernels into one
+  skel and runs them through an agent on the phone that holds their FastRPC session
+  and device-resident buffers, over a socket (`adb forward`); `build.py`/`env.py`
+  drive the Hexagon SDK build, and `fastrpc.py` holds the pieces of a project the
+  skels share. `adapter.py` is `tilelang.compile`'s: a compiled kernel is a session
+  of one. On a Linux BSP (`linux_runtime.py`), with no agent, a kernel runs one call
+  at a time through a host driver of its own.
 
 ---
 
@@ -292,8 +294,8 @@ and explicit HMX atoms.
   than returning unwritten/partial output (the silent-wrong-output trap). The codegen
   emits the `return`s; a new recipe that can fail should return a nonzero code rather
   than fault or skip silently.
-- **Validate** with the `HexagonKernelAdapter` + a small torch reference (the
-  `test_*.py` pattern). The persistent agent (`agent.py`) makes a call ~4 ms,
+- **Validate** with `tilelang.compile` + a small torch reference (the `test_*.py`
+  pattern). A compiled kernel is a session of one (below): a call costs a few ms,
   about 1.5 ms of it the `adb forward` round trip. Each message crosses the socket
   in one write: `adb` relays every write as a packet, and a small packet followed by
   another waited out a delayed ACK, which cost ~40 ms per call.

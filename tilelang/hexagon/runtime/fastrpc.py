@@ -1,14 +1,14 @@
-"""Generate a self-contained FastRPC project around a tilelang-generated Hexagon
-kernel: the IDL, the DSP skel handler (wrapping the kernel), an HLOS host driver,
-and a CMakeLists, all derived from the kernel source + its :class:`KernelParam`s.
+"""The FastRPC pieces of a kernel's project: what its skel needs from the
+templates (:func:`skel_runtime`), the PD's setup, the kernel status, and the
+CMakeLists. A session's project (:mod:`.session`) builds its skel and agent
+with them.
 
-The generated project mirrors ``mini-htp``'s proven structure.  Buffers cross the
-FastRPC boundary as ``sequence<uint8>`` (``in`` for inputs, ``rout`` for outputs);
-scalar kernel params (dynamic dims) cross as ``in int32``.  Byte sizes are baked
-into the host driver from the (static) param shapes.  This is the simple,
-correct M1 transport; VTCM/ION zero-copy is an M3 optimization.
-
-Dependency-light: only stdlib + numpy (for itemsize/shape products).
+On a Linux BSP, where there is no agent, a kernel's own project
+(:func:`write_project`) adds an IDL with the kernel's buffers and a one-shot
+host driver that runs one call (:class:`~.linux_runtime.OneShotKernel`).
+Buffers cross the FastRPC boundary as ``sequence<uint8>`` (``in`` for inputs,
+``rout`` for outputs), scalars as ``in int32``; the driver's byte sizes come
+from the static parameter shapes.
 """
 
 from __future__ import annotations
@@ -299,161 +299,31 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
     )
 
 
-def gen_agent(iface: str, plans: list[BufferPlan]) -> str:
-    """A persistent FastRPC agent: one cDSP session, many invokes over a TCP
-    socket (reached via `adb forward`).  Per invoke the client sends an op byte
-    (1=run, 0=close conn, 2=shutdown), then for ``run`` the input buffers (+ any
-    int32 scalars) in param order; the agent runs and returns the output buffers.
-    Buffer sizes are baked, so the wire carries only raw bytes."""
-    # Buffers are rpcmem-allocated once and kept resident: FastRPC maps them to
-    # the DSP zero-copy, and a per-invoke ``mask`` lets the client skip
-    # re-sending unchanged inputs (e.g. a fixed weight) so only changed bytes
-    # cross USB.
-    allocs, frees, recvs, calls, writes = [], [], [], ["g_handle"], []
-    in_bit = 0
-    for pl in plans:
-        if pl.is_scalar:
-            raise NotImplementedError("scalar params over the agent are not wired yet")
-        allocs.append(
-            f"  unsigned char* rbuf_{pl.name} = (unsigned char*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, {pl.nbytes});\n"
-            f'  if (!rbuf_{pl.name}) {{ fprintf(stderr, "rpcmem_alloc failed\\n"); return 3; }}\n'
-            f"  memset(rbuf_{pl.name}, 0, {pl.nbytes});  // avoid garbage if a buffer is masked-out before first send"
-        )
-        frees.append(f"  rpcmem_free(rbuf_{pl.name});")
-        calls.append(f"rbuf_{pl.name}")
-        calls.append(f"{pl.nbytes}")
-        if pl.is_output:
-            writes.append(f"{{rbuf_{pl.name}, {pl.nbytes}}}")
-        else:
-            recvs.append(f"      if ((mask >> {in_bit}) & 1) {{ if (read_full(cli, rbuf_{pl.name}, {pl.nbytes})) break; }}")
-            in_bit += 1
-    body_allocs = "\n".join(allocs)
-    body_frees = "\n".join(frees)
-    body_recvs = "\n".join(recvs)
-    # The status byte and the outputs leave in one write: adb relays each write
-    # as a packet, and a small packet followed by another waits out a delayed
-    # ACK, which cost ~40 ms per call.
-    body_writes = ", ".join(["{&status, 1}", *writes])
-    call_str = ", ".join(calls)
-    return f"""// Auto-generated persistent FastRPC agent for a tilelang Hexagon kernel.
-#include <AEEStdErr.h>
-#include <remote.h>
-#include "rpcmem.h"
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include "dsp_capabilities_utils.h"
-#include "{iface}.h"
-
-static remote_handle64 g_handle = -1;
-
-static int read_full(int fd, void* buf, size_t n) {{
-  size_t got = 0;
-  while (got < n) {{ ssize_t r = read(fd, (char*)buf + got, n - got); if (r <= 0) return -1; got += (size_t)r; }}
-  return 0;
-}}
-static int write_full(int fd, const void* buf, size_t n) {{
-  size_t put = 0;
-  while (put < n) {{ ssize_t w = write(fd, (const char*)buf + put, n - put); if (w <= 0) return -1; put += (size_t)w; }}
-  return 0;
-}}
-// All of `io`, in one writev unless it stops short.
-static int writev_full(int fd, struct iovec* io, int count) {{
-  ssize_t w = writev(fd, io, count);
-  if (w < 0) return -1;
-  size_t done = (size_t)w;
-  for (int i = 0; i < count; ++i) {{
-    if (done >= io[i].iov_len) {{ done -= io[i].iov_len; continue; }}
-    if (write_full(fd, (const char*)io[i].iov_base + done, io[i].iov_len - done)) return -1;
-    done = 0;
-  }}
-  return 0;
-}}
-
-static int open_session(int domain_id) {{
-  domain* d = get_domain(domain_id);
-  if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
-{PD_SETUP}  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
-  char* uri = (char*)malloc(len);
-  snprintf(uri, len, "%s%s", {iface}_URI, d->uri);
-  int e = {iface}_open(uri, &g_handle); free(uri);
-  if (e != AEE_SUCCESS) {{ fprintf(stderr, "open failed: 0x%x\\n", e); return -1; }}
-  return 0;
-}}
-
-int main(int argc, char** argv) {{
-  int port = (argc > 1) ? atoi(argv[1]) : 9777;
-  if (open_session(CDSP_DOMAIN_ID) != 0) return 1;
-{body_allocs}
-  int srv = socket(AF_INET, SOCK_STREAM, 0);
-  int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((unsigned short)port);
-  if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {{ perror("bind"); return 2; }}
-  listen(srv, 1);
-  printf("AGENT_READY port=%d\\n", port); fflush(stdout);
-  int running = 1;
-  while (running) {{
-    int cli = accept(srv, 0, 0);
-    if (cli < 0) continue;
-    setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    for (;;) {{
-      unsigned char op, mask;
-      if (read_full(cli, &op, 1)) break;
-      if (op == 0) break;
-      if (op == 2) {{ running = 0; break; }}
-      if (read_full(cli, &mask, 1)) break;
-{body_recvs}
-      int e = {iface}_run({call_str});
-      // A status byte, so the client never hangs on a failed run: 0, a
-      // kernel's TL_ERR_* status, or 255 for another error.
-      unsigned char status = e == AEE_SUCCESS ? 0 : (e > {KERNEL_STATUS_BASE:#x} && e < {KERNEL_STATUS_BASE + 255:#x}) ? (unsigned char)(e - {KERNEL_STATUS_BASE:#x}) : 255;
-      struct iovec io[] = {{{body_writes}}};
-      if (writev_full(cli, io, e == AEE_SUCCESS ? sizeof(io) / sizeof(io[0]) : 1)) break;
-    }}
-    close(cli);
-  }}
-{body_frees}
-  {iface}_close(g_handle);
-  return 0;
-}}
-"""
-
-
-def gen_cmake(iface: str, template_dir: str, with_agent: bool = True) -> str:
-    # Mirrors mini-htp/CMakeLists.txt: host exe (stub + driver) and DSP skel
-    # (skel + impl, compiled with HVX/HMX enabled).  ``template_dir`` is the
-    # parent of ``tl_templates`` so the kernel's <tl_templates/hexagon/...>
-    # include resolves (matches how nvcc/hipcc get -I TILELANG_TEMPLATE_PATH).
-    # The persistent agent target is emitted only when the kernel is agent-eligible.
+def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
+    # The DSP skel (skel + impl, compiled with HVX/HMX enabled) and, for a
+    # session, its Android agent (stub + agent). ``template_dir`` is the parent
+    # of ``tl_templates`` so the kernel's <tl_templates/hexagon/...> include
+    # resolves (as nvcc/hipcc get -I TILELANG_TEMPLATE_PATH). A Linux BSP builds
+    # its host driver itself (linux_build.py).
     # Kernels clean up by scope (DMA queues, worker HMX scopes) and never throw;
     # -fno-exceptions keeps those destructors from importing the C++ unwinder,
     # which the DSP does not have.
     agent_block = (
-        (
-            """
-    # Persistent agent: same FastRPC stub, served over a TCP socket (reuses the
-    # IDL artifacts from IFACE_test, ordered via add_dependencies).
+        """
     add_executable(IFACE_agent
         ${CMAKE_CURRENT_BINARY_DIR}/IFACE_stub.c
         ${HEXAGON_SDK_ROOT}/utils/examples/dsp_capabilities_utils.c
         ${CMAKE_CURRENT_SOURCE_DIR}/IFACE_agent.c
     )
-    add_dependencies(IFACE_agent IFACE_test)
+    build_idl(IFACE.idl IFACE_agent)
     set_common_compile_and_link_options(IFACE_agent)
     if(${CMAKE_SYSTEM_NAME} MATCHES "Android")
         target_link_options(IFACE_agent PUBLIC -llog -ldl)
     endif()
+    choose_dsprpc(${DSP_TYPE} dsprpc)
     link_custom_library(IFACE_agent ${dsprpc})
     copy_binaries(IFACE_agent)""".replace("IFACE", iface)
-        )
-        if with_agent
+        if agent
         else ""
     )
     return f"""cmake_minimum_required(VERSION 3.14.3)
@@ -477,22 +347,7 @@ include_directories(
     {template_dir}
 )
 
-if(${{OS_TYPE}} MATCHES "HLOS")
-    add_executable({iface}_test
-        ${{CMAKE_CURRENT_BINARY_DIR}}/{iface}_stub.c
-        ${{HEXAGON_SDK_ROOT}}/utils/examples/dsp_capabilities_utils.c
-        ${{CMAKE_CURRENT_SOURCE_DIR}}/{iface}_host.c
-    )
-    build_idl({iface}.idl {iface}_test)
-    set_common_compile_and_link_options({iface}_test)
-    target_compile_definitions({iface}_test PUBLIC VERIFY_PRINT_ERROR)
-    if(${{CMAKE_SYSTEM_NAME}} MATCHES "Android")
-        target_link_options({iface}_test PUBLIC -llog -ldl)
-    endif()
-    choose_dsprpc(${{DSP_TYPE}} dsprpc)
-    link_custom_library({iface}_test ${{dsprpc}})
-    copy_binaries({iface}_test)
-{agent_block}
+if(${{OS_TYPE}} MATCHES "HLOS"){agent_block}
 else()
     add_library({iface}_skel SHARED
         ${{CMAKE_CURRENT_BINARY_DIR}}/{iface}_skel.c
@@ -516,7 +371,8 @@ endif()
 
 
 def write_project(workdir: str, kernel_name: str, kernel_source: str, params, result_idx) -> tuple[str, str]:
-    """Write the full FastRPC project under *workdir*.  Returns (project_dir, iface)."""
+    """Write a kernel's own FastRPC project, its one-shot host driver's, under
+    *workdir*. Returns (project_dir, iface)."""
     from tilelang.env import TILELANG_TEMPLATE_PATH
 
     iface = "tl_" + kernel_name
@@ -530,19 +386,12 @@ def write_project(workdir: str, kernel_name: str, kernel_source: str, params, re
             f"{TILELANG_TEMPLATE_PATH!r}; set TL_TEMPLATE_PATH to the directory containing "
             "tl_templates/hexagon/common.h"
         )
-    # The persistent agent doesn't marshal scalar params and its changed-mask is
-    # one byte (max 8 inputs); generate it only when eligible — otherwise the
-    # one-shot host driver is the transport (and the adapter falls back to it).
-    n_in = sum(1 for pl in plans if not pl.is_output and not pl.is_scalar)
-    with_agent = not any(pl.is_scalar for pl in plans) and n_in <= 8
     files = {
         f"{iface}.idl": gen_idl(iface, plans),
         f"{iface}_dsp.cc": gen_dsp(iface, kernel_name, kernel_source, plans),
         f"{iface}_host.c": gen_host(iface, plans),
-        "CMakeLists.txt": gen_cmake(iface, TILELANG_TEMPLATE_PATH, with_agent=with_agent),
+        "CMakeLists.txt": gen_cmake(iface, TILELANG_TEMPLATE_PATH, agent=False),
     }
-    if with_agent:
-        files[f"{iface}_agent.c"] = gen_agent(iface, plans)
     for fn, content in files.items():
         with open(os.path.join(workdir, fn), "w") as f:
             f.write(content)

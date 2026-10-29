@@ -135,7 +135,7 @@ Ninja 会在 CMakeLists 变化时自动 reconfigure。**跑任何 tilelang 都�
 ## 6. 设备(adb + FastRPC)
 
 - 设备:OnePlus 13(PJZ110),Hexagon **v79**。adb 已授权。
-- 部署目录:运行时自动推送 skel 和 agent 到 `/data/local/tmp/tilelang_hexagon`。
+- 部署目录:运行时自动推送 skel 和 agent 到 `/data/local/tmp/tilelang_hexagon`(`TILELANG_HEXAGON_REMOTE_DIR` 可改)。
 - DSP 库搜索路径(跑时设):`ADSP_LIBRARY_PATH=.:/vendor/lib/rfsa/adsp:/dsp`。
 - **USB 偶尔掉线**(本轮多次)。重连:
   ```bash

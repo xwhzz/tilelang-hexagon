@@ -36,8 +36,8 @@ class FastRPCArtifacts:
     """Resolved paths to the products of a FastRPC build."""
 
     dsp_skel: str  # lib<name>_skel.so for the cDSP
-    host_exe: str  # aarch64 Android one-shot host driver
-    agent_exe: str = ""  # aarch64 persistent socket agent
+    host_exe: str = ""  # a Linux BSP's one-shot host driver
+    agent_exe: str = ""  # a session's Android agent
 
 
 def _run(argv: list[str], cwd: str, env: dict[str, str], verbose: bool) -> None:
@@ -67,7 +67,17 @@ def _find_one(patterns: list[str]) -> str | None:
     return None
 
 
-def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, build_host: bool) -> str | None:
+# What picks or reaches the device, which a build does not depend on.
+_TRANSPORT = {
+    "TILELANG_HEXAGON_DEVICE",
+    "TILELANG_HEXAGON_DEVICE_LOCK",
+    "TILELANG_HEXAGON_REMOTE_DIR",
+    "TILELANG_HEXAGON_SSH_HOST",
+    "TILELANG_HEXAGON_SSH_KNOWN_HOSTS",
+}
+
+
+def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str) -> str | None:
     """The build cache directory of this project, or None when caching is off."""
     from tilelang.env import TILELANG_TEMPLATE_PATH, env
 
@@ -95,14 +105,13 @@ def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hl
         "name": name,
         "dsp_arch": dsp_arch,
         "hlos": hlos,
-        "build_host": build_host,
         "sdk_root": sdk.sdk_root,
         "ndk_root": sdk.ndk_root,
         "cmake_root": sdk.cmake_root,
-        # Build switches and the Linux HLOS toolchain (linux_build.py). Like
-        # the paths above, they identify tools; replacing a tool in place
-        # needs a cleared cache.
-        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k != "TILELANG_HEXAGON_DEVICE_LOCK"},
+        # Build switches and the Linux HLOS toolchain (linux_build.py), not
+        # the device a build runs on. Like the paths above, they identify
+        # tools; replacing a tool in place needs a cleared cache.
+        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k not in _TRANSPORT},
     }
     digest.update(json.dumps(toolchain, sort_keys=True).encode())
     return os.path.join(env.TILELANG_CACHE_DIR, "hexagon_builds", digest.hexdigest())
@@ -147,11 +156,11 @@ def build_cmake_fastrpc(
     name: str,
     sdk: HexagonSDK | None = None,
     dsp_arch: str | None = None,
-    build_host: bool = True,
     verbose: bool = False,
 ) -> FastRPCArtifacts:
-    """Build a CMake-based FastRPC project for both the DSP and (optionally) the
-    aarch64 host, returning the resolved artifact paths.
+    """Build a FastRPC project: its DSP skel, and its Android agent (a
+    session's) or, on a Linux BSP, its one-shot host driver. Returns the
+    products' paths.
 
     A build whose inputs match a cached one returns the cached products.
 
@@ -161,36 +170,34 @@ def build_cmake_fastrpc(
     name        : the interface/library base name (skel is ``lib<name>_skel.so``).
     sdk         : a :class:`HexagonSDK` (constructed+validated if omitted).
     dsp_arch    : Hexagon arch (e.g. ``v73``); defaults to ``sdk.dsp_arch``.
-    build_host  : also build the HLOS host binary (needs the Android NDK).
     """
     sdk = (sdk or HexagonSDK()).validate()
     dsp_arch = dsp_arch or sdk.dsp_arch
     hlos = os.environ.get("TILELANG_HEXAGON_HLOS", "android")
     if hlos not in {"android", "linux"}:
         raise HexagonBuildError(f"Unsupported HLOS: {hlos}")
-    entry = _cache_entry(project_dir, name, sdk, dsp_arch, hlos, build_host)
+    entry = _cache_entry(project_dir, name, sdk, dsp_arch, hlos)
     if entry:
         cached = _load_cached(entry)
         if cached:
             if verbose:
                 print(f"[hexagon-build] cached: {entry}")
             return cached
-    artifacts = _build(project_dir, name, sdk, dsp_arch, hlos, build_host, verbose)
+    artifacts = _build(project_dir, name, sdk, dsp_arch, hlos, verbose)
     return _store_cached(entry, artifacts) if entry else artifacts
 
 
-def _build(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, build_host: bool, verbose: bool) -> FastRPCArtifacts:
+def _build(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, verbose: bool) -> FastRPCArtifacts:
     if hlos == "linux":
         from .linux_runtime import build_linux_fastrpc
 
-        return build_linux_fastrpc(project_dir, name, sdk, dsp_arch, build_host, verbose)
+        return build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose)
     env = sdk.environ
     build_cmake = sdk.build_cmake
 
     # Never inherit a Linux BSP compatibility setting from a reused CMake tree.
     _run([build_cmake, "hexagon", f"DSP_ARCH={dsp_arch}", "TL_HEXAGON_LEGACY_COMPUTE_RES=OFF"], cwd=project_dir, env=env, verbose=verbose)
-    if build_host:
-        _run([build_cmake, "android"], cwd=project_dir, env=env, verbose=verbose)
+    _run([build_cmake, "android"], cwd=project_dir, env=env, verbose=verbose)
 
     skel = _find_one(
         [
@@ -198,30 +205,14 @@ def _build(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: st
             os.path.join(project_dir, f"hexagon_*_{dsp_arch}", f"lib{name}_skel.so"),
         ]
     )
-    host = (
-        _find_one(
-            [
-                os.path.join(project_dir, "android_*_aarch64", "**", f"{name}_test"),
-                os.path.join(project_dir, "android_*_aarch64", f"{name}_test"),
-            ]
-        )
-        if build_host
-        else ""
+    agent = _find_one(
+        [
+            os.path.join(project_dir, "android_*_aarch64", "**", f"{name}_agent"),
+            os.path.join(project_dir, "android_*_aarch64", f"{name}_agent"),
+        ]
     )
-    agent = (
-        _find_one(
-            [
-                os.path.join(project_dir, "android_*_aarch64", "**", f"{name}_agent"),
-                os.path.join(project_dir, "android_*_aarch64", f"{name}_agent"),
-            ]
-        )
-        if build_host
-        else ""
-    )
-
     if not skel:
         raise HexagonBuildError(f"DSP skel lib{name}_skel.so not found after build in {project_dir}")
-    if build_host and not host:
-        raise HexagonBuildError(f"host binary {name}_test not found after build in {project_dir}")
-
-    return FastRPCArtifacts(dsp_skel=skel, host_exe=host or "", agent_exe=agent or "")
+    if not agent:
+        raise HexagonBuildError(f"agent {name}_agent not found after build in {project_dir}")
+    return FastRPCArtifacts(dsp_skel=skel, agent_exe=agent)

@@ -1,39 +1,30 @@
-"""Adapter that runs a tilelang-generated Hexagon kernel on a real device.
+"""tilelang.compile's adapter for Hexagon kernels.
 
-Flow: take the generated kernel C source + its :class:`KernelParam`s, emit a
-FastRPC project (:mod:`.fastrpc`), build it with the Hexagon SDK
-(:mod:`.build`), deploy the skel + host driver over adb (:mod:`.device`), and
-return a torch-callable.  Each call marshals input tensors to ``.bin`` files,
-pushes them, runs the host driver (which FastRPC-invokes the cDSP kernel), and
-pulls the outputs back.  Simple one-shot transport — correctness first; a
-persistent low-latency agent is an M3 concern.
+On Android, a compiled kernel is a :class:`~.session.Session` of one kernel:
+its skel, and an agent on the phone that holds its FastRPC session, reached
+through ``adb forward``. A call sends the kernel's inputs and scalars and
+returns its outputs, in ``out_idx`` order. ``close()``, or ``close_all()``
+between tests, ends the session and frees the device; the next call starts
+another, from the cached build.
+
+On a Linux BSP (``TILELANG_HEXAGON_HLOS=linux``) there is no agent: each call
+runs the kernel's one-shot host driver (:class:`~.linux_runtime.OneShotKernel`).
 """
 
 from __future__ import annotations
 
 import contextlib
-import itertools
 import os
 import re
-import shutil
-import tempfile
 import weakref
-
-import numpy as np
-import torch
 
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
-from . import fastrpc
-from .build import build_cmake_fastrpc
-from .device import DEVICE_LOCK, AdbConnection, HexagonConnection
 from .env import HexagonSDK
-from .config import device_serial
 
-# The kernel entry is the non-static generated function.  Hexagon kernels return
-# int32_t so the FastRPC skel can propagate failures; older/source kernels may
-# still be void.  Skip static helpers such as `<name>_worker`.
+# The kernel entry is the generated function that returns its int32 status;
+# static helpers such as `<name>_worker` are not.
 _KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
@@ -45,11 +36,8 @@ def _kernel_name(source: str) -> str:
 
 
 class HexagonKernelAdapter(BaseKernelAdapter):
-    """Build + deploy a generated Hexagon kernel and call it on-device."""
+    """A generated Hexagon kernel, built and called on the device."""
 
-    # Process-wide sequence so concurrent adapters get distinct agent ports and
-    # device workdirs — otherwise they collide on tcp:9777 and the shared dir.
-    _port_seq = itertools.count()
     # Adapters of this process, for close_all().
     _live: weakref.WeakSet = weakref.WeakSet()
 
@@ -60,16 +48,12 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         target,
         kernel_source: str,
         *,
-        kernel_name: str | None = None,
-        connection: HexagonConnection | None = None,
         sdk: HexagonSDK | None = None,
         dsp_arch: str | None = None,
         verbose: bool = False,
-        workdir: str | None = None,
-        use_agent: bool = True,
     ) -> None:
         self.kernel_source = kernel_source
-        self.kernel_name = kernel_name or _kernel_name(kernel_source)
+        self.kernel_name = _kernel_name(kernel_source)
         self.target = target
         self.verbose = verbose
         # The target names the DSP architecture; HEXAGON_DSP_ARCH only seeds
@@ -78,97 +62,48 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self.sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self.dsp_arch = dsp_arch or self.sdk.dsp_arch
         self._param_list = list(params)
-        # Legalize negative output indices (e.g. out_idx=-1) up front: _deploy()
-        # consumes self._result_idx before BaseKernelAdapter.__init__ runs, so we
-        # can't rely on the base's self.result_idx here.
         n = len(self._param_list)
         ri = list(result_idx) if isinstance(result_idx, (list, tuple)) else ([] if result_idx is None else [result_idx])
         self._result_idx = [i if i >= 0 else n + i for i in ri]
-        if workdir is None:
-            # The adapter's own directory, removed with the adapter: its
-            # FastRPC project, build tree and argument files.
-            workdir = tempfile.mkdtemp(prefix="tl_hexagon_")
-            weakref.finalize(self, shutil.rmtree, workdir, True)
-        self._workdir = workdir
-        self._conn = connection
-        self._use_agent = use_agent
-        self._agent = None
-        self._on_device = False
-        self._holds_device = False
-        self._deploy()
+        # The kernel on the device (a session, or a Linux one-shot kernel),
+        # and the callable that runs it.
+        self._device = None
+        self._run = None
+        # Up now, so that a build error surfaces at compile time.
+        self._open()
         HexagonKernelAdapter._live.add(self)
-        # BaseKernelAdapter wires self.func = self._convert_torch_func()
         super().__init__(mod=None, params=params, result_idx=result_idx)
 
-    # ---- build + deploy ---------------------------------------------------
-    def _connection(self) -> HexagonConnection:
-        if self._conn is None:
+    def _open(self):
+        """The callable that runs the kernel on the device, which it starts
+        unless it is up."""
+        if self._device is None:
             if os.environ.get("TILELANG_HEXAGON_HLOS") == "linux":
-                from .linux_runtime import LinuxConnection
+                from .linux_runtime import OneShotKernel
 
-                self._conn = LinuxConnection.from_environment()
-                return self._conn
-            self._conn = AdbConnection(serial=device_serial())
-        return self._conn
-
-    def _deploy(self) -> None:
-        proj, iface = fastrpc.write_project(self._workdir, self.kernel_name, self.kernel_source, self._param_list, self._result_idx)
-        self._iface = iface
-        if self.verbose:
-            print(f"[hexagon] FastRPC project: {proj} (iface={iface})")
-        self._artifacts = build_cmake_fastrpc(proj, iface, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
-        # Prefer the persistent agent (one held session, ~30x lower per-call
-        # latency) unless the kernel has scalar params (not yet marshaled over
-        # the agent); otherwise fall back to the one-shot host driver.
-        has_scalar = any(p.is_scalar() for p in self._param_list)
-        self._agent_transport = bool(self._use_agent and self._artifacts.agent_exe and not has_scalar)
-        self._ensure_on_device()
-
-    def _ensure_on_device(self) -> None:
-        """Deploys the kernel and starts its session, unless they are up.
-
-        close() takes them down; the next call brings them back. While they
-        are up the adapter holds the device lock (device.py), if one is set.
-        """
-        if self._on_device:
-            return
-        self._holds_device = DEVICE_LOCK.acquire()
-        try:
-            conn = self._connection()
-            conn.push(self._artifacts.dsp_skel)
-            self._exe_remote = conn.push(self._artifacts.host_exe)
-            if self.verbose:
-                print(f"[hexagon] deployed skel + host to {conn.workdir}")
-            if self._agent_transport:
-                from .agent import HexagonAgentSession
-
-                idx = next(HexagonKernelAdapter._port_seq)
-                port = 10000 + (os.getpid() * 13 + idx) % 40000
-                self._agent = HexagonAgentSession(
-                    self._artifacts.dsp_skel,
-                    self._artifacts.agent_exe,
+                self._device = OneShotKernel(
+                    self.kernel_name,
+                    self.kernel_source,
                     self._param_list,
                     self._result_idx,
-                    serial=getattr(conn, "serial", None),
-                    device_port=port,
-                    workdir=f"/data/local/tmp/tilelang_hex_agent_{os.getpid()}_{idx}",
+                    sdk=self.sdk,
+                    dsp_arch=self.dsp_arch,
+                    verbose=self.verbose,
                 )
-                if self.verbose:
-                    print("[hexagon] persistent agent transport active")
-            self._on_device = True
-        except BaseException:
-            self.close()
-            raise
+                self._run = self._device
+            else:
+                from .session import Session
 
-    def close(self):
-        """Stops the kernel's session and releases the device; a call restarts them."""
-        if getattr(self, "_agent", None) is not None:
-            self._agent.close()
-            self._agent = None
-        self._on_device = False
-        if getattr(self, "_holds_device", False):
-            self._holds_device = False
-            DEVICE_LOCK.release()
+                lowered = [(self.kernel_name, self.kernel_source, self._param_list, self._result_idx)]
+                self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
+                self._run = self._device.kernels[0]
+        return self._run
+
+    def close(self) -> None:
+        """Ends the kernel's session and releases the device; a call starts another."""
+        device, self._device, self._run = getattr(self, "_device", None), None, None
+        if device is not None:
+            device.close()
 
     @classmethod
     def close_all(cls) -> None:
@@ -180,75 +115,5 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         with contextlib.suppress(Exception):
             self.close()
 
-    def _agent_forward(self, *ins):
-        self._ensure_on_device()
-        params, result_idx = self._param_list, set(self._result_idx)
-        it = iter(ins)
-        in_arrays = []
-        for i, _param in enumerate(params):
-            if i in result_idx:
-                continue
-            in_arrays.append(next(it).detach().to("cpu").contiguous().numpy())
-        out_arrays = self._agent.invoke(in_arrays)
-        # invoke() yields outputs in ascending param-index (plan) order; the
-        # public contract is self._result_idx order (matches the one-shot path),
-        # so reorder — matters when out_idx isn't ascending.
-        by_param = dict(zip(sorted(self._result_idx), out_arrays))
-        outs = [torch.from_numpy(np.ascontiguousarray(by_param[i])) for i in self._result_idx]
-        return outs[0] if len(outs) == 1 else outs
-
-    # ---- call -------------------------------------------------------------
     def _convert_torch_func(self):
-        params = self._param_list
-        result_idx = set(self._result_idx)
-        if self._agent_transport:
-            return self._agent_forward
-        conn = self._connection()
-
-        def forward(*ins):
-            self._ensure_on_device()
-            # Materialize args in kernel-param order; allocate outputs.
-            values = [None] * len(params)
-            it = iter(ins)
-            for i, p in enumerate(params):
-                if i in result_idx:
-                    values[i] = torch.empty(tuple(int(s) for s in p.shape), dtype=p.torch_dtype(), device="cpu")
-                else:
-                    t = next(it)
-                    # A scalar is a Python number or a 0-d tensor.
-                    values[i] = t if p.is_scalar() else t.detach().to("cpu").contiguous()
-
-            # Build argv (kernel-param order): buffer -> pushed file; scalar -> int.
-            argv = []
-            pulls = []  # (local_path, remote_name, out_tensor)
-            for i, p in enumerate(params):
-                if p.is_scalar():
-                    argv.append(str(int(values[i])))
-                    continue
-                fname = f"{self._iface}_p{i}.bin"
-                local = os.path.join(self._workdir, fname)
-                if i in result_idx:
-                    pulls.append((local, fname, values[i]))
-                else:
-                    arr = values[i].numpy()
-                    with open(local, "wb") as f:
-                        f.write(arr.tobytes())
-                    conn.push(local, fname)
-                argv.append(fname)
-
-            rc, out = conn.run_host_binary(self._exe_remote, argv, timeout=120)
-            if rc != 0:
-                raise RuntimeError(f"Hexagon device run failed (rc={rc}):\n{out}")
-
-            # Pull outputs back into the allocated tensors.
-            for local, fname, tensor in pulls:
-                conn.pull(os.path.join(conn.workdir, fname), local)
-                with open(local, "rb") as f:
-                    buf = f.read()
-                arr = np.frombuffer(buf, dtype=np.dtype(str(tensor.dtype).replace("torch.", ""))).reshape(tensor.shape)
-                tensor.copy_(torch.from_numpy(arr.copy()))
-
-            outs = [values[i] for i in self._result_idx]
-            return outs[0] if len(outs) == 1 else outs
-
-        return forward
+        return lambda *args: self._open()(*args)

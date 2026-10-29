@@ -308,7 +308,7 @@ def test_dsp_build_avoids_exception_runtime():
 
     # Scope-based cleanup (DMA queues, worker HMX scopes) must not import the
     # C++ unwinder, which the DSP does not have.
-    assert "-fno-exceptions" in fastrpc.gen_cmake("test", "/templates")
+    assert "-fno-exceptions" in fastrpc.gen_cmake("test", "/templates", agent=True)
 
 
 def test_async_hmx_error_cleanup_is_armed_and_disarmed():

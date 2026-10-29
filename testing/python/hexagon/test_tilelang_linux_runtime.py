@@ -43,25 +43,44 @@ def test_adapter_architecture_respects_environment_and_explicit_argument(monkeyp
     if configured:
         monkeypatch.setenv("HEXAGON_DSP_ARCH", configured)
     monkeypatch.setattr(env.HexagonSDK, "validate", lambda sdk: sdk)
-    monkeypatch.setattr(adapter.HexagonKernelAdapter, "_deploy", lambda self: None)
-    monkeypatch.setattr(adapter.HexagonKernelAdapter, "_convert_torch_func", lambda self: lambda: None)
-    instance = adapter.HexagonKernelAdapter([], [], None, "int test() {}", dsp_arch=explicit, workdir=str(tmp_path))
+    monkeypatch.setattr(adapter.HexagonKernelAdapter, "_open", lambda self: None)
+    instance = adapter.HexagonKernelAdapter([], [], None, "int test() {}", dsp_arch=explicit)
     assert instance.dsp_arch == expected
     assert instance.sdk.dsp_arch == expected
-    assert instance._use_agent is True
 
 
-def test_adapter_selects_linux_connection_only_for_linux(monkeypatch):
-    monkeypatch.delenv("TILELANG_HEXAGON_HLOS", raising=False)
-    monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "root@board")
-    monkeypatch.setattr(device.AdbConnection, "list_devices", lambda: ["android"])
-    instance = object.__new__(adapter.HexagonKernelAdapter)
-    instance._conn = None
-    assert type(instance._connection()) is device.AdbConnection
+def test_adapter_runs_a_session_on_android_and_one_shot_kernels_on_linux(monkeypatch):
+    from tilelang.hexagon.runtime import session
+
+    monkeypatch.setattr(env.HexagonSDK, "validate", lambda sdk: sdk)
+    opened = []
+    fake = SimpleNamespace(kernels=[lambda *args: "session"], close=lambda: None)
+    monkeypatch.setattr(session.Session, "of_lowered", classmethod(lambda cls, lowered, **kwargs: opened.append(lowered) or fake))
+
+    class OneShot:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *args):
+            return "one shot"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(linux_runtime, "OneShotKernel", OneShot)
+    kernel = adapter.HexagonKernelAdapter([], [], None, "int32_t k() {}", dsp_arch="v79")
+    assert kernel.func() == "session"
+    assert opened == [[("k", "int32_t k() {}", [], [])]]
     monkeypatch.setenv("TILELANG_HEXAGON_HLOS", "linux")
-    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "board")
-    instance._conn = None
-    assert type(instance._connection()) is linux_runtime.LinuxConnection
+    assert adapter.HexagonKernelAdapter([], [], None, "int32_t k() {}", dsp_arch="v73").func() == "one shot"
+
+
+def test_a_session_on_linux_is_refused(monkeypatch):
+    from tilelang.hexagon.runtime import session
+
+    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", "linux")
+    with pytest.raises(NotImplementedError, match="one call at a time"):
+        session.Session.of_lowered([], dsp_arch="v73")
 
 
 @pytest.mark.parametrize("legacy", ["0", "1"])
@@ -85,12 +104,12 @@ def test_android_build_remains_default(monkeypatch):
     monkeypatch.setenv("TILELANG_HEXAGON_LEGACY_COMPUTE_RES", "1")
     calls = []
     monkeypatch.setattr(build, "_run", lambda argv, **kwargs: calls.append(argv))
-    products = iter(["/project/skel.so", "/project/host", "/project/agent"])
+    products = iter(["/project/skel.so", "/project/agent"])
     monkeypatch.setattr(build, "_find_one", lambda patterns: next(products))
     artifacts = build.build_cmake_fastrpc("/project", "example", sdk=FakeSDK())
     assert [argv[1] for argv in calls] == ["hexagon", "android"]
     assert "TL_HEXAGON_LEGACY_COMPUTE_RES=OFF" in calls[0]
-    assert artifacts.host_exe == "/project/host"
+    assert artifacts.host_exe == ""
     assert artifacts.agent_exe == "/project/agent"
 
 
@@ -188,34 +207,27 @@ def test_two_same_named_linux_kernels_keep_separate_deployments(monkeypatch, tmp
         skel, host = project / ("lib" + iface + "_skel.so"), project / (iface + "_test")
         skel.write_bytes(source)
         host.write_bytes(source)
-        return build.FastRPCArtifacts(str(skel), str(host), "")
+        return build.FastRPCArtifacts(str(skel), host_exe=str(host))
 
     monkeypatch.setattr(linux_runtime.LinuxConnection, "_run", adb)
-    monkeypatch.setattr(adapter, "build_cmake_fastrpc", compile_project)
+    monkeypatch.setattr(build, "build_cmake_fastrpc", compile_project)
     kernels = [
-        adapter.HexagonKernelAdapter(
-            [],
-            [],
-            None,
-            f"int32_t same_name() {{ return {value}; }}",
-            sdk=FakeSDK(),
-            workdir=str(tmp_path / str(value)),
-        )
-        for value in (11, 22)
+        adapter.HexagonKernelAdapter([], [], None, f"int32_t same_name() {{ return {value}; }}", sdk=FakeSDK()) for value in (11, 22)
     ]
-    assert kernels[0]._exe_remote != kernels[1]._exe_remote
-    for kernel, value in zip(kernels, (11, 22)):
-        assert f"return {value}".encode() in remote_files[kernel._exe_remote]
-        kernel._connection().push(str(Path(kernel._workdir) / "tl_same_name_test"), "p0.bin")
+    one_shot = [kernel._device for kernel in kernels]
+    assert one_shot[0]._exe != one_shot[1]._exe
+    for kernel, value in zip(one_shot, (11, 22)):
+        assert f"return {value}".encode() in remote_files[kernel._exe]
+        kernel._conn.push(str(Path(kernel._workdir) / "tl_same_name_test"), "p0.bin")
     assert len([path for path in remote_files if path.endswith("/p0.bin")]) == 2
 
 
 def test_android_honors_explicit_device(monkeypatch):
+    from tilelang.hexagon.runtime import config
+
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
     monkeypatch.setattr(device.AdbConnection, "list_devices", lambda: ["board", "phone"])
-    instance = object.__new__(adapter.HexagonKernelAdapter)
-    instance._conn = None
-    assert instance._connection().serial == "phone"
+    assert config.device_serial() == "phone"
 
 
 def test_linux_workdir_failure_is_reported_even_with_ssh(monkeypatch):
