@@ -16,6 +16,7 @@ v79 cDSP, every operation a TileLang kernel, at batch 1.
 | `bench.py` | Prompt processing and token generation on the device, in the style of llama-bench. |
 | `ppl.py` | The bundle's perplexity on the device. |
 | `tiny.py` | A small random LFM2 with the same structure, for tests. |
+| `OPTIMIZATION.md` | How the decode and the prefill got fast: each step's measured gain, what did not help, where the time goes, and what is left. |
 
 ## Weights
 
