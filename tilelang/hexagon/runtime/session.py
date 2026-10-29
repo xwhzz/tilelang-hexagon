@@ -670,7 +670,9 @@ class Session:
         while b"AGENT_READY" not in printed:
             if self._proc.poll() is not None:
                 printed += self._proc.stdout.read()
-                raise RuntimeError(f"Hexagon session agent exited ({self._proc.returncode}) before ready:\n{printed.decode(errors='replace')}")
+                raise RuntimeError(
+                    f"Hexagon session agent exited ({self._proc.returncode}) before ready:\n{printed.decode(errors='replace')}"
+                )
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise RuntimeError(f"Hexagon session agent did not report ready in time:\n{printed.decode(errors='replace')}")
