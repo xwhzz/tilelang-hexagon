@@ -659,18 +659,24 @@ class Session:
             f"cd {self._device_dir} && chmod 755 {exe} && LD_LIBRARY_PATH={self._device_dir} ADSP_LIBRARY_PATH={adsp} "
             f"./{exe} {self._device_port}; rm -rf {self._device_dir}"
         )
-        self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        # select() keeps a silent agent from blocking past the deadline.
+        self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # select() keeps a silent agent from blocking past the deadline, and
+        # the reads take what the pipe holds, unbuffered: a buffered readline
+        # could leave AGENT_READY where select() does not see it. What the
+        # agent prints before it is ready is its diagnosis, should it not get
+        # there.
         deadline = time.time() + ready_timeout
-        while True:
+        printed = b""
+        while b"AGENT_READY" not in printed:
             if self._proc.poll() is not None:
-                raise RuntimeError(f"Hexagon session agent exited before ready:\n{self._proc.stdout.read()}")
+                printed += self._proc.stdout.read()
+                raise RuntimeError(f"Hexagon session agent exited ({self._proc.returncode}) before ready:\n{printed.decode(errors='replace')}")
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise RuntimeError("Hexagon session agent did not report ready in time")
+                raise RuntimeError(f"Hexagon session agent did not report ready in time:\n{printed.decode(errors='replace')}")
             ready, _, _ = select.select([self._proc.stdout], [], [], min(0.2, remaining))
-            if ready and "AGENT_READY" in self._proc.stdout.readline():
-                break
+            if ready:
+                printed += os.read(self._proc.stdout.fileno(), 4096)
         for _ in range(100):
             try:
                 self._sock = socket.create_connection(("127.0.0.1", self._host_port), timeout=2.0)
@@ -698,6 +704,7 @@ class Session:
             except Exception:
                 with contextlib.suppress(Exception):
                     self._proc.terminate()
+            self._proc.stdout.close()
         if getattr(self, "_host_port", None):
             subprocess.run(self._base + ["forward", "--remove", f"tcp:{self._host_port}"], capture_output=True)
         if self._holds_device:

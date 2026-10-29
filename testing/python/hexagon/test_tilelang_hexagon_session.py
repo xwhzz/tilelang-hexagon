@@ -1,7 +1,9 @@
 """Device sessions: several kernels sharing resident buffers in one FastRPC session."""
 
 import os
+import subprocess
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,6 +104,48 @@ def test_session_agent_maps_buffers_into_the_dsp_once():
     agent = session.gen_agent("tl_session_x")
     assert "rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED" in agent
     assert "fastrpc_mmap(CDSP_DOMAIN_ID, fd, p, 0, size, FASTRPC_MAP_FD)" in agent
+
+
+class _LocalAgent:
+    """adb for a session whose agent is a local shell command."""
+
+    PIPE, STDOUT = subprocess.PIPE, subprocess.STDOUT
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    def run(self, argv, **kwargs):
+        return SimpleNamespace(stdout="1234\n")
+
+    def Popen(self, argv, **kwargs):
+        return subprocess.Popen(["sh", "-c", self.agent], **kwargs)
+
+
+def _start(monkeypatch, agent):
+    monkeypatch.setattr(session, "subprocess", _LocalAgent(agent))
+    sock = SimpleNamespace(setsockopt=lambda *args: None, settimeout=lambda timeout: None)
+    monkeypatch.setattr(session, "socket", SimpleNamespace(create_connection=lambda *args, **kwargs: sock, IPPROTO_TCP=0, TCP_NODELAY=0))
+    s = session.Session.__new__(session.Session)
+    s._base, s._closed, s._holds_device = ["adb"], False, False
+    s._artifacts = SimpleNamespace(dsp_skel="skel.so", agent_exe="agent")
+    try:
+        s._start(5.0)
+    except BaseException:
+        s.close()
+        raise
+    return s
+
+
+def test_a_session_reports_what_its_agent_printed_when_it_exits(monkeypatch):
+    with pytest.raises(RuntimeError, match=r"exited \(3\) before ready:\ncannot load the skel"):
+        _start(monkeypatch, "echo 'cannot load the skel'; exit 3")
+
+
+def test_a_session_sees_its_agent_ready_after_other_output(monkeypatch):
+    # Both lines reach the pipe at once.
+    s = _start(monkeypatch, "printf 'loading\\nAGENT_READY port=1\\n'; sleep 30")
+    s._proc.kill()
+    s.close()
 
 
 @pytest.fixture(scope="module")
