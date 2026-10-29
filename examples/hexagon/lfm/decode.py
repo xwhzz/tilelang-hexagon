@@ -475,8 +475,9 @@ class Decoder:
     with the bundle, the KV cache and the conv state resident across calls.
 
     The bundle is read from `device_path` on the phone when given (push it there
-    once), else written from the host. `prefill_rows` is the prefill's chunk
-    (None: prompts run through the decode, a token a step)."""
+    once), and the host needs only its header at `bundle_path`; else it is
+    written from the host. `prefill_rows` is the prefill's chunk (None:
+    prompts run through the decode, a token a step)."""
 
     def __init__(
         self, bundle_path: str, device_path: str | None = None, max_pos: int = 4096, max_tokens: int = 4096, prefill_rows: int | None = 128
@@ -493,17 +494,9 @@ class Decoder:
         if prefill_rows:
             kernels.append((make_prefill(c, shapes, prefill_rows, max_pos, max_tokens), []))
         self.session = Session(kernels)
-        size = os.path.getsize(bundle_path)
-        self.weights = self.session.buffer(size)
-        if device_path is not None:
-            self.weights.load(device_path)
-        else:
-            with open(bundle_path, "rb") as f:
-                self.weights.write(f.read())
-        start = header["data_offset"]
-        tensors = header["tensors"]
-        self.args = [self.weights.at(start + tensors[n]["offset"], tensors[n]["nbytes"]) for n in BUNDLE_ARGS]
-        self.prefill_args = [self.weights.at(start + tensors[n]["offset"], tensors[n]["nbytes"]) for n in PREFILL_ARGS]
+        self.weights = bundle.load(self.session, bundle_path, device_path)
+        self.args = [self.weights[n] for n in BUNDLE_ARGS]
+        self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
         cos, sin = rope_tables(c, max_pos)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)
         kv = La * c.kv_heads * max_pos * c.head_dim * 4

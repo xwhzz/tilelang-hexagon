@@ -2,9 +2,9 @@
 
 One file: an 8-byte magic, the header's length (little-endian u64), the
 header (JSON), then the tensors, each starting on a 4 KB boundary. The device
-loads the file's tensors into resident buffers, and each kernel argument is a
-slice of one (``DeviceBuffer.at``). The host needs only the header: a copy of
-the file's first ``data_offset`` bytes serves.
+loads each tensor into a resident buffer of its own (``load``), a kernel
+argument. The host needs only the header: a copy of the file's first
+``data_offset`` bytes serves.
 
 Tensors stack layers along a leading dimension. Two writers fill it:
 
@@ -85,3 +85,25 @@ def read_tensor(path: str, header: dict, name: str) -> torch.Tensor:
     if t["dtype"] in _TORCH and t["layout"] == "row_major":
         return raw.view(_TORCH[t["dtype"]]).reshape(t["shape"])
     return raw
+
+
+def load(session, path: str, device_path: str | None = None) -> dict:
+    """The bundle's tensors in resident buffers of `session`, a buffer each
+    (name -> DeviceBuffer), allocated the largest first: a buffer is under
+    2 GiB, and the DSP's 4 GB of addresses take LFM3-1.7B's 3.5 GB as a
+    buffer per tensor (``Session.buffer``).
+
+    The tensors are read from the bundle at `device_path` on the device when
+    given, so that the host needs only the header at `path`; else they are
+    written from `path`."""
+    header = read_header(path)
+    tensors = header["tensors"]
+    buffers = {}
+    for name in sorted(tensors, key=lambda n: -tensors[n]["nbytes"]):
+        t = tensors[name]
+        buf = buffers[name] = session.buffer(t["nbytes"])
+        if device_path is None:
+            buf.write(read_tensor(path, header, name))
+        elif buf.load(device_path, header["data_offset"] + t["offset"]) != t["nbytes"]:
+            raise ValueError(f"{device_path} on the device ends inside {name}: not the bundle {path} heads")
+    return {name: buffers[name] for name in tensors}

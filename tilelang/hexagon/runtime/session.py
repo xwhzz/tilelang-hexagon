@@ -14,9 +14,10 @@ scalar a Python int. Its ``out_idx`` parameters come back as tensors unless a
 :class:`DeviceBuffer` is passed for them too.
 
 The host writes a buffer's bytes with :meth:`DeviceBuffer.write`, or has the
-agent read them from a file on the device (:meth:`DeviceBuffer.load`); the DSP
-first writes back and drops its copies of the lines written, so neither a
-stale copy nor a dirty line a kernel left survives the write.
+agent read them from a byte range of a file on the device
+(:meth:`DeviceBuffer.load`); the DSP first writes back and drops its copies of
+the lines written, so neither a stale copy nor a dirty line a kernel left
+survives the write.
 :meth:`DeviceBuffer.read` writes the DSP's lines back first. The buffers are
 uncached on the CPU, so the host needs no cache maintenance of its own.
 
@@ -342,23 +343,25 @@ static int serve(int cli, unsigned char op, int* running) {{
   if (op == {_OP_WRITE} || op == {_OP_READ} || op == {_OP_LOAD}) {{
     int32_t id; uint64_t offset, size;
     if (read_full(cli, &id, 4) || read_full(cli, &offset, 8) || read_full(cli, &size, 8)) return 1;
-    int ok = id >= 0 && id < MAX_BUFFERS && g_buffers[id].ptr && offset <= g_buffers[id].size;
+    int ok = id >= 0 && id < MAX_BUFFERS && g_buffers[id].ptr && offset <= g_buffers[id].size && size <= g_buffers[id].size - offset;
     if (op == {_OP_LOAD}) {{
-      // `size` bytes of path, then the file's bytes into the buffer.
+      // The file's bytes from `start` on into the `size` bytes at `offset`,
+      // as many as it has: the start, the path's length and the path follow.
+      uint64_t start; uint32_t n;
       char path[1024];
-      if (size >= sizeof(path) || read_full(cli, path, size)) return 1;
-      path[size] = 0;
-      uint64_t got = 0;
+      if (read_full(cli, &start, 8) || read_full(cli, &n, 4) || n >= sizeof(path) || read_full(cli, path, n)) return 1;
+      path[n] = 0;
+      int64_t got = -1;
       FILE* f = ok ? fopen(path, "rb") : 0;
       if (f) {{
-        {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)(g_buffers[id].size - offset), 0);
-        got = fread(g_buffers[id].ptr + offset, 1, g_buffers[id].size - offset, f);
+        if (fseeko(f, (off_t)start, SEEK_SET) == 0) {{
+          {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 0);
+          got = (int64_t)fread(g_buffers[id].ptr + offset, 1, size, f);
+        }}
         fclose(f);
       }}
-      int64_t result = f ? (int64_t)got : -1;
-      return write_full(cli, &result, 8);
+      return write_full(cli, &got, 8);
     }}
-    ok = ok && size <= g_buffers[id].size - offset;
     if (op == {_OP_WRITE}) {{
       // The bytes come either way, so the wire stays in step.
       uint8_t* dst = ok ? g_buffers[id].ptr + offset : 0;
@@ -464,9 +467,11 @@ class DeviceBuffer:
         n = self.nbytes - offset if nbytes is None else nbytes
         return self.session._read(self.id, self.offset + offset, n)
 
-    def load(self, device_path: str, offset: int = 0) -> int:
-        """Read the file at ``device_path`` on the device into the buffer; returns its size."""
-        return self.session._load(self.id, self.offset + offset, device_path)
+    def load(self, device_path: str, start: int = 0) -> int:
+        """Read the file at ``device_path`` on the device, from byte ``start``
+        on, into the buffer: as many bytes as the buffer holds, or as the file
+        has past ``start``. Returns how many it read."""
+        return self.session._load(self.id, self.offset, self.nbytes, device_path, start)
 
     def free(self) -> None:
         self.session._free(self.id)
@@ -753,7 +758,12 @@ class Session:
 
     # ---- buffers ----------------------------------------------------------
     def buffer(self, nbytes: int) -> DeviceBuffer:
-        """``nbytes`` of zeroed resident memory."""
+        """``nbytes`` of zeroed resident memory, under 2 GiB (rpcmem_alloc
+        takes an int). Large buffers fragment the DSP's 4 GB of addresses: on
+        a v79, seven of 512 MiB map and an eighth does not, while 3.5 GB of
+        model weights map as a buffer per tensor, the largest first."""
+        if not 0 < nbytes < 1 << 31:
+            raise ValueError(f"a resident buffer holds 1 byte to 2 GiB - 1, not {nbytes}")
         self._sock.sendall(bytes([_OP_ALLOC]) + struct.pack("<Q", nbytes))
         (bid,) = struct.unpack("<i", self._recv(4))
         if bid < 0:
@@ -773,9 +783,9 @@ class Session:
         self._status("a buffer read")
         return self._recv(n)
 
-    def _load(self, bid: int, offset: int, path: str) -> int:
+    def _load(self, bid: int, offset: int, nbytes: int, path: str, start: int) -> int:
         raw = path.encode()
-        self._sock.sendall(bytes([_OP_LOAD]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw)
+        self._sock.sendall(bytes([_OP_LOAD]) + struct.pack("<iQQQI", bid, offset, nbytes, start, len(raw)) + raw)
         (got,) = struct.unpack("<q", self._recv(8))
         if got < 0:
             raise RuntimeError(f"Hexagon session: could not read {path} on the device")

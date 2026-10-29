@@ -184,6 +184,38 @@ def test_host_writes_and_device_files_reach_kernels(sess):
 
 
 @DEVICE
+def test_a_buffer_loads_a_range_of_a_device_file(sess, tmp_path):
+    _, k_add = sess.kernels
+    data = torch.randn(4 * N)
+    (tmp_path / "data.bin").write_bytes(data.numpy().tobytes())
+    path = f"{sess._device_dir}/data.bin"
+    subprocess.run(sess._base + ["push", str(tmp_path / "data.bin"), path], check=True, capture_output=True)
+    buf = sess.buffer(3 * N * 4)
+    buf.write(torch.full((3 * N,), 7.0))
+    x = torch.randn(N)
+    # The DSP caches the lines it reads; a load drops them.
+    torch.testing.assert_close(k_add(x, buf), x + 7)
+    # The file's second N floats into the buffer's: those bytes alone.
+    assert buf.at(N * 4, N * 4).load(path, N * 4) == N * 4
+    # Past the file's end, a load reads what is left.
+    assert buf.load(path, 3 * N * 4) == N * 4
+    sevens = torch.full((N,), 7.0)
+    got = torch.frombuffer(bytearray(buf.read()), dtype=torch.float32)
+    torch.testing.assert_close(got, torch.cat([data[3 * N :], data[N : 2 * N], sevens]))
+    torch.testing.assert_close(k_add(x, buf), x + data[3 * N :])
+    with pytest.raises(RuntimeError, match="could not read"):
+        buf.load(f"{sess._device_dir}/missing.bin")
+    buf.free()
+
+
+def test_a_buffer_is_under_2_gib():
+    s = session.Session.__new__(session.Session)
+    for nbytes in (0, 1 << 31):
+        with pytest.raises(ValueError, match="1 byte to 2 GiB - 1"):
+            s.buffer(nbytes)
+
+
+@DEVICE
 def test_a_host_write_replaces_what_a_kernel_wrote(sess):
     k_fill, k_add = sess.kernels
     buf = sess.buffer(N * 4)

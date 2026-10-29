@@ -3,6 +3,7 @@ bundles, and the 4-bit decode and prefill kernels, on small random models
 with the real ones' structures (tiny.py)."""
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon.runtime.config import device_serial, remote_dir
 from tilelang.hexagon.runtime.session import lower_kernels
 
 LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
@@ -190,6 +192,32 @@ def test_decode_samples_at_a_temperature(tiny_bundle):
         assert [t for part in decoder.stream(prompt, 12, temperature=1.0, seed=1, chunk=5) for t in part] == a
     finally:
         decoder.close()
+
+
+@DEVICE
+def test_a_decoder_reads_its_bundle_on_the_device(tiny_bundle, tmp_path):
+    """With the bundle on the device, the host needs only its header."""
+    _, _, _, path = tiny_bundle
+    head = tmp_path / "head.bundle"
+    with open(path, "rb") as f:
+        head.write_bytes(f.read(bundle.read_header(path)["data_offset"]))
+    adb = ["adb", "-s", device_serial()]
+    on_device = f"{remote_dir('android')}/test_lfm_{os.getpid()}"
+    subprocess.run(adb + ["push", path, f"{on_device}.bundle"], check=True, capture_output=True)
+    subprocess.run(adb + ["push", str(head), f"{on_device}.head"], check=True, capture_output=True)
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000]
+    with torch.no_grad():
+        want = BundleModel(path).generate(torch.tensor(prompt), 8)
+    try:
+        decoder = Decoder(str(head), f"{on_device}.bundle", max_pos=256, max_tokens=64)
+        try:
+            assert decoder.generate(prompt, 8) == want
+            with pytest.raises(ValueError, match="ends inside"):
+                bundle.load(decoder.session, str(head), f"{on_device}.head")
+        finally:
+            decoder.close()
+    finally:
+        subprocess.run(adb + ["shell", f"rm -f {on_device}.bundle {on_device}.head"], capture_output=True)
 
 
 def test_prefill_is_one_loop_over_the_layers(tiny_bundle):

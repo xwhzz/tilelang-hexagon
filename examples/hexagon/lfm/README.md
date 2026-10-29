@@ -70,7 +70,8 @@ the 4-bit codes on HVX, exactly in int32 per group, weighed by the scales into
 fp32.
 
 The bundle, the KV cache and the conv state stay on the device in one session
-(`tilelang.hexagon.runtime.session`).
+(`tilelang.hexagon.runtime.session`), each of the bundle's tensors in a
+resident buffer of its own (`bundle.load`).
 
 On v79, with the bundle above (685.2 MB a token), decode runs at **81 t/s,
 12.3 ms a token** over 140 steps (a 13-token prompt and 128 new tokens): it
@@ -133,6 +134,10 @@ match the decode's.
     python bench.py lfm2.bundle /data/local/tmp/lfm2.bundle --pp 512,1024 --tg 128
     python ppl.py lfm2.bundle /data/local/tmp/lfm2.bundle LFM2-1.2B --text wikitext2_test.txt
 
+The device reads the bundle's tensors from its copy, and the host needs only
+the header: a copy of the file's first `data_offset` bytes
+(`bundle.read_header`) serves as the first argument.
+
 `generate.py` renders the checkpoint's chat template and tokenizes on the
 host (it needs `tokenizers` and `jinja2`), prefills the prompt and streams the
 reply, a decode call per 16 tokens; `--temperature` and `--seed` sample.
@@ -191,3 +196,9 @@ the parts that one phase multiplies (B, C and x; w1 and w3; a KV head's
 queries, key, value and gates) interleave by panels of 32 channels. The
 bundle is 3463.4 MB, and a decoded token reads 3461.9 MB of it: at the DMA's
 57 GB/s, 16.5 tokens/s at most.
+
+One session holds it: the DSP's 4 GB of addresses fit its tensors as a buffer
+each, allocated the largest first (1440 MiB for the FFN's w1 and w3 down to
+137.5 MiB for the attention's projections), where seven buffers of 512 MiB
+are as many as map. On the phone, the 14 buffers are allocated in 0.4 s and
+read from the device's copy in 0.6 s.

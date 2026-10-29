@@ -314,8 +314,11 @@ and explicit HMX atoms.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
-    cost. The host writes a buffer, or has the agent read a file on the device into
-    it (512 MB in 0.12 s). Before a host write, the DSP writes its cached lines of the
+    cost. The host writes a buffer, or has the agent read a byte range of a file on
+    the device into it (512 MB in 0.12 s). A buffer is under 2 GiB (`rpcmem_alloc`
+    takes an `int`), and the DSP's 4 GB of addresses fragment under large ones: seven
+    of 512 MiB map, while LFM3-1.7B's 3.5 GB of weights map as a buffer per tensor,
+    the largest first. Before a host write, the DSP writes its cached lines of the
     bytes back and drops them, so a dirty line a kernel left cannot overwrite the
     host's bytes later; before a host read, it writes them back.
   - **Arguments.** Each parameter takes, per call, a `DeviceBuffer`, a tensor (copied
