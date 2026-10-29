@@ -170,6 +170,7 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   TL_VEC_BINOP(-)
   TL_VEC_BINOP(*)
   TL_VEC_BINOP(/)
+  TL_VEC_BINOP(%)
   TL_VEC_BINOP(&)
   TL_VEC_BINOP(|)
   TL_VEC_BINOP(^)

@@ -287,6 +287,46 @@ def test_maps_over_crouton_tiles_match_torch(kind, dtype):
         kernel.adapter.close()
 
 
+def _masked(kind):
+    """Y = X where j <= i + d, else 0, through Crouton tiles of layout `kind`:
+    a map that computes with its indices, which a register's lanes take from
+    their position in it (a row pair's lanes alternate between its rows)."""
+
+    @T.prim_func
+    def kernel(X: T.Tensor((R, C), "float16"), Y: T.Tensor((R, C), "float16"), d: T.int32):
+        with T.Kernel(1):
+            tiles = T.alloc_shared((R, C), "float16")
+            T.annotate_layout({tiles: KINDS[kind](tiles)})
+            T.copy(X, tiles)
+            for i, j in T.Parallel(R, C):
+                tiles[i, j] = T.if_then_else(j <= i + d, tiles[i, j], T.float16(0))
+            T.copy(tiles, Y)
+
+    return kernel
+
+
+def test_maps_over_crouton_tiles_compute_with_their_indices_in_registers():
+    source = _source(_masked("activation"))
+    # A lane's row and column: its index's parity and half.
+    assert "tl_vec_ramp<int32_t, 64>(0, 1) % " in source
+    assert not SCALAR_TILE_STORE.search(source)
+
+
+@DEVICE
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_maps_over_crouton_tiles_compute_with_their_indices(kind):
+    import torch
+
+    kernel = tilelang.compile(_masked(kind), out_idx=[1], target="hexagon")
+    try:
+        x = torch.randn(R, C, generator=torch.Generator().manual_seed(37)).half()
+        i, j = torch.meshgrid(torch.arange(R), torch.arange(C), indexing="ij")
+        for d in (0, 5, -7):
+            torch.testing.assert_close(kernel(x, d), torch.where(j <= i + d, x, torch.zeros_like(x)), rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def _reduce(kind, op, dim, dtype, shape=(R, C)):
     """Y = op of X along `dim`, from Crouton tiles of layout `kind`."""
     rows, cols = shape
