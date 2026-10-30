@@ -42,9 +42,10 @@ TVM_DLL const Op &hexagon_dma_queue();
  * \brief Submit one DMA descriptor: hexagon_dma_submit(dst, src, dst_stride,
  * src_stride, row_bytes, rows, direction). Strides and row size are in bytes;
  * direction is dma.h's tl_hexagon_dma_direction, which picks the DDR side's
- * cache maintenance: 0 for DDR to VTCM and 1 for VTCM to DDR, as lowered; 2,
- * none, for a buffer only DMA moves (MarkDMAOnlyBuffers); 3 for DDR to VTCM
- * from an argument the kernel never writes (MarkUnwrittenDMASources).
+ * cache maintenance: 0 for DDR to VTCM and 1 for VTCM to DDR, as lowered; 3
+ * for DDR to VTCM from memory no dirty line holds (MarkUnwrittenDMASources,
+ * MarkDMAOnlyBuffers), 4 for VTCM to DDR into memory the DSP holds no lines
+ * of (MarkDMAOnlyBuffers).
  */
 TVM_DLL const Op &hexagon_dma_submit();
 

@@ -318,7 +318,9 @@ in flight moved at 3.3 GB/s and 16 KB blocks at 23 GB/s; without it, 14.6 and
 34 GB/s. A DDR buffer that only DMA moves, in every kernel of the session that
 reaches it, can be declared so: `T.annotate_dma_only(X)` (`MarkDMAOnlyBuffers`).
 The DSP then holds none of its lines, and its loads and stores skip the maintenance
-both ways (`TL_HEXAGON_DMA_NO_CACHE`). The compiler rejects any other use of the
+(`TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN`, `TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED`).
+Like every transfer, they bypass the L2: through it, 4 workers' 32 KB loads read
+DDR at 30 GB/s rather than 57. The compiler rejects any other use of the
 buffer in the kernel; it cannot check the session's other kernels. On v79 a 32 KB
 transfer's writeback took about 2,000 cycles to submit, and a store's invalidate
 more when it was retired: LFM3's prefill, which moves its residual stream between

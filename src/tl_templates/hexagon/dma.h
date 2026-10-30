@@ -25,14 +25,16 @@
 enum tl_hexagon_dma_direction {
   TL_HEXAGON_DMA_DDR_TO_VTCM = 0,
   TL_HEXAGON_DMA_VTCM_TO_DDR = 1,
-  // No cache maintenance: an empty slot, or either direction of a transfer
-  // of a DDR buffer that only DMA moves (T.annotate_dma_only), of which the
-  // DSP holds no cache lines.
+  // An empty slot, which needs no cache maintenance.
   TL_HEXAGON_DMA_NO_CACHE = 2,
-  // DDR to VTCM from memory the DSP has not written since it was handed the
-  // memory, such as a kernel's read-only argument: no dirty cache line can
-  // hold newer bytes than DDR, so the source needs no writeback.
+  // DDR to VTCM from memory of which no dirty cache line can hold newer bytes
+  // than DDR, so the source needs no writeback: memory the DSP has not
+  // written since it was handed the memory, such as a kernel's read-only
+  // argument, or a buffer only DMA moves (T.annotate_dma_only).
   TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN = 3,
+  // VTCM to DDR into memory the DSP holds no cache lines of, a buffer only
+  // DMA moves (T.annotate_dma_only): no writeback before, no invalidate after.
+  TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED = 4,
 };
 
 enum tl_hexagon_dma_result {
@@ -162,12 +164,16 @@ TL_DMA_INLINE int tl_hexagon_dma_engine_reset() {
 // Descriptor construction and submission
 // ---------------------------------------------------------------------------
 
+// A transfer's DDR side bypasses the L2, which spares the L2 the lines it
+// moves: through the L2, 4 workers' DMA loads read DDR at 30 GB/s on v79
+// rather than 57.
 TL_DMA_HOT tl_hexagon_dma_options
 tl_hexagon_dma_options_for_direction(int direction) {
   return {
       direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
           direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN,
-      direction == TL_HEXAGON_DMA_VTCM_TO_DDR,
+      direction == TL_HEXAGON_DMA_VTCM_TO_DDR ||
+          direction == TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED,
       false,
   };
 }
@@ -366,7 +372,8 @@ TL_DMA_INLINE int tl_hexagon_dma_prepare_ddr(const void *dst, const void *src,
     // Preserve dirty bytes sharing the destination's boundary cache lines.
     return tl_hexagon_dma_cache_clean(dst, bytes, QURT_MEM_CACHE_FLUSH, sync);
   if (direction == TL_HEXAGON_DMA_NO_CACHE ||
-      direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN)
+      direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN ||
+      direction == TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED)
     return TL_HEXAGON_DMA_OK;
   return TL_HEXAGON_DMA_ERR_ARGUMENT;
 }
@@ -375,6 +382,7 @@ TL_DMA_INLINE int tl_hexagon_dma_finish_ddr(const void *dst, uint32_t bytes,
                                             int direction) {
   if (direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
       direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN ||
+      direction == TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED ||
       direction == TL_HEXAGON_DMA_NO_CACHE)
     return TL_HEXAGON_DMA_OK;
   if (direction == TL_HEXAGON_DMA_VTCM_TO_DDR)
@@ -386,7 +394,8 @@ TL_DMA_HOT bool tl_hexagon_dma_valid_direction(int direction) {
   return direction == TL_HEXAGON_DMA_DDR_TO_VTCM ||
          direction == TL_HEXAGON_DMA_VTCM_TO_DDR ||
          direction == TL_HEXAGON_DMA_NO_CACHE ||
-         direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN;
+         direction == TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN ||
+         direction == TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED;
 }
 
 // Writes back the DDR rows of a transfer: every row's lines, then one syncht.

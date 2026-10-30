@@ -176,9 +176,10 @@ def test_dma_only_buffers_skip_cache_maintenance():
             T.dma_wait()
             T.dma_copy(s, B)
 
-    # A read-only argument's load skips the writeback (3); both of X's
-    # transfers skip all cache maintenance (2); B's store keeps it (1).
-    assert submit_directions(lower(probe)) == [3, 2, 2, 1]
+    # A read-only argument's load skips the writeback (3); X's load does too,
+    # and its store skips both the writeback and the invalidate (4); B's store
+    # keeps them (1).
+    assert submit_directions(lower(probe)) == [3, 4, 3, 1]
 
 
 @pytest.mark.parametrize("use", ["load", "copy"])

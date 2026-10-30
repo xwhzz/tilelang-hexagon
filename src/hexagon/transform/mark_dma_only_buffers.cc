@@ -7,9 +7,12 @@
  * source's lines back, and around a store it writes the destination's lines
  * back and then drops them, about a cycle every 16 bytes moved. A buffer that
  * T.annotate_dma_only declares is moved by DMA alone, in every kernel that
- * reaches it, so the DSP holds none of its lines: its transfers use
- * TL_HEXAGON_DMA_NO_CACHE. The pass checks this kernel's side of that: a use
- * of the buffer other than as a transfer's DDR endpoint is an error.
+ * reaches it, so the DSP holds none of its lines: its loads use
+ * TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN and its stores
+ * TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED, which skip the maintenance and bypass
+ * the L2 as the other transfers do. The pass checks this kernel's side of
+ * that: a use of the buffer other than as a transfer's DDR endpoint is an
+ * error.
  *
  * Runs after LowerTileOp, which lowers T.dma_copy to the submits.
  */
@@ -37,7 +40,8 @@ constexpr const char *kDMAOnly = "tl.hexagon_dma_only";
 // dma.h's tl_hexagon_dma_direction.
 constexpr int64_t kDDRToVTCM = 0;
 constexpr int64_t kVTCMToDDR = 1;
-constexpr int64_t kNoCache = 2;
+constexpr int64_t kDDRToVTCMUnwritten = 3;
+constexpr int64_t kVTCMToDDRUncached = 4;
 
 class DMAOnlyCollector : public StmtVisitor {
 public:
@@ -95,7 +99,9 @@ private:
     Array<PrimExpr> args;
     for (size_t i = 0; i < op->args.size(); ++i)
       args.push_back(i == ddr ? op->args[i] : VisitExpr(op->args[i]));
-    args.Set(6, IntImm(direction->dtype, kNoCache));
+    args.Set(6, IntImm(direction->dtype, direction->value == kDDRToVTCM
+                                             ? kDDRToVTCMUnwritten
+                                             : kVTCMToDDRUncached));
     return Call(op->dtype, op->op, args, op->annotations, op->span);
   }
 
