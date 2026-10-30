@@ -30,7 +30,8 @@ enum tl_hexagon_dma_direction {
   // DDR to VTCM from memory of which no dirty cache line can hold newer bytes
   // than DDR, so the source needs no writeback: memory the DSP has not
   // written since it was handed the memory, such as a kernel's read-only
-  // argument, or a buffer only DMA moves (T.annotate_dma_only).
+  // argument; a buffer only DMA moves (T.annotate_dma_only); or one whose
+  // writes are written back as they happen (T.annotate_write_through).
   TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN = 3,
   // VTCM to DDR into memory the DSP holds no cache lines of, a buffer only
   // DMA moves (T.annotate_dma_only): no writeback before, no invalidate after.
@@ -719,6 +720,26 @@ struct tl_hexagon_dma_async_context {
     return TL_HEXAGON_DMA_OK;
   }
 };
+
+// Writes back the DSP's cache lines of `runs` runs of `run_bytes` bytes,
+// `stride` bytes apart, then completes the writes with one syncht: memory the
+// DSP wrote and DMA reads next, whose loads then skip their own writeback
+// (T.annotate_write_through). A run of more than 128 KiB writes the whole data
+// cache back, as a transfer's writeback does.
+TL_DMA_INLINE int tl_hexagon_cache_writeback(const void *ptr,
+                                             uint32_t run_bytes, uint32_t runs,
+                                             uint32_t stride) {
+  for (uint32_t run = 0; run < runs; ++run) {
+    const uint8_t *start =
+        static_cast<const uint8_t *>(ptr) + static_cast<uint64_t>(run) * stride;
+    if (tl_hexagon_dma_cache_clean(start, run_bytes, QURT_MEM_CACHE_FLUSH,
+                                   /*sync=*/false) != TL_HEXAGON_DMA_OK)
+      return TL_ERR_DMA;
+  }
+  if (runs != 0 && run_bytes != 0)
+    asm volatile("syncht" : : : "memory");
+  return TL_OK;
+}
 
 // The kernel-facing calls: a failure becomes the kernel status TL_ERR_DMA.
 template <uint32_t Descriptors, uint32_t Groups>

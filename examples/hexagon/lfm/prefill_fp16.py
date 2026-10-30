@@ -487,6 +487,10 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             T.annotate_layout(layouts)
             # Only DMA moves the residual: its transfers need no cache upkeep.
             T.annotate_dma_only(x)
+            # The KV cache and the queries are written once and read by DMA
+            # many times: written back as they are written, their loads skip
+            # the writeback. The decode declares the cache so too.
+            T.annotate_write_through(kv_k, kv_v, qs)
 
             for chunk in T.serial(T.ceildiv(n, R)):
                 base = pos0 + chunk * R

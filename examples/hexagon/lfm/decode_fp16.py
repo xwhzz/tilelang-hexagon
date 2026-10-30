@@ -393,6 +393,9 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             phases.append(Phase.rows(p_head, 0, w * VW, VW // TILE))
             st = Stream(phases, DEPTH)
             T.annotate_layout({**st.layouts(), **kv_layouts(kv_k, kv_v), **kv_layouts(kb, vb)})
+            # The prefill reads the KV cache by DMA, so each key and value
+            # written here goes back to DDR at once (prefill_fp16).
+            T.annotate_write_through(kv_k, kv_v)
             st.prologue()
 
             for t in T.serial(n):

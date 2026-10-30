@@ -252,6 +252,116 @@ def test_dma_only_scratch_round_trip():
         kernel.adapter.close()
 
 
+def writebacks(source):
+    """The arguments after the pointer of each cache writeback, in order."""
+    return [line.split("tl_hexagon_cache_writeback(", 1)[1] for line in source.splitlines() if "tl_hexagon_cache_writeback(" in line]
+
+
+def test_write_through_buffer_is_written_back_and_loaded_without_writeback():
+    @T.prim_func
+    def probe(A: T.Tensor((32, 128), "float16"), X: T.Tensor((32, 128), "float16"), B: T.Tensor((32, 128), "float16")):
+        with T.Kernel(1):
+            T.annotate_write_through(X)
+            s = T.alloc_shared((32, 128), "float16")
+            t = T.alloc_shared((32, 128), "float16")
+            T.dma_copy(A, s)
+            T.dma_wait()
+            T.copy(s, X)
+            T.dma_copy(X, t)
+            T.dma_wait()
+            T.dma_copy(t, B)
+
+    source = lower(probe)
+    # The copy's 32 rows of 256 bytes are written back, before X's load,
+    # which then skips its writeback (3); B's store keeps its maintenance (1).
+    (call,) = writebacks(source)
+    assert "(uint32_t)256, (uint32_t)32, (uint32_t)256)" in call
+    assert source.index("tl_hexagon_cache_writeback(") < source.index("X[0])), (uint32_t)8192")
+    assert submit_directions(source) == [3, 3, 1]
+
+
+def test_write_through_parallel_stores_are_written_back():
+    @T.prim_func
+    def probe(X: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            T.annotate_write_through(X)
+            s = T.alloc_shared((256,), "float16")
+            for i in T.Parallel(256):
+                X[i] = T.float16(1)
+            T.dma_copy(X, s)
+            T.dma_wait()
+            T.dma_copy(s, B)
+
+    (call,) = writebacks(lower(probe))
+    assert "(uint32_t)512, (uint32_t)1, (uint32_t)512)" in call
+
+
+def test_write_through_crouton_writes_back_whole_tiles():
+    @T.prim_func
+    def probe(X: T.Tensor((128, 64), "float16"), r: T.int32):
+        with T.Kernel(1):
+            T.annotate_layout({X: make_hmx_weight_layout(X)})
+            T.annotate_write_through(X)
+            for j in T.Parallel(64):
+                X[r, j] = T.float16(1)
+
+    # One row of K = 128 by N = 64 in weight tiles: its tile along K in each of
+    # the 2 tiles of N, 2 KB runs 4 tiles (8 KB) apart.
+    (call,) = writebacks(lower(probe))
+    assert "(uint32_t)2048, (uint32_t)2, (uint32_t)8192)" in call
+
+
+def test_dma_only_and_write_through_conflict():
+    @T.prim_func
+    def probe(X: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            T.annotate_dma_only(X)
+            T.annotate_write_through(X)
+            s = T.alloc_shared((256,), "float16")
+            T.dma_copy(X, s)
+            T.dma_wait()
+
+    with pytest.raises(Exception, match="declared both DMA-only and write-through"):
+        lower(probe)
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_write_through_round_trip():
+    """HVX stores rows into a write-through buffer in DDR, and DMA reads them
+    straight back, with no writeback before the load."""
+    import torch
+
+    @T.prim_func
+    def probe(A: T.Tensor((64, 256), "int32"), X: T.Tensor((64, 256), "int32"), B: T.Tensor((64, 256), "int32")):
+        with T.Kernel(1):
+            T.annotate_write_through(X)
+            s = T.alloc_shared((8, 256), "int32")
+            t = T.alloc_shared((8, 256), "int32")
+            for r in T.serial(8):
+                T.dma_copy(A[r * 8 : (r + 1) * 8, :], s)
+                T.dma_wait()
+                for i, j in T.Parallel(8, 256):
+                    s[i, j] = s[i, j] * 2 + 1
+                T.copy(s, X[r * 8 : (r + 1) * 8, :])
+                T.dma_copy(X[r * 8 : (r + 1) * 8, :], t)
+                T.dma_wait()
+                for i, j in T.Parallel(8, 256):
+                    t[i, j] = t[i, j] + 3
+                T.dma_copy(t, B[r * 8 : (r + 1) * 8, :])
+                T.dma_wait()
+
+    kernel = tilelang.compile(probe, out_idx=[1, 2], target="hexagon")
+    try:
+        for seed in [1, 2, 3]:
+            torch.manual_seed(seed)
+            a = torch.randint(-(2**20), 2**20, (64, 256), dtype=torch.int32)
+            x, b = kernel(a)
+            torch.testing.assert_close(x, a * 2 + 1, rtol=0, atol=0)
+            torch.testing.assert_close(b, a * 2 + 4, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_async_hmx_dsl_schedule():
     source = lower(make_dma_hmx_matmul())
     # Double buffering: two output blocks of two copies each are in flight.

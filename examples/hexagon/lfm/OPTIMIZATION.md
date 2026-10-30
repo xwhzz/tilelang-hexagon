@@ -286,7 +286,7 @@ runs. #179 tracks this work.
 
 | | decode, tg128 | prefill, pp1024 |
 |---|---:|---:|
-| **this example** | **16.6-16.7 t/s** (60 ms a token) | **248.8 ms, 4116 t/s** |
+| **this example** | **16.6-16.7 t/s** (60 ms a token) | **246.8 ms, 4150 t/s** |
 | roofline | 16.7 t/s (3461.9 MB a token at the DMA's 57.7 GB/s) | about 200 ms (each chunk of 256 rows streams 2835 MB of weights at the DMA's rate; HMX alone would take 174 ms) |
 
 The decode reads its weights at the DMA's top rate, and HVX loads straight
@@ -301,7 +301,7 @@ Quality: WikiText-2 perplexity on the device is 15.8834 over 16 windows of
 prompt, prefilled, the first 64 greedy tokens match the checkpoint's own code
 (transformers 5.22, fp32).
 
-### LFM3's prefill: from 320.7 to 248.8 ms
+### LFM3's prefill: from 320.7 to 246.8 ms
 
 The first four steps are #189's.
 
@@ -315,6 +315,7 @@ The first four steps are #189's.
 | the residual moved with no cache maintenance (`T.annotate_dma_only`, #193) | 254.2 ms |
 | ... and bypassing the L2, as other transfers do (#195) | 250.1 ms |
 | the residual adds' batches in pairs, so that each loop's slot is a constant; the sandwich scales as vectors (#197) | 248.8 ms |
+| the KV cache and the queries write-through: written back as they are written, so that their DMA loads skip the writeback (`T.annotate_write_through`, #201) | 246.8 ms |
 
 ### LFM3: where the prefill's time goes
 
@@ -323,17 +324,17 @@ phase and barrier (Mcycles per worker, the mean of 4; ms at 2.06 GHz):
 
 | phase | Mcycles | ms |
 |---|---:|---:|
-| the GEMM phases: in_proj and qkv, out_proj, w1/w3 with SwiGLU, w2 | 423.3 | 205 |
-| attention | 41.9 | 20 |
-| the residual adds and norms | 33.5 | 16 |
-| barriers | 15.9 | 8 |
-| the chunk's start: embedding, RoPE rows, the first norm | 7.3 | 3.5 |
-| total | 521.7 | 253 |
+| the GEMM phases: in_proj and qkv, out_proj, w1/w3 with SwiGLU, w2 | 424.7 | 206 |
+| attention | 35.6 | 17 |
+| the residual adds and norms | 33.9 | 16 |
+| barriers | 15.6 | 8 |
+| the chunk's start: embedding, RoPE rows, the first norm | 7.4 | 3.6 |
+| total | 517.1 | 251 |
 
-Inside attention (Mcycles, the slowest worker): exp2 and the row sums 13.5,
-waiting for keys and values 8.1, the row blocks' prologue and epilogue 7.0,
-P V on HMX 6.2, the mask, the row max and alpha 4.5, the rescale 2.6, q K^T on
-HMX 0.6.
+Inside attention (Mcycles, the slowest worker): exp2 and the row sums 14.4,
+P V on HMX 6.1, waiting for keys and values 4.2, the mask, the row max and
+alpha 4.2, the row blocks' prologue and epilogue 4.1, the rescale 2.5, q K^T
+on HMX 0.7.
 
 The barriers are mostly the first worker waiting, as in LFM2's prefill: it
 finishes its GEMM phases ahead of the others (w1/w3: 204.9M against 213.2M
@@ -348,6 +349,8 @@ cycles).
 | `l2fetch` of the next panel before HVX loads it from DDR | 22.0 GB/s, against 22.4 without |
 | Unrolling every float map by two, not only the heavy ones (#127) | the residual add's loop alone: 14.2 -> 10.3 cycles a vector; the whole prefill: unchanged (527.6 against 529.2 Mcycles) |
 | The decode's attention on the KV cache's tiles (#191) | tg128 unchanged, in an A/B in one sitting: 16.53 against 16.49 t/s |
+| The embedding gather (1024 rows of 4 bytes a token by DMA) with 4 or 8 tokens' transfers in flight | 20.5K cycles a token whatever the depth: about 20 cycles a row |
+| ... with scalar loads from DDR instead, `l2fetch` of the next token's rows ahead | 23-44K cycles a token, against 20.7K by DMA (104K without the prefetch) |
 
 ### LFM3: what the hardware taught us
 
@@ -367,6 +370,10 @@ cycles).
   schedule does not explain it, and the cause is not established. A probe that
   seemed to show the run-time slot stopping the pipeliner also had its buffers
   unmarked as exclusive, which is enough on its own.
+- **Write once, read many.** A DMA load from memory the DSP wrote writes the
+  lines back first, every time. The KV cache, written once and read by every
+  later block of queries, now writes them back once, as it is written
+  (`T.annotate_write_through`, #201): attention 42.5M -> 36.3M cycles a worker.
 - **The decode's ceiling is the DMA's.** DMA alone read 53-58 GB/s of weights;
   HVX loads from DDR beside it lowered the total.
 - **VTCM capacity.** At 256 rows a chunk takes 7.82 of the 8 MiB. 384 rows do
@@ -374,9 +381,10 @@ cycles).
 
 ### LFM3: what is next
 
-- **Attention's HVX work.** exp2 and the row sums take 13.5M cycles a worker
-  at pp1024. Waiting for keys and values takes 8.1M, much of it their loads'
-  writeback: the decode and the prefill write the cache with HVX, so its
-  transfers keep the maintenance.
+- **Attention's HVX work.** exp2 (already the fp16 fast path, in qf16) and
+  the row sums take 14.4M cycles a worker at pp1024, most of attention's 36M.
 - **The embedding.** A token's row is a column of the head's tiles, which the
-  DMA gathers as 1024 rows of 4 bytes: 7.3M cycles a worker at pp1024.
+  DMA gathers as 1024 rows of 4 bytes: 7.3M cycles a worker at pp1024. A
+  row-major copy of the 524 MB embedding would make it one 4 KB transfer a
+  token, but would bring the session's buffers to about 3.99 GB, at the edge
+  of what the DSP's address space maps.

@@ -218,7 +218,9 @@ squares, which they write beside their slices). Projections take their inputs
 in fp16. The KV cache is fp16, in HMX's tiles (keys as the transposed weight
 operand of q K^T, values as the weight operand of P V), which the decode's
 attention multiplies on HVX as they are and the prefill's moves into HMX's
-operands by DMA.
+operands by DMA. Both kernels declare it write-through
+(`T.annotate_write_through`): each key and value goes back to DDR as it is
+written, so that the prefill's many DMA loads of it skip their writeback.
 
 On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
 call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a
@@ -259,16 +261,16 @@ call):
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp256 | 60.5 | 4230 |
-| pp512 | 121.9 | 4199 |
-| pp1024 | 248.8 | 4116 |
-| pp2048 | 522.8 | 3917 |
+| pp256 | 62.3 | 4109 |
+| pp512 | 120.9 | 4233 |
+| pp1024 | 246.8 | 4150 |
+| pp2048 | 509.5 | 4019 |
 
 A chunk streams 2835 MB of weights: for 1024 tokens, 205 ms of GEMM phases at
 55 GB/s, near the DMA's top rate, while HMX's multiplies alone would take
 174 ms at 8.1 cycles a 32 x 32 x 32 op. A cycle profile puts the rest of pp1024 in four
 places:
-- attention, mostly HVX: exp2, the row sums and the output's rescaling (20 ms);
+- attention, mostly HVX: exp2, the row sums and the output's rescaling (17 ms);
 - the residual adds and norms, HVX passes over each chunk's rows (16 ms);
 - the barriers (8 ms);
 - the embedding, each token's row gathered from the head's tiles as 1024 DMA

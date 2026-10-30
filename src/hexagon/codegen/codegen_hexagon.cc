@@ -57,6 +57,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        true, true},
       {tl::hexagon_dma_wait(), "tl_hexagon_dma_async_wait", "dma.h", false,
        true, true, 1},
+      {tl::hexagon_cache_writeback(), "tl_hexagon_cache_writeback", "dma.h",
+       false, false, true},
       {tl::hexagon_exp(), "tl_hvx_exp", "hvx_math.h", false},
       {tl::hexagon_exp2(), "tl_hvx_exp2", "hvx_math.h", false},
       {tl::hexagon_log(), "tl_hvx_log", "hvx_math.h", false},
