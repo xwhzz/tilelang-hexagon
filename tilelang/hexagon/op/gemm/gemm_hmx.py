@@ -18,6 +18,11 @@ In a worker pool, whose workers share HMX (``LowerKernelLaunch`` marks such
 calls), each output tile is a critical section of its own instead, and its
 epilogue runs outside it, while another worker multiplies.
 
+A call may multiply only the first rows of A at run time
+(``annotations={"hexagon.rows": rows}``, a multiple of 32 up to M): HMX then
+neither reads A's other rows nor writes C's, which keep what they held. A
+prefill's last chunk, shorter than the chunk, multiplies its own rows only.
+
 ``T.gemm_blockscaled`` of an fp16 A runs here too (:class:`GemmHMXBlockScaled`):
 HVX dequantizes its 4-bit B into fp16 weight tiles, a column of output tiles
 at a time, for HMX to multiply every row of A by.
@@ -48,6 +53,8 @@ GEMM_INST_HMX_BLOCK_SCALED = "hexagon.hmx.blockscaled"
 
 # The worker count LowerKernelLaunch puts on the gemms of a worker pool.
 _NUM_WORKERS = "hexagon.num_workers"
+# The rows a call multiplies at run time, when fewer than M.
+_ROWS = "hexagon.rows"
 # The conversion config HMX reads: 32 scale words, then 32 bias words.
 CONFIG_WORDS = 64
 
@@ -123,6 +130,12 @@ class GemmHMX(GemmBase):
             return "rows"
         return "elements"
 
+    def _rows(self):
+        """The rows the call multiplies: M, or the run-time count its
+        annotations give, a multiple of 32 up to M."""
+        rows = self.gemm_node.annotations.get(_ROWS, None)
+        return self.M if rows is None else rows
+
     def _shared(self) -> bool:
         """Whether the workers of a pool take turns at HMX for this call."""
         workers = self.gemm_node.annotations.get(_NUM_WORKERS, None)
@@ -174,10 +187,12 @@ class GemmHMX(GemmBase):
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm")
         shared = _flag(self._shared())
         M, N, K = self.M, self.N, self.K
+        # The rows HMX multiplies; the accesses above cover all M.
+        rows = self._rows()
 
-        def call(c, ldc, rows: bool, aligned: bool, clear, stage, config):
-            flags = [_flag(rows), _flag(aligned), shared, _flag(direct)]
-            args = [M, N, K, c, ldc, a, a_row_tile, b, b_column_tile, T.Cast("bool", clear)]
+        def call(c, ldc, rows_major: bool, aligned: bool, clear, stage, config):
+            flags = [_flag(rows_major), _flag(aligned), shared, _flag(direct)]
+            args = [rows, N, K, c, ldc, a, a_row_tile, b, b_column_tile, T.Cast("bool", clear)]
             args += [T.access_ptr(stage[0], "rw", 2 * TILE_ELEMS), T.access_ptr(config[0], "rw", CONFIG_WORDS)]
             return tirx.call_intrin("void", gemm, *flags, *args)
 
@@ -194,6 +209,8 @@ class GemmHMX(GemmBase):
 
             return _gemm_hmx
 
+        if self.gemm_node.annotations.get(_ROWS, None) is not None:
+            raise ValueError(f"{name}: run-time rows need a row-major or Crouton C, not {layout_map.get(self.C, None)}")
         C_buf = self.CRegion.buffer
         c_origin = _origin(self.CRegion)
 

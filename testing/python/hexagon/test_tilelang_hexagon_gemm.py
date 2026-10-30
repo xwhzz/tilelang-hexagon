@@ -162,6 +162,36 @@ def test_sub_matrices_start_at_their_tiles():
     ) in source
 
 
+def _run_time_rows(c_dtype="float32"):
+    """C = A @ B over the first `rows` rows only, a run-time count; C's other
+    rows keep C0's."""
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((128, 64), "float16"),
+        B: T.Tensor((64, 32), "float16"),
+        C0: T.Tensor((128, 32), c_dtype),
+        rows: T.int32,
+        C: T.Tensor((128, 32), c_dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((128, 64), "float16")
+            b = T.alloc_shared((64, 32), "float16")
+            c = T.alloc_shared((128, 32), c_dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            T.copy(C0, c)
+            T.gemm(a, b, c, clear_accum=True, annotations={"hexagon.rows": rows})
+            T.copy(c, C)
+
+    return kernel
+
+
+def test_run_time_rows_are_the_calls_m():
+    (call,) = [line for line in _source(_run_time_rows()).splitlines() if "tl_hexagon_hmx_gemm<" in line]
+    assert "(rows, 32, 64, " in call
+
+
 def test_c_of_another_layout_takes_a_row_major_product_element_by_element():
     source = _source(_c_layout("columns16"))
     assert "tl_hexagon_hmx_gemm<true, true, false, false>(64, 32, 64, (&(((half*)product)[0])), 32, " in source
@@ -277,6 +307,25 @@ def test_shapes_match_torch(M, N, K, BK):
     out = _run(_k_loop(M, N, K, BK, clear="first"), a, b)
     ref = a.float() @ b.float()
     torch.testing.assert_close(out, ref, atol=_tolerance(ref, K // BK), rtol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("c_dtype", ["float32", "float16"])
+def test_run_time_rows_match_torch(c_dtype):
+    import torch
+
+    a = (torch.randn(128, 64) * 0.25).half()
+    b = (torch.randn(64, 32) * 0.25).half()
+    c0 = torch.randn(128, 32).to(getattr(torch, c_dtype))
+    kernel = tilelang.compile(_run_time_rows(c_dtype), out_idx=[4], target="hexagon")
+    try:
+        for rows in (32, 96, 128):
+            out = kernel(a, b, c0, rows).float()
+            ref = c0.float().clone()
+            ref[:rows] = a[:rows].float() @ b.float()
+            torch.testing.assert_close(out, ref, atol=_tolerance(ref, 1), rtol=0)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE
