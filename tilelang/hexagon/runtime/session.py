@@ -61,9 +61,14 @@ _RESIDENT = 0  # (fd, byte offset)
 _INPUT = 1  # (byte offset into the inputs, 0)
 _OUTPUT = 2  # (byte offset into the outputs, 0)
 _SCALAR = 3  # (value, 0)
+_STEP = 4  # a pipeline stage's step index, filled in at each step: (0, 0)
 
 # Agent operations.
-_OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_LOAD, _OP_TIMING = range(9)
+_OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_LOAD, _OP_TIMING, _OP_PIPELINE = range(10)
+
+# A pipeline's turn word (the skel's tl_turn_wait): a stage that fails leaves
+# it, and the stages waiting for their turns give up with this status.
+_TURN_GAVE_UP = fastrpc.KERNEL_STATUS_BASE + 0xFF
 
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
@@ -86,6 +91,7 @@ def gen_idl(iface: str) -> str:
         '#include "remote.idl"\n\n'
         f"interface {iface} : remote_handle64 {{\n"
         "   AEEResult run(in int32 kernel, in sequence<int32> args, in sequence<uint8> inputs, rout sequence<uint8> outputs);\n"
+        "   AEEResult pipeline(in int32 kernel, in sequence<int32> args, in int32 steps, in int32 stage, in int32 stages, in int32 turn);\n"
         "   AEEResult sync(in int32 fd, in uint32 offset, in uint32 size, in int32 writeback);\n"
         "   AEEResult release(in int32 fd);\n"
         "};\n"
@@ -128,6 +134,43 @@ static uint8_t* tl_session_address(int fd) {{
   tl_session_maps[tl_session_nmaps].base = (uint8_t*)vaddr;
   ++tl_session_nmaps;
   return (uint8_t*)vaddr;
+}}
+
+// Kernel `kernel` on the arguments `a`.
+static AEEResult tl_session_dispatch(int kernel, void** a) {{
+  switch (kernel) {{
+{calls}  default: return AEE_EBADPARM;
+  }}
+}}
+
+// A pipeline's turn word, which every process of the session maps: the turn of
+// a stage in a step is step * stages + stage, and a stage that fails leaves
+// TL_TURN_FAILED. The processes' caches are their own, so a read drops the
+// line first and a write cleans it to DDR.
+#define TL_TURN_FAILED 0xffffffffu
+static uint32_t tl_turn_read(volatile uint32_t* t) {{
+  asm volatile("dcinva(%0)" ::"r"(t) : "memory");
+  return *t;
+}}
+static void tl_turn_write(volatile uint32_t* t, uint32_t v) {{
+  *t = v;
+  asm volatile("dccleaninva(%0)" ::"r"(t) : "memory");
+}}
+// Wait for turn `mine`: spin a while, as a short stage passes the turn on soon,
+// then sleep between looks, so that a waiting process leaves the HW threads to
+// the one that runs. 0, or nonzero when a stage failed.
+#define TL_TURN_SPINS 512
+#define TL_TURN_SLEEP_US 20
+static int tl_turn_wait(volatile uint32_t* t, uint32_t mine) {{
+  for (int spins = 0;; ++spins) {{
+    uint32_t now = tl_turn_read(t);
+    if (now == mine) return 0;
+    if (now == TL_TURN_FAILED) return -1;
+    if (spins < TL_TURN_SPINS)
+      asm volatile("pause(#255)");
+    else
+      qurt_sleep(TL_TURN_SLEEP_US);
+  }}
 }}
 
 #ifdef __cplusplus
@@ -188,9 +231,48 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
       a[i] = (void*)(intptr_t)v;
     }}
   }}
-  switch (kernel) {{
-{calls}  default: return AEE_EBADPARM;
+  return tl_session_dispatch(kernel, a);
+}}
+
+// A stage of a pipeline: `steps` runs of the kernel, each in its turn, with
+// its _STEP arguments set to the step's index.
+AEEResult {iface}_pipeline(remote_handle64 h, int32 kernel, const int32* args, int argsLen, int32 steps, int32 stage, int32 stages, int32 turn) {{
+  (void)h;
+  volatile uint32_t* word = (volatile uint32_t*)tl_session_address(turn);
+  if (!word) return AEE_EBADPARM;
+  void* a[{max_params}];
+  int at_step[{max_params}], nstep = 0;
+  int n = argsLen / 3, ok = n <= {max_params};
+  for (int i = 0; ok && i < n; ++i) {{
+    int kind = args[3 * i], v = args[3 * i + 1], o = args[3 * i + 2];
+    if (kind == {_RESIDENT}) {{
+      uint8_t* base = tl_session_address(v);
+      ok = base != 0;
+      a[i] = base + (unsigned int)o;
+    }} else if (kind == {_STEP}) {{
+      at_step[nstep++] = i;
+    }} else if (kind == {_SCALAR}) {{
+      a[i] = (void*)(intptr_t)v;
+    }} else {{
+      ok = 0;
+    }}
   }}
+  if (!ok) {{
+    tl_turn_write(word, TL_TURN_FAILED);
+    return AEE_EBADPARM;
+  }}
+  for (int step = 0; step < steps; ++step) {{
+    uint32_t mine = (uint32_t)step * (uint32_t)stages + (uint32_t)stage;
+    if (tl_turn_wait(word, mine) != 0) return {_TURN_GAVE_UP:#x};
+    for (int j = 0; j < nstep; ++j) a[at_step[j]] = (void*)(intptr_t)step;
+    AEEResult r = tl_session_dispatch(kernel, a);
+    if (r != AEE_SUCCESS) {{
+      tl_turn_write(word, TL_TURN_FAILED);
+      return r;
+    }}
+    tl_turn_write(word, mine + 1);
+  }}
+  return AEE_SUCCESS;
 }}
 
 #ifdef __cplusplus
@@ -217,6 +299,7 @@ def gen_agent(iface: str) -> str:
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include "dsp_capabilities_utils.h"
 #include "{iface}.h"
 
@@ -253,6 +336,10 @@ static int reply(int fd, unsigned char status, const void* data, size_t n) {{
 // processes of the mask `procs`.
 #define MAX_BUFFERS 256
 static struct {{ uint8_t* ptr; int fd; uint64_t size; uint32_t procs; }} g_buffers[MAX_BUFFERS];
+
+// A pipeline's turn word, which every process maps (the skel's tl_turn_wait).
+#define TURN_BYTES 4096
+static uint8_t* g_turn; static int g_turn_fd = -1;
 
 // The duration of the last run's FastRPC call.
 static int64_t g_last_run_ns;
@@ -297,6 +384,24 @@ static int open_process(int p) {{
 {fastrpc.PD_SETUP}  int e = {iface}_open(uri, &g_handles[p]);
   if (e != AEE_SUCCESS) {{ fprintf(stderr, "opening process %d failed: 0x%x\\n", p, e); return -1; }}
   g_domains[p] = domain_id;
+  return 0;
+}}
+
+// The turn word, mapped into every process.
+static int open_turn(void) {{
+  g_turn = (uint8_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, TURN_BYTES);
+  g_turn_fd = g_turn ? rpcmem_to_fd(g_turn) : -1;
+  if (g_turn_fd < 0) return -1;
+  for (int p = 0; p < g_processes; ++p)
+    if (fastrpc_mmap(g_domains[p], g_turn_fd, g_turn, 0, TURN_BYTES, FASTRPC_MAP_FD) != 0) return -1;
+  return 0;
+}}
+
+// A stage of a pipeline: one FastRPC call to its process for all the steps.
+struct stage {{ int32_t kernel, process, n, steps, index, stages; int32_t* args; AEEResult result; }};
+static void* run_stage(void* arg) {{
+  struct stage* s = (struct stage*)arg;
+  s->result = {iface}_pipeline(g_handles[s->process], s->kernel, s->args, 3 * s->n, s->steps, s->index, s->stages, g_turn_fd);
   return 0;
 }}
 
@@ -350,6 +455,54 @@ static int serve(int cli, unsigned char op, int* running) {{
     return reply(cli, status, g_outputs, status == 0 ? out_bytes : 0);
   }}
   if (op == {_OP_TIMING}) return write_full(cli, &g_last_run_ns, 8);
+  if (op == {_OP_PIPELINE}) {{
+    int32_t head[2];  // stages, steps
+    if (read_full(cli, head, sizeof(head)) || head[0] < 1 || head[0] > g_processes) return 1;
+    struct stage st[MAX_PROCESSES];
+    int ok = 1, read = 0;
+    for (int i = 0; i < head[0]; ++i, ++read) {{
+      int32_t sh[3];  // kernel, process, number of args
+      st[i].args = 0;
+      if (read_full(cli, sh, sizeof(sh)) || sh[1] < 0 || sh[1] >= g_processes || sh[2] < 0) break;
+      st[i].kernel = sh[0]; st[i].process = sh[1]; st[i].n = sh[2];
+      st[i].steps = head[1]; st[i].index = i; st[i].stages = head[0];
+      st[i].args = (int32_t*)malloc(sizeof(int32_t) * 3 * (sh[2] > 0 ? sh[2] : 1));
+      if (!st[i].args || read_full(cli, st[i].args, sizeof(int32_t) * 3 * sh[2])) {{ ++read; break; }}
+      // Resident arguments name buffers the stage's process maps; the DSP takes their fds.
+      for (int j = 0; j < sh[2]; ++j) {{
+        if (st[i].args[3 * j] != {_RESIDENT}) continue;
+        int id = st[i].args[3 * j + 1];
+        int mapped = id >= 0 && id < MAX_BUFFERS && g_buffers[id].ptr && (g_buffers[id].procs >> sh[1] & 1);
+        ok = ok && mapped;
+        st[i].args[3 * j + 1] = mapped ? g_buffers[id].fd : -1;
+      }}
+    }}
+    if (read < head[0]) {{
+      for (int i = 0; i < read; ++i) free(st[i].args);
+      return 1;
+    }}
+    // The first turn is step 0's first stage's.
+    *(volatile uint32_t*)g_turn = 0;
+    for (int p = 0; p < g_processes; ++p) {iface}_sync(g_handles[p], g_turn_fd, 0, 128, 0);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_t threads[MAX_PROCESSES];
+    int started = 0;
+    for (; ok && started < head[0]; ++started)
+      if (pthread_create(&threads[started], 0, run_stage, &st[started]) != 0) break;
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
+    // The status of the first stage that failed, not of those that gave up.
+    unsigned char status = (!ok || started < head[0]) ? 255 : 0;
+    for (int i = 0; i < started && status == 0; ++i) {{
+      AEEResult e = st[i].result;
+      if (e == AEE_SUCCESS || e == {_TURN_GAVE_UP:#x}) continue;
+      status = (e > {fastrpc.KERNEL_STATUS_BASE:#x} && e < {fastrpc.KERNEL_STATUS_BASE + 255:#x}) ? (unsigned char)(e - {fastrpc.KERNEL_STATUS_BASE:#x}) : 255;
+    }}
+    for (int i = 0; i < head[0]; ++i) free(st[i].args);
+    return reply(cli, status, 0, 0);
+  }}
   if (op == {_OP_ALLOC}) {{
     uint64_t size = 0; uint32_t procs = 0;
     if (read_full(cli, &size, 8) || read_full(cli, &procs, 4)) return 1;
@@ -431,6 +584,7 @@ int main(int argc, char** argv) {{
   if (g_processes < 1 || g_processes > MAX_PROCESSES) return 1;
   for (int p = 0; p < g_processes; ++p)
     if (open_process(p) != 0) return 1;
+  if (open_turn() != 0) {{ fprintf(stderr, "the turn word failed\\n"); return 1; }}
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
@@ -484,6 +638,13 @@ def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tup
 # ---------------------------------------------------------------------------
 
 
+class _Step:
+    """Session.STEP: a pipeline stage's step index, an argument."""
+
+    def __repr__(self) -> str:
+        return "Session.STEP"
+
+
 @dataclass
 class DeviceBuffer:
     """``nbytes`` of resident memory of a :class:`Session`, from ``offset``."""
@@ -492,6 +653,7 @@ class DeviceBuffer:
     id: int
     nbytes: int
     offset: int = 0
+    processes: tuple = (0,)  # the DSP processes it is mapped into
 
     def at(self, offset: int, nbytes: int | None = None) -> DeviceBuffer:
         """The bytes from ``offset`` on, as an argument: a register boundary."""
@@ -500,7 +662,7 @@ class DeviceBuffer:
         n = self.nbytes - offset if nbytes is None else nbytes
         if offset < 0 or offset + n > self.nbytes:
             raise ValueError(f"bytes [{offset}, {offset + n}) are not in a buffer of {self.nbytes}")
-        return DeviceBuffer(self.session, self.id, n, self.offset + offset)
+        return DeviceBuffer(self.session, self.id, n, self.offset + offset, self.processes)
 
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
@@ -650,10 +812,15 @@ class Session:
     gives them back when it ends. Each process caches its own lines of a
     buffer, so data one process's kernel writes reaches another's only by DMA
     (``T.annotate_dma_only``); the host's reads and writes sync every process
-    that maps the buffer."""
+    that maps the buffer. A pipeline (:meth:`pipeline`) runs steps of kernels
+    on several processes with one FastRPC call each, the processes taking
+    their turns on the DSP."""
 
     # The processes one agent can open: a v79 opens 4.
     MAX_PROCESSES = 4
+
+    # In a pipeline stage's arguments, the step's index.
+    STEP = _Step()
 
     _port_seq = 0
 
@@ -825,6 +992,55 @@ class Session:
             got += len(c)
         return b"".join(chunks)
 
+    def _check_resident(self, kernel: SessionKernel, i: int, buf: DeviceBuffer, process: int) -> None:
+        """Argument ``i`` of ``kernel``, run on ``process``, may be ``buf``."""
+        if buf.session is not self:
+            raise ValueError(f"argument {i} of {kernel.name} is a buffer of another session")
+        if buf.nbytes < kernel.plans[i].nbytes:
+            raise ValueError(f"argument {i} of {kernel.name} takes {kernel.plans[i].nbytes} bytes, its buffer has {buf.nbytes}")
+        if process not in buf.processes:
+            raise ValueError(f"argument {i} of {kernel.name} runs on process {process}, its buffer is mapped into {list(buf.processes)}")
+
+    def pipeline(self, stages, steps: int) -> None:
+        """Run ``steps`` steps of ``stages``, ``(kernel, process, args)`` each.
+        In every step the stages run in order, each its kernel on its own
+        process. ``args`` give every parameter: resident buffers the process
+        maps, scalars, and ``Session.STEP``, which stands for the step's
+        index. Each process gets one FastRPC call for all the steps, and the
+        stages take their turns on the DSP: a turn costs 0.2 µs, and the VTCM
+        changing hands between processes about 72 µs more on a v79 (the
+        resource manager zeroes the 8 MiB), against about 300 µs for a call.
+        A stage that fails ends the pipeline, with its status. Data one stage
+        writes for another moves by DMA (see the class)."""
+        procs = [process for _, process, _ in stages]
+        if not 1 <= len(stages) <= self.processes or len(set(procs)) < len(procs):
+            raise ValueError(f"a pipeline's stages run on distinct processes of the session's {self.processes}, not on {procs}")
+        if steps < 0:
+            raise ValueError(f"a pipeline runs 0 steps or more, not {steps}")
+        wire = [bytes([_OP_PIPELINE]), struct.pack("<ii", len(stages), steps)]
+        for kernel, process, args in stages:
+            if kernel.session is not self or not 0 <= process < self.processes:
+                raise ValueError(f"{kernel.name} runs on one of processes 0 to {self.processes - 1} of its session, not {process}")
+            if len(args) != len(kernel.plans):
+                raise TypeError(f"{kernel.name} takes all its {len(kernel.plans)} arguments in a pipeline, got {len(args)}")
+            words = []
+            for i, (plan, value) in enumerate(zip(kernel.plans, args)):
+                if value is Session.STEP:
+                    if not plan.is_scalar:
+                        raise ValueError(f"argument {i} of {kernel.name} is a buffer; Session.STEP stands for a scalar")
+                    words += [_STEP, 0, 0]
+                elif plan.is_scalar:
+                    words += [_SCALAR, int(value), 0]
+                elif isinstance(value, DeviceBuffer):
+                    self._check_resident(kernel, i, value, process)
+                    words += [_RESIDENT, value.id, value.offset]
+                else:
+                    raise TypeError(f"argument {i} of {kernel.name}: a pipeline takes resident buffers and scalars")
+            wire.append(struct.pack(f"<iii{len(words)}i", kernel.index, process, len(words) // 3, *words))
+        # One write: adb relays each as a packet (see the agent's reply()).
+        self._sock.sendall(b"".join(wire))
+        self._status("a pipeline")
+
     def _status(self, what: str) -> None:
         status = self._recv(1)[0]
         if status != 0:
@@ -850,7 +1066,7 @@ class Session:
         if bid < 0:
             raise RuntimeError(f"Hexagon session: could not allocate and map {nbytes} bytes")
         # Freed by DeviceBuffer.free, or with the session.
-        return DeviceBuffer(self, bid, nbytes)
+        return DeviceBuffer(self, bid, nbytes, 0, tuple(sorted(set(procs))))
 
     def _free(self, bid: int) -> None:
         self._sock.sendall(bytes([_OP_FREE]) + struct.pack("<i", bid))
@@ -888,10 +1104,7 @@ class Session:
             if plan.is_scalar:
                 args += [_SCALAR, int(value), 0]
             elif isinstance(value, DeviceBuffer):
-                if value.session is not self:
-                    raise ValueError(f"argument {i} of {kernel.name} is a buffer of another session")
-                if value.nbytes < plan.nbytes:
-                    raise ValueError(f"argument {i} of {kernel.name} takes {plan.nbytes} bytes, its buffer has {value.nbytes}")
+                self._check_resident(kernel, i, value, process)
                 args += [_RESIDENT, value.id, value.offset]
             elif value is None:
                 args += [_OUTPUT, out_bytes, 0]

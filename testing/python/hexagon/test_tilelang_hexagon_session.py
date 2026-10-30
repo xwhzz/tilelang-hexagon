@@ -69,6 +69,13 @@ def hmx_gemm(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 32), "float16"),
         T.copy(c, C)
 
 
+@T.prim_func
+def stamp(step: T.int32, out: T.Tensor((64,), "int32")):
+    """out[step] = step + 1: a pipeline stage's step index."""
+    with T.Kernel(1):
+        out[step] = step + 1
+
+
 def _exp(fast: bool):
     @T.prim_func
     def kernel(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
@@ -133,6 +140,36 @@ def test_every_run_takes_the_processes_resources_and_gives_them_back():
     assert "return tl_hexagon_run_kernel([&]() { return tl_session_kernel_0(" in source
     run = source[source.index("static AEEResult tl_hexagon_run_kernel(") :]
     assert run.index("tl_hexagon_take()") < run.index("fn()") < run.index("tl_hexagon_give()")
+
+
+def test_a_pipeline_stage_runs_its_steps_in_turns():
+    plans = fastrpc._plan([], [])
+    source = session.gen_dsp("tl_session_x", [("fill_kernel", "int32_t fill_kernel(float* a) { return 0; }", plans)])
+    stage = source[source.index("AEEResult tl_session_x_pipeline(") :]
+    assert (
+        stage.index("tl_turn_wait(word, mine)")
+        < stage.index("tl_session_dispatch(kernel, a)")
+        < stage.index("tl_turn_write(word, mine + 1)")
+    )
+    # The processes' caches are their own: the turn word's line is dropped
+    # before a read and cleaned after a write.
+    assert 'asm volatile("dcinva(%0)"' in source and 'asm volatile("dccleaninva(%0)"' in source
+
+
+def test_pipeline_stages_take_resident_buffers_and_scalars_on_their_processes():
+    s = session.Session.__new__(session.Session)
+    s.processes = 2
+    ((name, _, params, out_idx),) = session.lower_kernels([(dma_step, [1])])
+    k = session.SessionKernel(s, 0, name, params, out_idx)
+    on0, on1 = session.DeviceBuffer(s, 0, N * 4, 0, (0,)), session.DeviceBuffer(s, 1, N * 4, 0, (1,))
+    with pytest.raises(ValueError, match="distinct processes"):
+        s.pipeline([(k, 0, [on0, on0]), (k, 0, [on0, on0])], 1)
+    with pytest.raises(ValueError, match=r"runs on process 1, its buffer is mapped into \[0\]"):
+        s.pipeline([(k, 1, [on0, on1])], 1)
+    with pytest.raises(ValueError, match="Session.STEP stands for a scalar"):
+        s.pipeline([(k, 0, [session.Session.STEP, on0])], 1)
+    with pytest.raises(TypeError, match="resident buffers and scalars"):
+        s.pipeline([(k, 0, [torch.zeros(N), on0])], 1)
 
 
 def test_session_agent_maps_a_buffer_into_the_processes_it_names():
@@ -366,3 +403,49 @@ def test_processes_take_turns_at_hmx():
             a = (torch.randn(64, 64) * 0.25).half()
             b = (torch.randn(64, 32) * 0.25).half()
             torch.testing.assert_close(k(a, b, process=i % 2), a.float() @ b.float(), atol=2e-2, rtol=2e-2)
+
+
+@DEVICE
+@pytest.mark.parametrize("processes", [1, 2, 4])
+def test_a_pipeline_hands_data_on_by_dma(processes):
+    with session.Session([(dma_step, [1])], processes=processes) as s:
+        (k,) = s.kernels
+        bufs = [s.buffer(N * 4) for _ in range(processes)]
+        x = torch.randn(N)
+        bufs[0].write(x)
+        # Stage p adds 1 to what stage p - 1 left, and the last hands on to the first.
+        stages = [(k, p, [bufs[p], bufs[(p + 1) % processes]]) for p in range(processes)]
+        s.pipeline(stages, 100 // processes)
+        torch.testing.assert_close(_f32(bufs[0]), x + 100)
+        for buf in bufs:
+            buf.free()
+
+
+@DEVICE
+def test_steps_reach_the_stages():
+    with session.Session([(stamp, [])], processes=2) as s:
+        (k,) = s.kernels
+        out = [s.buffer(64 * 4, processes=[p]) for p in (0, 1)]
+        s.pipeline([(k, 0, [session.Session.STEP, out[0]]), (k, 1, [session.Session.STEP, out[1]])], 64)
+        for buf in out:
+            torch.testing.assert_close(torch.frombuffer(bytearray(buf.read()), dtype=torch.int32), torch.arange(1, 65, dtype=torch.int32))
+            buf.free()
+
+
+@DEVICE
+def test_a_failing_stage_ends_the_pipeline():
+    with session.Session([(dma_step, [1])], processes=2) as s:
+        (k,) = s.kernels
+        a, b = s.buffer(N * 4), s.buffer(N * 4)
+        # The skel has no kernel 9: stage 0 fails at its first step, and stage 1
+        # gives up waiting for its turn.
+        missing = session.SessionKernel(s, 9, "missing", [], [])
+        with pytest.raises(RuntimeError, match="a pipeline failed"):
+            s.pipeline([(missing, 0, []), (k, 1, [a, b])], 4)
+        # The session carries on.
+        x = torch.randn(N)
+        a.write(x)
+        s.pipeline([(k, 0, [a, b]), (k, 1, [b, a])], 2)
+        torch.testing.assert_close(_f32(a), x + 4)
+        a.free()
+        b.free()

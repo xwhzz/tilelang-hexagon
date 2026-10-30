@@ -94,7 +94,12 @@ These are the decisions that keep the adaptation small and the code navigable.
   to 4 DSP processes (`Session(..., processes=P)`), each with its own 4 GB of
   addresses: a buffer is mapped into the processes it names, and a kernel runs on
   the one it is called on. Each process caches its own lines of a buffer, so data
-  that crosses processes moves by DMA (`T.annotate_dma_only`). `build.py`/`env.py`
+  that crosses processes moves by DMA (`T.annotate_dma_only`). `Session.pipeline`
+  runs steps of kernels on several processes with one FastRPC call each. The
+  processes pass a turn word on the DSP, which costs 0.2 µs a turn; a FastRPC call
+  costs about 300 µs. The VTCM changes hands with each turn, and the resource
+  manager zeroes it when it does: about 72 µs for the 8 MiB on a v79, and this
+  firmware does not let a client turn the zeroing off. `build.py`/`env.py`
   drive the Hexagon SDK build, and `fastrpc.py` holds the pieces of a project the
   skels share. `adapter.py` is `tilelang.compile`'s: a compiled kernel is a session
   of one. On a Linux BSP (`linux_runtime.py`), with no agent, a kernel runs one call
