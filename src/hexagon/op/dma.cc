@@ -458,6 +458,18 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
   return SeqStmt::Flatten(seq);
 }
 
+const VarNode *DMAPointedVar(const PrimExpr &ptr) {
+  const auto *call = ptr.as<CallNode>();
+  if (call == nullptr)
+    return ptr.as<VarNode>();
+  if (call->op.same_as(builtin::tvm_access_ptr()))
+    return call->args[1].as<VarNode>();
+  if (call->op.same_as(builtin::address_of()))
+    if (const auto *load = call->args[0].as<BufferLoadNode>())
+      return load->buffer->data.get();
+  return nullptr;
+}
+
 namespace {
 
 void CheckHexagonTarget(const Target &target) {

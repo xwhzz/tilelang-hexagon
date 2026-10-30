@@ -48,6 +48,12 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
  */
 bool DMAOutpacesHVX(const CopyNode &op, arith::Analyzer *analyzer);
 
+/*!
+ * \brief The data var a pointer argument of hexagon_dma_submit addresses:
+ * tvm_access_ptr's buffer, or an address_of's BufferLoad; nullptr otherwise.
+ */
+const tirx::VarNode *DMAPointedVar(const PrimExpr &ptr);
+
 } // namespace hexagon
 
 /*!

@@ -14,6 +14,7 @@
  */
 
 #include "hexagon/op/builtin.h"
+#include "hexagon/op/dma.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
@@ -34,20 +35,6 @@ namespace {
 constexpr int64_t kDDRToVTCM = 0;
 constexpr int64_t kDDRToVTCMUnwritten = 3;
 
-// The data var a pointer argument addresses: tvm_access_ptr's buffer, or an
-// address_of's BufferLoad.
-const VarNode *PointedVar(const PrimExpr &ptr) {
-  const auto *call = ptr.as<CallNode>();
-  if (call == nullptr)
-    return ptr.as<VarNode>();
-  if (call->op.same_as(builtin::tvm_access_ptr()))
-    return call->args[1].as<VarNode>();
-  if (call->op.same_as(builtin::address_of()))
-    if (const auto *load = call->args[0].as<BufferLoadNode>())
-      return load->buffer->data.get();
-  return nullptr;
-}
-
 class UnwrittenSourceMarker : public StmtExprMutator {
 public:
   explicit UnwrittenSourceMarker(std::unordered_set<const VarNode *> readonly)
@@ -60,7 +47,7 @@ private:
     // (dst, src, dst_stride, src_stride, row_bytes, rows, direction)
     const auto *direction = op->args[6].as<IntImmNode>();
     if (direction == nullptr || direction->value != kDDRToVTCM ||
-        !readonly_.count(PointedVar(op->args[1])))
+        !readonly_.count(hexagon::DMAPointedVar(op->args[1])))
       return StmtExprMutator::VisitExpr_(op);
     Array<PrimExpr> args = op->args;
     args.Set(6, IntImm(direction->dtype, kDDRToVTCMUnwritten));

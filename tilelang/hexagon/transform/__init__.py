@@ -99,6 +99,14 @@ def StageHMXOperandCopies():
     return _ffi_api.StageHMXOperandCopies()  # type: ignore
 
 
+def MarkDMAOnlyBuffers():
+    """Transfers of the buffers ``T.annotate_dma_only`` declares skip the
+    cache maintenance of their DDR side, and any other use of those buffers is
+    an error. Runs after ``LowerTileOp``.
+    """
+    return _ffi_api.MarkDMAOnlyBuffers()  # type: ignore
+
+
 def MarkUnwrittenDMASources():
     """DMA loads from read-only kernel arguments skip the cache writeback.
 

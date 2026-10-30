@@ -153,6 +153,104 @@ def test_async_strided_load_store():
     assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 2
 
 
+def submit_directions(source):
+    """The direction argument of each DMA submit, in order."""
+    return [
+        int(re.search(r", (\d)\)\) return tl_status;", line).group(1))
+        for line in source.splitlines()
+        if "tl_hexagon_dma_async_submit(" in line
+    ]
+
+
+def test_dma_only_buffers_skip_cache_maintenance():
+    @T.prim_func
+    def probe(A: T.Tensor((32, 128), "float16"), X: T.Tensor((32, 128), "float16"), B: T.Tensor((32, 128), "float16")):
+        with T.Kernel(1):
+            T.annotate_dma_only(X)
+            s = T.alloc_shared((32, 128), "float16")
+            T.dma_copy(A, s)
+            T.dma_wait()
+            T.dma_copy(s, X)
+            T.dma_wait()
+            T.dma_copy(X, s)
+            T.dma_wait()
+            T.dma_copy(s, B)
+
+    # A read-only argument's load skips the writeback (3); both of X's
+    # transfers skip all cache maintenance (2); B's store keeps it (1).
+    assert submit_directions(lower(probe)) == [3, 2, 2, 1]
+
+
+@pytest.mark.parametrize("use", ["load", "copy"])
+def test_dma_only_buffer_rejects_other_uses(use):
+    @T.prim_func
+    def probe(X: T.Tensor((256,), "float16"), B: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            T.annotate_dma_only(X)
+            s = T.alloc_shared((256,), "float16")
+            T.dma_copy(X, s)
+            T.dma_wait()
+            if use == "load":
+                for i in T.Parallel(256):
+                    B[i] = X[i] + s[i]
+            else:
+                T.copy(s, X)
+
+    with pytest.raises(Exception, match="`X` is read or written other than by T.dma_copy, in "):
+        lower(probe)
+
+
+def test_dma_only_takes_ddr_parameters():
+    @T.prim_func
+    def probe(A: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            T.annotate_dma_only(s)
+            T.dma_copy(A, s)
+            T.dma_wait()
+
+    with pytest.raises(Exception, match="takes the kernel's DDR buffer parameters; `s` is not one"):
+        lower(probe)
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_dma_only_scratch_round_trip():
+    """Rows go out to a DMA-only scratch in DDR and come back, a block at a
+    time with no cache maintenance either way, as a residual stream does."""
+    import torch
+
+    @T.prim_func
+    def probe(A: T.Tensor((64, 256), "int32"), X: T.Tensor((64, 256), "int32"), B: T.Tensor((64, 256), "int32")):
+        with T.Kernel(1):
+            T.annotate_dma_only(X)
+            s = T.alloc_shared((2, 8, 256), "int32")
+            for r in T.serial(8):
+                T.dma_copy(A[r * 8 : (r + 1) * 8, :], s[0, :, :])
+                T.dma_wait()
+                for i, j in T.Parallel(8, 256):
+                    s[1, i, j] = s[0, i, j] * 2 + 1
+                T.dma_copy(s[1, :, :], X[r * 8 : (r + 1) * 8, :])
+                T.dma_wait()
+            for r in T.serial(8):
+                T.dma_copy(X[(7 - r) * 8 : (8 - r) * 8, :], s[0, :, :])
+                T.dma_wait()
+                for i, j in T.Parallel(8, 256):
+                    s[1, i, j] = s[0, i, j] + 3
+                T.dma_copy(s[1, :, :], B[(7 - r) * 8 : (8 - r) * 8, :])
+                T.dma_wait()
+
+    kernel = tilelang.compile(probe, out_idx=[1, 2], target="hexagon")
+    try:
+        for seed in [1, 2]:
+            torch.manual_seed(seed)
+            a = torch.randint(-(2**20), 2**20, (64, 256), dtype=torch.int32)
+            x, b = kernel(a)
+            torch.testing.assert_close(x, a * 2 + 1, rtol=0, atol=0)
+            torch.testing.assert_close(b, a * 2 + 4, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_async_hmx_dsl_schedule():
     source = lower(make_dma_hmx_matmul())
     # Double buffering: two output blocks of two copies each are in flight.

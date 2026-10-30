@@ -315,8 +315,16 @@ argument the kernel never writes skips the flush (`MarkUnwrittenDMASources`,
 `TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN`): the DSP gets its arguments with clean
 caches. That flush was most of a transfer's cost on v79. With it, two 128-byte rows
 in flight moved at 3.3 GB/s and 16 KB blocks at 23 GB/s; without it, 14.6 and
-34 GB/s. This path is device-tested on v79; it does not imply independent physical
-engines or arbitrary nested dispatch.
+34 GB/s. A DDR buffer that only DMA moves, in every kernel of the session that
+reaches it, can be declared so: `T.annotate_dma_only(X)` (`MarkDMAOnlyBuffers`).
+The DSP then holds none of its lines, and its loads and stores skip the maintenance
+both ways (`TL_HEXAGON_DMA_NO_CACHE`). The compiler rejects any other use of the
+buffer in the kernel; it cannot check the session's other kernels. On v79 a 32 KB
+transfer's writeback took about 2,000 cycles to submit, and a store's invalidate
+more when it was retired: LFM3's prefill, which moves its residual stream between
+DDR and VTCM a few rows at a time, spends 29% fewer cycles on its residual adds
+with the stream declared DMA-only. This path is device-tested on v79; it does not
+imply independent physical engines or arbitrary nested dispatch.
 
 The programs of one launch can run in phases. `T.sync_grid()` waits until every tile
 program of the launch reaches it, and what a program stored before it, from HVX or

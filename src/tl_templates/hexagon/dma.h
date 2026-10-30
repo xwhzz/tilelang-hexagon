@@ -25,7 +25,9 @@
 enum tl_hexagon_dma_direction {
   TL_HEXAGON_DMA_DDR_TO_VTCM = 0,
   TL_HEXAGON_DMA_VTCM_TO_DDR = 1,
-  // An empty slot, which needs no cache maintenance.
+  // No cache maintenance: an empty slot, or either direction of a transfer
+  // of a DDR buffer that only DMA moves (T.annotate_dma_only), of which the
+  // DSP holds no cache lines.
   TL_HEXAGON_DMA_NO_CACHE = 2,
   // DDR to VTCM from memory the DSP has not written since it was handed the
   // memory, such as a kernel's read-only argument: no dirty cache line can

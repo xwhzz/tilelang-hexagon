@@ -241,6 +241,8 @@ with nothing to dequantize.
     row before the residual add.
 
   The residual itself is in DDR, a worker's rows moving by DMA two slots deep.
+  Only DMA moves it (`T.annotate_dma_only`), so its transfers skip the cache
+  maintenance a DDR buffer the DSP also reads or writes needs.
 - **Attention** runs per query head, in blocks of 64 rows against 128 keys at a
   time, with an online softmax in base 2. Blocks of keys and values come from
   the cache into HMX's operands by DMA, a block ahead, with no pack; so do the

@@ -7,7 +7,7 @@ import tilelang.language.common as T_comm
 from tilelang.backend import create_backend_context, get_backend
 from tilelang.hexagon import language as T
 
-HEXAGON_ONLY_NAMES = {"dma_copy", "dma_wait"}
+HEXAGON_ONLY_NAMES = {"annotate_dma_only", "dma_copy", "dma_wait"}
 
 
 def test_hexagon_language_composes_common_and_hexagon_symbols():
@@ -22,7 +22,7 @@ def test_hexagon_symbols_stay_out_of_other_dialects():
     assert HEXAGON_ONLY_NAMES.isdisjoint(T_comm.__all__)
     assert HEXAGON_ONLY_NAMES.isdisjoint(T_default.__all__)
     # The definitions live in the dialect, not in the shared language modules.
-    for name in ("dma_copy", "dma_wait"):
+    for name in HEXAGON_ONLY_NAMES:
         assert not hasattr(T_default, name)
         assert not hasattr(T_comm, name)
 

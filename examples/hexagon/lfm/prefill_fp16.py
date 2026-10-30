@@ -17,8 +17,9 @@ A chunk's activations stay in VTCM the workers share (``global.vtcm``):
   write and the FFN's parts add, and which LFM3's sandwich norm normalizes
   over its rows before the residual add.
 
-The residual x, in fp32, is in DDR, a worker's rows moving by DMA; so are the
-queries, which attention reads a block of rows at a time.
+The residual x, in fp32, is in DDR, a worker's rows moving by DMA alone, so
+that its transfers need no cache maintenance (``T.annotate_dma_only``). The
+queries are in DDR too, which attention reads a block of rows at a time.
 
 The layers are one loop at run time, which reads each layer's kind, its index
 among the layers of that kind and its attention's RoPE table from a table
@@ -116,16 +117,27 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             bf.rows[i, k] = bf.xr[s, i, k] * bf.ss[i] * bf.nw[k]
 
     @T.macro
-    def normalize_rows(bf, weight):
-        """a = x * rsqrt(mean(x^2) + eps) * weight[k], the worker's rows, RB at
-        a time, from x in DDR by DMA."""
+    def embed(bf, chunk, n, tokens, head_rows, weight):
+        """The chunk's embeddings, the worker's rows of x, RB at a time: each
+        token's pairs from the head's tiles. Each batch goes to x by DMA, and
+        is normalized by weight[k] into a, the first layer's input."""
         T.copy(weight, bf.nw)
         for rb in T.serial(RW // RB):
             r = bf.w * RW + rb * RB
-            T.dma_copy(bf.x[r : r + RB, :], bf.xr[0, :, :])
-            T.dma_wait(0)
+            for i in T.serial(RB):
+                t = chunk * R + r + i
+                token = T.max(T.min(T.if_then_else(t < n, tokens[T.min(t, n - 1)], 0), c.vocab - 1), 0)
+                T.dma_copy(
+                    head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], bf.erow
+                )
+                # The pairs are in, and the batch before is stored.
+                T.dma_wait(0)
+                for k in T.Parallel(D):
+                    bf.xr[0, i, k] = T.Cast("float32", bf.erow[k // 2, k % 2])
+            T.dma_copy(bf.xr[0, :, :], bf.x[r : r + RB, :])
             normalize(bf, 0)
             T.copy(bf.rows, bf.a[r : r + RB, :])
+        T.dma_wait(0)
 
     @T.macro
     def add_branch(bf, post, sandwich: bool, weight, normed):
@@ -447,7 +459,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
 
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, nw=nw, pw=pw, hd=hd, rot=rot,
+                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
                 hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
                 acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,
@@ -466,6 +478,8 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             layouts.update(kv_layouts(kv_k, kv_v))
             layouts.update(kv_layouts(kblk, vblk))
             T.annotate_layout(layouts)
+            # Only DMA moves the residual: its transfers need no cache upkeep.
+            T.annotate_dma_only(x)
 
             for chunk in T.serial(T.ceildiv(n, R)):
                 base = pos0 + chunk * R
@@ -477,19 +491,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     cos_rows[t, r, d] = rope_cos[t, T.min(base + r, max_pos - 1), d]
                     sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
 
-                # The chunk's embeddings, the worker's rows of x: each token's
-                # pairs from the head's tiles.
-                for r in T.serial(RW):
-                    t = chunk * R + w * RW + r
-                    token = T.max(T.min(T.if_then_else(t < n, tokens[T.min(t, n - 1)], 0), c.vocab - 1), 0)
-                    T.dma_copy(
-                        head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow
-                    )
-                    T.dma_wait(0)
-                    for i, k in T.Parallel(1, D):
-                        xr[0, i, k] = T.Cast("float32", erow[k // 2, k % 2])
-                    T.copy(xr[0, 0:1, :], x[w * RW + r : w * RW + r + 1, :])
-                normalize_rows(bf, op_norm[0, :])
+                embed(bf, chunk, n, tokens, head_rows, op_norm[0, :])
                 T.sync_grid()
 
                 for layer in T.serial(L):

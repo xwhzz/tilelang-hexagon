@@ -92,6 +92,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.hexagon.transform.MarkDMAOnlyBuffers()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
     mod = tilelang.transform.DecoupleTypeCast()(mod)
