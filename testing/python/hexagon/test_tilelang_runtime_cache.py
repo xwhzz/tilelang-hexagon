@@ -35,8 +35,10 @@ def key(cache):
         ("TILELANG_HEXAGON_HLOS", "android"),
         ("HEXAGON_DSP_ARCH", "v79"),
         ("TILELANG_HEXAGON_DEVICE", "phone"),
+        ("TILELANG_HEXAGON_DOMAIN", "4"),
+        ("TILELANG_HEXAGON_RESOURCE_LIFETIME", "call"),
+        ("TILELANG_HEXAGON_DSP_LIBRARY_PATH", "/custom/dsp"),
         ("TILELANG_HEXAGON_SSH_HOST", "root@other"),
-        ("TILELANG_HEXAGON_SSH_KNOWN_HOSTS", "/other/known_hosts"),
         ("TILELANG_HEXAGON_REMOTE_DIR", "/other/remote"),
         ("TILELANG_HEXAGON_LEGACY_COMPUTE_RES", "1"),
         ("TILELANG_HEXAGON_ELF_CRC", "1"),
@@ -153,9 +155,31 @@ def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):
     monkeypatch.setenv("TILELANG_HEXAGON_LINUX_CC", "/other/gcc")
     builds.run()
     assert len(builds.runs) == 2
-    # The device lock does not change what a build produces.
+    # Neither the device lock nor runtime FastRPC domain changes a build.
+    monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", "4")
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE_LOCK", "/tmp/lock")
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT", "1800")
     builds.run()
+    assert len(builds.runs) == 2
+
+
+def test_resource_lifetime_changes_build_and_live_cache(builds, cache, monkeypatch):
+    from tilelang.hexagon.runtime import session
+
+    monkeypatch.delenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", raising=False)
+    original_key = key(cache)
+    source = session.gen_dsp("test", [])
+    first = builds.run(source)
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "session")
+    assert key(cache) == original_key
+    assert session.gen_dsp("test", []) == source
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "call")
+    assert key(cache) != original_key
+    call_source = session.gen_dsp("test", [])
+    assert call_source != source
+    call_build = builds.run(call_source)
+    assert call_build != first and len(builds.runs) == 2
+    assert builds.run(call_source) == call_build
     assert len(builds.runs) == 2
 
 
@@ -250,3 +274,26 @@ def test_kernels_remove_the_work_directories_they_make(monkeypatch, tmp_path):
     del kernel
     gc.collect()
     assert list(temp.iterdir()) == []
+
+
+def test_ssh_cache_identity_ignores_adb_and_tracks_host_keys(cache, monkeypatch):
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "root@board")
+    monkeypatch.setattr(device.AdbConnection, "list_devices", lambda: pytest.fail("SSH must not discover ADB"))
+    original = key(cache)
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "unrelated-phone")
+    monkeypatch.setenv("ADB_SERVER_SOCKET", "tcp:localhost:9999")
+    assert key(cache) == original
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_KNOWN_HOSTS", "/different/known_hosts")
+    assert key(cache) != original
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "")
+    with pytest.raises(ValueError, match="nonempty SSH host"):
+        key(cache)
+
+
+def test_ssh_transfer_timeout_changes_only_live_cache_identity(cache, monkeypatch):
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "root@board")
+    original = key(cache)
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT", "600.0")
+    assert key(cache) == original
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT", "1800")
+    assert key(cache) != original

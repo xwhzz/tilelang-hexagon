@@ -1,8 +1,7 @@
-"""Kernels on a Linux BSP (TILELANG_HEXAGON_HLOS=linux): their build, and
-their transport, ADB for files and ADB or SSH for commands.
+"""Linux BSP builds and transport: SSH alone, or ADB when SSH is not set.
 
-There is no agent on a Linux BSP: a compiled kernel runs one call at a time
-(:class:`OneShotKernel`). Android kernels run in sessions (session.py).
+Linux and Android use the same resident session protocol. The one-shot
+runner remains available for small bring-up programs.
 """
 
 from __future__ import annotations
@@ -10,6 +9,9 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import socket
+import select
+import time
 import subprocess
 import tempfile
 import uuid
@@ -20,11 +22,11 @@ import numpy as np
 import torch
 
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
-from .config import device_serial, remote_dir
+from .config import device_serial, remote_dir, ssh_host, ssh_transfer_timeout
 
 
 def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
-    """Build a DSP skel and its Linux one-shot driver."""
+    """Build a DSP skel and the project's Linux agent or one-shot driver."""
     from . import build, linux_build
 
     env = sdk.environ
@@ -51,38 +53,37 @@ def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
     host = linux_build.build_linux_host(project_dir, name, sdk, env, verbose)
     if not host:
         raise build.HexagonBuildError(f"host binary {name}_test not found after build in {project_dir}")
+    if os.path.isfile(os.path.join(project_dir, name + "_agent.c")):
+        return build.FastRPCArtifacts(dsp_skel=skel, agent_exe=host)
     return build.FastRPCArtifacts(dsp_skel=skel, host_exe=host)
 
 
 @dataclass
 class LinuxConnection(AdbConnection):
-    """Transfer files with ADB; execute Linux commands with ADB or optional SSH."""
+    """SSH files, commands and loopback tunnels, or ADB when SSH is unset.
+
+    ``transfer_timeout`` bounds each SSH upload, download and deployment mkdir
+    in seconds. It defaults to TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT (600s),
+    captured on construction; larger model files may need a higher setting.
+    Persistent agents and their kernel calls have separate lifetime limits.
+    """
 
     workdir: str = field(default_factory=lambda: "/tmp/tilelang_hexagon/" + uuid.uuid4().hex)
-    ssh_host: str | None = field(default_factory=lambda: os.environ.get("TILELANG_HEXAGON_SSH_HOST"))
+    ssh_host: str | None = field(default_factory=ssh_host)
     known_hosts: str | None = field(default_factory=lambda: os.environ.get("TILELANG_HEXAGON_SSH_KNOWN_HOSTS"))
+    transfer_timeout: float | None = None
 
     def __post_init__(self):
         super().__post_init__()
-        # Keep existing deployments attached to their original server/SSH setup
-        # when a caller changes the environment to compile for another device.
-        self._transport_env = dict(os.environ)
-        self._base[0] = shutil.which(self.adb) or self.adb
+        self.transfer_timeout = ssh_transfer_timeout(self.transfer_timeout)
+        self._tunnels = {}
 
     @classmethod
-    def from_environment(cls):
-        return cls(serial=device_serial(), workdir=os.path.join(remote_dir("linux"), uuid.uuid4().hex))
-
-    def _run(self, argv, timeout=None):
-        proc = subprocess.run(
-            self._base + argv,
-            env=self._transport_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
+    def from_environment(cls, serial=None):
+        return cls(
+            serial=None if ssh_host() is not None else serial or device_serial(),
+            workdir=os.path.join(remote_dir("linux"), uuid.uuid4().hex),
         )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
     def _adb_shell(self, command, timeout=None):
         # Older Linux adbd reports transport success even when the command fails.
@@ -98,31 +99,29 @@ class LinuxConnection(AdbConnection):
                 pass
         return transport_rc or 1, output + "\nMissing remote command exit status"
 
-    def _ensure_workdir(self):
-        if not self._ensured:
-            # The ADB uploader must own the directory, even when execution uses SSH.
-            rc, out = self._adb_shell(f"mkdir -p {shlex.quote(self.workdir)}")
-            if rc:
-                raise HexagonConnectionError(f"Creating device workdir failed: {out}")
-            self._ensured = True
+    def _ssh_argv(self):
+        host_key_options = ["-o", "UserKnownHostsFile=" + self.known_hosts] if self.known_hosts else []
+        return [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            *host_key_options,
+        ]
+
+    def _shell_argv(self, command):
+        if self.ssh_host:
+            return [*self._ssh_argv(), self.ssh_host, command]
+        return super()._shell_argv(command)
 
     def shell(self, command, timeout=None):
         if not self.ssh_host:
             return self._adb_shell(command, timeout=timeout)
-        host_key_options = ["-o", "UserKnownHostsFile=" + self.known_hosts] if self.known_hosts else []
         proc = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                *host_key_options,
-                self.ssh_host,
-                command,
-            ],
+            self._shell_argv(command),
             env=self._transport_env,
             capture_output=True,
             text=True,
@@ -131,22 +130,130 @@ class LinuxConnection(AdbConnection):
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
-    def run_host_binary(self, exe_remote_path, args, adsp_library_path=None, timeout=None):
-        rc, out = self.shell(f"chmod 755 {shlex.quote(exe_remote_path)}")
-        if rc:
-            return rc, out
+    def push(self, local_path, remote_name=None):
+        if not self.ssh_host:
+            return super().push(local_path, remote_name)
+        self._ensure_workdir(timeout=self.transfer_timeout)
+        remote = os.path.join(self.workdir, remote_name or os.path.basename(local_path))
+        # A shell stream works with BSPs that have no SFTP server or scp.
+        with open(local_path, "rb") as src:
+            proc = subprocess.run(
+                self._shell_argv(f"cat > {shlex.quote(remote)}"),
+                env=self._transport_env,
+                stdin=src,
+                capture_output=True,
+                timeout=self.transfer_timeout,
+            )
+        if proc.returncode:
+            raise HexagonConnectionError(f"SSH upload failed: {proc.stderr.decode(errors='replace')}")
+        return remote
+
+    def pull(self, remote_path, local_path):
+        if not self.ssh_host:
+            return super().pull(remote_path, local_path)
+        # A failed transfer must not replace an existing local result.
+        fd, staging = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(local_path)))
+        try:
+            with os.fdopen(fd, "wb") as dst:
+                proc = subprocess.run(
+                    self._shell_argv(f"cat {shlex.quote(remote_path)}"),
+                    env=self._transport_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=dst,
+                    stderr=subprocess.PIPE,
+                    timeout=self.transfer_timeout,
+                )
+            if proc.returncode:
+                raise HexagonConnectionError(f"SSH download failed: {proc.stderr.decode(errors='replace')}")
+            os.replace(staging, local_path)
+        finally:
+            if os.path.exists(staging):
+                os.unlink(staging)
+        return local_path
+
+    def forward_port(self, remote_port):
+        if not self.ssh_host:
+            return super().forward_port(remote_port)
+        # OpenSSH cannot choose a local forwarding port for us. Reserve one
+        # briefly, and let ExitOnForwardFailure reject a conflicting listener.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            local_port = listener.getsockname()[1]
+        proc = subprocess.Popen(
+            [
+                *self._ssh_argv(),
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-T",
+                "-L",
+                f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
+                self.ssh_host,
+                "printf 'TILELANG_TUNNEL_READY\\n'; cat",
+            ],
+            env=self._transport_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self._tunnels[local_port] = proc
+        try:
+            # The remote command starts only after SSH has set up forwarding.
+            # Its open stdin keeps it alive; unlike a TCP probe, this cannot
+            # accidentally accept an unrelated listener that won the port race.
+            deadline = time.monotonic() + 15
+            printed = b""
+            while b"TILELANG_TUNNEL_READY\n" not in printed:
+                if proc.poll() is not None:
+                    printed += proc.stdout.read()
+                    raise HexagonConnectionError(f"SSH tunnel exited ({proc.returncode}): {printed.decode(errors='replace')}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HexagonConnectionError(f"SSH tunnel did not become ready: {printed.decode(errors='replace')}")
+                ready, _, _ = select.select([proc.stdout], [], [], min(0.2, remaining))
+                if ready:
+                    printed += os.read(proc.stdout.fileno(), 4096)
+            return local_port
+        except BaseException:
+            self.remove_forward(local_port)
+            raise
+
+    def remove_forward(self, local_port):
+        if not self.ssh_host:
+            return super().remove_forward(local_port)
+        proc = self._tunnels.pop(local_port, None)
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            proc.stdin.close()
+            proc.stdout.close()
+
+    def _host_command(self, exe_remote_path, args, adsp_library_path=None):
         exe_dir = os.path.dirname(exe_remote_path)
-        adsp_dirs = [self.workdir, exe_dir, "/vendor/dsp/cdsp", "/usr/share/fastrpc", "/usr/lib/rfsa/adsp", *_DEFAULT_ADSP_DIRS]
+        adsp_dirs = [
+            self.workdir,
+            exe_dir,
+            "/vendor/dsp/cdsp",
+            "/vendor/dsp/cdsp1",
+            "/usr/share/fastrpc",
+            "/usr/lib/rfsa/adsp",
+            *_DEFAULT_ADSP_DIRS,
+        ]
+        configured = self._transport_env.get("TILELANG_HEXAGON_DSP_LIBRARY_PATH")
+        if configured is not None:
+            adsp_dirs = [self.workdir, exe_dir, *filter(None, configured.split(";"))]
         adsp = ";".join(dict.fromkeys(adsp_library_path or adsp_dirs))
-        argstr = " ".join(shlex.quote(a) for a in args)
-        command = (
-            f"cd {shlex.quote(exe_dir)} && "
-            f"LD_LIBRARY_PATH={shlex.quote(exe_dir)} "
-            f"ADSP_LIBRARY_PATH={shlex.quote(adsp)} "
-            f"CDSP_LIBRARY_PATH={shlex.quote(adsp)} "
+        argstr = " ".join(shlex.quote(str(a)) for a in args)
+        return (
+            f"cd {shlex.quote(exe_dir)} && chmod 755 {shlex.quote(exe_remote_path)} && "
+            f"exec env LD_LIBRARY_PATH={shlex.quote(exe_dir)} "
+            f"ADSP_LIBRARY_PATH={shlex.quote(adsp)} CDSP_LIBRARY_PATH={shlex.quote(adsp)} "
+            f"CDSP1_LIBRARY_PATH={shlex.quote(adsp)} "
             f"{shlex.quote(exe_remote_path)} {argstr}"
         )
-        return self.shell(command, timeout=timeout)
 
 
 class OneShotKernel:

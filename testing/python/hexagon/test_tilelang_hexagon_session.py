@@ -1,6 +1,8 @@
 """Device sessions: several kernels sharing resident buffers in one FastRPC session."""
 
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import time
 from types import SimpleNamespace
@@ -65,6 +67,7 @@ def test_session_kernels_lower_once(tmp_path, monkeypatch):
     from tilelang.env import env
 
     monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("TILELANG_DISABLE_CACHE", raising=False)
     calls = []
     lower = tilelang.lower
@@ -103,30 +106,70 @@ def test_session_skel_dispatches_by_kernel():
 def test_session_agent_maps_buffers_into_the_dsp_once():
     agent = session.gen_agent("tl_session_x")
     assert "rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED" in agent
-    assert "fastrpc_mmap(CDSP_DOMAIN_ID, fd, p, 0, size, FASTRPC_MAP_FD)" in agent
+    assert "fastrpc_mmap(g_domain, fd, p, 0, size, FASTRPC_MAP_FD)" in agent
+
+
+@pytest.mark.parametrize("lifetime", ["session", "call"])
+def test_session_dispatch_lifecycle_on_host(tmp_path, monkeypatch, lifetime):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a host C++ compiler is required for the dispatch lifecycle test")
+    # Exercise the generated implementation with real host synchronization.
+    # This checks resource ownership/error cleanup, not DSP stack capacity.
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", lifetime)
+    monkeypatch.setattr(fastrpc, "SKEL_RESOURCES_OPEN", "  return resources_open();\n")
+    monkeypatch.setattr(fastrpc, "SKEL_RESOURCES_CLOSE", "  resources_close();\n")
+    dispatch = session._dispatch_source("  case 0: return test_kernel(a);\n")
+    harness = Path(__file__).with_name("session_dispatch_host.cc").read_text()
+    source, executable = tmp_path / "dispatch.cc", tmp_path / "dispatch"
+    source.write_text(harness.replace("// GENERATED_DISPATCH", dispatch))
+    subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(executable)], check=True, timeout=30)
+    for mode, failures in [
+        ("direct", ["none", "query", "resources"]),
+        ("worker", ["none", "query", "allocate", "create", "resources", "join"]),
+    ]:
+        for failure in failures:
+            subprocess.run([str(executable), mode, failure], check=True, timeout=10)
+
+
+@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session "])
+def test_invalid_resource_lifetime_fails_before_lowering_or_build(monkeypatch, value):
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", value)
+    monkeypatch.setattr(session, "lower_kernels", lambda *args: pytest.fail("must reject before lowering"))
+    monkeypatch.setattr(session, "write_project", lambda *args: pytest.fail("must reject before building"))
+    for create in (session.Session, session.Session.of_lowered):
+        with pytest.raises(ValueError, match="TILELANG_HEXAGON_RESOURCE_LIFETIME"):
+            create([])
 
 
 class _LocalAgent:
-    """adb for a session whose agent is a local shell command."""
-
-    PIPE, STDOUT = subprocess.PIPE, subprocess.STDOUT
+    """A session transport whose agent is a local shell command."""
 
     def __init__(self, agent):
         self.agent = agent
 
-    def run(self, argv, **kwargs):
-        return SimpleNamespace(stdout="1234\n")
+    def push(self, local):
+        return local
 
-    def Popen(self, argv, **kwargs):
-        return subprocess.Popen(["sh", "-c", self.agent], **kwargs)
+    def start_host_binary(self, exe, args):
+        return subprocess.Popen(["sh", "-c", self.agent], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def forward_port(self, port):
+        return 1234
+
+    def remove_forward(self, port):
+        pass
+
+    def cleanup(self):
+        pass
 
 
 def _start(monkeypatch, agent):
-    monkeypatch.setattr(session, "subprocess", _LocalAgent(agent))
     sock = SimpleNamespace(setsockopt=lambda *args: None, settimeout=lambda timeout: None)
     monkeypatch.setattr(session, "socket", SimpleNamespace(create_connection=lambda *args, **kwargs: sock, IPPROTO_TCP=0, TCP_NODELAY=0))
     s = session.Session.__new__(session.Session)
-    s._base, s._closed, s._holds_device = ["adb"], False, False
+    s._conn, s._closed, s._holds_device = _LocalAgent(agent), False, False
+    s._device_dir, s._domain = "/tmp/session", 3
     s._artifacts = SimpleNamespace(dsp_skel="skel.so", agent_exe="agent")
     try:
         s._start(5.0)
@@ -189,7 +232,7 @@ def test_a_buffer_loads_a_range_of_a_device_file(sess, tmp_path):
     data = torch.randn(4 * N)
     (tmp_path / "data.bin").write_bytes(data.numpy().tobytes())
     path = f"{sess._device_dir}/data.bin"
-    subprocess.run(sess._base + ["push", str(tmp_path / "data.bin"), path], check=True, capture_output=True)
+    sess._conn.push(str(tmp_path / "data.bin"), "data.bin")
     buf = sess.buffer(3 * N * 4)
     buf.write(torch.full((3 * N,), 7.0))
     x = torch.randn(N)
@@ -234,6 +277,28 @@ def test_a_kernel_has_a_deep_stack():
         (k_deep,) = s.kernels
         x = torch.randn(N)
         torch.testing.assert_close(k_deep(x), 4 * x)
+
+
+@DEVICE
+def test_a_kernel_has_the_requested_execution_stack():
+    from tilelang.engine.param import KernelParam
+
+    source = """#include <stdint.h>
+#include <qurt.h>
+int32_t stack_info(int32_t* out) {
+  qurt_thread_attr_t attr;
+  if (qurt_thread_attr_get(qurt_thread_get_id(), &attr) != QURT_EOK) return 1;
+  out[0] = attr.stack_size;
+  out[1] = (intptr_t)attr.stack_addr;
+  out[2] = (intptr_t)&attr;
+  return 0;
+}
+"""
+    with session.Session.of_lowered([("stack_info", source, [KernelParam("int32", [3])], [0])]) as s:
+        size, base, local = s.kernels[0]().tolist()
+        # Check the execution thread, not the host's accepted stack request.
+        assert size >= fastrpc.PD_THREAD_STACK
+        assert base & 0xFFFFFFFF <= local & 0xFFFFFFFF < (base & 0xFFFFFFFF) + size
 
 
 @DEVICE

@@ -117,8 +117,9 @@ class HexagonSDK:
             "qaic": self.qaic,
             "cmake": self.cmake,
             "ninja": self.ninja,
-            "Android NDK root": self.ndk_root,
         }
+        if os.environ.get("TILELANG_HEXAGON_HLOS", "android") == "android":
+            checks["Android NDK root"] = self.ndk_root
         missing = [f"{name}: {path}" for name, path in checks.items() if not os.path.exists(path)]
         if missing:
             raise HexagonEnvError("Hexagon toolchain incomplete:\n  " + "\n  ".join(missing))

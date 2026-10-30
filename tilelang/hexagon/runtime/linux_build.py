@@ -25,11 +25,15 @@ def _check(argv, *, cwd, env, verbose):
 
 
 def build_linux_host(project_dir, name, sdk, env, verbose=False):
+    """Build the project's POSIX agent or one-shot driver against BSP libraries."""
     root = Path(project_dir).resolve()
     out = root / "linux_aarch64"
     out.mkdir(exist_ok=True)
     sdk_root = Path(sdk.sdk_root)
-    runtime = Path(os.environ["TILELANG_HEXAGON_LINUX_RPC_LIB_DIR"]).resolve()
+    runtime_dir = os.environ.get("TILELANG_HEXAGON_LINUX_RPC_LIB_DIR")
+    if not runtime_dir:
+        raise RuntimeError("Set TILELANG_HEXAGON_LINUX_RPC_LIB_DIR to the target BSP's captured runtime libraries")
+    runtime = Path(runtime_dir).resolve()
     rpc = runtime / "libcdsprpc.so"
     if not rpc.is_file():
         raise RuntimeError(f"Target FastRPC library missing: {rpc}")
@@ -39,8 +43,10 @@ def build_linux_host(project_dir, name, sdk, env, verbose=False):
     includes = [out, sdk_root / "incs", sdk_root / "incs/stddef", sdk_root / "utils/examples", sdk_root / "ipc/fastrpc/incs"]
     inc_flags = ["-I" + str(p) for p in includes]
     _check([sdk.qaic, "-mdll", "-o", str(out), *inc_flags, str(root / (name + ".idl"))], cwd=root, env=env, verbose=verbose)
-    exe = out / (name + "_test")
-    sources = [out / (name + "_stub.c"), sdk_root / "utils/examples/dsp_capabilities_utils.c", root / (name + "_host.c")]
+    agent = (root / (name + "_agent.c")).is_file()
+    exe = out / (name + ("_agent" if agent else "_test"))
+    source = root / (name + ("_agent.c" if agent else "_host.c"))
+    sources = [out / (name + "_stub.c"), sdk_root / "utils/examples/dsp_capabilities_utils.c", source]
     command = [
         cc,
         "-std=gnu11",

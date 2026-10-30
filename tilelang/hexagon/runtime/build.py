@@ -4,7 +4,7 @@ This drives the Hexagon SDK's ``build_cmake`` over a generated project
 (``fastrpc.write_project``), producing the FastRPC artifacts:
 
   * the **DSP skel** ``lib<name>_skel.so`` (Hexagon ELF, runs on the cDSP), and
-  * the **HLOS host** binaries (aarch64 Android, open the FastRPC session).
+  * the **HLOS host** binaries (aarch64 Android or Linux, open the FastRPC session).
 
 Build products are cached by content under the TileLang cache directory: the
 project files, the Hexagon template headers they include and the toolchain
@@ -38,7 +38,7 @@ class FastRPCArtifacts:
 
     dsp_skel: str  # lib<name>_skel.so for the cDSP
     host_exe: str = ""  # a Linux BSP's one-shot host driver
-    agent_exe: str = ""  # a session's Android agent
+    agent_exe: str = ""  # a session's HLOS agent
 
 
 def _run(argv: list[str], cwd: str, env: dict[str, str], verbose: bool) -> None:
@@ -71,10 +71,13 @@ def _find_one(patterns: list[str]) -> str | None:
 # What picks or reaches the device, which a build does not depend on.
 _TRANSPORT = {
     "TILELANG_HEXAGON_DEVICE",
+    "TILELANG_HEXAGON_DOMAIN",
+    "TILELANG_HEXAGON_DSP_LIBRARY_PATH",
     "TILELANG_HEXAGON_DEVICE_LOCK",
     "TILELANG_HEXAGON_REMOTE_DIR",
     "TILELANG_HEXAGON_SSH_HOST",
     "TILELANG_HEXAGON_SSH_KNOWN_HOSTS",
+    "TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT",
 }
 
 
@@ -159,9 +162,8 @@ def build_cmake_fastrpc(
     dsp_arch: str | None = None,
     verbose: bool = False,
 ) -> FastRPCArtifacts:
-    """Build a FastRPC project: its DSP skel, and its Android agent (a
-    session's) or, on a Linux BSP, its one-shot host driver. Returns the
-    products' paths.
+    """Build a FastRPC project: its DSP skel and HLOS agent, or a Linux
+    one-shot driver when the project requests it. Returns the products' paths.
 
     A build whose inputs match a cached one returns the cached products.
 

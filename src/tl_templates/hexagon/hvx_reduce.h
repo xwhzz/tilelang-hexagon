@@ -12,6 +12,7 @@
 #include <hexagon_types.h>
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/hvx_convert.h>
 #include <tl_templates/hexagon/hvx_lanes.h>
 
 #include <limits>
@@ -153,7 +154,7 @@ tl_reduce_step_value(const HVX_Vector (&src)[tl_reduce_step_regs<A, S>]) {
   if constexpr (std::is_same_v<A, S>) {
     return tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(src[0]));
   } else if constexpr (std::is_same_v<A, float> && std::is_same_v<S, half>) {
-    HVX_VectorPair w = Q6_Wsf_vcvt_Vhf(src[0]);
+    HVX_VectorPair w = tl_hvx_convert_hf_to_sf(src[0]);
     return tl_reduce_combine<K>(
         tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_lo_W(w))),
         tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_hi_W(w))));
@@ -239,7 +240,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
     if constexpr (std::is_same_v<S, float>) {
       return Q6_Vqf32_vadd_VsfVsf(x, Q6_V_vzero());
     } else {
-      HVX_VectorPair w = Q6_Wsf_vcvt_Vhf(x);
+      HVX_VectorPair w = tl_hvx_convert_hf_to_sf(x);
       return Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w));
     }
   };
@@ -249,7 +250,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
       return Q6_Vqf32_vadd_Vqf32Vsf(acc, x);
     } else {
       // The halves first, off the accumulator's chain of adds.
-      HVX_VectorPair w = Q6_Wsf_vcvt_Vhf(x);
+      HVX_VectorPair w = tl_hvx_convert_hf_to_sf(x);
       return Q6_Vqf32_vadd_Vqf32Vqf32(
           acc, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w)));
     }

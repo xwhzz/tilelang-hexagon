@@ -24,17 +24,17 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
 
     @T.prim_func
     def probe(
-        A: T.Tensor((size + 64,), "float32"),
-        Scratch: T.Tensor((size + 64,), "float32"),
-        Dst: T.Tensor((size + 64,), "float32"),
-        Readback: T.Tensor((size + 64,), "float32"),
-        Copied: T.Tensor((size,), "float32"),
+        A: T.Tensor((size + 64,), "int32"),
+        Scratch: T.Tensor((size + 64,), "int32"),
+        Dst: T.Tensor((size + 64,), "int32"),
+        Readback: T.Tensor((size + 64,), "int32"),
+        Copied: T.Tensor((size,), "int32"),
     ):
         with T.Kernel(1):
-            staged = T.alloc_shared((size,), "float32", align=128)
+            staged = T.alloc_shared((size,), "int32", align=128)
             for j in T.Parallel(size + 64):
-                Scratch[j] = A[j] * T.float32(2) + T.float32(1)
-                Dst[j] = T.float32(-321.25)
+                Scratch[j] = A[j] ^ T.int32(0x5A5A5A5A)
+                Dst[j] = T.int32(-321)
             T.dma_copy(Scratch[1 : size + 1], staged)
             T.dma_wait()
             T.dma_copy(staged, Dst[1 : size + 1])
@@ -46,10 +46,12 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
     try:
         for seed in [1, 2, 3]:
             torch.manual_seed(seed)
-            src = torch.randn(size + 64)
+            # Keep the dirty payload bit-exact across DSP and host arithmetic;
+            # this test checks cache/DMA visibility, not qfloat rounding.
+            src = torch.randint(-(2**31), 2**31, (size + 64,), dtype=torch.int32)
             scratch, dst, readback, copied = kernel(src)
-            expected = src * 2 + 1
-            guarded = torch.full_like(src, -321.25)
+            expected = src ^ 0x5A5A5A5A
+            guarded = torch.full_like(src, -321)
             guarded[1 : size + 1] = expected[1 : size + 1]
             torch.testing.assert_close(scratch, expected, rtol=0, atol=0)
             torch.testing.assert_close(copied, expected[1 : size + 1], rtol=0, atol=0)

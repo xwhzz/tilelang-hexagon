@@ -3,7 +3,7 @@ kernels' sources (``SKEL_OPEN``, ``SKEL_CLOSE``), the PD's setup, the kernel
 status, and the CMakeLists. A session's project (:mod:`.session`) builds its
 skel and agent with them.
 
-On a Linux BSP, where there is no agent, a kernel's own project
+For one-shot BSP bring-up, a kernel's own project
 (:func:`write_project`) adds an IDL with the kernel's buffers and a one-shot
 host driver that runs one call (:class:`~.linux_runtime.OneShotKernel`).
 Buffers cross the FastRPC boundary as ``sequence<uint8>`` (``in`` for inputs,
@@ -114,23 +114,24 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
 # TL_HEXAGON_USES_VTCM); _close must release them, or they leak for the agent's
 # life, and tl_hmx_session_deinit releases the VTCM too. _open fails loudly
 # when they cannot be acquired (e.g. a leaked agent still holds VTCM), rather
-# than running and returning silent zeros.
+# than running and returning silent zeros. Resident sessions may scope just
+# the VTCM/HMX fragments to each call while retaining their clock vote.
 SKEL_INCLUDES = "#include <tl_templates/hexagon/power.h>\n"
-SKEL_OPEN = """  tl_power_vote();
-#if defined(TL_HEXAGON_USES_HMX)
+SKEL_RESOURCES_OPEN = """#if defined(TL_HEXAGON_USES_HMX)
   tl_hmx_session_init();
   if (!tl_hmx_session_ok()) return AEE_EFAILED;
 #elif defined(TL_HEXAGON_USES_VTCM)
   if (!tl_vtcm_base()) return AEE_EFAILED;
 #endif
 """
-SKEL_CLOSE = """#if defined(TL_HEXAGON_USES_HMX)
+SKEL_RESOURCES_CLOSE = """#if defined(TL_HEXAGON_USES_HMX)
   tl_hmx_session_deinit();
 #elif defined(TL_HEXAGON_USES_VTCM)
   tl_vtcm_release();
 #endif
-  tl_power_unvote();
 """
+SKEL_OPEN = "  tl_power_vote();\n" + SKEL_RESOURCES_OPEN
+SKEL_CLOSE = SKEL_RESOURCES_CLOSE + "  tl_power_unvote();\n"
 
 
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
@@ -265,7 +266,7 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
 
 def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
     # The DSP skel (skel + impl, compiled with HVX/HMX enabled) and, for a
-    # session, its Android agent (stub + agent). ``template_dir`` is the parent
+    # session, its HLOS agent (stub + agent). ``template_dir`` is the parent
     # of ``tl_templates`` so the kernel's <tl_templates/hexagon/...> include
     # resolves (as nvcc/hipcc get -I TILELANG_TEMPLATE_PATH). A Linux BSP builds
     # its host driver itself (linux_build.py).

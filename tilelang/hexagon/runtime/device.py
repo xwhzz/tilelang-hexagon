@@ -1,15 +1,7 @@
-"""On-device transport for Hexagon kernels.
+"""File transfer, process launch and loopback forwarding to Hexagon HLOS hosts.
 
-The Hexagon NPU is a *remote, out-of-process* device: it lives on a separate
-chip (the cDSP) running a separate OS (QuRT), reached over FastRPC from an
-Android-ARM host process, which we in turn reach over ``adb`` from this x86 dev
-box.  Everything that crosses that boundary is funnelled through the
-:class:`HexagonConnection` interface so the rest of the backend never bakes in
-"adb" assumptions — a future low-latency transport (e.g. a persistent on-device
-agent, or TVM's Hexagon RPC server) can be dropped in by implementing the same
-interface.
-
-Dependency-free (stdlib only).
+The FastRPC agent runs on the ARM host next to the cDSP. Connections hide
+ADB and SSH from the resident session's buffer and kernel protocol.
 """
 
 from __future__ import annotations
@@ -18,6 +10,7 @@ import abc
 import fcntl
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -102,6 +95,22 @@ class HexagonConnection(abc.ABC):
         """Execute an HLOS host binary on the device with the FastRPC library
         search path configured so the cDSP can find the skel ``.so``."""
 
+    @abc.abstractmethod
+    def start_host_binary(self, exe_remote_path: str, args: list[str]) -> subprocess.Popen:
+        """Start a resident agent; retain stdout and an open stdin for its lifetime."""
+
+    @abc.abstractmethod
+    def forward_port(self, remote_port: int) -> int:
+        """Forward a device loopback TCP port and return its local port."""
+
+    @abc.abstractmethod
+    def remove_forward(self, local_port: int) -> None:
+        """Release a forwarding created by this connection."""
+
+    @abc.abstractmethod
+    def cleanup(self) -> None:
+        """Remove this session's private deployment directory, if creation began."""
+
 
 # Standard locations the FastRPC runtime searches for skel libraries, in
 # addition to our workdir (which must come first).
@@ -117,10 +126,8 @@ _DEFAULT_ADSP_DIRS = (
 class AdbConnection(HexagonConnection):
     """FastRPC transport over ``adb`` to a USB-attached Android device.
 
-    This is the lean, mini-htp-style transport: push the skel + host driver,
-    then ``adb shell`` the driver with ``ADSP_LIBRARY_PATH`` pointing at the
-    workdir so the cDSP loads our skel.  One process per invocation — simple and
-    correct; a persistent agent can replace it later for low latency.
+    Files and commands use ADB, and ``adb forward`` reaches a persistent
+    agent's loopback socket. The same connection can run a one-shot driver.
     """
 
     serial: str | None = None
@@ -128,13 +135,16 @@ class AdbConnection(HexagonConnection):
     adb: str = "adb"
 
     def __post_init__(self) -> None:
-        self._base = [self.adb] + (["-s", self.serial] if self.serial else [])
+        self._base = [shutil.which(self.adb) or self.adb] + (["-s", self.serial] if self.serial else [])
+        self._transport_env = dict(os.environ)
         self._ensured = False
+        self._workdir_attempted = False
 
     # ---- helpers ----------------------------------------------------------
     def _run(self, argv: list[str], timeout: float | None = None) -> tuple[int, str]:
         proc = subprocess.run(
             self._base + argv,
+            env=self._transport_env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -142,9 +152,12 @@ class AdbConnection(HexagonConnection):
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
-    def _ensure_workdir(self) -> None:
+    def _ensure_workdir(self, timeout: float | None = None) -> None:
         if not self._ensured:
-            self.shell(f"mkdir -p {shlex.quote(self.workdir)}")
+            self._workdir_attempted = True
+            rc, out = self.shell(f"mkdir -p {shlex.quote(self.workdir)}", timeout=timeout)
+            if rc:
+                raise HexagonConnectionError(f"Creating device workdir failed: {out}")
             self._ensured = True
 
     @classmethod
@@ -179,24 +192,66 @@ class AdbConnection(HexagonConnection):
     def shell(self, command: str, timeout: float | None = None) -> tuple[int, str]:
         return self._run(["shell", command], timeout=timeout)
 
-    def run_host_binary(
-        self,
-        exe_remote_path: str,
-        args: list[str],
-        adsp_library_path: list[str] | None = None,
-        timeout: float | None = None,
-    ) -> tuple[int, str]:
-        self.shell(f"chmod 755 {shlex.quote(exe_remote_path)}")
+    def _shell_argv(self, command: str) -> list[str]:
+        return self._base + ["shell", command]
+
+    def start_shell(self, command: str):
+        """Start a command whose output stays available until it exits."""
+        return subprocess.Popen(
+            self._shell_argv(command),
+            env=self._transport_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    def forward_port(self, remote_port: int) -> int:
+        """Forward a device loopback port; close it with ``remove_forward``."""
+        rc, out = self._run(["forward", "tcp:0", f"tcp:{remote_port}"])
+        if rc:
+            raise HexagonConnectionError(f"adb forward failed: {out}")
+        return int(out.split()[-1])
+
+    def remove_forward(self, local_port: int) -> None:
+        self._run(["forward", "--remove", f"tcp:{local_port}"])
+
+    def _host_command(self, exe_remote_path, args, adsp_library_path=None):
         exe_dir = os.path.dirname(exe_remote_path)
         adsp_dirs = [self.workdir, exe_dir, *_DEFAULT_ADSP_DIRS]
-        # de-dup while preserving order
-        seen: set[str] = set()
-        adsp = os.pathsep.join(d for d in (adsp_library_path or adsp_dirs) if not (d in seen or seen.add(d)))
-        argstr = " ".join(shlex.quote(a) for a in args)
-        cmd = (
-            f"cd {shlex.quote(exe_dir)} && "
-            f"LD_LIBRARY_PATH={shlex.quote(exe_dir)} "
+        configured = self._transport_env.get("TILELANG_HEXAGON_DSP_LIBRARY_PATH")
+        if configured is not None:
+            adsp_dirs = [self.workdir, exe_dir, *filter(None, configured.split(";"))]
+        adsp = os.pathsep.join(dict.fromkeys(adsp_library_path or adsp_dirs))
+        argstr = " ".join(shlex.quote(str(a)) for a in args)
+        return (
+            f"cd {shlex.quote(exe_dir)} && chmod 755 {shlex.quote(exe_remote_path)} && "
+            f"exec env LD_LIBRARY_PATH={shlex.quote(exe_dir)} "
             f"ADSP_LIBRARY_PATH={shlex.quote(adsp)} "
             f"{shlex.quote(exe_remote_path)} {argstr}"
         )
-        return self.shell(cmd, timeout=timeout)
+
+    def run_host_binary(self, exe_remote_path, args, adsp_library_path=None, timeout=None):
+        return self.shell(self._host_command(exe_remote_path, args, adsp_library_path), timeout=timeout)
+
+    def start_host_binary(self, exe_remote_path, args):
+        """Start a session agent, removing its private directory on exit."""
+        # Keep the agent a child of the transport shell so a failed startup or
+        # interrupted SSH connection can terminate it as well as the shell.
+        # Preserve stdin on fd 3: POSIX shells otherwise give a background
+        # command /dev/null before its redirections are applied.
+        command = self._host_command(exe_remote_path, args)
+        cleanup = f'kill "$_tl_agent" "$_tl_watch" 2>/dev/null; rm -rf -- {shlex.quote(self.workdir)}'
+        return self.start_shell(
+            f"exec 3<&0; ( {command} ) 3<&- & _tl_agent=$!; "
+            '( while IFS= read -r _tl_line; do :; done; kill "$_tl_agent" 2>/dev/null ) <&3 3<&- & _tl_watch=$!; exec 3<&-; '
+            f"trap {shlex.quote(cleanup)} EXIT; "
+            "trap 'exit 1' HUP INT TERM; "
+            'wait "$_tl_agent"; _tl_status=$?; exit "$_tl_status"'
+        )
+
+    def cleanup(self) -> None:
+        if self._workdir_attempted:
+            rc, out = self.shell(f"rm -rf -- {shlex.quote(self.workdir)}", timeout=10)
+            if rc:
+                raise HexagonConnectionError(f"Removing private device workdir failed: {out}")
+            self._ensured = self._workdir_attempted = False

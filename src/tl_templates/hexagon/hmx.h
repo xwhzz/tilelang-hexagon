@@ -110,13 +110,13 @@ TL_HMX_INLINE void tl_hmx_store_cvt(__fp16 *o) {
   asm volatile("mxmem(%0, %1) = cvt" ::"r"(o), "r"(TL_HMX_SPATIAL_RT)
                : "memory");
 }
-// Persistent session resources: power/VTCM/HMX are acquired once and held
-// across many matmuls. The generated FastRPC _open handler calls init; _close
-// calls deinit. The one-shot runtime also initializes resources before kernel
-// execution. NOTE: the check-then-set of these globals is NOT internally
-// synchronized; it is safe because every caller invokes it single-threaded
-// BEFORE tl_parallel spawns workers. A future persistent/cross-kernel pool that
-// could init from two threads must add a lock here.
+// Resource scope: init acquires the HMX rail, VTCM/HMX grants and this thread's
+// HMX enable; deinit releases them on the same execution thread after all
+// workers finish. The resident runtime chooses session scope by default or
+// one scope per invocation with resource_lifetime=call. Its DSP clock vote and
+// worker pool remain session-scoped. The one-shot runtime uses the same pair.
+// These globals are not internally synchronized: the caller serializes scope
+// changes and never initializes or tears down resources under active workers.
 static int tl_hmx_inited;
 static qurt_thread_t
     tl_hmx_session_tid; // thread whose HMX SHARED enable session_init holds

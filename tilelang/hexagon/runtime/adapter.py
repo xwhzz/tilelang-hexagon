@@ -1,14 +1,14 @@
 """tilelang.compile's adapter for Hexagon kernels.
 
-On Android, a compiled kernel is a :class:`~.session.Session` of one kernel:
+On Android and Linux, a compiled kernel is a :class:`~.session.Session` of one kernel:
 its skel, and an agent on the phone that holds its FastRPC session, reached
 through ``adb forward``. A call sends the kernel's inputs and scalars and
 returns its outputs, in ``out_idx`` order. ``close()``, or ``close_all()``
 between tests, ends the session and frees the device; the next call starts
 another, from the cached build.
 
-On a Linux BSP (``TILELANG_HEXAGON_HLOS=linux``) there is no agent: each call
-runs the kernel's one-shot host driver (:class:`~.linux_runtime.OneShotKernel`).
+Linux BSPs use a POSIX agent built against their FastRPC libraries and
+reached over SSH, or over ADB when SSH is not configured.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import weakref
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
-from .config import hlos
 from .env import HexagonSDK
 
 # The kernel entry is the generated function that returns its int32 status;
@@ -78,25 +77,11 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         """The callable that runs the kernel on the device, which it starts
         unless it is up."""
         if self._device is None:
-            if hlos() == "linux":
-                from .linux_runtime import OneShotKernel
+            from .session import Session
 
-                self._device = OneShotKernel(
-                    self.kernel_name,
-                    self.kernel_source,
-                    self._param_list,
-                    self._result_idx,
-                    sdk=self.sdk,
-                    dsp_arch=self.dsp_arch,
-                    verbose=self.verbose,
-                )
-                self._run = self._device
-            else:
-                from .session import Session
-
-                lowered = [(self.kernel_name, self.kernel_source, self._param_list, self._result_idx)]
-                self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
-                self._run = self._device.kernels[0]
+            lowered = [(self.kernel_name, self.kernel_source, self._param_list, self._result_idx)]
+            self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
+            self._run = self._device.kernels[0]
         return self._run
 
     def close(self) -> None:

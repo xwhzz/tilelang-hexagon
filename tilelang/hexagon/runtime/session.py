@@ -1,6 +1,6 @@
 """Device sessions: several kernels and their resident buffers in one FastRPC session.
 
-A :class:`Session` holds one agent process on the phone and one FastRPC
+A :class:`Session` holds one agent process on the HLOS and one FastRPC
 session on the cDSP (one PD, one VTCM grant, one worker pool), with every
 kernel it was given built into one skel. Its :class:`DeviceBuffer` objects live
 in the session: rpcmem the agent maps into the DSP once (``fastrpc_mmap`` with
@@ -34,24 +34,27 @@ import contextlib
 import functools
 import hashlib
 import json
+import operator
 import os
 import re
 import select
 import shutil
 import socket
 import struct
-import subprocess
 import tempfile
 import time
 import weakref
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from . import fastrpc
-from .device import _DEFAULT_ADSP_DIRS, DEVICE_LOCK
+from . import config, fastrpc
+from .device import DEVICE_LOCK
+from . import sequence
+from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -67,6 +70,7 @@ _OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_
 
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
+_MAX_BUFFERS = 256
 
 _KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
@@ -92,12 +96,146 @@ def gen_idl(iface: str) -> str:
     )
 
 
+def _dispatch_source(calls: str) -> str:
+    """Keep large kernel frames off a FastRPC thread whose requested stack
+    was not applied. The Session protocol serializes calls; semaphore handoffs
+    retain arguments until completion and publish the kernel's status."""
+    return f"""
+static constexpr bool tl_session_resources_per_call = {str(config.resource_lifetime() == "call").lower()};
+
+// Prevent kernel frames from being inlined into the FastRPC dispatcher.
+static __attribute__((noinline)) AEEResult tl_session_invoke(int kernel, void** a) {{
+  switch (kernel) {{
+{calls}  default: return AEE_EBADPARM;
+  }}
+}}
+
+static AEEResult tl_session_resources_open() {{
+{fastrpc.SKEL_RESOURCES_OPEN}  return AEE_SUCCESS;
+}}
+static void tl_session_resources_close() {{
+{fastrpc.SKEL_RESOURCES_CLOSE}}}
+
+static AEEResult tl_session_execution_open() {{
+  tl_power_vote();
+  return tl_session_resources_per_call ? AEE_SUCCESS : tl_session_resources_open();
+}}
+static void tl_session_execution_close() {{
+  if (!tl_session_resources_per_call) tl_session_resources_close();
+  tl_power_unvote();
+}}
+
+static AEEResult tl_session_execute(int kernel, void** args) {{
+  if (!tl_session_resources_per_call) return tl_session_invoke(kernel, args);
+  AEEResult status = tl_session_resources_open();
+  if (status == AEE_SUCCESS) status = tl_session_invoke(kernel, args);
+  // invoke has joined its workers and drained their DMA queues before return.
+  // Release even after an acquisition or kernel error, before reporting done.
+  tl_session_resources_close();
+  return status;
+}}
+
+// A session executes either on its FastRPC caller or one persistent thread.
+// HMX enable/disable must run on the same execution thread as the kernels.
+static struct {{
+  qurt_thread_t thread;
+  qurt_sem_t go, done;
+  void* stack;
+  int started, stopping, kernel;
+  void** args;
+  AEEResult status;
+}} tl_session_dispatch;
+
+static void tl_session_worker(void*) {{
+  tl_session_dispatch.status = tl_session_execution_open();
+  qurt_sem_up(&tl_session_dispatch.done);
+  if (tl_session_dispatch.status != AEE_SUCCESS) {{
+    tl_session_execution_close();
+    return;
+  }}
+  for (;;) {{
+    qurt_sem_down(&tl_session_dispatch.go);
+    if (tl_session_dispatch.stopping) break;
+    tl_session_dispatch.status = tl_session_execute(tl_session_dispatch.kernel, tl_session_dispatch.args);
+    qurt_sem_up(&tl_session_dispatch.done);
+  }}
+  tl_session_execution_close();
+}}
+
+static AEEResult tl_session_join_worker() {{
+  int status;
+  // Never free a stack whose thread has not been joined successfully.
+  if (qurt_thread_join(tl_session_dispatch.thread, &status) != QURT_EOK) return AEE_EFAILED;
+  tl_session_dispatch.started = 0;
+  qurt_sem_destroy(&tl_session_dispatch.go);
+  qurt_sem_destroy(&tl_session_dispatch.done);
+  free(tl_session_dispatch.stack);
+  tl_session_dispatch.stack = 0;
+  return AEE_SUCCESS;
+}}
+
+static AEEResult tl_session_dispatch_open() {{
+  qurt_thread_attr_t caller;
+  if (qurt_thread_attr_get(qurt_thread_get_id(), &caller) != QURT_EOK) return AEE_EFAILED;
+  if (caller.stack_size >= {fastrpc.PD_THREAD_STACK}) {{
+    AEEResult status = tl_session_execution_open();
+    if (status != AEE_SUCCESS) tl_session_execution_close();
+    return status;
+  }}
+  tl_session_dispatch.stack = malloc({fastrpc.PD_THREAD_STACK});
+  if (!tl_session_dispatch.stack) return AEE_ENOMEMORY;
+  tl_session_dispatch.stopping = 0;
+  qurt_sem_init_val(&tl_session_dispatch.go, 0);
+  qurt_sem_init_val(&tl_session_dispatch.done, 0);
+  qurt_thread_attr_t worker;
+  qurt_thread_attr_init(&worker);
+  qurt_thread_attr_set_stack_addr(&worker, tl_session_dispatch.stack);
+  qurt_thread_attr_set_stack_size(&worker, {fastrpc.PD_THREAD_STACK});
+  qurt_thread_attr_set_priority(&worker, caller.priority);
+  if (qurt_thread_create(&tl_session_dispatch.thread, &worker, tl_session_worker, 0) != QURT_EOK) {{
+    qurt_sem_destroy(&tl_session_dispatch.go);
+    qurt_sem_destroy(&tl_session_dispatch.done);
+    free(tl_session_dispatch.stack);
+    tl_session_dispatch.stack = 0;
+    return AEE_EFAILED;
+  }}
+  tl_session_dispatch.started = 1;
+  qurt_sem_down(&tl_session_dispatch.done);
+  AEEResult status = tl_session_dispatch.status;
+  if (status != AEE_SUCCESS) {{
+    AEEResult joined = tl_session_join_worker();
+    if (joined != AEE_SUCCESS) return joined;
+  }}
+  return status;
+}}
+
+static AEEResult tl_session_dispatch_run(int kernel, void** args) {{
+  if (!tl_session_dispatch.started) return tl_session_execute(kernel, args);
+  tl_session_dispatch.kernel = kernel;
+  tl_session_dispatch.args = args;
+  qurt_sem_up(&tl_session_dispatch.go);
+  qurt_sem_down(&tl_session_dispatch.done);
+  return tl_session_dispatch.status;
+}}
+
+static AEEResult tl_session_dispatch_close() {{
+  if (!tl_session_dispatch.started) {{
+    tl_session_execution_close();
+    return AEE_SUCCESS;
+  }}
+  tl_session_dispatch.stopping = 1;
+  qurt_sem_up(&tl_session_dispatch.go);
+  return tl_session_join_worker();
+}}
+"""
+
+
 def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     """The skel of `kernels`, (name, source, plans) each: one translation unit,
     every kernel's entry renamed to its index."""
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
-        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <type_traits>\n",
+        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <type_traits>\n",
         f'#include "{iface}.h"\n\n',
         fastrpc.SKEL_INCLUDES,
     ]
@@ -112,6 +250,7 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
+    parts.append(_dispatch_source(calls))
     parts.append(f"""
 // The DSP address of each resident buffer, by its fd.
 #define TL_SESSION_MAPS 256
@@ -136,7 +275,7 @@ extern "C" {{
 
 AEEResult {iface}_open(const char* uri, remote_handle64* h) {{
   (void)uri; *h = 0;
-{fastrpc.SKEL_OPEN}  return AEE_SUCCESS;
+  return tl_session_dispatch_open();
 }}
 
 AEEResult {iface}_release(remote_handle64 h, int32 fd) {{
@@ -153,7 +292,7 @@ AEEResult {iface}_release(remote_handle64 h, int32 fd) {{
 AEEResult {iface}_close(remote_handle64 h) {{
   (void)h;
   while (tl_session_nmaps > 0) {{ HAP_mmap_put(tl_session_maps[tl_session_nmaps - 1].fd); --tl_session_nmaps; }}
-{fastrpc.SKEL_CLOSE}  return AEE_SUCCESS;
+  return tl_session_dispatch_close();
 }}
 
 AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, int32 writeback) {{
@@ -165,8 +304,8 @@ AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, 
   // before it writes them, they go there too and the DSP's copies go. A dirty
   // line left behind would overwrite the host's bytes when evicted, and an
   // invalidate on its own writes dirty lines back.
-  qurt_mem_cache_clean((qurt_addr_t)(base + offset), size, writeback ? QURT_MEM_CACHE_FLUSH : QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
-  return AEE_SUCCESS;
+  int rc = qurt_mem_cache_clean((qurt_addr_t)(base + offset), size, writeback ? QURT_MEM_CACHE_FLUSH : QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
+  return rc == QURT_EOK ? AEE_SUCCESS : AEE_EFAILED;
 }}
 
 AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int argsLen, const uint8* inputs, int inputsLen, uint8* outputs, int outputsLen) {{
@@ -188,9 +327,7 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
       a[i] = (void*)(intptr_t)v;
     }}
   }}
-  switch (kernel) {{
-{calls}  default: return AEE_EBADPARM;
-  }}
+  return tl_session_dispatch_run(kernel, a);
 }}
 
 #ifdef __cplusplus
@@ -200,9 +337,9 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
     return "".join(parts)
 
 
-def gen_agent(iface: str) -> str:
+def gen_agent(iface: str, kernels=()) -> str:
     """The agent: one FastRPC session, its resident buffers, and a TCP socket
-    (reached through ``adb forward``) for the host's operations."""
+    (reached through the transport's loopback tunnel) for host operations."""
     return f"""// Auto-generated agent of a tilelang Hexagon session.
 #include <AEEStdErr.h>
 #include <remote.h>
@@ -221,6 +358,7 @@ def gen_agent(iface: str) -> str:
 #include "{iface}.h"
 
 static remote_handle64 g_handle = -1;
+static int g_domain = CDSP_DOMAIN_ID;
 
 static int read_full(int fd, void* buf, size_t n) {{
   size_t got = 0;
@@ -245,8 +383,8 @@ static int reply(int fd, unsigned char status, const void* data, size_t n) {{
 }}
 
 // Resident buffers: rpcmem, uncached on the CPU, mapped into the DSP once.
-#define MAX_BUFFERS 256
-static struct {{ uint8_t* ptr; int fd; uint64_t size; }} g_buffers[MAX_BUFFERS];
+#define MAX_BUFFERS {_MAX_BUFFERS}
+static struct {{ uint8_t* ptr; int fd; uint64_t size, generation; }} g_buffers[MAX_BUFFERS];
 
 // The duration of the last run's FastRPC call.
 static int64_t g_last_run_ns;
@@ -278,15 +416,18 @@ static int open_session(int domain_id) {{
 static void free_buffer(int id) {{
   if (id < 0 || id >= MAX_BUFFERS || !g_buffers[id].ptr) return;
   {iface}_release(g_handle, g_buffers[id].fd);
-  fastrpc_munmap(CDSP_DOMAIN_ID, g_buffers[id].fd, g_buffers[id].ptr, g_buffers[id].size);
+  fastrpc_munmap(g_domain, g_buffers[id].fd, g_buffers[id].ptr, g_buffers[id].size);
   rpcmem_free(g_buffers[id].ptr);
   g_buffers[id].ptr = 0;
 }}
+
+{sequence.agent_source(iface, kernels)}
 
 // One operation of the host; nonzero ends the connection.
 static int serve(int cli, unsigned char op, int* running) {{
   if (op == {_OP_CLOSE}) return 1;
   if (op == {_OP_SHUTDOWN}) {{ *running = 0; return 1; }}
+  if (op == {sequence.OP_SEQUENCE}) return tl_serve_sequence(cli);
   if (op == {_OP_RUN}) {{
     int32_t head[3];  // kernel, number of args, inline output bytes
     if (read_full(cli, head, sizeof(head))) return 1;
@@ -320,16 +461,19 @@ static int serve(int cli, unsigned char op, int* running) {{
     uint64_t size = 0;
     if (read_full(cli, &size, 8)) return 1;
     int32_t id = -1;
+    // rpcmem_alloc takes int; validate before narrowing or zeroing its result.
+    if (size == 0 || size >= (UINT64_C(1) << 31)) return write_full(cli, &id, 4);
     for (int i = 0; i < MAX_BUFFERS; ++i) if (!g_buffers[i].ptr) {{ id = i; break; }}
     if (id >= 0) {{
       uint8_t* p = (uint8_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, (int)size);
       int fd = p ? rpcmem_to_fd(p) : -1;
-      if (!p || fd < 0 || fastrpc_mmap(CDSP_DOMAIN_ID, fd, p, 0, size, FASTRPC_MAP_FD) != 0) {{
+      if (!p || fd < 0 || fastrpc_mmap(g_domain, fd, p, 0, size, FASTRPC_MAP_FD) != 0) {{
         if (p) rpcmem_free(p);
         id = -1;
       }} else {{
         memset(p, 0, size);
         g_buffers[id].ptr = p; g_buffers[id].fd = fd; g_buffers[id].size = size;
+        ++g_buffers[id].generation;
       }}
     }}
     return write_full(cli, &id, 4);
@@ -384,7 +528,8 @@ static int serve(int cli, unsigned char op, int* running) {{
 int main(int argc, char** argv) {{
   // The port to listen on, 0 for one the kernel picks, which it reports.
   int port = (argc > 1) ? atoi(argv[1]) : 0;
-  if (open_session(CDSP_DOMAIN_ID) != 0) return 1;
+  if (argc > 2) g_domain = atoi(argv[2]);
+  if (open_session(g_domain) != 0) return 1;
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
@@ -424,7 +569,7 @@ def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tup
     files = {
         f"{iface}.idl": gen_idl(iface),
         f"{iface}_dsp.cc": gen_dsp(iface, kernels),
-        f"{iface}_agent.c": gen_agent(iface),
+        f"{iface}_agent.c": gen_agent(iface, kernels),
         "CMakeLists.txt": fastrpc.gen_cmake(iface, TILELANG_TEMPLATE_PATH, agent=True),
     }
     for fn, content in files.items():
@@ -439,6 +584,14 @@ def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tup
 
 
 @dataclass
+class _BufferAllocation:
+    id: int
+    nbytes: int
+    generation: int
+    alive: bool = True
+
+
+@dataclass
 class DeviceBuffer:
     """``nbytes`` of resident memory of a :class:`Session`, from ``offset``."""
 
@@ -446,35 +599,56 @@ class DeviceBuffer:
     id: int
     nbytes: int
     offset: int = 0
+    _allocation: _BufferAllocation | None = None
+
+    def _live_allocation(self) -> _BufferAllocation:
+        allocation = self._allocation
+        if (
+            allocation is None
+            or not allocation.alive
+            or allocation.id != self.id
+            or getattr(self.session, "_closed", True)
+            or getattr(self.session, "_allocations", {}).get(self.id) is not allocation
+        ):
+            raise ValueError("the resident buffer allocation is no longer live")
+        if self.offset < 0 or self.nbytes < 0 or self.offset > allocation.nbytes or self.nbytes > allocation.nbytes - self.offset:
+            raise ValueError("the resident buffer view is outside its allocation")
+        return allocation
 
     def at(self, offset: int, nbytes: int | None = None) -> DeviceBuffer:
         """The bytes from ``offset`` on, as an argument: a register boundary."""
+        allocation = self._live_allocation()
         if offset % _ALIGN:
             raise ValueError(f"a resident argument starts on a {_ALIGN}-byte boundary, not at {offset}")
         n = self.nbytes - offset if nbytes is None else nbytes
-        if offset < 0 or offset + n > self.nbytes:
+        if offset < 0 or n < 0 or offset + n > self.nbytes:
             raise ValueError(f"bytes [{offset}, {offset + n}) are not in a buffer of {self.nbytes}")
-        return DeviceBuffer(self.session, self.id, n, self.offset + offset)
+        return DeviceBuffer(self.session, self.id, n, self.offset + offset, allocation)
 
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
+        self._live_allocation()
         raw = _bytes(data)
-        if offset + len(raw) > self.nbytes:
+        if offset < 0 or offset + len(raw) > self.nbytes:
             raise ValueError(f"{len(raw)} bytes at {offset} overrun a buffer of {self.nbytes}")
         self.session._write(self.id, self.offset + offset, raw)
 
     def read(self, nbytes: int | None = None, offset: int = 0) -> bytes:
+        self._live_allocation()
         n = self.nbytes - offset if nbytes is None else nbytes
+        if offset < 0 or n < 0 or offset > self.nbytes or n > self.nbytes - offset:
+            raise ValueError("read range is outside its resident buffer view")
         return self.session._read(self.id, self.offset + offset, n)
 
     def load(self, device_path: str, start: int = 0) -> int:
         """Read the file at ``device_path`` on the device, from byte ``start``
         on, into the buffer: as many bytes as the buffer holds, or as the file
         has past ``start``. Returns how many it read."""
+        self._live_allocation()
         return self.session._load(self.id, self.offset, self.nbytes, device_path, start)
 
     def free(self) -> None:
-        self.session._free(self.id)
+        self.session._free(self.id, self._live_allocation())
 
 
 def _bytes(data) -> bytes:
@@ -591,13 +765,22 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
 
 
 class Session:
-    """Kernels sharing one FastRPC session and its resident buffers."""
+    """Kernels sharing one FastRPC session and its resident buffers.
+
+    TILELANG_HEXAGON_RESOURCE_LIFETIME=call limits VTCM/HMX ownership to each
+    kernel invocation. The default, session, retains them until close. DDR
+    buffers, execution threads and DSP clock votes live for the whole session.
+    Call-scoped resources do not provide preemption inside a long kernel.
+    Calls on one Session must be serialized; its socket protocol is not
+    thread-safe, including buffer operations and run_sequence.
+    """
 
     _port_seq = 0
 
     def __init__(self, kernels, *, target="hexagon", serial: str | None = None, verbose: bool = False, ready_timeout: float = 30.0):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
         the DSP the target names."""
+        config.resource_lifetime()  # Reject invalid profiles before lowering.
         from tilelang.backend.target import determine_target
         from tilelang.hexagon.target import hexagon_arch
 
@@ -623,15 +806,15 @@ class Session:
         return session
 
     def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float) -> None:
+        config.resource_lifetime()  # Also cover of_lowered, before build/deploy.
         from .build import build_cmake_fastrpc
-        from .config import device_serial, hlos
+        from .config import device_serial, domain_id, hlos, remote_dir
+        from .device import AdbConnection
         from .env import HexagonSDK
 
         self._closed = True
-        if hlos() == "linux":
-            raise NotImplementedError(
-                "a session needs the Android agent; on a Linux BSP, tilelang.compile runs a kernel one call at a time"
-            )
+        self._allocations = {}
+        self._buffer_generations = {}
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")
@@ -640,8 +823,18 @@ class Session:
         sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, dsp_arch=dsp_arch, verbose=verbose)
         self.kernels = [SessionKernel(self, i, name, params, out) for i, (name, _, params, out) in enumerate(lowered)]
-        self._serial = serial or device_serial()
-        self._base = ["adb"] + (["-s", self._serial] if self._serial else [])
+        self._domain = domain_id()
+        if hlos() == "linux":
+            from .linux_runtime import LinuxConnection
+
+            self._conn = LinuxConnection.from_environment(serial)
+        else:
+            Session._port_seq += 1
+            self._conn = AdbConnection(
+                serial=serial or device_serial(),
+                workdir=f"{remote_dir('android')}/session_{os.getpid()}_{Session._port_seq}",
+            )
+        self._device_dir = self._conn.workdir
         self._holds_device = DEVICE_LOCK.acquire()
         self._closed = False
         try:
@@ -653,25 +846,10 @@ class Session:
 
     # ---- lifecycle --------------------------------------------------------
     def _start(self, ready_timeout: float) -> None:
-        Session._port_seq += 1
-        from .config import remote_dir
-
-        self._device_dir = f"{remote_dir('android')}/session_{os.getpid()}_{Session._port_seq}"
-        subprocess.run(self._base + ["shell", f"mkdir -p {self._device_dir}"], check=True, capture_output=True)
         for local in (self._artifacts.dsp_skel, self._artifacts.agent_exe):
-            subprocess.run(self._base + ["push", local, f"{self._device_dir}/"], check=True, capture_output=True)
-        exe = os.path.basename(self._artifacts.agent_exe)
-        adsp = os.pathsep.join([self._device_dir, *_DEFAULT_ADSP_DIRS])
-        # The agent listens on a port the kernel picks, which it reports: the
-        # device refused a port the host had picked now and then ("bind:
-        # Operation not permitted", 3 of some 700 sessions in a regression),
-        # and another session may hold it. The command exits with the agent's
-        # status.
-        cmd = (
-            f"cd {self._device_dir} && chmod 755 {exe} && LD_LIBRARY_PATH={self._device_dir} ADSP_LIBRARY_PATH={adsp} "
-            f"./{exe} 0; status=$?; rm -rf {self._device_dir}; exit $status"
-        )
-        self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self._conn.push(local)
+        exe = os.path.join(self._device_dir, os.path.basename(self._artifacts.agent_exe))
+        self._proc = self._conn.start_host_binary(exe, ["0", str(self._domain)])
         # select() keeps a silent agent from blocking past the deadline, and
         # the reads take what the pipe holds, unbuffered: a buffered readline
         # could leave AGENT_READY where select() does not see it. What the
@@ -691,10 +869,7 @@ class Session:
             ready, _, _ = select.select([self._proc.stdout], [], [], min(0.2, remaining))
             if ready:
                 printed += os.read(self._proc.stdout.fileno(), 4096)
-        done = subprocess.run(
-            self._base + ["forward", "tcp:0", f"tcp:{int(ready_line.group(1))}"], check=True, capture_output=True, text=True
-        )
-        self._host_port = int(done.stdout.split()[-1])
+        self._host_port = self._conn.forward_port(int(ready_line.group(1)))
         for _ in range(100):
             try:
                 self._sock = socket.create_connection(("127.0.0.1", self._host_port), timeout=2.0)
@@ -710,24 +885,55 @@ class Session:
         if getattr(self, "_closed", True):
             return
         self._closed = True
+        for allocation in getattr(self, "_allocations", {}).values():
+            allocation.alive = False
+        self._allocations = {}
         with contextlib.suppress(Exception):
             atexit.unregister(self.close)
-        if getattr(self, "_sock", None) is not None:
-            with contextlib.suppress(Exception):
-                self._sock.sendall(bytes([_OP_SHUTDOWN]))
-                self._sock.close()
-        if getattr(self, "_proc", None) is not None:
-            try:
-                self._proc.wait(timeout=10)
-            except Exception:
+        try:
+            shutdown_sent = False
+            if getattr(self, "_sock", None) is not None:
                 with contextlib.suppress(Exception):
-                    self._proc.terminate()
-            self._proc.stdout.close()
-        if getattr(self, "_host_port", None):
-            subprocess.run(self._base + ["forward", "--remove", f"tcp:{self._host_port}"], capture_output=True)
-        if self._holds_device:
-            self._holds_device = False
-            DEVICE_LOCK.release()
+                    self._sock.sendall(bytes([_OP_SHUTDOWN]))
+                    shutdown_sent = True
+                with contextlib.suppress(Exception):
+                    self._sock.close()
+            if getattr(self, "_proc", None) is not None:
+                # EOF also wakes the remote watchdog if no socket was opened.
+                if not shutdown_sent and self._proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        self._proc.stdin.close()
+                try:
+                    self._proc.wait(timeout=10)
+                except Exception:
+                    if self._proc.stdin is not None:
+                        with contextlib.suppress(Exception):
+                            self._proc.stdin.close()
+                    with contextlib.suppress(Exception):
+                        self._proc.terminate()
+                        self._proc.wait(timeout=5)
+                    if self._proc.poll() is None:
+                        with contextlib.suppress(Exception):
+                            self._proc.kill()
+                            self._proc.wait()
+                if self._proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        self._proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    self._proc.stdout.close()
+            if getattr(self, "_host_port", None):
+                with contextlib.suppress(Exception):
+                    self._conn.remove_forward(self._host_port)
+            try:
+                self._conn.cleanup()
+            except Exception as error:
+                # A lost network can prevent immediate remote removal, but
+                # must never keep the host device lock held or hide startup's error.
+                warnings.warn(f"Hexagon session cleanup failed: {error}", RuntimeWarning, stacklevel=2)
+        finally:
+            if self._holds_device:
+                self._holds_device = False
+                DEVICE_LOCK.release()
 
     def __enter__(self):
         return self
@@ -762,17 +968,43 @@ class Session:
         takes an int). Large buffers fragment the DSP's 4 GB of addresses: on
         a v79, seven of 512 MiB map and an eighth does not, while 3.5 GB of
         model weights map as a buffer per tensor, the largest first."""
+        try:
+            nbytes = operator.index(nbytes)
+        except TypeError:
+            raise ValueError("a resident buffer size must be an integer") from None
         if not 0 < nbytes < 1 << 31:
             raise ValueError(f"a resident buffer holds 1 byte to 2 GiB - 1, not {nbytes}")
-        self._sock.sendall(bytes([_OP_ALLOC]) + struct.pack("<Q", nbytes))
-        (bid,) = struct.unpack("<i", self._recv(4))
+        if self._closed:
+            raise ValueError("the Hexagon session is closed")
+        request = bytes([_OP_ALLOC]) + struct.pack("<Q", nbytes)
+        try:
+            self._sock.sendall(request)
+            (bid,) = struct.unpack("<i", self._recv(4))
+        except BaseException:
+            # An allocation reply lost in transit leaves generation counters
+            # unsynchronized. Do not retry on this session.
+            self.close()
+            raise
         if bid < 0:
             raise RuntimeError(f"Hexagon session: could not allocate and map {nbytes} bytes")
+        if bid >= _MAX_BUFFERS or bid in self._allocations:
+            self.close()
+            raise RuntimeError("invalid Hexagon session allocation reply")
         # Freed by DeviceBuffer.free, or with the session.
-        return DeviceBuffer(self, bid, nbytes)
+        generation = self._buffer_generations.get(bid, 0) + 1
+        self._buffer_generations[bid] = generation
+        allocation = _BufferAllocation(bid, nbytes, generation)
+        self._allocations[bid] = allocation
+        return DeviceBuffer(self, bid, nbytes, _allocation=allocation)
 
-    def _free(self, bid: int) -> None:
-        self._sock.sendall(bytes([_OP_FREE]) + struct.pack("<i", bid))
+    def _free(self, bid: int, allocation: _BufferAllocation) -> None:
+        try:
+            self._sock.sendall(bytes([_OP_FREE]) + struct.pack("<i", bid))
+        except BaseException:
+            self.close()
+            raise
+        allocation.alive = False
+        del self._allocations[bid]
 
     def _write(self, bid: int, offset: int, raw: bytes) -> None:
         self._sock.sendall(bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw)
@@ -799,6 +1031,29 @@ class Session:
         return ns * 1e-9
 
     # ---- runs -------------------------------------------------------------
+    def run_sequence(self, operations) -> SequenceResult:
+        """Execute a bounded, explicit Run/Copy list with one agent round trip.
+
+        All descriptors are validated before execution. A failed operation
+        stops the sequence and raises SequenceError with partial timings;
+        even the failed operation may have partial side effects. Effects
+        remain and are never replayed automatically.
+        Each Run retains the normal per-call DSP resource scope. Copies use
+        byte offsets, while Run buffer arguments remain 128-byte aligned.
+        """
+        if self._closed:
+            raise ValueError("the Hexagon session is closed")
+        operations, wire = sequence.encode(self, operations)
+        try:
+            self._sock.sendall(wire)
+            return sequence.receive(self, operations)
+        except SequenceError:
+            raise
+        except BaseException:
+            # Do not reuse a socket after a partial send or truncated reply.
+            self.close()
+            raise
+
     def _run(self, kernel: SessionKernel, given: list):
         args, inputs, outputs = [], bytearray(), []
         out_bytes = 0
@@ -809,6 +1064,7 @@ class Session:
             elif isinstance(value, DeviceBuffer):
                 if value.session is not self:
                     raise ValueError(f"argument {i} of {kernel.name} is a buffer of another session")
+                value._live_allocation()
                 if value.nbytes < plan.nbytes:
                     raise ValueError(f"argument {i} of {kernel.name} takes {plan.nbytes} bytes, its buffer has {value.nbytes}")
                 args += [_RESIDENT, value.id, value.offset]

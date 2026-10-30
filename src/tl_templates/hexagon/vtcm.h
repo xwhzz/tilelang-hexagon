@@ -8,9 +8,10 @@
 // to `tl_vtcm_arena()`; a worker loop splits the region into per-worker arenas
 // instead (tl_vtcm_worker_arenas in worker.h).
 //
-// One acquisition is held for the whole FastRPC session (idempotent, lazy on
-// first use); the layout comes from the compiler, so this header only owns the
-// acquire/release of the region itself.
+// Acquisition is idempotent until release, and may happen lazily on first use.
+// The caller chooses its lifetime: the resident runtime holds it for a session
+// by default, or for each invocation with resource_lifetime=call. This header
+// only owns acquire/release; the compiler supplies the arena layout.
 //
 // Compiled into the FastRPC skel (.cc) with the Hexagon SDK on the include
 // path; it pulls in HAP headers, so it is only included when a kernel uses
@@ -73,9 +74,9 @@ TL_VTCM_INLINE int tl_vtcm_bind_region(void *base, unsigned int size) {
   return 0;
 }
 
-// Acquire the full VTCM region once.  Idempotent: a second call is a no-op
-// while a region is held, so alloc_shared kernels and (later) the HMX path can
-// share the same arena without double-acquiring.
+// Acquire the full VTCM region. A second call is a no-op while the region is
+// held, so alloc_shared kernels and HMX share one arena. After release, the
+// next acquisition obtains a new grant; its address need not be the same.
 TL_VTCM_INLINE void tl_vtcm_acquire(void) {
   if (tl_vtcm_base_ptr)
     return;
