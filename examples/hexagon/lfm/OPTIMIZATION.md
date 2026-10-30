@@ -1,9 +1,10 @@
-# How LFM2 got fast on Hexagon
+# How LFM2 and LFM3 got fast on Hexagon
 
-This is the record of the optimization work on the LFM2-1.2B example: what each
-step bought, measured on the device; what was tried and did not help; where
-the time goes now; and what is left. The [README](README.md) describes the
-kernels as they are.
+This is the record of the optimization work on the LFM2-1.2B example, and then
+on LFM3-1.7B in fp16 ([below](#lfm3-17b-in-fp16)): what each step bought,
+measured on the device; what was tried and did not help; where the time goes
+now; and what is left. The [README](README.md) describes the kernels as they
+are.
 
 All numbers are from the v79 cDSP of a Snapdragon 8 Elite (SM8750) phone,
 batch 1, with the bundle of #106 (4-bit projections with an fp16 scale per 64
@@ -273,3 +274,109 @@ Within W4A16, each of these would give about 0.5-1%:
   would be a load, a compare and a select a register.
 - **A leaner fp16 sigmoid.** Within the sigmoid's own clamp, the exp2 inside
   it need not clamp again.
+
+## LFM3-1.7B in fp16
+
+LFM3-1.7B runs unquantized: its projections in fp16, in a bundle of 3463.4 MB,
+of which a decoded token reads 3461.9 MB. The numbers are from the same phone
+and the same measurements as above, with `bench.py` taking the median of 3
+runs. #179 tracks this work.
+
+### LFM3: where it stands
+
+| | decode, tg128 | prefill, pp1024 |
+|---|---:|---:|
+| **this example** | **16.6-16.7 t/s** (60 ms a token) | **248.8 ms, 4116 t/s** |
+| roofline | 16.7 t/s (3461.9 MB a token at the DMA's 57.7 GB/s) | about 200 ms (each chunk of 256 rows streams 2835 MB of weights at the DMA's rate; HMX alone would take 174 ms) |
+
+The decode reads its weights at the DMA's top rate, and HVX loads straight
+from DDR do not raise it (see below). The prefill's GEMM phases run near both
+limits at once: at about 55 GB/s, and with HMX at about 9.7 cycles per
+32 x 32 x 32 multiply, against 8.1 at its best. A chunk of 256 rows is what
+VTCM holds; the rest of the time is HVX work between the GEMM phases.
+
+Quality: WikiText-2 perplexity on the device is 15.8834 over 16 windows of
+1024 tokens, against 15.8812 for the fp32 reference (`model.py`) on the host;
+15.8814 with the device's fp16 projection inputs emulated. After a chat
+prompt, prefilled, the first 64 greedy tokens match the checkpoint's own code
+(transformers 5.22, fp32).
+
+### LFM3's prefill: from 320.7 to 248.8 ms
+
+The first four steps are #189's.
+
+| step | pp1024 |
+|---|---:|
+| the first version: the residual and the branch outputs in DDR, rows moved by HVX | 320.7 ms |
+| the residual's rows by DMA; each residual add fused with the next norm; the last layer's FFN skipped | 308.9 ms |
+| the branch outputs in VTCM, the GEMMs adding into them; attention in blocks of 64 keys; masks only where needed | 274.6 ms |
+| the residual's DMA two slots deep; the queries by DMA in HMX's tiles (#189) | 270.9 ms |
+| the KV cache in HMX's tiles, so keys and values reach HMX's operands by DMA with no pack; blocks of 64 rows against 128 keys; the gates by head; the sandwich norm's sums in the GEMMs' epilogues (#191) | 259.2 ms |
+| the residual moved with no cache maintenance (`T.annotate_dma_only`, #193) | 254.2 ms |
+| ... and bypassing the L2, as other transfers do (#195) | 250.1 ms |
+| the residual adds' batches in pairs, so that each loop's slot is a constant; the sandwich scales as vectors (#197) | 248.8 ms |
+
+### LFM3: where the prefill's time goes
+
+pp1024, a copy of the kernel with `HAP_perf_get_pcycles` marks after each
+phase and barrier (Mcycles per worker, the mean of 4; ms at 2.06 GHz):
+
+| phase | Mcycles | ms |
+|---|---:|---:|
+| the GEMM phases: in_proj and qkv, out_proj, w1/w3 with SwiGLU, w2 | 423.3 | 205 |
+| attention | 41.9 | 20 |
+| the residual adds and norms | 33.5 | 16 |
+| barriers | 15.9 | 8 |
+| the chunk's start: embedding, RoPE rows, the first norm | 7.3 | 3.5 |
+| total | 521.7 | 253 |
+
+Inside attention (Mcycles, the slowest worker): exp2 and the row sums 13.5,
+waiting for keys and values 8.1, the row blocks' prologue and epilogue 7.0,
+P V on HMX 6.2, the mask, the row max and alpha 4.5, the rescale 2.6, q K^T on
+HMX 0.6.
+
+The barriers are mostly the first worker waiting, as in LFM2's prefill: it
+finishes its GEMM phases ahead of the others (w1/w3: 204.9M against 213.2M
+cycles).
+
+### LFM3: what did not work
+
+| tried | measured |
+|---|---|
+| HVX loads from DDR beside the DMA, in the same workers: a quarter or an eighth of each worker's panels | 49.1 and 42.8 GB/s in all, against 53.4 by DMA alone (probe of 256 MiB of weights) |
+| 2 or 4 more workers multiplying their panels straight from DDR | 43.3-52.4 GB/s in all |
+| `l2fetch` of the next panel before HVX loads it from DDR | 22.0 GB/s, against 22.4 without |
+| Unrolling every float map by two, not only the heavy ones (#127) | the residual add's loop alone: 14.2 -> 10.3 cycles a vector; the whole prefill: unchanged (527.6 against 529.2 Mcycles) |
+| The decode's attention on the KV cache's tiles (#191) | tg128 unchanged, in an A/B in one sitting: 16.53 against 16.49 t/s |
+
+### LFM3: what the hardware taught us
+
+- **DMA's cache maintenance.** A transfer's DDR side is kept in step with the
+  DSP's caches: a load writes the source's lines back first, and a store
+  writes the destination's lines back and drops them after. That costs about
+  a cycle every 16 bytes: a 32 KB transfer's writeback took 2,000 cycles to
+  submit, and a store's invalidate more when it was retired. A buffer that
+  only DMA moves needs none of it (`T.annotate_dma_only`, #193).
+- **DMA and the L2.** Transfers bypass the DSP's L2. Through it, 4 workers'
+  DMA loads read DDR at 30 GB/s, against 50 bypassing it, whatever the block
+  size (16-128 KB) or the transfers in flight (1-4) (#195).
+- **Constant slots.** The residual adds' loops ran 24% faster with their
+  slot of the two-slot ring a constant (the batches in pairs, #197) than with
+  the run-time `rb % 2`: the add 16.0M against 12.2M cycles a worker. Yet
+  `hexagon-clang` pipelined both with the same initiation interval (6), so the
+  schedule does not explain it, and the cause is not established. A probe that
+  seemed to show the run-time slot stopping the pipeliner also had its buffers
+  unmarked as exclusive, which is enough on its own.
+- **The decode's ceiling is the DMA's.** DMA alone read 53-58 GB/s of weights;
+  HVX loads from DDR beside it lowered the total.
+- **VTCM capacity.** At 256 rows a chunk takes 7.82 of the 8 MiB. 384 rows do
+  not fit.
+
+### LFM3: what is next
+
+- **Attention's HVX work.** exp2 and the row sums take 13.5M cycles a worker
+  at pp1024. Waiting for keys and values takes 8.1M, much of it their loads'
+  writeback: the decode and the prefill write the cache with HVX, so its
+  transfers keep the maintenance.
+- **The embedding.** A token's row is a column of the head's tiles, which the
+  DMA gathers as 1024 rows of 4 bytes: 7.3M cycles a worker at pp1024.

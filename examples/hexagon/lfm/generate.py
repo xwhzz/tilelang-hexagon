@@ -1,14 +1,15 @@
-"""Chat with LFM2 on the device. The tokenizer and the chat template run on
-the host (``text.py``); the prefill, the decode and the sampling run on the
-device, and the reply shows as it comes, a decode call per 16 tokens.
+"""Chat with LFM2 or LFM3 on the device. The tokenizer and the chat template
+run on the host (``text.py``); the prefill, the decode and the sampling run on
+the device, and the reply shows as it comes, a decode call per 16 tokens.
 
     python generate.py <bundle> <bundle on the device> <checkpoint dir> --prompt "What is the capital of France?"
     python generate.py <bundle> <bundle on the device> <checkpoint dir> --chat
 
 Each `--prompt` (it repeats) is answered from a fresh conversation; `--chat`
 holds one conversation from stdin, a turn a line. `--temperature` samples, with
-`--seed` (greedy at 0, the default). The checkpoint directory needs only the
-tokenizer's files.
+`--seed` (greedy at 0, the default). LFM3's chat template has the reply think
+first, in a <think> section; `--no-think` asks for the answer alone. The
+checkpoint directory needs only the tokenizer's files.
 """
 
 import argparse
@@ -23,7 +24,7 @@ from text import Detokenizer, Text  # noqa: E402
 
 def reply(decoder: Decoder, text: Text, messages: list, args) -> str:
     """The assistant's next message, printed as it comes, then the speeds."""
-    prompt = text.chat(messages)
+    prompt = text.chat(messages, **({"enable_thinking": False} if args.no_think else {}))
     shown, ids, timings = Detokenizer(text), [], []
     t0 = time.perf_counter()
     for part in decoder.stream(prompt, args.max_new, args.temperature, args.seed, timings=timings):
@@ -54,6 +55,7 @@ def main():
     p.add_argument("--max-new", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-think", action="store_true", help="LFM3: answer without the <think> section its template asks for")
     args = p.parse_args()
     assert args.prompt or args.chat, "--prompt or --chat"
     text = Text(args.checkpoint)

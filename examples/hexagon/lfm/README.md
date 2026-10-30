@@ -259,20 +259,66 @@ call):
 
 | test | ms | t/s |
 |---|---:|---:|
-| pp256 | 65.1 | 3932 |
-| pp512 | 129.2 | 3964 |
-| pp1024 | 259.2 | 3951 |
-| pp2048 | 543.2 | 3770 |
+| pp256 | 60.5 | 4230 |
+| pp512 | 121.9 | 4199 |
+| pp1024 | 248.8 | 4116 |
+| pp2048 | 522.8 | 3917 |
 
-A chunk streams 2835 MB of weights: for 1024 tokens, 201 ms of GEMM phases at
-56 GB/s, the DMA's rate, while HMX's multiplies alone take 180 ms at 8.1
-cycles a 32 x 32 x 32 op. A cycle profile puts the rest of pp1024 in three
+A chunk streams 2835 MB of weights: for 1024 tokens, 205 ms of GEMM phases at
+55 GB/s, near the DMA's top rate, while HMX's multiplies alone would take
+174 ms at 8.1 cycles a 32 x 32 x 32 op. A cycle profile puts the rest of pp1024 in four
 places:
-- attention, mostly HVX: exp2, the row sums and the output's rescaling (21 ms);
-- the residual adds and norms, mostly moving the residual's rows (26 ms);
-- the barriers (8 ms).
+- attention, mostly HVX: exp2, the row sums and the output's rescaling (20 ms);
+- the residual adds and norms, HVX passes over each chunk's rows (16 ms);
+- the barriers (8 ms);
+- the embedding, each token's row gathered from the head's tiles as 1024 DMA
+  rows of 4 bytes (3.5 ms).
+
+[OPTIMIZATION.md](OPTIMIZATION.md#lfm3-17b-in-fp16) has how each step got
+here and what did not work.
 
 After a chat prompt, prefilled, the first 64 greedy tokens still match the
 checkpoint's own code.
 
     python bench.py lfm3.head /data/local/tmp/lfm3.bundle --pp 512,1024 --tg 128
+
+### LFM3 on the device
+
+    python generate.py lfm3.head /data/local/tmp/lfm3.bundle LFM3-1.7B --prompt "What is 17 times 23?"
+    python ppl.py lfm3.head /data/local/tmp/lfm3.bundle LFM3-1.7B --text wikitext2_test.txt --windows 16
+
+LFM3's chat template opens the reply with a `<think>` section, which the model
+closes before it answers; `--no-think` asks for the answer alone. Greedy, on
+v79:
+
+    > What is 17 times 23?
+    We need to compute 17 times 23. That's a simple multiplication. 17 * 23. We
+    can do 17 * 20 = 340, and 17 * 3 = 51, sum = 391. ...
+    Thus final answer: \boxed{391}.</think>To find the product of 17 and 23, we
+    can multiply directly:
+    ...
+    Thus, the result is 391.
+    [prompt 18 tokens, prefill 63 ms; 197 tokens, decode 16.7 t/s; 12.96 s in all]
+
+With `--no-think`:
+
+    > Translate to French: The weather is nice today.
+    Le temps est beau aujourd'hui.
+    [prompt 22 tokens, prefill 63 ms; 7 tokens, decode 16.6 t/s; 1.09 s in all]
+
+The prefill runs whole chunks of 256 rows, so a short prompt takes as long as
+256 tokens do.
+
+WikiText-2 perplexity, 16 windows of 1024 tokens (BOS and 1023 tokens of the
+text, each window scored token by token):
+
+| | ppl |
+|---|---:|
+| the reference (`model.py`) in fp32 on the bundle's weights, on the host | 15.8812 |
+| the same, each projection's input rounded to fp16 as on the device | 15.8814 |
+| the bundle, on the device (`ppl.py`) | 15.8834 |
+
+The device scores every token with the decode (`Decoder.score`). Besides the
+fp16 inputs of its projections, its attention multiplies the fp16 KV cache by
+queries and probabilities rounded to fp16, which the host reference keeps in
+fp32.
