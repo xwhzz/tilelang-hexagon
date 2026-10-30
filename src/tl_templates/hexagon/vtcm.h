@@ -8,9 +8,12 @@
 // to `tl_vtcm_arena()`; a worker loop splits the region into per-worker arenas
 // instead (tl_vtcm_worker_arenas in worker.h).
 //
-// One acquisition is held for the whole FastRPC session (idempotent, lazy on
-// first use); the layout comes from the compiler, so this header only owns the
-// acquire/release of the region itself.
+// The region belongs to the DSP process's compute-resource context: a cached
+// HAP_compute_res context, which the skel opens (tl_vtcm_open). A kernel's run
+// takes it (tl_vtcm_take) and gives it back when it ends (tl_vtcm_give), so
+// that another DSP process of the session, or another client, can use VTCM in
+// between; the region keeps its address throughout. The layout comes from the
+// compiler, so this header only owns the region itself.
 //
 // Compiled into the FastRPC skel (.cc) with the Hexagon SDK on the include
 // path; it pulls in HAP headers, so it is only included when a kernel uses
@@ -43,9 +46,11 @@ compute_resource_attr_init_v2(compute_res_attr_t *attr, unsigned int size,
 
 #define TL_VTCM_INLINE static inline __attribute__((unused))
 
-static uint8_t *tl_vtcm_base_ptr;  // base of the acquired VTCM region
-static unsigned int tl_vtcm_total; // bytes acquired (capacity guard)
-static int tl_vtcm_ctx;            // HAP_compute_res handle
+static uint8_t *tl_vtcm_base_ptr;  // base of the region the current run holds
+static unsigned int tl_vtcm_total; // its bytes (capacity guard)
+static int tl_vtcm_ctx;            // the process's HAP_compute_res context
+static void *tl_vtcm_region;       // the context's region, as HAP gives it
+static unsigned int tl_vtcm_region_bytes;
 
 // The VTCM arena of the current serial kernel, in bytes from
 // tl_vtcm_base_ptr. Codegen publishes this for embedding/export capacity
@@ -73,54 +78,70 @@ TL_VTCM_INLINE int tl_vtcm_bind_region(void *base, unsigned int size) {
   return 0;
 }
 
-// Acquire the full VTCM region once.  Idempotent: a second call is a no-op
-// while a region is held, so alloc_shared kernels and (later) the HMX path can
-// share the same arena without double-acquiring.
-TL_VTCM_INLINE void tl_vtcm_acquire(void) {
-  if (tl_vtcm_base_ptr)
-    return;
+// How long a run waits for VTCM that another client holds.
+#define TL_VTCM_TAKE_TIMEOUT_US 1000000u
+
+// Open the process's context: the whole VTCM and, for kernels that issue HMX,
+// the HMX unit (hmx.h). Returns 0, or nonzero when there is no context to be
+// had; a run takes it.
+TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
+  if (tl_vtcm_ctx)
+    return 0;
   unsigned int avail, total;
   compute_res_vtcm_page_t avail_pg, total_pg;
   if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg))
-    return;
+    return -1;
   compute_res_attr_t req;
   HAP_compute_res_attr_init(&req);
   HAP_compute_res_attr_set_vtcm_param(&req, total, 1);
+  if (hmx)
+    HAP_compute_res_attr_set_hmx_param(&req, 1);
+  HAP_compute_res_attr_set_cache_mode(&req, 1);
   tl_vtcm_ctx = HAP_compute_res_acquire(&req, 10000);
   if (!tl_vtcm_ctx)
-    return;
-  void *raw_base = HAP_compute_res_attr_get_vtcm_ptr(&req);
-  if (tl_vtcm_bind_region(raw_base, total) != 0) {
-    HAP_compute_res_release(tl_vtcm_ctx);
-    tl_vtcm_ctx = 0;
-  }
+    return -1;
+  tl_vtcm_region = HAP_compute_res_attr_get_vtcm_ptr(&req);
+  tl_vtcm_region_bytes = total;
+  return 0;
 }
 
-TL_VTCM_INLINE void tl_vtcm_release(void) {
-  if (tl_vtcm_ctx)
-    HAP_compute_res_release(tl_vtcm_ctx);
-  tl_vtcm_ctx = 0;
+// A run takes the region: 0, or nonzero when it cannot be had in time.
+TL_VTCM_INLINE int tl_vtcm_take(void) {
+  if (tl_vtcm_base_ptr)
+    return 0;
+  if (!tl_vtcm_ctx ||
+      HAP_compute_res_acquire_cached(tl_vtcm_ctx, TL_VTCM_TAKE_TIMEOUT_US))
+    return -1;
+  if (tl_vtcm_bind_region(tl_vtcm_region, tl_vtcm_region_bytes) != 0) {
+    HAP_compute_res_release_cached(tl_vtcm_ctx);
+    return -1;
+  }
+  return 0;
+}
+
+// The end of a run: the region goes back to the context.
+TL_VTCM_INLINE void tl_vtcm_give(void) {
+  if (!tl_vtcm_base_ptr)
+    return;
+  HAP_compute_res_release_cached(tl_vtcm_ctx);
   tl_vtcm_base_ptr = 0;
   tl_vtcm_total = 0;
 }
 
-// Base of the VTCM arena (lazily acquires on first use).  Returns NULL if VTCM
-// could not be acquired — generated code that dereferences it would fault,
-// which is the intended loud failure (a kernel that needs VTCM and can't get
-// it).
-TL_VTCM_INLINE void *tl_vtcm_base(void) {
-  tl_vtcm_acquire();
-  return tl_vtcm_base_ptr;
+TL_VTCM_INLINE void tl_vtcm_close(void) {
+  tl_vtcm_give();
+  if (tl_vtcm_ctx)
+    HAP_compute_res_release(tl_vtcm_ctx);
+  tl_vtcm_ctx = 0;
 }
 
-// Base of the kernel arena, the whole region (lazily acquires), or NULL
-// without VTCM.
-TL_VTCM_INLINE uint8_t *tl_vtcm_arena(void) {
-  return (uint8_t *)tl_vtcm_base();
-}
+// Base of the VTCM arena: the region the current run holds, NULL outside a
+// run. Generated code that dereferences NULL faults, which is the intended
+// loud failure.
+TL_VTCM_INLINE void *tl_vtcm_base(void) { return tl_vtcm_base_ptr; }
 
-// Bytes of the kernel arena (0 without VTCM).
-TL_VTCM_INLINE unsigned int tl_vtcm_arena_bytes(void) {
-  tl_vtcm_acquire();
-  return tl_vtcm_total;
-}
+// Base of the kernel arena, the whole region, or NULL outside a run.
+TL_VTCM_INLINE uint8_t *tl_vtcm_arena(void) { return tl_vtcm_base_ptr; }
+
+// Bytes of the kernel arena (0 outside a run).
+TL_VTCM_INLINE unsigned int tl_vtcm_arena_bytes(void) { return tl_vtcm_total; }

@@ -23,38 +23,22 @@
 
 #define TL_HMX_INLINE static inline __attribute__((unused, always_inline))
 
-// ------------------------------ VTCM --------------------------------------
-// Delegated to the shared tl_vtcm arena (vtcm.h) so HMX scratch and
-// alloc_shared operands draw from one acquisition — no double-acquire when a
-// T.gemm kernel has its operands in VTCM and also drives HMX.
-TL_HMX_INLINE void tl_hmx_vtcm_setup(void) { tl_vtcm_acquire(); }
-TL_HMX_INLINE void tl_hmx_vtcm_reset(void) { tl_vtcm_release(); }
-
 // ------------------------------ HMX lock ----------------------------------
-static int tl_hmx_ctx;
+// HMX is part of the process's compute-resource context (vtcm.h), with the
+// VTCM its operands live in: tl_vtcm_open(1) asks for both.
 static int tl_hmx_spin;
-TL_HMX_INLINE void tl_hmx_setup(void) {
-  compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-  HAP_compute_res_attr_set_hmx_param(&req, 1);
-  tl_hmx_ctx = HAP_compute_res_acquire(&req, 10000);
-}
-TL_HMX_INLINE void tl_hmx_reset(void) {
-  if (tl_hmx_ctx)
-    HAP_compute_res_release(tl_hmx_ctx);
-  tl_hmx_ctx = 0;
-}
 // Per-thread HMX SHARED enable: each thread that issues HMX MACs must call this
-// once. Returns 0 if this thread now holds the lock, non-zero on failure
-// (incl. no ctx) so callers can refuse rather than run MACs with HMX unlocked.
+// once its run holds the context. Returns 0 if this thread now holds the lock,
+// non-zero on failure (incl. no context) so callers can refuse rather than run
+// MACs with HMX unlocked.
 TL_HMX_INLINE int tl_hmx_enable(void) {
-  if (!tl_hmx_ctx)
+  if (!tl_vtcm_ctx)
     return -1;
-  return HAP_compute_res_hmx_lock2(tl_hmx_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  return HAP_compute_res_hmx_lock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
 }
 TL_HMX_INLINE void tl_hmx_disable(void) {
-  if (tl_hmx_ctx)
-    HAP_compute_res_hmx_unlock2(tl_hmx_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  if (tl_vtcm_ctx)
+    HAP_compute_res_hmx_unlock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
 }
 TL_HMX_INLINE void tl_hmx_unit_acquire(void) {
   int *lp = &tl_hmx_spin;
@@ -110,61 +94,64 @@ TL_HMX_INLINE void tl_hmx_store_cvt(__fp16 *o) {
   asm volatile("mxmem(%0, %1) = cvt" ::"r"(o), "r"(TL_HMX_SPATIAL_RT)
                : "memory");
 }
-// Persistent session resources: power/VTCM/HMX are acquired once and held
-// across many matmuls. The generated FastRPC _open handler calls init; _close
-// calls deinit. The one-shot runtime also initializes resources before kernel
-// execution. NOTE: the check-then-set of these globals is NOT internally
+// The process's resources: HMX's power and the compute-resource context, its
+// VTCM and HMX. The generated FastRPC _open handler calls init and _close
+// deinit; each run takes the context (tl_hmx_take) and gives it back
+// (tl_hmx_give), so that another DSP process of the session can run in
+// between. NOTE: the check-then-set of these globals is NOT internally
 // synchronized; it is safe because every caller invokes it single-threaded
-// BEFORE tl_parallel spawns workers. A future persistent/cross-kernel pool that
-// could init from two threads must add a lock here.
+// BEFORE tl_parallel spawns workers.
 static int tl_hmx_inited;
 static qurt_thread_t
-    tl_hmx_session_tid; // thread whose HMX SHARED enable session_init holds
+    tl_hmx_run_tid; // the run's thread, whose HMX enable take holds
 static void tl_hmx_session_init(void) {
   if (tl_hmx_inited)
     return;
   tl_power_hmx(true);
-  tl_hmx_vtcm_setup();
-  tl_hmx_setup();
-  // Require BOTH the VTCM grant AND a successful per-thread HMX enable (which
-  // needs the ctx from tl_hmx_setup): otherwise tear everything down so
-  // tl_hmx_session_ok() reports failure loudly, rather than marking the session
-  // ready while enable was a silent no-op (ctx==0) and every later MAC runs
-  // with HMX never locked.
-  if (tl_vtcm_base_ptr && tl_hmx_enable() == 0) {
-    tl_hmx_session_tid =
-        qurt_thread_get_id(); // this enable is bound to this thread
+  if (tl_vtcm_open(1) == 0)
     tl_hmx_inited = 1;
-  } else {
-    // VTCM acquire failed: release the HMX ctx and power HMX down so a failed
-    // init doesn't leak the unit for the agent's lifetime.
-    tl_hmx_reset();
-    tl_hmx_vtcm_reset();
-    tl_power_hmx(false);
-  }
+  else
+    tl_power_hmx(false); // a failed init must not leave HMX powered
 }
 static void tl_hmx_session_deinit(void) {
   if (!tl_hmx_inited)
     return;
-  tl_hmx_disable();
-  tl_hmx_reset();
-  tl_hmx_vtcm_reset();
+  tl_vtcm_close();
   tl_power_hmx(false);
   tl_hmx_inited = 0;
 }
 
-// Let the FastRPC runtime reject execution if VTCM/HMX acquisition failed.
+// Let the FastRPC runtime reject execution if the context could not be had.
 static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 
+// A run takes the context, VTCM and HMX, and enables HMX for its own thread;
+// pool threads enable it for themselves (tl_hmx_worker_scope). Returns TL_OK,
+// or the TL_ERR_* of what could not be had.
+static int tl_hmx_take(void) {
+  if (tl_vtcm_take() != 0)
+    return TL_ERR_VTCM;
+  if (tl_hmx_enable() != 0) {
+    tl_vtcm_give();
+    return TL_ERR_HMX;
+  }
+  tl_hmx_run_tid = qurt_thread_get_id();
+  return TL_OK;
+}
+static void tl_hmx_give(void) {
+  tl_hmx_disable();
+  tl_hmx_run_tid = 0;
+  tl_vtcm_give();
+}
+
 // tl_parallel_for worker scope for tile programs that issue HMX: a pool thread
-// enables HMX for itself around its programs. The session thread already holds
-// the enable that tl_hmx_session_init took.
+// enables HMX for itself around its programs. The run's thread already holds
+// the enable that tl_hmx_take took.
 struct tl_hmx_worker_scope {
   int status = TL_OK;
   bool enabled = false;
 
   tl_hmx_worker_scope() {
-    if (qurt_thread_get_id() == tl_hmx_session_tid)
+    if (qurt_thread_get_id() == tl_hmx_run_tid)
       return;
     if (tl_hmx_enable() != 0)
       status = TL_ERR_HMX; // refuse rather than run MACs with HMX unlocked

@@ -90,7 +90,11 @@ These are the decisions that keep the adaptation small and the code navigable.
   their own), `worker.h` (the HW-thread pool).
 - **Layer 5** — `tilelang/hexagon/runtime/`: `session.py` builds kernels into one
   skel and runs them through an agent on the phone that holds their FastRPC session
-  and device-resident buffers, over a socket (`adb forward`); `build.py`/`env.py`
+  and device-resident buffers, over a socket (`adb forward`). A session can span up
+  to 4 DSP processes (`Session(..., processes=P)`), each with its own 4 GB of
+  addresses: a buffer is mapped into the processes it names, and a kernel runs on
+  the one it is called on. Each process caches its own lines of a buffer, so data
+  that crosses processes moves by DMA (`T.annotate_dma_only`). `build.py`/`env.py`
   drive the Hexagon SDK build, and `fastrpc.py` holds the pieces of a project the
   skels share. `adapter.py` is `tilelang.compile`'s: a compiled kernel is a session
   of one. On a Linux BSP (`linux_runtime.py`), with no agent, a kernel runs one call
@@ -257,11 +261,17 @@ and explicit HMX atoms.
   - **Arenas.** The programs' arenas start after these buffers.
   - **Capacity.** `VerifyVTCMArena` counts the buffers with the arenas.
 
+- **VTCM and HMX are taken per run.** They form one cached `HAP_compute_res`
+  context per DSP process, which the skel's `_open` creates (`vtcm.h`). Each run
+  takes it and gives it back when it ends (`tl_hexagon_run_kernel`), so the
+  processes of a session take turns. The region keeps its address throughout. An
+  uncontended release and acquire costs about 5 µs on a v79.
+
 - **The worker pool = 1 HMX + 6 HVX.** The producer/consumer model: the 6 HVX units
   run pack/unpack/softmax/copies in parallel; the 1 HMX MAC is serialized by a
   `memw_locked` spinlock around the accumulator sequence. Each HW thread enables HMX
-  once via `HAP_compute_res_hmx_lock2(SHARED)`, **keyed on thread id** so the session
-  thread (which `_open` already enabled) doesn't double-enable. The pool is
+  once via `HAP_compute_res_hmx_lock2(SHARED)`, **keyed on thread id** so the run's
+  thread (which enabled it when it took the context) doesn't double-enable. The pool is
   **persistent** (spawned once, blocks on semaphores) so per-call spawn doesn't
   dominate tiny ops. *Never `qurt_hvx_lock`* — just never spawn more workers than HVX
   contexts, and QuRT assigns them implicitly (the htp-ops-lib pattern).

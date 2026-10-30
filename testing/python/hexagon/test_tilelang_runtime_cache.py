@@ -213,7 +213,7 @@ def _fake_kernel(monkeypatch):
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
     monkeypatch.setattr(build, "build_cmake_fastrpc", compile_project)
     monkeypatch.setattr(session.Session, "_start", lambda self, timeout: starts.append(len(starts)))
-    monkeypatch.setattr(session.Session, "_run", lambda self, kernel, given: None)
+    monkeypatch.setattr(session.Session, "_run", lambda self, kernel, given, process: None)
     sdk = SimpleNamespace(sdk_root="/sdk", ndk_root="/ndk", cmake_root="/cmake", dsp_arch="v79", validate=lambda: sdk)
     return adapter.HexagonKernelAdapter([], [], None, "int32_t k() { return 0; }", sdk=sdk), starts
 

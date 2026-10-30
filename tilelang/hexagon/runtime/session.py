@@ -103,12 +103,12 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     ]
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
-    parts.append("\n" + fastrpc.FORWARD_KERNEL_STATUS)
+    parts.append("\n" + fastrpc.RUN_KERNEL)
     for i, (_, _, plans) in enumerate(kernels):
         args = ", ".join(f"({pl.ctype})(intptr_t)a[{j}]" if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return tl_hexagon_forward_kernel_status([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return tl_hexagon_run_kernel([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -201,8 +201,8 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
 
 
 def gen_agent(iface: str) -> str:
-    """The agent: one FastRPC session, its resident buffers, and a TCP socket
-    (reached through ``adb forward``) for the host's operations."""
+    """The agent: the session's DSP processes, its resident buffers, and a TCP
+    socket (reached through ``adb forward``) for the host's operations."""
     return f"""// Auto-generated agent of a tilelang Hexagon session.
 #include <AEEStdErr.h>
 #include <remote.h>
@@ -220,7 +220,12 @@ def gen_agent(iface: str) -> str:
 #include "dsp_capabilities_utils.h"
 #include "{iface}.h"
 
-static remote_handle64 g_handle = -1;
+// The session's DSP processes (user PDs), each with its own 4 GB of
+// addresses: process 0 is the default session, the others are reserved.
+#define MAX_PROCESSES 4
+static remote_handle64 g_handles[MAX_PROCESSES];
+static int g_domains[MAX_PROCESSES];
+static int g_processes;
 
 static int read_full(int fd, void* buf, size_t n) {{
   size_t got = 0;
@@ -244,9 +249,10 @@ static int reply(int fd, unsigned char status, const void* data, size_t n) {{
   return sent < n ? write_full(fd, (const char*)data + sent, n - sent) : 0;
 }}
 
-// Resident buffers: rpcmem, uncached on the CPU, mapped into the DSP once.
+// Resident buffers: rpcmem, uncached on the CPU, mapped once into each of the
+// processes of the mask `procs`.
 #define MAX_BUFFERS 256
-static struct {{ uint8_t* ptr; int fd; uint64_t size; }} g_buffers[MAX_BUFFERS];
+static struct {{ uint8_t* ptr; int fd; uint64_t size; uint32_t procs; }} g_buffers[MAX_BUFFERS];
 
 // The duration of the last run's FastRPC call.
 static int64_t g_last_run_ns;
@@ -264,21 +270,49 @@ static uint8_t* grow(uint8_t* buf, uint32_t* size, uint32_t need) {{
   return buf;
 }}
 
-static int open_session(int domain_id) {{
-  domain* d = get_domain(domain_id);
-  if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
-{fastrpc.PD_SETUP}  int len = strlen({iface}_URI) + MAX_DOMAIN_URI_SIZE;
-  char* uri = (char*)malloc(len);
-  snprintf(uri, len, "%s%s", {iface}_URI, d->uri);
-  int e = {iface}_open(uri, &g_handle); free(uri);
-  if (e != AEE_SUCCESS) {{ fprintf(stderr, "open failed: 0x%x\\n", e); return -1; }}
+// Process `p`: the default session for 0, a reserved one otherwise, with the
+// session's skel loaded.
+static int open_process(int p) {{
+  int domain_id = CDSP_DOMAIN_ID;
+  char uri[512];
+  if (p == 0) {{
+    domain* d = get_domain(domain_id);
+    if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
+    snprintf(uri, sizeof(uri), "%s%s", {iface}_URI, d->uri);
+  }} else {{
+    char name[16]; snprintf(name, sizeof(name), "tl_process%d", p);
+    remote_rpc_reserve_new_session_t r; memset(&r, 0, sizeof(r));
+    r.domain_name = (char*)CDSP_DOMAIN_NAME; r.domain_name_len = strlen(CDSP_DOMAIN_NAME);
+    r.session_name = name; r.session_name_len = strlen(name);
+    int e = remote_session_control(FASTRPC_RESERVE_NEW_SESSION, &r, sizeof(r));
+    if (e != AEE_SUCCESS) {{ fprintf(stderr, "reserving process %d failed: 0x%x\\n", p, e); return -1; }}
+    domain_id = (int)r.effective_domain_id;
+    remote_rpc_get_uri_t u; memset(&u, 0, sizeof(u));
+    u.domain_name = (char*)CDSP_DOMAIN_NAME; u.domain_name_len = strlen(CDSP_DOMAIN_NAME);
+    u.session_id = r.session_id; u.module_uri = (char*){iface}_URI; u.module_uri_len = strlen({iface}_URI);
+    u.uri = uri; u.uri_len = sizeof(uri);
+    e = remote_session_control(FASTRPC_GET_URI, &u, sizeof(u));
+    if (e != AEE_SUCCESS) {{ fprintf(stderr, "the URI of process %d failed: 0x%x\\n", p, e); return -1; }}
+  }}
+{fastrpc.PD_SETUP}  int e = {iface}_open(uri, &g_handles[p]);
+  if (e != AEE_SUCCESS) {{ fprintf(stderr, "opening process %d failed: 0x%x\\n", p, e); return -1; }}
+  g_domains[p] = domain_id;
   return 0;
+}}
+
+// Each process caches its own lines of a buffer: a host access syncs them all.
+static void sync_buffer(int id, uint64_t offset, uint64_t size, int writeback) {{
+  for (int p = 0; p < g_processes; ++p)
+    if (g_buffers[id].procs >> p & 1) {iface}_sync(g_handles[p], g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, writeback);
 }}
 
 static void free_buffer(int id) {{
   if (id < 0 || id >= MAX_BUFFERS || !g_buffers[id].ptr) return;
-  {iface}_release(g_handle, g_buffers[id].fd);
-  fastrpc_munmap(CDSP_DOMAIN_ID, g_buffers[id].fd, g_buffers[id].ptr, g_buffers[id].size);
+  for (int p = 0; p < g_processes; ++p) {{
+    if (!(g_buffers[id].procs >> p & 1)) continue;
+    {iface}_release(g_handles[p], g_buffers[id].fd);
+    fastrpc_munmap(g_domains[p], g_buffers[id].fd, g_buffers[id].ptr, g_buffers[id].size);
+  }}
   rpcmem_free(g_buffers[id].ptr);
   g_buffers[id].ptr = 0;
 }}
@@ -288,8 +322,8 @@ static int serve(int cli, unsigned char op, int* running) {{
   if (op == {_OP_CLOSE}) return 1;
   if (op == {_OP_SHUTDOWN}) {{ *running = 0; return 1; }}
   if (op == {_OP_RUN}) {{
-    int32_t head[3];  // kernel, number of args, inline output bytes
-    if (read_full(cli, head, sizeof(head))) return 1;
+    int32_t head[4];  // kernel, number of args, inline output bytes, process
+    if (read_full(cli, head, sizeof(head)) || head[3] < 0 || head[3] >= g_processes) return 1;
     int32_t n = head[1];
     uint32_t out_bytes = (uint32_t)head[2];
     int32_t* args = (int32_t*)malloc(sizeof(int32_t) * 3 * (n > 0 ? n : 1));
@@ -307,7 +341,7 @@ static int serve(int cli, unsigned char op, int* running) {{
     }}
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int e = {iface}_run(g_handle, head[0], args, 3 * n, g_inputs, (int)in_bytes, g_outputs, (int)out_bytes);
+    int e = {iface}_run(g_handles[head[3]], head[0], args, 3 * n, g_inputs, (int)in_bytes, g_outputs, (int)out_bytes);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
     free(args);
@@ -317,19 +351,28 @@ static int serve(int cli, unsigned char op, int* running) {{
   }}
   if (op == {_OP_TIMING}) return write_full(cli, &g_last_run_ns, 8);
   if (op == {_OP_ALLOC}) {{
-    uint64_t size = 0;
-    if (read_full(cli, &size, 8)) return 1;
+    uint64_t size = 0; uint32_t procs = 0;
+    if (read_full(cli, &size, 8) || read_full(cli, &procs, 4)) return 1;
     int32_t id = -1;
     for (int i = 0; i < MAX_BUFFERS; ++i) if (!g_buffers[i].ptr) {{ id = i; break; }}
     if (id >= 0) {{
       uint8_t* p = (uint8_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, (int)size);
       int fd = p ? rpcmem_to_fd(p) : -1;
-      if (!p || fd < 0 || fastrpc_mmap(CDSP_DOMAIN_ID, fd, p, 0, size, FASTRPC_MAP_FD) != 0) {{
+      // Mapped into every process of `procs`, or into none.
+      uint32_t mapped = 0;
+      for (int q = 0; p && fd >= 0 && q < g_processes; ++q) {{
+        if (!(procs >> q & 1)) continue;
+        if (fastrpc_mmap(g_domains[q], fd, p, 0, size, FASTRPC_MAP_FD) != 0) break;
+        mapped |= 1u << q;
+      }}
+      if (!p || fd < 0 || !procs || mapped != procs) {{
+        for (int q = 0; q < g_processes; ++q)
+          if (mapped >> q & 1) fastrpc_munmap(g_domains[q], fd, p, size);
         if (p) rpcmem_free(p);
         id = -1;
       }} else {{
         memset(p, 0, size);
-        g_buffers[id].ptr = p; g_buffers[id].fd = fd; g_buffers[id].size = size;
+        g_buffers[id].ptr = p; g_buffers[id].fd = fd; g_buffers[id].size = size; g_buffers[id].procs = procs;
       }}
     }}
     return write_full(cli, &id, 4);
@@ -355,7 +398,7 @@ static int serve(int cli, unsigned char op, int* running) {{
       FILE* f = ok ? fopen(path, "rb") : 0;
       if (f) {{
         if (fseeko(f, (off_t)start, SEEK_SET) == 0) {{
-          {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 0);
+          sync_buffer(id, offset, size, 0);
           got = (int64_t)fread(g_buffers[id].ptr + offset, 1, size, f);
         }}
         fclose(f);
@@ -365,7 +408,7 @@ static int serve(int cli, unsigned char op, int* running) {{
     if (op == {_OP_WRITE}) {{
       // The bytes come either way, so the wire stays in step.
       uint8_t* dst = ok ? g_buffers[id].ptr + offset : 0;
-      if (ok) {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 0);
+      if (ok) sync_buffer(id, offset, size, 0);
       uint8_t chunk[65536];
       for (uint64_t done = 0; done < size;) {{
         uint64_t n = size - done < sizeof(chunk) ? size - done : sizeof(chunk);
@@ -375,7 +418,7 @@ static int serve(int cli, unsigned char op, int* running) {{
       unsigned char status = ok ? 0 : 1;
       return write_full(cli, &status, 1);
     }}
-    if (ok) {iface}_sync(g_handle, g_buffers[id].fd, (uint32_t)offset, (uint32_t)size, 1);
+    if (ok) sync_buffer(id, offset, size, 1);
     return reply(cli, ok ? 0 : 1, ok ? g_buffers[id].ptr + offset : 0, ok ? size : 0);
   }}
   return 1;
@@ -384,7 +427,10 @@ static int serve(int cli, unsigned char op, int* running) {{
 int main(int argc, char** argv) {{
   // The port to listen on, 0 for one the kernel picks, which it reports.
   int port = (argc > 1) ? atoi(argv[1]) : 0;
-  if (open_session(CDSP_DOMAIN_ID) != 0) return 1;
+  g_processes = (argc > 2) ? atoi(argv[2]) : 1;
+  if (g_processes < 1 || g_processes > MAX_PROCESSES) return 1;
+  for (int p = 0; p < g_processes; ++p)
+    if (open_process(p) != 0) return 1;
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
@@ -408,7 +454,7 @@ int main(int argc, char** argv) {{
   for (int i = 0; i < MAX_BUFFERS; ++i) free_buffer(i);
   if (g_inputs) rpcmem_free(g_inputs);
   if (g_outputs) rpcmem_free(g_outputs);
-  {iface}_close(g_handle);
+  for (int p = 0; p < g_processes; ++p) {iface}_close(g_handles[p]);
   return 0;
 }}
 """
@@ -500,12 +546,15 @@ class SessionKernel:
         self.out_idx = [i if i >= 0 else n + i for i in out_idx]
         self.plans = fastrpc._plan(self.params, [])
 
-    def __call__(self, *args):
+    def __call__(self, *args, process: int = 0):
         """``args`` fill the parameters outside ``out_idx`` in order, and the
         ``out_idx`` ones come back as tensors, in ``out_idx`` order (one
         output alone, not in a list). Passing every parameter instead
         decides each one: an ``out_idx`` parameter given a DeviceBuffer is
-        written there, one given None comes back."""
+        written there, one given None comes back. The kernel runs on DSP
+        process ``process`` of the session."""
+        if not 0 <= process < self.session.processes:
+            raise ValueError(f"{self.name} runs on one of processes 0 to {self.session.processes - 1}, not {process}")
         if len(args) == len(self.params):
             given = list(args)
         elif len(args) == len(self.params) - len(self.out_idx):
@@ -515,7 +564,7 @@ class SessionKernel:
             raise TypeError(
                 f"{self.name} takes {len(self.params) - len(self.out_idx)} arguments (or all {len(self.params)}), got {len(args)}"
             )
-        return self.session._run(self, given)
+        return self.session._run(self, given, process)
 
 
 @functools.cache
@@ -591,18 +640,40 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
 
 
 class Session:
-    """Kernels sharing one FastRPC session and its resident buffers."""
+    """Kernels sharing one FastRPC session and its resident buffers.
+
+    A session runs on ``processes`` DSP processes (user PDs), each with its own
+    4 GB of addresses, so that a model larger than one process's addresses can
+    spread over several. Every process loads the session's kernels; a buffer is
+    mapped into the processes it names, and a kernel runs on the process it is
+    called on. The processes take turns at VTCM and HMX: a run takes them and
+    gives them back when it ends. Each process caches its own lines of a
+    buffer, so data one process's kernel writes reaches another's only by DMA
+    (``T.annotate_dma_only``); the host's reads and writes sync every process
+    that maps the buffer."""
+
+    # The processes one agent can open: a v79 opens 4.
+    MAX_PROCESSES = 4
 
     _port_seq = 0
 
-    def __init__(self, kernels, *, target="hexagon", serial: str | None = None, verbose: bool = False, ready_timeout: float = 30.0):
+    def __init__(
+        self,
+        kernels,
+        *,
+        target="hexagon",
+        serial: str | None = None,
+        verbose: bool = False,
+        ready_timeout: float = 30.0,
+        processes: int = 1,
+    ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
-        the DSP the target names."""
+        the DSP the target names, which ``processes`` DSP processes load."""
         from tilelang.backend.target import determine_target
         from tilelang.hexagon.target import hexagon_arch
 
         target = determine_target(target, return_object=True)
-        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout)
+        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes)
 
     @classmethod
     def of_lowered(
@@ -614,20 +685,24 @@ class Session:
         serial: str | None = None,
         verbose: bool = False,
         ready_timeout: float = 30.0,
+        processes: int = 1,
     ) -> Session:
         """A session of kernels lowered already, (name, source, params,
         out_idx) each as :func:`lower_kernels` gives them: a compiled kernel
         (tilelang.compile) is a session of one."""
         session = cls.__new__(cls)
-        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout)
+        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes)
         return session
 
-    def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float) -> None:
+    def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float, processes: int) -> None:
         from .build import build_cmake_fastrpc
         from .config import device_serial, hlos
         from .env import HexagonSDK
 
         self._closed = True
+        if not 1 <= processes <= Session.MAX_PROCESSES:
+            raise ValueError(f"a session runs on 1 to {Session.MAX_PROCESSES} DSP processes, not {processes}")
+        self.processes = processes
         if hlos() == "linux":
             raise NotImplementedError(
                 "a session needs the Android agent; on a Linux BSP, tilelang.compile runs a kernel one call at a time"
@@ -669,7 +744,7 @@ class Session:
         # status.
         cmd = (
             f"cd {self._device_dir} && chmod 755 {exe} && LD_LIBRARY_PATH={self._device_dir} ADSP_LIBRARY_PATH={adsp} "
-            f"./{exe} 0; status=$?; rm -rf {self._device_dir}; exit $status"
+            f"./{exe} 0 {self.processes}; status=$?; rm -rf {self._device_dir}; exit $status"
         )
         self._proc = subprocess.Popen(self._base + ["shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         # select() keeps a silent agent from blocking past the deadline, and
@@ -757,14 +832,20 @@ class Session:
             raise RuntimeError(f"Hexagon session: {what} failed: {reason}")
 
     # ---- buffers ----------------------------------------------------------
-    def buffer(self, nbytes: int) -> DeviceBuffer:
+    def buffer(self, nbytes: int, processes=None) -> DeviceBuffer:
         """``nbytes`` of zeroed resident memory, under 2 GiB (rpcmem_alloc
-        takes an int). Large buffers fragment the DSP's 4 GB of addresses: on
-        a v79, seven of 512 MiB map and an eighth does not, while 3.5 GB of
-        model weights map as a buffer per tensor, the largest first."""
+        takes an int), mapped into the DSP processes listed (all of them by
+        default). Each takes as many addresses of its 4 GB, and large buffers
+        fragment them: on a v79, seven of 512 MiB map and an eighth does not,
+        while 3.5 GB of model weights map as a buffer per tensor, the largest
+        first."""
         if not 0 < nbytes < 1 << 31:
             raise ValueError(f"a resident buffer holds 1 byte to 2 GiB - 1, not {nbytes}")
-        self._sock.sendall(bytes([_OP_ALLOC]) + struct.pack("<Q", nbytes))
+        procs = range(self.processes) if processes is None else list(processes)
+        if not procs or any(not 0 <= p < self.processes for p in procs):
+            raise ValueError(f"a buffer is mapped into some of processes 0 to {self.processes - 1}, not {list(procs)}")
+        mask = sum(1 << p for p in set(procs))
+        self._sock.sendall(bytes([_OP_ALLOC]) + struct.pack("<QI", nbytes, mask))
         (bid,) = struct.unpack("<i", self._recv(4))
         if bid < 0:
             raise RuntimeError(f"Hexagon session: could not allocate and map {nbytes} bytes")
@@ -799,7 +880,7 @@ class Session:
         return ns * 1e-9
 
     # ---- runs -------------------------------------------------------------
-    def _run(self, kernel: SessionKernel, given: list):
+    def _run(self, kernel: SessionKernel, given: list, process: int):
         args, inputs, outputs = [], bytearray(), []
         out_bytes = 0
         for i, plan in enumerate(kernel.plans):
@@ -826,7 +907,7 @@ class Session:
         # any other parameter given None after them.
         rank = {i: k for k, i in enumerate(kernel.out_idx)}
         outputs.sort(key=lambda output: rank.get(output[0], len(rank) + output[0]))
-        head = struct.pack("<iii", kernel.index, len(args) // 3, out_bytes)
+        head = struct.pack("<iiii", kernel.index, len(args) // 3, out_bytes, process)
         # One write: adb relays each as a packet (see the agent's reply()).
         self._sock.sendall(b"".join([bytes([_OP_RUN]), head, struct.pack(f"<{len(args)}i", *args), struct.pack("<I", len(inputs)), inputs]))
         self._status(f"kernel {kernel.name}")

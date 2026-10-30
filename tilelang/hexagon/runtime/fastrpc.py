@@ -108,29 +108,11 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
 
 
 # What a skel adds around its kernels' sources, which include the template
-# headers they call. Every session votes for clocks at _open and removes the
-# vote at _close (power.h). It acquires HMX, or the VTCM alone, for kernels
-# whose sources say they use them (the codegen defines TL_HEXAGON_USES_HMX and
-# TL_HEXAGON_USES_VTCM); _close must release them, or they leak for the agent's
-# life, and tl_hmx_session_deinit releases the VTCM too. _open fails loudly
-# when they cannot be acquired (e.g. a leaked agent still holds VTCM), rather
-# than running and returning silent zeros.
+# headers they call: its _open takes the DSP process's resources and its _close
+# gives them up (tl_hexagon_open and tl_hexagon_close, RUN_KERNEL).
 SKEL_INCLUDES = "#include <tl_templates/hexagon/power.h>\n"
-SKEL_OPEN = """  tl_power_vote();
-#if defined(TL_HEXAGON_USES_HMX)
-  tl_hmx_session_init();
-  if (!tl_hmx_session_ok()) return AEE_EFAILED;
-#elif defined(TL_HEXAGON_USES_VTCM)
-  if (!tl_vtcm_base()) return AEE_EFAILED;
-#endif
-"""
-SKEL_CLOSE = """#if defined(TL_HEXAGON_USES_HMX)
-  tl_hmx_session_deinit();
-#elif defined(TL_HEXAGON_USES_VTCM)
-  tl_vtcm_release();
-#endif
-  tl_power_unvote();
-"""
+SKEL_OPEN = "  if (tl_hexagon_open() != 0) return AEE_EFAILED;\n"
+SKEL_CLOSE = "  tl_hexagon_close();\n"
 
 
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
@@ -156,15 +138,73 @@ KERNEL_STATUS_BASE = 0x1000
 # The TL_ERR_* statuses, by code.
 KERNEL_STATUS = {1: "TL_ERR_VTCM (no VTCM region fits)", 2: "TL_ERR_HMX", 3: "TL_ERR_DMA", 4: "TL_ERR_GRID (too few workers for the grid)"}
 
-FORWARD_KERNEL_STATUS = f"""template <typename Fn>
-static AEEResult tl_hexagon_forward_kernel_status(Fn&& fn) {{
-  if constexpr (std::is_void_v<decltype(fn())>) {{
-    fn();
-    return AEE_SUCCESS;
-  }} else {{
-    int tl_rc = (int)fn();
-    return tl_rc == 0 ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
+RUN_KERNEL = f"""// The DSP process's resources: its power votes (power.h) and, for kernels
+// whose sources say they use HMX or VTCM (the codegen defines
+// TL_HEXAGON_USES_HMX and TL_HEXAGON_USES_VTCM), its compute-resource context
+// (vtcm.h). A run takes the context when it starts and gives it back when it
+// ends, so that another DSP process of the session can run in between.
+// tl_hexagon_take returns 0 or a TL_ERR_* status.
+static inline int tl_hexagon_take(void) {{
+#if defined(TL_HEXAGON_USES_HMX)
+  return tl_hmx_take();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  return tl_vtcm_take() == 0 ? TL_OK : TL_ERR_VTCM;
+#else
+  return TL_OK;
+#endif
+}}
+static inline void tl_hexagon_give(void) {{
+#if defined(TL_HEXAGON_USES_HMX)
+  tl_hmx_give();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  tl_vtcm_give();
+#endif
+}}
+
+// _close gives the resources up, or they leak for the agent's life.
+static inline void tl_hexagon_close(void) {{
+#if defined(TL_HEXAGON_USES_HMX)
+  tl_hmx_session_deinit();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  tl_vtcm_close();
+#endif
+  tl_power_unvote();
+}}
+
+// _open takes the context once, so that it fails loudly when another client
+// holds the resources (e.g. a leaked agent), rather than a run returning silent
+// zeros; a failed open gives up what it took. 0, or nonzero.
+static inline int tl_hexagon_open(void) {{
+  tl_power_vote();
+#if defined(TL_HEXAGON_USES_HMX)
+  tl_hmx_session_init();
+  bool ok = tl_hmx_session_ok();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  bool ok = tl_vtcm_open(0) == 0;
+#else
+  bool ok = true;
+#endif
+  if (ok && tl_hexagon_take() == TL_OK) {{
+    tl_hexagon_give();
+    return 0;
   }}
+  tl_hexagon_close();
+  return -1;
+}}
+
+// A kernel's run, between take and give; a nonzero status comes back from
+// run() as KERNEL_STATUS_BASE + status, an error FastRPC passes through.
+template <typename Fn>
+static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
+  int tl_rc = tl_hexagon_take();
+  if (tl_rc == TL_OK) {{
+    if constexpr (std::is_void_v<decltype(fn())>)
+      fn();
+    else
+      tl_rc = (int)fn();
+    tl_hexagon_give();
+  }}
+  return tl_rc == TL_OK ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
 }}
 """
 
@@ -195,12 +235,12 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"{SKEL_INCLUDES}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
-        f"{FORWARD_KERNEL_STATUS}\n"
+        f"{RUN_KERNEL}\n"
         '#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
         f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{\n  (void)uri; *h = 0;\n{SKEL_OPEN}  return AEE_SUCCESS;\n}}\n\n"
         f"AEEResult {iface}_close(remote_handle64 h) {{\n  (void)h;\n{SKEL_CLOSE}  return AEE_SUCCESS;\n}}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
-        f"  return tl_hexagon_forward_kernel_status([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
+        f"  return tl_hexagon_run_kernel([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
         "}\n\n"
         "#ifdef __cplusplus\n}\n#endif\n"
     )
