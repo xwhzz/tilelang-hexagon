@@ -89,7 +89,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
     FQW = FQ // NW  # a worker's of a part
     NK = len(c.rope)
     half = HD // 2
-    assert R % ROWS == 0 and RW % RB == 0 and max_pos % KEYS == 0 and FQW % TILE == 0
+    assert R % ROWS == 0 and RW % (2 * RB) == 0 and max_pos % KEYS == 0 and FQW % TILE == 0
     assert D <= 64 * TILE, "a slot of the ring holds a projection's whole K"
     eps = c.eps
     HID = max(D, FQ)
@@ -147,41 +147,47 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
         the worker's rows, RB at a time, x by DMA."""
         if sandwich:
             T.copy(post, bf.pw)
+            # The sandwich norm's scales of the worker's rows, as vectors: from
+            # the workers' parts of the branch's rows' sums of squares, which
+            # the GEMMs' epilogues made.
+            for i in T.Parallel(RW):
+                total = bf.psum[0, bf.w * RW + i]
+                for v in list(range(1, NW)):
+                    total = total + bf.psum[v, bf.w * RW + i]
+                bf.sw[i] = T.rsqrt(total * T.float32(1 / D) + T.float32(eps))
         T.copy(weight, bf.nw)
         # Two slots of rows: a batch's rows come in while the one before is
-        # added, stored and normalized.
+        # added, stored and normalized. The batches go in pairs, so that each
+        # loop over a slot's rows addresses it at a constant offset, which the
+        # software pipeliner needs: with the slot a run-time offset, LLVM did
+        # not pipeline the add, and it ran 2.3 times slower.
         nb = RW // RB
         T.dma_copy(bf.x[bf.w * RW : bf.w * RW + RB, :], bf.xr[0, :, :])
-        for rb in T.serial(nb):
-            r = bf.w * RW + rb * RB
-            s = rb % 2
-            # The batch's rows are in, and the slot the next takes is stored.
-            T.dma_wait(0)
-            if rb + 1 < nb:
-                nxt = bf.w * RW + T.min(rb + 1, nb - 1) * RB
-                T.dma_copy(bf.x[nxt : nxt + RB, :], bf.xr[1 - s, :, :])
-            if sandwich:
-                # The branch's rows' sums of squares: the workers' parts of
-                # them, which the GEMMs' epilogues made.
-                for i in T.Parallel(RB):
-                    total = bf.psum[0, r + i]
-                    for v in list(range(1, NW)):
-                        total = total + bf.psum[v, r + i]
-                    bf.ss[i] = T.rsqrt(total * T.float32(1 / D) + T.float32(eps))
-                # The new rows, and their squares for the next norm.
-                for i, k in T.Parallel(RB, D):
-                    v = bf.xr[s, i, k] + bf.f[r + i, k] * bf.ss[i] * bf.pw[k]
-                    bf.xr[s, i, k] = v
-                    bf.sq[i, k] = v * v
-            else:
-                for i, k in T.Parallel(RB, D):
-                    v = bf.xr[s, i, k] + bf.f[r + i, k]
-                    bf.xr[s, i, k] = v
-                    bf.sq[i, k] = v * v
-            T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
-            if normed:
-                normalize(bf, s, True)
-                T.copy(bf.rows, bf.a[r : r + RB, :])
+        for pair in T.serial(nb // 2):
+            for s in list(range(2)):
+                rb = pair * 2 + s
+                r = bf.w * RW + rb * RB
+                # The batch's rows are in, and the slot the next takes is
+                # stored.
+                T.dma_wait(0)
+                if rb + 1 < nb:
+                    nxt = bf.w * RW + T.min(rb + 1, nb - 1) * RB
+                    T.dma_copy(bf.x[nxt : nxt + RB, :], bf.xr[1 - s, :, :])
+                if sandwich:
+                    # The new rows, and their squares for the next norm.
+                    for i, k in T.Parallel(RB, D):
+                        v = bf.xr[s, i, k] + bf.f[r + i, k] * bf.sw[rb * RB + i] * bf.pw[k]
+                        bf.xr[s, i, k] = v
+                        bf.sq[i, k] = v * v
+                else:
+                    for i, k in T.Parallel(RB, D):
+                        v = bf.xr[s, i, k] + bf.f[r + i, k]
+                        bf.xr[s, i, k] = v
+                        bf.sq[i, k] = v * v
+                T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
+                if normed:
+                    normalize(bf, s, True)
+                    T.copy(bf.rows, bf.a[r : r + RB, :])
         T.dma_wait(0)
 
     @T.macro
@@ -431,6 +437,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             rows = T.alloc_fragment((RB, D), "float32")
             sq = T.alloc_fragment((RB, D), "float32")
             ss = T.alloc_fragment((RB,), "float32")
+            sw = T.alloc_shared((RW,), "float32")
             nw = T.alloc_shared((D,), "float32")
             pw = T.alloc_shared((D,), "float32")
             erow = T.alloc_shared((D // 2, 2), "float16")
@@ -459,7 +466,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
 
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
+                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
                 hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
                 acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,
