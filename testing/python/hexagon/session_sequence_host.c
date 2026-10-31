@@ -1,7 +1,15 @@
 // Execute the generated ARM agent natively with a cache-aware fake DSP.
 // Each allocation has distinct CPU and DSP bytes. Omitting either side of
 // Copy's cache protocol corrupts the resident recurrence tested by Python.
+#include <pthread.h>
+static int test_pthread_create(pthread_t *, const pthread_attr_t *,
+                               void *(*)(void *), void *);
+static int test_pthread_join(pthread_t, void **);
+#define pthread_create test_pthread_create
+#define pthread_join test_pthread_join
 #include "agent.c"
+#undef pthread_create
+#undef pthread_join
 #include <assert.h>
 
 struct allocation {
@@ -12,6 +20,23 @@ struct allocation {
 };
 static struct allocation memory[1024];
 static int next_fd = 100, runs, acquires, releases, lease, sync_failure;
+static int pipeline_calls, thread_attempts, threads_created, threads_joined;
+static int test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                               void *(*entry)(void *), void *arg) {
+  const char *fail_after = getenv("TL_TEST_FAIL_CREATE_AFTER");
+  if (fail_after && thread_attempts++ == atoi(fail_after))
+    return 11;
+  int status = pthread_create(thread, attr, entry, arg);
+  if (status == 0)
+    ++threads_created;
+  return status;
+}
+static int test_pthread_join(pthread_t thread, void **result) {
+  int status = pthread_join(thread, result);
+  if (status == 0)
+    ++threads_joined;
+  return status;
+}
 
 static struct allocation *by_fd(int fd) {
   for (int i = 0; i < 1024; ++i)
@@ -85,6 +110,7 @@ int seq_test_open(const char *uri, remote_handle64 *h) {
 int seq_test_close(remote_handle64 h) {
   (void)h;
   assert(!lease && acquires == releases);
+  assert(threads_created == threads_joined);
   return 0;
 }
 int seq_test_release(remote_handle64 h, int32_t fd) {
@@ -155,6 +181,9 @@ int seq_test_run(remote_handle64 h, int32_t kernel, const int32_t *args, int n,
     values[0] = runs;
     values[1] = acquires - 1;
     values[2] = releases;
+    values[3] = pipeline_calls;
+    values[4] = threads_created;
+    values[5] = threads_joined;
   }
   m->dirty[p][offset / 128] = 1;
   ++runs;
@@ -185,5 +214,6 @@ int seq_test_pipeline(remote_handle64 h, int32_t kernel, const int32_t *args,
   (void)stage;
   (void)stages;
   (void)turn;
+  __atomic_add_fetch(&pipeline_calls, 1, __ATOMIC_SEQ_CST);
   return steps == 0 ? AEE_SUCCESS : AEE_EBADPARM;
 }

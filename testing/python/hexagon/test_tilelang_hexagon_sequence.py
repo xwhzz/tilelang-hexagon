@@ -99,8 +99,14 @@ int seq_test_run(remote_handle64, int32_t, const int32_t*, int, const uint8_t*, 
 
 @pytest.fixture
 def agent(native_agent, request):
-    processes = getattr(request, "param", 1)
-    proc = subprocess.Popen([str(native_agent), "0", str(processes)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    value = getattr(request, "param", 1)
+    processes, fail_after = value if isinstance(value, tuple) else (value, None)
+    env = os.environ.copy()
+    if fail_after is not None:
+        env["TL_TEST_FAIL_CREATE_AFTER"] = str(fail_after)
+    proc = subprocess.Popen(
+        [str(native_agent), "0", str(processes)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
     # The generated main flushes this line only after its real TCP listener is ready.
     if not select.select([proc.stdout], [], [], 5)[0]:
         proc.kill()
@@ -504,5 +510,24 @@ def test_pipeline_and_sequence_have_distinct_wire_operations(agent):
     # The fake DSP only accepts zero pipeline steps; this checks framing and
     # dispatch coexistence, not DSP pipeline execution or synchronization.
     agent.pipeline([(agent.kernels[0], 0, (buffer, 1))], 0)
+    assert agent.run_sequence([Run(agent.kernels[0], (buffer, 7))]).completed_operations == 1
+    assert _ints(buffer)[1] == 7
+
+
+@pytest.mark.parametrize("agent,created", [((3, 1), 1), ((3, 2), 2)], indirect=["agent"])
+def test_pipeline_thread_creation_failure_starts_no_stage_and_recovers(agent, created):
+    buffer = agent.buffer(128)
+    stages = [(agent.kernels[0], p, (buffer, 1)) for p in range(3)]
+    with pytest.raises(RuntimeError, match="FastRPC call failed"):
+        agent.pipeline(stages, 4)
+    stats = agent.buffer(128)
+    agent.kernels[3](stats)
+    before = _ints(stats)
+    assert before[3] == 0  # No stage entered its FastRPC pipeline call.
+    assert before[4] == before[5] == created
+    agent.pipeline(stages, 0)
+    agent.kernels[3](stats)
+    after = _ints(stats)
+    assert after[3] == 3 and after[4] == after[5] == before[4] + 3
     assert agent.run_sequence([Run(agent.kernels[0], (buffer, 7))]).completed_operations == 1
     assert _ints(buffer)[1] == 7

@@ -511,9 +511,16 @@ static int open_turn(void) {{
 }}
 
 // A stage of a pipeline: one FastRPC call to its process for all the steps.
-struct stage {{ int32_t kernel, process, n, steps, index, stages; int32_t* args; AEEResult result; }};
+// Workers do not enter FastRPC until every stage thread exists. Otherwise a
+// started DSP stage could wait forever for a turn assigned to a missing one.
+struct launch_gate {{ pthread_mutex_t mutex; int run; }};
+struct stage {{ int32_t kernel, process, n, steps, index, stages; int32_t* args; AEEResult result; struct launch_gate* gate; }};
 static void* run_stage(void* arg) {{
   struct stage* s = (struct stage*)arg;
+  pthread_mutex_lock(&s->gate->mutex);
+  int run = s->gate->run;
+  pthread_mutex_unlock(&s->gate->mutex);
+  if (!run) return 0;
   s->result = {iface}_pipeline(g_handles[s->process], s->kernel, s->args, 3 * s->n, s->steps, s->index, s->stages, g_turn_fd);
   return 0;
 }}
@@ -607,10 +614,17 @@ static int serve(int cli, unsigned char op, int* running) {{
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     pthread_t threads[MAX_PROCESSES];
+    struct launch_gate gate = {{PTHREAD_MUTEX_INITIALIZER, 0}};
+    pthread_mutex_lock(&gate.mutex);
     int started = 0;
-    for (; ok && started < head[0]; ++started)
+    for (; ok && started < head[0]; ++started) {{
+      st[started].gate = &gate;
       if (pthread_create(&threads[started], 0, run_stage, &st[started]) != 0) break;
+    }}
+    gate.run = ok && started == head[0];
+    pthread_mutex_unlock(&gate.mutex);
     for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+    pthread_mutex_destroy(&gate.mutex);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
     // The status of the first stage that failed, not of those that gave up.
