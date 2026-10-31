@@ -277,16 +277,16 @@ and explicit HMX atoms.
   takes it and gives it back when it ends (`tl_hexagon_run_kernel`), so the
   processes of a session take turns. The region keeps its address throughout. An
   uncontended release and acquire costs about 5 µs on the upstream-tested v79.
-  `TILELANG_HEXAGON_RESOURCE_LIFETIME=cached` is the default. An explicit `call`
-  profile uses full, independent VTCM/HMX grants per invocation for older BSPs;
-  its compiled code does not import the cached-resource APIs. Both profiles keep
-  resident DDR, workers, and DSP power votes alive across calls and release grants
-  only after the kernel has joined its workers and drained DMA. Neither preempts
-  a long kernel or promises a release-callback deadline. The earlier draft's
-  `session` profile is removed: use `cached`, or `call` for the compatible BSP.
-  Multi-process sessions currently require `cached` on Android's default cDSP
-  domain; Linux, other domains, and `call` multi-process combinations fail before
-  building. New platform combinations need independent device qualification.
+  Resident DDR, workers, and DSP power votes stay alive across calls; grants are
+  released only after the kernel has joined its workers and drained DMA. This
+  does not preempt a long kernel or promise a release-callback deadline.
+  The earlier draft's `session` and `call` modes have been removed in favor of
+  the upstream cached lifecycle. Unset `TILELANG_HEXAGON_RESOURCE_LIFETIME`
+  (explicit `cached` is also accepted); obsolete values fail with a migration
+  error. The BSP's legacy resource-attribute initializer option remains independent.
+  Multi-process sessions currently require Android's default cDSP domain;
+  Linux and other domains fail before building. New platform combinations need
+  independent device qualification.
 
 - **The worker pool = 1 HMX + 6 HVX.** The producer/consumer model: the 6 HVX units
   run pack/unpack/softmax/copies in parallel; the 1 HMX MAC is serialized by a
@@ -343,15 +343,12 @@ and explicit HMX atoms.
     kernel's script, the target, its pass configs and the compiler (tilelang's version,
     native libraries and Python sources): the LFM2 decode lowers in 36 s, and in 2 s
     from the cache.
-  - **Resource policy.** `TILELANG_HEXAGON_RESOURCE_LIFETIME=cached` is the default:
-    each run takes and gives the process's cached VTCM/HMX context. Explicit `call`
-    uses full acquire/release without cached-resource imports for compatible BSPs.
-    Both release on the execution thread after workers finish, including kernel
-    errors. The DSP power vote, execution threads, worker pool, and resident DDR
-    retain their Session lifetime. VTCM contents are not preserved between runs;
-    only `cached` retains the context's address. The build cache includes the
-    policy; neither the DSP ISA nor `run_sequence` selects it automatically. The
-    earlier draft's `session` value now fails with an explicit migration message.
+  - **Resources.** Each run takes and gives the process's cached VTCM/HMX context,
+    on the execution thread after workers finish, including kernel errors. DSP
+    power votes, execution threads, the worker pool, and resident DDR retain their
+    Session lifetime. The context's VTCM address stays fixed; its contents are not
+    preserved between runs. The earlier draft's `session` and `call` settings now
+    fail with a migration message; unset the setting or use `cached`.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
@@ -368,9 +365,8 @@ and explicit HMX atoms.
     of `Run(kernel, args)` and `Copy(src, dst, nbytes, src_offset=0, dst_offset=0)`
     descriptors, imported from `tilelang.hexagon.runtime.session`. It sends the list
     in one round trip; the ARM agent invokes FastRPC separately for each Run and
-    retains the Session's selected resource policy. With `call`, VTCM/HMX are
-    acquired/released for each invocation. Neither policy nor this sequence API
-    preempts a long Run or provides a 5 ms scheduling guarantee.
+    takes/gives the cached VTCM/HMX context for each invocation. The sequence API
+    does not preempt a long Run or provide a 5 ms scheduling guarantee.
     Each Run targets process 0 and supplies every parameter, using resident buffers and int32 scalars;
     inline tensors are unsupported. A Run buffer remains 128-byte aligned and must
     contain the kernel's full static extent. Copy uses arbitrary byte offsets

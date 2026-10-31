@@ -1,5 +1,5 @@
 // Exercise the actual arena header with a grant-tracking HAP implementation.
-// The call profile deliberately has no cached API declarations.
+// Cached take/give must release each grant, including failed arena binding.
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -46,7 +46,6 @@ static void HAP_compute_res_release(int ctx) {
   context_live = grant_live = false;
   ++releases;
 }
-#if TL_HEXAGON_CACHED_RESOURCES
 static void HAP_compute_res_attr_set_hmx_param(compute_res_attr_t *, int) {}
 static void HAP_compute_res_attr_set_cache_mode(compute_res_attr_t *req,
                                                 int cached) {
@@ -65,7 +64,6 @@ static void HAP_compute_res_release_cached(int ctx) {
   grant_live = false;
   ++gives;
 }
-#endif
 #include <tl_templates/hexagon/vtcm.h>
 
 int main() {
@@ -74,8 +72,7 @@ int main() {
     int opened = tl_vtcm_open(0);
     if (opened == 0) {
       int got = tl_vtcm_take();
-      bool expected = failure == "none" ||
-                      (!TL_HEXAGON_CACHED_RESOURCES && failure == "take");
+      bool expected = failure == "none";
       assert((got == 0) == expected);
       if (got == 0) {
         assert(grant_live && tl_vtcm_arena() == arena);
@@ -86,8 +83,7 @@ int main() {
         tl_vtcm_give();
       }
     } else {
-      assert(TL_HEXAGON_CACHED_RESOURCES &&
-             (failure == "query" || failure == "acquire"));
+      assert(failure == "query" || failure == "acquire");
     }
     tl_vtcm_close();
     assert(!context_live && !grant_live && !tl_vtcm_arena());

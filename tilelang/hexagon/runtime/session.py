@@ -219,11 +219,12 @@ static AEEResult tl_session_dispatch_close() {{
 def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     """The skel of `kernels`, (name, source, plans) each: one translation unit,
     every kernel's entry renamed to its index."""
+    config.resource_lifetime()
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
         "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <type_traits>\n",
         f'#include "{iface}.h"\n\n',
-        fastrpc.resource_defines() + fastrpc.SKEL_INCLUDES,
+        fastrpc.SKEL_INCLUDES,
     ]
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
@@ -984,10 +985,8 @@ class Session:
     spread over several. Every process loads the session's kernels; a buffer is
     mapped into the processes it names, and a kernel runs on the process it is
     called on. The processes take turns at VTCM and HMX: a run takes them and
-    gives them back when it ends. Cached contexts are the default; explicit
-    TILELANG_HEXAGON_RESOURCE_LIFETIME=call uses complete acquire/release for
-    BSPs without cached-resource support, on one process only. Neither profile
-    preempts a running kernel. Each process caches its own lines of a
+    gives them back when it ends, using upstream cached contexts. This does not
+    preempt a running kernel. Each process caches its own lines of a
     buffer, so data one process's kernel writes reaches another's only by DMA
     (``T.annotate_dma_only``); the host's reads and writes sync every process
     that maps the buffer. A pipeline (:meth:`pipeline`) runs steps of kernels
@@ -1015,7 +1014,7 @@ class Session:
     ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
         the DSP the target names, which ``processes`` DSP processes load."""
-        config.resource_lifetime()  # Reject invalid profiles before lowering.
+        config.resource_lifetime()  # Reject obsolete launch settings before lowering.
         from tilelang.backend.target import determine_target
         from tilelang.hexagon.target import hexagon_arch
 
@@ -1054,8 +1053,8 @@ class Session:
         if not 1 <= processes <= Session.MAX_PROCESSES:
             raise ValueError(f"a session runs on 1 to {Session.MAX_PROCESSES} DSP processes, not {processes}")
         self.processes = processes
-        if processes > 1 and (config.resource_lifetime() != "cached" or hlos() != "android" or domain_id() != 3):
-            raise NotImplementedError("multiple DSP processes require cached resources on Android's default cDSP domain")
+        if processes > 1 and (hlos() != "android" or domain_id() != 3):
+            raise NotImplementedError("multiple DSP processes require Android's default cDSP domain")
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")

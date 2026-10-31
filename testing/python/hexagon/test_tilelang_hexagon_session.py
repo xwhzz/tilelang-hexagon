@@ -260,14 +260,12 @@ def test_buffers_and_runs_name_processes_of_their_session():
         kernel(process=2)
 
 
-@pytest.mark.parametrize("lifetime", ["cached", "call"])
-def test_session_dispatch_lifecycle_on_host(tmp_path, monkeypatch, lifetime):
+def test_session_dispatch_lifecycle_on_host(tmp_path):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("a host C++ compiler is required for the dispatch lifecycle test")
     # Exercise the generated implementation with real host synchronization.
     # This checks resource ownership/error cleanup, not DSP stack capacity.
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", lifetime)
     dispatch = fastrpc.RUN_KERNEL + session._dispatch_source("  case 0: return tl_hexagon_run_kernel([&]() { return test_kernel(a); });\n")
     harness = Path(__file__).with_name("session_dispatch_host.cc").read_text()
     source, executable = tmp_path / "dispatch.cc", tmp_path / "dispatch"
@@ -281,7 +279,7 @@ def test_session_dispatch_lifecycle_on_host(tmp_path, monkeypatch, lifetime):
             subprocess.run([str(executable), mode, failure], check=True, timeout=10)
 
 
-@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session ", "session"])
+@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session ", "session", "call"])
 def test_invalid_resource_lifetime_fails_before_lowering_or_build(monkeypatch, value):
     monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", value)
     monkeypatch.setattr(session, "lower_kernels", lambda *args: pytest.fail("must reject before lowering"))
@@ -572,22 +570,20 @@ def test_a_failing_stage_ends_the_pipeline():
         b.free()
 
 
-@pytest.mark.parametrize("hlos,domain,lifetime", [("linux", "3", "cached"), ("android", "4", "cached"), ("android", "3", "call")])
-def test_unsupported_multi_process_profiles_fail_before_build(monkeypatch, hlos, domain, lifetime):
+@pytest.mark.parametrize("hlos,domain", [("linux", "3"), ("android", "4")])
+def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, hlos, domain):
     monkeypatch.setenv("TILELANG_HEXAGON_HLOS", hlos)
     monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", domain)
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", lifetime)
     monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
-    with pytest.raises(NotImplementedError, match="multiple DSP processes require cached"):
+    with pytest.raises(NotImplementedError, match="multiple DSP processes require Android"):
         session.Session.of_lowered([], processes=2)
 
 
-@pytest.mark.parametrize("cached", [0, 1])
-def test_vtcm_profiles_release_partial_grants_on_host(tmp_path, cached):
+def test_vtcm_cached_context_releases_partial_grants_on_host(tmp_path):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("a host C++ compiler is required")
-    # The harness supplies HAP declarations; call deliberately omits cached APIs.
+    # The harness tracks actual cached-context grants and failure cleanup.
     (tmp_path / "HAP_compute_res.h").write_text("")
     source = Path(__file__).with_name("vtcm_lifetime_host.cc")
     root = Path(__file__).resolve().parents[3]
@@ -597,7 +593,6 @@ def test_vtcm_profiles_release_partial_grants_on_host(tmp_path, cached):
             compiler,
             "-std=c++17",
             "-O2",
-            f"-DTL_HEXAGON_CACHED_RESOURCES={cached}",
             "-I",
             str(tmp_path),
             "-I",

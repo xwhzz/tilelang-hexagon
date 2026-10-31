@@ -36,7 +36,6 @@ def key(cache):
         ("HEXAGON_DSP_ARCH", "v79"),
         ("TILELANG_HEXAGON_DEVICE", "phone"),
         ("TILELANG_HEXAGON_DOMAIN", "4"),
-        ("TILELANG_HEXAGON_RESOURCE_LIFETIME", "call"),
         ("TILELANG_HEXAGON_DSP_LIBRARY_PATH", "/custom/dsp"),
         ("TILELANG_HEXAGON_SSH_HOST", "root@other"),
         ("TILELANG_HEXAGON_REMOTE_DIR", "/other/remote"),
@@ -163,7 +162,7 @@ def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):
     assert len(builds.runs) == 2
 
 
-def test_resource_lifetime_changes_build_and_live_cache(builds, cache, monkeypatch):
+def test_cached_resource_setting_preserves_cache_and_rejects_removed_modes(builds, cache, monkeypatch):
     from tilelang.hexagon.runtime import session
 
     monkeypatch.delenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", raising=False)
@@ -173,14 +172,16 @@ def test_resource_lifetime_changes_build_and_live_cache(builds, cache, monkeypat
     monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
     assert key(cache) == original_key
     assert session.gen_dsp("test", []) == source
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "call")
-    assert key(cache) != original_key
-    call_source = session.gen_dsp("test", [])
-    assert call_source != source
-    call_build = builds.run(call_source)
-    assert call_build != first and len(builds.runs) == 2
-    assert builds.run(call_source) == call_build
-    assert len(builds.runs) == 2
+    assert builds.run(source) == first and len(builds.runs) == 1
+    for removed in ("call", "session"):
+        monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", removed)
+        with pytest.raises(ValueError, match="unset it .*cached"):
+            key(cache)
+        with pytest.raises(ValueError, match="unset it .*cached"):
+            session.gen_dsp("test", [])
+        with pytest.raises(ValueError, match="unset it .*cached"):
+            builds.run(source)
+    assert len(builds.runs) == 1
 
 
 def test_a_disabled_cache_always_builds(builds, monkeypatch):

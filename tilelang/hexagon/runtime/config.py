@@ -68,17 +68,18 @@ def domain_id() -> int:
 
 
 def resource_lifetime() -> str:
-    """VTCM/HMX lease: cached contexts (default) or full per-call acquisition.
+    """Validate old launch settings; resources use upstream cached take/give.
 
-    This is a firmware/profile choice, independent of HLOS and DSP ISA. DSP
-    clock votes, resident DDR buffers and execution threads stay session-scoped.
+    Accept explicit cached for existing scripts. The unpublished session/call
+    modes were removed, so reject them rather than silently changing behavior.
     """
     lifetime = os.environ.get("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
-    if lifetime not in ("cached", "call"):
+    if lifetime != "cached":
         raise ValueError(
-            f"TILELANG_HEXAGON_RESOURCE_LIFETIME is cached or call, not {lifetime!r}; the former session lease is no longer supported"
+            f"TILELANG_HEXAGON_RESOURCE_LIFETIME={lifetime!r} is no longer supported; "
+            "unset it (or set cached) to use upstream per-call cached VTCM/HMX take/give"
         )
-    return lifetime
+    return "cached"
 
 
 def cache_identity() -> dict:

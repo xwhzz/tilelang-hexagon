@@ -26,31 +26,19 @@
 // ------------------------------ HMX lock ----------------------------------
 // HMX is part of the process's compute-resource context (vtcm.h), with the
 // VTCM its operands live in: tl_vtcm_open(1) asks for both.
-#if !TL_HEXAGON_CACHED_RESOURCES
-// Older BSPs use independent VTCM/HMX grants, released after each call.
-static int tl_hmx_ctx;
-#endif
-TL_HMX_INLINE int tl_hmx_context(void) {
-#if TL_HEXAGON_CACHED_RESOURCES
-  return tl_vtcm_ctx;
-#else
-  return tl_hmx_ctx;
-#endif
-}
 static int tl_hmx_spin;
 // Per-thread HMX SHARED enable: each thread that issues HMX MACs must call this
 // once its run holds the context. Returns 0 if this thread now holds the lock,
 // non-zero on failure (incl. no context) so callers can refuse rather than run
 // MACs with HMX unlocked.
 TL_HMX_INLINE int tl_hmx_enable(void) {
-  if (!tl_hmx_context())
+  if (!tl_vtcm_ctx)
     return -1;
-  return HAP_compute_res_hmx_lock2(tl_hmx_context(),
-                                   HAP_COMPUTE_RES_HMX_SHARED);
+  return HAP_compute_res_hmx_lock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
 }
 TL_HMX_INLINE void tl_hmx_disable(void) {
-  if (tl_hmx_context())
-    HAP_compute_res_hmx_unlock2(tl_hmx_context(), HAP_COMPUTE_RES_HMX_SHARED);
+  if (tl_vtcm_ctx)
+    HAP_compute_res_hmx_unlock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
 }
 TL_HMX_INLINE void tl_hmx_unit_acquire(void) {
   int *lp = &tl_hmx_spin;
@@ -142,18 +130,7 @@ static int tl_hmx_session_ok(void) { return tl_hmx_inited; }
 static int tl_hmx_take(void) {
   if (tl_vtcm_take() != 0)
     return TL_ERR_VTCM;
-#if !TL_HEXAGON_CACHED_RESOURCES
-  compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-  HAP_compute_res_attr_set_hmx_param(&req, 1);
-  tl_hmx_ctx = HAP_compute_res_acquire(&req, 10000);
-#endif
   if (tl_hmx_enable() != 0) {
-#if !TL_HEXAGON_CACHED_RESOURCES
-    if (tl_hmx_ctx)
-      HAP_compute_res_release(tl_hmx_ctx);
-    tl_hmx_ctx = 0;
-#endif
     tl_vtcm_give();
     return TL_ERR_HMX;
   }
@@ -163,11 +140,6 @@ static int tl_hmx_take(void) {
 static void tl_hmx_give(void) {
   tl_hmx_disable();
   tl_hmx_run_tid = 0;
-#if !TL_HEXAGON_CACHED_RESOURCES
-  if (tl_hmx_ctx)
-    HAP_compute_res_release(tl_hmx_ctx);
-  tl_hmx_ctx = 0;
-#endif
   tl_vtcm_give();
 }
 

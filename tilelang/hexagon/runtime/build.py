@@ -68,8 +68,9 @@ def _find_one(patterns: list[str]) -> str | None:
     return None
 
 
-# What picks or reaches the device, which a build does not depend on.
-_TRANSPORT = {
+# Runtime settings that do not change the generated build inputs.
+_RUNTIME_ONLY = {
+    "TILELANG_HEXAGON_RESOURCE_LIFETIME",
     "TILELANG_HEXAGON_DEVICE",
     "TILELANG_HEXAGON_DOMAIN",
     "TILELANG_HEXAGON_DSP_LIBRARY_PATH",
@@ -115,7 +116,7 @@ def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hl
         # Build switches and the Linux HLOS toolchain (linux_build.py), not
         # the device a build runs on. Like the paths above, they identify
         # tools; replacing a tool in place needs a cleared cache.
-        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k not in _TRANSPORT},
+        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k not in _RUNTIME_ONLY},
     }
     digest.update(json.dumps(toolchain, sort_keys=True).encode())
     return os.path.join(env.TILELANG_CACHE_DIR, "hexagon_builds", digest.hexdigest())
@@ -174,6 +175,7 @@ def build_cmake_fastrpc(
     sdk         : a :class:`HexagonSDK` (constructed+validated if omitted).
     dsp_arch    : Hexagon arch (e.g. ``v73``); defaults to ``sdk.dsp_arch``.
     """
+    config.resource_lifetime()  # Reject obsolete modes even for pre-generated projects.
     sdk = (sdk or HexagonSDK()).validate()
     dsp_arch = dsp_arch or sdk.dsp_arch
     hlos = config.hlos()

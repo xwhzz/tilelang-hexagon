@@ -44,13 +44,6 @@ compute_resource_attr_init_v2(compute_res_attr_t *attr, unsigned int size,
 #endif
 #endif
 
-// A generated skel selects the explicit BSP compatibility profile. Never infer
-// firmware resource APIs from the DSP ISA. The call profile must not import
-// cached-resource symbols, which older loaders may not provide.
-#ifndef TL_HEXAGON_CACHED_RESOURCES
-#define TL_HEXAGON_CACHED_RESOURCES 1
-#endif
-
 #define TL_VTCM_INLINE static inline __attribute__((unused))
 
 static uint8_t *tl_vtcm_base_ptr;  // base of the region the current run holds
@@ -92,7 +85,6 @@ TL_VTCM_INLINE int tl_vtcm_bind_region(void *base, unsigned int size) {
 // the HMX unit (hmx.h). Returns 0, or nonzero when there is no context to be
 // had; a run takes it.
 TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
-#if TL_HEXAGON_CACHED_RESOURCES
   if (tl_vtcm_ctx)
     return 0;
   unsigned int avail, total;
@@ -110,9 +102,6 @@ TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
     return -1;
   tl_vtcm_region = HAP_compute_res_attr_get_vtcm_ptr(&req);
   tl_vtcm_region_bytes = total;
-#else
-  (void)hmx; // Full grants are acquired by take, not retained by open.
-#endif
   return 0;
 }
 
@@ -120,31 +109,11 @@ TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
 TL_VTCM_INLINE int tl_vtcm_take(void) {
   if (tl_vtcm_base_ptr)
     return 0;
-#if TL_HEXAGON_CACHED_RESOURCES
   if (!tl_vtcm_ctx ||
       HAP_compute_res_acquire_cached(tl_vtcm_ctx, TL_VTCM_TAKE_TIMEOUT_US))
     return -1;
-#else
-  unsigned int avail, total;
-  compute_res_vtcm_page_t avail_pg, total_pg;
-  if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg))
-    return -1;
-  compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-  HAP_compute_res_attr_set_vtcm_param(&req, total, 1);
-  tl_vtcm_ctx = HAP_compute_res_acquire(&req, 10000);
-  if (!tl_vtcm_ctx)
-    return -1;
-  tl_vtcm_region = HAP_compute_res_attr_get_vtcm_ptr(&req);
-  tl_vtcm_region_bytes = total;
-#endif
   if (tl_vtcm_bind_region(tl_vtcm_region, tl_vtcm_region_bytes) != 0) {
-#if TL_HEXAGON_CACHED_RESOURCES
     HAP_compute_res_release_cached(tl_vtcm_ctx);
-#else
-    HAP_compute_res_release(tl_vtcm_ctx);
-    tl_vtcm_ctx = 0;
-#endif
     return -1;
   }
   return 0;
@@ -154,12 +123,7 @@ TL_VTCM_INLINE int tl_vtcm_take(void) {
 TL_VTCM_INLINE void tl_vtcm_give(void) {
   if (!tl_vtcm_base_ptr)
     return;
-#if TL_HEXAGON_CACHED_RESOURCES
   HAP_compute_res_release_cached(tl_vtcm_ctx);
-#else
-  HAP_compute_res_release(tl_vtcm_ctx);
-  tl_vtcm_ctx = 0;
-#endif
   tl_vtcm_base_ptr = 0;
   tl_vtcm_total = 0;
 }

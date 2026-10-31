@@ -115,12 +115,6 @@ SKEL_OPEN = "  if (tl_hexagon_open() != 0) return AEE_EFAILED;\n"
 SKEL_CLOSE = "  tl_hexagon_close();\n"
 
 
-def resource_defines() -> str:
-    from .config import resource_lifetime
-
-    return f"#define TL_HEXAGON_CACHED_RESOURCES {int(resource_lifetime() == 'cached')}\n"
-
-
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
 # Bytes of stack of the FastRPC thread, which runs a kernel's first program:
 # its default, 16 KB, overflows at a large kernel's frames.
@@ -216,6 +210,9 @@ static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
 
 
 def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[BufferPlan]) -> str:
+    from .config import resource_lifetime
+
+    resource_lifetime()
     # qaic skel signature for run(), in the types of its header: in seq ->
     # (const uint8*, int); rout seq -> (uint8*, int); in int32 -> (int32), which
     # is not an int on the DSP.
@@ -238,7 +235,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         "#include <AEEStdErr.h>\n"
         "#include <type_traits>\n"
         f'#include "{iface}.h"   // QAIC-generated handler prototypes\n\n'
-        f"{resource_defines()}{SKEL_INCLUDES}"
+        f"{SKEL_INCLUDES}"
         "// ---- the tilelang-generated device kernel ----\n"
         f"{kernel_source}\n\n"
         f"{RUN_KERNEL}\n"
