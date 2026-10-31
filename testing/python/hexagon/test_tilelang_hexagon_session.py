@@ -137,6 +137,53 @@ def test_session_skel_dispatches_by_kernel():
     assert "HAP_mmap_get(fd, &vaddr, &paddr)" in source
 
 
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_raw_session_skel_compiles_without_kernel_template_includes(tmp_path, arch):
+    from tilelang.hexagon.runtime.env import HexagonSDK, HexagonEnvError
+
+    sdk = HexagonSDK()
+    try:
+        compiler = Path(sdk.tools_root) / "bin" / "hexagon-clang++"
+    except HexagonEnvError:
+        pytest.skip("a Hexagon SDK is required for the offline skel compile")
+    qurt = Path(sdk.sdk_root) / "rtos" / "qurt" / f"compute{arch}" / "include"
+    if not compiler.is_file() or not qurt.is_dir():
+        pytest.skip(f"the Hexagon SDK must include the {arch} toolchain and QuRT headers")
+    # of_lowered also accepts raw kernels with no codegen headers or USES markers.
+    # The wrapper itself owns the common.h status ABI dependency.
+    source = session.gen_dsp("tl_raw", [("raw", "int32_t raw() { return 0; }", [])])
+    (tmp_path / "raw.cc").write_text(source)
+    (tmp_path / "tl_raw.h").write_text("#include <remote.h>\n")
+    includes = [
+        Path(__file__).resolve().parents[3] / "src",
+        tmp_path,
+        Path(sdk.sdk_root) / "incs",
+        Path(sdk.sdk_root) / "incs" / "stddef",
+        qurt,
+        qurt / "qurt",
+    ]
+    result = subprocess.run(
+        [
+            str(compiler),
+            f"-m{arch}",
+            "-mhvx",
+            "-mhvx-length=128b",
+            "-O2",
+            "-fPIC",
+            "-std=c++17",
+            *[flag for path in includes for flag in ("-I", str(path))],
+            "-c",
+            str(tmp_path / "raw.cc"),
+            "-o",
+            str(tmp_path / "raw.o"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_every_run_takes_the_processes_resources_and_gives_them_back():
     plans = fastrpc._plan([], [])
     source = session.gen_dsp("tl_session_x", [("fill_kernel", "int32_t fill_kernel(float* a) { return 0; }", plans)])
@@ -162,7 +209,8 @@ def test_a_pipeline_stage_runs_its_steps_in_turns():
 def test_pipeline_stages_take_resident_buffers_and_scalars_on_their_processes():
     s = session.Session.__new__(session.Session)
     s.processes = 2
-    s._closed = False
+    s._closed, s._holds_device = False, False
+    s._conn = SimpleNamespace(cleanup=lambda: None)
     s._allocations, s._buffer_generations = {}, {}
     ((name, _, params, out_idx),) = session.lower_kernels([(dma_step, [1])])
     k = session.SessionKernel(s, 0, name, params, out_idx)
@@ -200,7 +248,8 @@ def test_a_session_runs_on_one_to_four_processes():
 def test_buffers_and_runs_name_processes_of_their_session():
     s = session.Session.__new__(session.Session)
     s.processes = 2
-    s._closed = False
+    s._closed, s._holds_device = False, False
+    s._conn = SimpleNamespace(cleanup=lambda: None)
     s._allocations, s._buffer_generations = {}, {}
     with pytest.raises(ValueError, match="processes 0 to 1"):
         s.buffer(64, processes=[2])

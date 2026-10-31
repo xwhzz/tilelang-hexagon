@@ -110,7 +110,7 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
 # What a skel adds around its kernels' sources, which include the template
 # headers they call: its _open takes the DSP process's resources and its _close
 # gives them up (tl_hexagon_open and tl_hexagon_close, RUN_KERNEL).
-SKEL_INCLUDES = "#include <tl_templates/hexagon/power.h>\n"
+SKEL_INCLUDES = "#include <tl_templates/hexagon/common.h>\n#include <tl_templates/hexagon/power.h>\n"
 SKEL_OPEN = "  if (tl_hexagon_open() != 0) return AEE_EFAILED;\n"
 SKEL_CLOSE = "  tl_hexagon_close();\n"
 

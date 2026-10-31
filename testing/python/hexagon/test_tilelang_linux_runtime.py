@@ -445,7 +445,7 @@ def test_session_transport_cleans_up_agent_on_shutdown(monkeypatch, tmp_path):
     agent.write_text(
         f"#!{sys.executable}\n"
         "import socket, sys\n"
-        "assert sys.argv[1:] == ['0', '4'], sys.argv\n"
+        "assert sys.argv[1:] == ['0', '1', '4'], sys.argv\n"
         "s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\n"
         "print('AGENT_READY port=%d' % s.getsockname()[1], flush=True)\n"
         "conn, _=s.accept()\n"
