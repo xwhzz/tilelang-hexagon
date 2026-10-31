@@ -317,6 +317,46 @@ def test_fp16_prefill_matches_the_reference(model, tmp_path):
         decoder.close()
 
 
+@DEVICE
+@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
+def test_fp16_prefill_after_decode_steps(model, tmp_path):
+    """A chat's second turn: a prefill, decode steps, then a prefill from where
+    they stopped. The second prefill's attention reads by DMA the keys and
+    values the decode wrote with scalar stores, which the write-through cache
+    wrote back as they were written."""
+    path = _fp16_bundle(tmp_path, model)
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    torch.manual_seed(3)
+    seq = torch.randint(0, c.vocab, (150,))
+    first, steps = 60, 20
+    La, KVH, HD, max_pos = len(c.attention_layers), c.kv_heads, c.head_dim, 512
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    try:
+        decoder.reset()
+        decoder.prefill(seq[:first].tolist())
+        decoder.run(seq[first : first + steps].tolist(), first, steps, steps)
+        decoder.prefill(seq[first + steps :].tolist(), first + steps)
+        state = ref.new_state()
+        with torch.no_grad():
+            ref.run(seq, state)
+
+        def rel(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        n = len(seq)
+        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16)
+        k = convert.from_crouton_weight(k, (La, KVH, HD, max_pos)).float()
+        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16)
+        v = convert.from_crouton_weight(v, (La, KVH, max_pos, HD)).transpose(-1, -2).float()
+        conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, c.conv_taps - 1, c.dim)
+        errors = [rel(k[ai, :, :n], state.k[ai]) for ai in range(La)] + [rel(v[ai, :, :n], state.v[ai]) for ai in range(La)]
+        errors += [rel(conv[ci], state.conv[ci]) for ci in range(conv.shape[0])]
+        assert max(errors) < 1e-2, errors
+    finally:
+        decoder.close()
+
+
 def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
     c, _, _, path = tiny_bundle
     header = bundle.read_header(path)

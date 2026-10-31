@@ -458,6 +458,73 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
   return SeqStmt::Flatten(seq);
 }
 
+Stmt LowerCacheWriteback(const Buffer &buffer, const Array<Range> &region,
+                         const LowerArgs &T, arith::Analyzer *analyzer) {
+  ICHECK(IsGlobalBuffer(buffer))
+      << "a cache writeback is of DDR, not of " << buffer->name;
+  size_t n = region.size();
+  for (size_t i = 0; i + 2 < n; ++i)
+    ICHECK(analyzer->CanProveEqual(region[i]->extent, 1))
+        << "a cache writeback covers one matrix of " << buffer->name
+        << " at a time";
+  int64_t bytes = buffer->dtype.bytes();
+  Array<PrimExpr> strides = GetBufferStrides(buffer);
+  auto u32 = [&](const PrimExpr &e) {
+    return cast(DataType::UInt(32), analyzer->Simplify(e));
+  };
+  // `value` in the dtype of `like`.
+  auto as = [](const PrimExpr &like, int64_t value) {
+    return make_const(like.dtype(), value);
+  };
+  auto writeback = [&](const Array<Range> &start, const PrimExpr &run_bytes,
+                       const PrimExpr &runs, const PrimExpr &stride) {
+    PrimExpr span = (runs - 1) * stride + run_bytes;
+    PrimExpr ptr = MakeAccessPtrAtRegion(
+        buffer, start, strides, kAccessRead,
+        analyzer->Simplify(floordiv(span, as(span, bytes))));
+    return Evaluate(Call(DataType::Int(32), hexagon_cache_writeback(),
+                         {ptr, u32(run_bytes), u32(runs), u32(stride)}));
+  };
+  if (const CroutonLayoutNode *layout = CroutonOf(buffer, T.layout_map)) {
+    int run_axis = layout->column_tiles ? layout->RowAxis() : layout->ColAxis();
+    int across_axis =
+        layout->column_tiles ? layout->ColAxis() : layout->RowAxis();
+    // The tiles the region touches along an axis, [first, end).
+    auto tile = [&](int axis) {
+      return make_const(region[axis]->min.dtype(), kCroutonTile);
+    };
+    auto first = [&](int axis) {
+      return floordiv(region[axis]->min, tile(axis));
+    };
+    auto end = [&](int axis) {
+      return floordiv(region[axis]->min + region[axis]->extent + tile(axis) - 1,
+                      tile(axis));
+    };
+    int64_t tile_bytes = kCroutonTileElems * bytes;
+    int64_t stride =
+        (layout->column_tiles ? layout->RowTiles() : layout->ColTiles()) *
+        tile_bytes;
+    // The first tile's first element: LowerTileOp maps it through the layout.
+    Array<Range> start = region;
+    for (int axis : {run_axis, across_axis})
+      start.Set(axis, Range::FromMinExtent(first(axis) * tile(axis),
+                                           region[axis]->extent));
+    PrimExpr run_tiles = end(run_axis) - first(run_axis);
+    PrimExpr run_bytes = run_tiles * as(run_tiles, tile_bytes);
+    return writeback(start, run_bytes, end(across_axis) - first(across_axis),
+                     make_const(run_bytes.dtype(), stride));
+  }
+  ICHECK(RowMajor(buffer, T.layout_map))
+      << "a cache writeback of " << buffer->name
+      << " needs a row-major or Crouton layout";
+  // The region's rows of its last axis, at the buffer's row stride.
+  PrimExpr row_bytes = region[n - 1]->extent * as(region[n - 1]->extent, bytes);
+  PrimExpr rows = n >= 2 ? region[n - 2]->extent : as(row_bytes, 1);
+  PrimExpr stride =
+      n >= 2 ? strides[n - 2] * as(strides[n - 2], bytes) : row_bytes;
+  return writeback(region, row_bytes, rows, stride);
+}
+
 const VarNode *DMAPointedVar(const PrimExpr &ptr) {
   const auto *call = ptr.as<CallNode>();
   if (call == nullptr)
@@ -524,8 +591,46 @@ TIR_REGISTER_TL_TILE_OP(HexagonDmaCopy, dma_copy)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+HexagonCacheWriteback::HexagonCacheWriteback(
+    Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+  (void)annotations;
+  ObjectPtr<HexagonCacheWritebackNode> node =
+      make_object<HexagonCacheWritebackNode>();
+  // It reads the lines and makes DDR hold what they hold: ordered with the
+  // writes before it and the DMA loads after it.
+  auto access = NormalizeToAccessRegion(args[0], kAccessReadWrite);
+  node->buffer = access.region->buffer;
+  node->region = access.region->region;
+  node->SetAccessRegions({access});
+  data_ = std::move(node);
+}
+
+TileOperator HexagonCacheWritebackNode::Clone() const {
+  return HexagonCacheWriteback(make_object<HexagonCacheWritebackNode>(*this));
+}
+
+LayoutMap
+HexagonCacheWritebackNode::InferLayout(const LayoutInferArgs &layout_args,
+                                       InferLevel level) const {
+  (void)level;
+  hexagon::CheckHexagonTarget(layout_args.target);
+  return {};
+}
+
+Stmt HexagonCacheWritebackNode::Lower(const LowerArgs &lower_args,
+                                      arith::Analyzer *analyzer) const {
+  hexagon::CheckHexagonTarget(lower_args.target);
+  return hexagon::LowerCacheWriteback(buffer, region, lower_args, analyzer);
+}
+
+TIR_REGISTER_TL_TILE_OP(HexagonCacheWriteback, cache_writeback)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   HexagonDmaCopyNode::RegisterReflection();
+  HexagonCacheWritebackNode::RegisterReflection();
   namespace refl = tvm::ffi::reflection;
   // The commit and wait of a software pipeline's async copies (the target's
   // "async_copy_commit" and "async_copy_wait"): DMA groups of the queue.

@@ -49,6 +49,15 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
 bool DMAOutpacesHVX(const CopyNode &op, arith::Analyzer *analyzer);
 
 /*!
+ * \brief The writeback of `region` of the DDR buffer `buffer`
+ * (hexagon_cache_writeback): of a Crouton buffer, the whole tiles the region
+ * touches, a run of tiles at a time as a Crouton transfer moves them; of a
+ * row-major one, the region's rows.
+ */
+Stmt LowerCacheWriteback(const tirx::Buffer &buffer, const Array<Range> &region,
+                         const LowerArgs &T, arith::Analyzer *analyzer);
+
+/*!
  * \brief The data var a pointer argument of hexagon_dma_submit addresses:
  * tvm_access_ptr's buffer, or an address_of's BufferLoad; nullptr otherwise.
  */
@@ -80,6 +89,49 @@ public:
 
 protected:
   TileOperator Clone() const override;
+};
+
+/*!
+ * \brief The writeback of a DDR region's cache lines, which
+ * InsertWriteThroughWritebacks puts after each write of a buffer that
+ * T.annotate_write_through declares, so that DMA reads what the DSP wrote.
+ *
+ * Parsed from tl.tileop.cache_writeback; Hexagon only.
+ */
+class HexagonCacheWritebackNode : public TileOperatorNode {
+public:
+  tirx::Buffer buffer;
+  Array<Range> region;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.HexagonCacheWriteback",
+                                    HexagonCacheWritebackNode,
+                                    TileOperatorNode);
+
+  static void RegisterReflection() {
+    reflection::ObjectDef<HexagonCacheWritebackNode>();
+  }
+
+  Stmt Lower(const LowerArgs &lower_args,
+             arith::Analyzer *analyzer) const override;
+
+  LayoutMap InferLayout(const LayoutInferArgs &layout_args,
+                        InferLevel level) const override;
+
+  TileOperator Clone() const override;
+};
+
+class HexagonCacheWriteback : public TileOperator {
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(HexagonCacheWriteback,
+                                             TileOperator,
+                                             HexagonCacheWritebackNode);
+
+  /*! \brief From tl.tileop.cache_writeback's argument: the region. */
+  TVM_DLL HexagonCacheWriteback(
+      Array<PrimExpr> args,
+      Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+
+  static const Op &Get();
 };
 
 class HexagonDmaCopy : public Copy {

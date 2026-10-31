@@ -170,7 +170,7 @@ def test_resource_lifetime_changes_build_and_live_cache(builds, cache, monkeypat
     original_key = key(cache)
     source = session.gen_dsp("test", [])
     first = builds.run(source)
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "session")
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
     assert key(cache) == original_key
     assert session.gen_dsp("test", []) == source
     monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "call")
@@ -237,7 +237,7 @@ def _fake_kernel(monkeypatch):
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
     monkeypatch.setattr(build, "build_cmake_fastrpc", compile_project)
     monkeypatch.setattr(session.Session, "_start", lambda self, timeout: starts.append(len(starts)))
-    monkeypatch.setattr(session.Session, "_run", lambda self, kernel, given: None)
+    monkeypatch.setattr(session.Session, "_run", lambda self, kernel, given, process: None)
     sdk = SimpleNamespace(sdk_root="/sdk", ndk_root="/ndk", cmake_root="/cmake", dsp_arch="v79", validate=lambda: sdk)
     return adapter.HexagonKernelAdapter([], [], None, "int32_t k() { return 0; }", sdk=sdk), starts
 

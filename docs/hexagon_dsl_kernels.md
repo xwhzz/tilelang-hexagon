@@ -316,7 +316,7 @@ argument the kernel never writes skips the flush (`MarkUnwrittenDMASources`,
 caches. That flush was most of a transfer's cost on v79. With it, two 128-byte rows
 in flight moved at 3.3 GB/s and 16 KB blocks at 23 GB/s; without it, 14.6 and
 34 GB/s. A DDR buffer that only DMA moves, in every kernel of the session that
-reaches it, can be declared so: `T.annotate_dma_only(X)` (`MarkDMAOnlyBuffers`).
+reaches it, can be declared so: `T.annotate_dma_only(X)` (`MarkDMACacheDirections`).
 The DSP then holds none of its lines, and its loads and stores skip the maintenance
 (`TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN`, `TL_HEXAGON_DMA_VTCM_TO_DDR_UNCACHED`).
 Like every transfer, they bypass the L2: through it, 4 workers' 32 KB loads read
@@ -325,8 +325,17 @@ buffer in the kernel; it cannot check the session's other kernels. On v79 a 32 K
 transfer's writeback took about 2,000 cycles to submit, and a store's invalidate
 more when it was retired: LFM3's prefill, which moves its residual stream between
 DDR and VTCM a few rows at a time, spends 29% fewer cycles on its residual adds
-with the stream declared DMA-only. This path is device-tested on v79; it does not
-imply independent physical engines or arbitrary nested dispatch.
+with the stream declared DMA-only. A DDR buffer that the DSP writes and DMA reads,
+such as a KV cache, can instead be declared write-through: `T.annotate_write_through(X)`.
+The compiler then writes back each region written right after its write
+(`InsertWriteThroughWritebacks`): after a `T.copy` into the buffer, a `T.Parallel`
+loop that stores into it, or another store. Of a Crouton buffer it writes back the
+whole tiles the region touches, a run of tiles at a time. Its DMA loads then skip
+the source's writeback (`TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN`), which pays where a
+region is read many times after one write. As with DMA-only buffers, every kernel
+of the session that writes the buffer must declare it. This path is
+device-tested on v79; it does not imply independent physical engines or arbitrary
+nested dispatch.
 
 The programs of one launch can run in phases. `T.sync_grid()` waits until every tile
 program of the launch reaches it, and what a program stored before it, from HVX or

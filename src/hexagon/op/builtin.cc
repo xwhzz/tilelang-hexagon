@@ -34,6 +34,11 @@ TIR_DEFINE_TL_BUILTIN(hexagon_dma_wait)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(hexagon_cache_writeback)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 #define TL_HEXAGON_MATH_BUILTIN(Name)                                          \
   TIR_DEFINE_TL_BUILTIN(Name)                                                  \
       .set_num_inputs(1)                                                       \

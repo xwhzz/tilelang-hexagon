@@ -54,6 +54,13 @@ PrimExpr MakeAccessPtrAtRegion(const tirx::Buffer &buffer,
  */
 bool RowMajor(const tirx::Buffer &buffer, const LayoutMap &layout_map);
 
+/*!
+ * \brief tl.region(BufferLoad(buffer, mins), access_mask, extents...): a tile
+ * operator's operand covering `ranges` of `buffer`.
+ */
+PrimExpr RegionArg(const tirx::Buffer &buffer, const ffi::Array<Range> &ranges,
+                   int access_mask);
+
 } // namespace hexagon
 } // namespace tl
 } // namespace tvm

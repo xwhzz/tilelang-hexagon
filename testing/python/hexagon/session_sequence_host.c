@@ -5,7 +5,8 @@
 #include <assert.h>
 
 struct allocation {
-  uint8_t *host, *dsp, *valid, *dirty;
+  uint8_t *host, *dsp[MAX_PROCESSES], *valid[MAX_PROCESSES],
+      *dirty[MAX_PROCESSES];
   size_t size, lines;
   int fd;
 };
@@ -27,11 +28,14 @@ void *rpcmem_alloc(int heap, int flags, int size) {
       m->size = (size_t)size;
       m->lines = (m->size + 127) / 128;
       m->host = calloc(1, m->size);
-      m->dsp = calloc(1, m->size);
-      m->valid = calloc(m->lines, 1);
-      m->dirty = calloc(m->lines, 1);
+      for (int p = 0; p < MAX_PROCESSES; ++p) {
+        m->dsp[p] = calloc(1, m->size);
+        m->valid[p] = calloc(m->lines, 1);
+        m->dirty[p] = calloc(m->lines, 1);
+        assert(m->dsp[p] && m->valid[p] && m->dirty[p]);
+      }
       m->fd = next_fd++;
-      assert(m->host && m->dsp && m->valid && m->dirty);
+      assert(m->host);
       return m->host;
     }
   return 0;
@@ -46,9 +50,11 @@ void rpcmem_free(void *p) {
   for (int i = 0; i < 1024; ++i)
     if (memory[i].host == p) {
       free(memory[i].host);
-      free(memory[i].dsp);
-      free(memory[i].valid);
-      free(memory[i].dirty);
+      for (int p = 0; p < MAX_PROCESSES; ++p) {
+        free(memory[i].dsp[p]);
+        free(memory[i].valid[p]);
+        free(memory[i].dirty[p]);
+      }
       memset(&memory[i], 0, sizeof(memory[i]));
       return;
     }
@@ -72,7 +78,8 @@ int fastrpc_munmap(int d, int fd, void *p, uint64_t n) {
 }
 int seq_test_open(const char *uri, remote_handle64 *h) {
   (void)uri;
-  *h = 1;
+  static int opened;
+  *h = (remote_handle64)opened++;
   return 0;
 }
 int seq_test_close(remote_handle64 h) {
@@ -86,18 +93,18 @@ int seq_test_release(remote_handle64 h, int32_t fd) {
   return 0;
 }
 
-static void load_line(struct allocation *m, size_t line) {
-  if (m->valid[line])
+static void load_line(struct allocation *m, int p, size_t line) {
+  if (m->valid[p][line])
     return;
   size_t start = line * 128, n = m->size - start;
   if (n > 128)
     n = 128;
-  memcpy(m->dsp + start, m->host + start, n);
-  m->valid[line] = 1;
+  memcpy(m->dsp[p] + start, m->host + start, n);
+  m->valid[p][line] = 1;
 }
 int seq_test_sync(remote_handle64 h, int32_t fd, uint32_t off, uint32_t size,
                   int32_t writeback) {
-  (void)h;
+  int p = (int)h;
   if (sync_failure && --sync_failure == 0)
     return (int)0x80000073u;
   struct allocation *m = by_fd(fd);
@@ -110,17 +117,17 @@ int seq_test_sync(remote_handle64 h, int32_t fd, uint32_t off, uint32_t size,
     size_t start = line * 128, n = m->size - start;
     if (n > 128)
       n = 128;
-    if (m->valid[line] && m->dirty[line])
-      memcpy(m->host + start, m->dsp + start, n);
-    m->dirty[line] = 0;
+    if (m->valid[p][line] && m->dirty[p][line])
+      memcpy(m->host + start, m->dsp[p] + start, n);
+    m->dirty[p][line] = 0;
     if (!writeback)
-      m->valid[line] = 0;
+      m->valid[p][line] = 0;
   }
   return 0;
 }
 int seq_test_run(remote_handle64 h, int32_t kernel, const int32_t *args, int n,
                  const uint8_t *in, int ni, uint8_t *out, int no) {
-  (void)h;
+  int p = (int)h;
   (void)in;
   (void)ni;
   (void)out;
@@ -132,8 +139,8 @@ int seq_test_run(remote_handle64 h, int32_t kernel, const int32_t *args, int n,
   struct allocation *m = by_fd(args[1]);
   assert(m && args[0] == 0);
   size_t offset = (uint32_t)args[2];
-  load_line(m, offset / 128);
-  int32_t *values = (int32_t *)(m->dsp + offset);
+  load_line(m, p, offset / 128);
+  int32_t *values = (int32_t *)(m->dsp[p] + offset);
   int status = 0, scalar = kernel == 3 ? 0 : args[4];
   if (kernel == 0) {
     values[1] = values[0] + scalar;
@@ -149,9 +156,34 @@ int seq_test_run(remote_handle64 h, int32_t kernel, const int32_t *args, int n,
     values[1] = acquires - 1;
     values[2] = releases;
   }
-  m->dirty[offset / 128] = 1;
+  m->dirty[p][offset / 128] = 1;
   ++runs;
   ++releases;
   lease = 0;
   return status;
+}
+
+int remote_session_control(int op, void *arg, unsigned int size) {
+  (void)size;
+  if (op == FASTRPC_RESERVE_NEW_SESSION) {
+    remote_rpc_reserve_new_session_t *r = arg;
+    r->effective_domain_id = 11;
+    r->session_id = 1;
+  } else if (op == FASTRPC_GET_URI) {
+    remote_rpc_get_uri_t *u = arg;
+    u->uri[0] = 0;
+  }
+  return AEE_SUCCESS;
+}
+int seq_test_pipeline(remote_handle64 h, int32_t kernel, const int32_t *args,
+                      int n, int32_t steps, int32_t stage, int32_t stages,
+                      int32_t turn) {
+  (void)h;
+  (void)kernel;
+  (void)args;
+  (void)n;
+  (void)stage;
+  (void)stages;
+  (void)turn;
+  return steps == 0 ? AEE_SUCCESS : AEE_EBADPARM;
 }

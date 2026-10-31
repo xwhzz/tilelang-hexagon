@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 using AEEResult = int;
 enum { AEE_SUCCESS, AEE_EFAILED, AEE_ENOMEMORY, AEE_EBADPARM, QURT_EOK = 0 };
@@ -91,18 +92,33 @@ static void test_free(void *p) {
   ++frees;
   std::free(p);
 }
-static int resources_open() {
-  assert(votes == 1 && unvotes == 0 && !resources_live);
+#define TL_HEXAGON_USES_VTCM 1
+#define TL_OK 0
+#define TL_ERR_VTCM 1
+static bool context_live;
+static int tl_vtcm_open(int) {
+  assert(votes == 1 && unvotes == 0 && !context_live);
+  context_live = true;
+  return 0;
+}
+static int tl_vtcm_take() {
+  assert(context_live && !resources_live);
   assert(power_owner == std::this_thread::get_id());
+  if (failure == "resources" || failure == "take")
+    return -1;
   owner = std::this_thread::get_id();
   resources_live = true;
   ++opened;
-  return failure == "resources" ? AEE_EFAILED : AEE_SUCCESS;
+  return 0;
 }
-static void resources_close() {
+static void tl_vtcm_give() {
   assert(resources_live && owner == std::this_thread::get_id());
   resources_live = false;
   ++closed;
+}
+static void tl_vtcm_close() {
+  assert(context_live && !resources_live);
+  context_live = false;
 }
 static void tl_power_vote() {
   assert(votes == 0);
@@ -131,30 +147,33 @@ int main(int argc, char **argv) {
   assert(argc == 3);
   caller_stack = std::string(argv[1]) == "direct" ? 512 * 1024 : 16 * 1024;
   failure = argv[2];
+  std::string requested = failure;
+  if (failure == "take")
+    failure = "none";
   int status = tl_session_dispatch_open();
+  failure = requested;
   bool startup_failure =
-      failure != "none" && failure != "join" &&
-      !(failure == "resources" && tl_session_resources_per_call);
+      failure != "none" && failure != "join" && failure != "take";
   if (startup_failure) {
     assert(status == (failure == "allocate" ? AEE_ENOMEMORY : AEE_EFAILED));
   } else {
     assert(status == AEE_SUCCESS);
     int value = 0;
     void *args[] = {&value};
-    assert(resources_live == !tl_session_resources_per_call);
+    assert(!resources_live && context_live);
     assert(votes == 1 && unvotes == 0);
-    if (failure == "resources") {
-      // A call-scoped acquisition failure is returned without invoking the
-      // kernel, releases partial resources, and leaves the session usable.
-      assert(tl_session_dispatch_run(0, args) == AEE_EFAILED);
-      assert(value == 0 && opened == 1 && closed == 1 && !resources_live);
+    if (failure == "take") {
+      failure = "resources";
+      assert(tl_session_dispatch_run(0, args) == 0x1001);
+      assert(value == 0 && opened == closed && !resources_live);
       failure = "none";
     }
     for (int i = 1; i <= 20; ++i) {
-      assert(tl_session_dispatch_run(0, args) == (i == 20 ? 37 : AEE_SUCCESS));
+      assert(tl_session_dispatch_run(0, args) ==
+             (i == 20 ? 0x1000 + 37 : AEE_SUCCESS));
       assert(value == i);
-      assert(resources_live == !tl_session_resources_per_call);
-      assert(opened - closed == (tl_session_resources_per_call ? 0u : 1u));
+      assert(!resources_live);
+      assert(opened == closed);
       assert(votes == 1 && unvotes == 0);
     }
     assert(tl_session_dispatch_run(1, args) == AEE_EBADPARM);

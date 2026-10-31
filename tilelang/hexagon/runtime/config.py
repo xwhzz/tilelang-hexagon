@@ -68,14 +68,16 @@ def domain_id() -> int:
 
 
 def resource_lifetime() -> str:
-    """VTCM/HMX lease: a whole Session (default) or each completed kernel call.
+    """VTCM/HMX lease: cached contexts (default) or full per-call acquisition.
 
     This is a firmware/profile choice, independent of HLOS and DSP ISA. DSP
     clock votes, resident DDR buffers and execution threads stay session-scoped.
     """
-    lifetime = os.environ.get("TILELANG_HEXAGON_RESOURCE_LIFETIME", "session")
-    if lifetime not in ("session", "call"):
-        raise ValueError(f"TILELANG_HEXAGON_RESOURCE_LIFETIME is session or call, not {lifetime!r}")
+    lifetime = os.environ.get("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
+    if lifetime not in ("cached", "call"):
+        raise ValueError(
+            f"TILELANG_HEXAGON_RESOURCE_LIFETIME is cached or call, not {lifetime!r}; the former session lease is no longer supported"
+        )
     return lifetime
 
 

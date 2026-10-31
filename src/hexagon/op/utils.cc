@@ -10,7 +10,8 @@
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
-#include "op/utils.h" // IsSharedBuffer, IsFragmentBuffer
+#include "op/builtin.h" // region
+#include "op/utils.h"   // IsSharedBuffer, IsFragmentBuffer
 #include "support/check.h"
 
 namespace tvm {
@@ -81,6 +82,19 @@ bool RowMajor(const Buffer &buffer, const LayoutMap &layout_map) {
   }
   return analyzer.CanProveEqual(layout.value()->GetLinearizedForwardIndex(),
                                 row_major);
+}
+
+PrimExpr RegionArg(const Buffer &buffer, const Array<Range> &ranges,
+                   int access_mask) {
+  Array<PrimExpr> mins;
+  Array<PrimExpr> args;
+  for (const Range &r : ranges)
+    mins.push_back(r->min);
+  args.push_back(BufferLoad(buffer, mins));
+  args.push_back(IntImm(DataType::Int(32), access_mask));
+  for (const Range &r : ranges)
+    args.push_back(r->extent);
+  return Call(DataType::Handle(), region(), args);
 }
 
 } // namespace hexagon

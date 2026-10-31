@@ -99,12 +99,27 @@ def StageHMXOperandCopies():
     return _ffi_api.StageHMXOperandCopies()  # type: ignore
 
 
-def MarkDMAOnlyBuffers():
-    """Transfers of the buffers ``T.annotate_dma_only`` declares skip the
-    cache maintenance of their DDR side, and any other use of those buffers is
-    an error. Runs after ``LowerTileOp``.
+def InsertWriteThroughWritebacks():
+    """Write back each write of a buffer ``T.annotate_write_through`` declares.
+
+    After each ``T.copy`` into such a buffer, each ``T.Parallel`` loop that
+    stores into it, and each other store, the region written is written back
+    to DDR (``tl.tileop.cache_writeback``), so that its DMA loads may skip
+    their own writeback (``MarkDMACacheDirections``). Runs on tile programs,
+    before ``LayoutInference``.
     """
-    return _ffi_api.MarkDMAOnlyBuffers()  # type: ignore
+    return _ffi_api.InsertWriteThroughWritebacks()  # type: ignore
+
+
+def MarkDMACacheDirections():
+    """The cache maintenance a DDR buffer's declarations let its DMA skip.
+
+    Transfers of the buffers ``T.annotate_dma_only`` declares skip it both
+    ways, and any other use of those buffers is an error; loads of the buffers
+    ``T.annotate_write_through`` declares skip the source's writeback. Runs
+    after ``LowerTileOp``.
+    """
+    return _ffi_api.MarkDMACacheDirections()  # type: ignore
 
 
 def MarkUnwrittenDMASources():

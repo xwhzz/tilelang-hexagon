@@ -44,8 +44,8 @@ TVM_DLL const Op &hexagon_dma_queue();
  * direction is dma.h's tl_hexagon_dma_direction, which picks the DDR side's
  * cache maintenance: 0 for DDR to VTCM and 1 for VTCM to DDR, as lowered; 3
  * for DDR to VTCM from memory no dirty line holds (MarkUnwrittenDMASources,
- * MarkDMAOnlyBuffers), 4 for VTCM to DDR into memory the DSP holds no lines
- * of (MarkDMAOnlyBuffers).
+ * MarkDMACacheDirections), 4 for VTCM to DDR into memory the DSP holds no
+ * lines of (MarkDMACacheDirections).
  */
 TVM_DLL const Op &hexagon_dma_submit();
 
@@ -61,6 +61,15 @@ TVM_DLL const Op &hexagon_dma_commit();
  * codegen does not print them.
  */
 TVM_DLL const Op &hexagon_dma_wait();
+
+/*!
+ * \brief Write the DSP's cache lines of a DDR region back to DDR:
+ * hexagon_cache_writeback(ptr, run_bytes, runs, stride), `runs` runs of
+ * `run_bytes` bytes, `stride` bytes apart. The writeback of a write-through
+ * buffer's writes (InsertWriteThroughWritebacks), so that DMA reads what the
+ * DSP wrote.
+ */
+TVM_DLL const Op &hexagon_cache_writeback();
 
 // HVX math. LowerMath rewrites the fp16/fp32 tirx math intrinsics into these
 // before vectorization: they are vectorizable, and the codegen prints scalar

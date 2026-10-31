@@ -19,7 +19,7 @@ using half = __fp16;
 
 // Kernel status ABI.  A tilelang Hexagon kernel entry returns int32_t — 0 on
 // success, nonzero on an unrecoverable device condition.  The FastRPC skel maps
-// nonzero to AEE_EFAILED (tl_hexagon_forward_kernel_status in
+// nonzero to an error status (tl_hexagon_run_kernel in
 // runtime/fastrpc.py), so the host's run() raises instead of silently returning
 // unwritten/partial output.  The codegen emits these codes into the
 // kernel/worker source.

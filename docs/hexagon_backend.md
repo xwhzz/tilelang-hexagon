@@ -90,7 +90,16 @@ These are the decisions that keep the adaptation small and the code navigable.
   their own), `worker.h` (the HW-thread pool).
 - **Layer 5** — `tilelang/hexagon/runtime/`: `session.py` builds kernels into one
   skel and runs them through an Android or Linux agent that holds their FastRPC session
-  and device-resident buffers, over a socket forwarded by ADB or SSH; `build.py`/`env.py`
+  and device-resident buffers, over a socket forwarded by ADB or SSH. A session can span up
+  to 4 DSP processes (`Session(..., processes=P)`), each with its own 4 GB of
+  addresses: a buffer is mapped into the processes it names, and a kernel runs on
+  the one it is called on. Each process caches its own lines of a buffer, so data
+  that crosses processes moves by DMA (`T.annotate_dma_only`). `Session.pipeline`
+  runs steps of kernels on several processes with one FastRPC call each. The
+  processes pass a turn word on the DSP, which costs 0.2 µs a turn; a FastRPC call
+  costs about 300 µs. The VTCM changes hands with each turn, and the resource
+  manager zeroes it when it does: about 72 µs for the 8 MiB on a v79, and this
+  firmware does not let a client turn the zeroing off. `build.py`/`env.py`
   drive the Hexagon SDK build, and `fastrpc.py` holds the pieces of a project the
   skels share. `adapter.py` is `tilelang.compile`'s: on both Android and Linux, a
   compiled kernel uses a resident session of one kernel. Android uses ADB; Linux
@@ -263,6 +272,22 @@ and explicit HMX atoms.
   - **Arenas.** The programs' arenas start after these buffers.
   - **Capacity.** `VerifyVTCMArena` counts the buffers with the arenas.
 
+- **VTCM and HMX are taken per run.** They form one cached `HAP_compute_res`
+  context per DSP process, which the skel's `_open` creates (`vtcm.h`). Each run
+  takes it and gives it back when it ends (`tl_hexagon_run_kernel`), so the
+  processes of a session take turns. The region keeps its address throughout. An
+  uncontended release and acquire costs about 5 µs on the upstream-tested v79.
+  `TILELANG_HEXAGON_RESOURCE_LIFETIME=cached` is the default. An explicit `call`
+  profile uses full, independent VTCM/HMX grants per invocation for older BSPs;
+  its compiled code does not import the cached-resource APIs. Both profiles keep
+  resident DDR, workers, and DSP power votes alive across calls and release grants
+  only after the kernel has joined its workers and drained DMA. Neither preempts
+  a long kernel or promises a release-callback deadline. The earlier draft's
+  `session` profile is removed: use `cached`, or `call` for the compatible BSP.
+  Multi-process sessions currently require `cached` on Android's default cDSP
+  domain; Linux, other domains, and `call` multi-process combinations fail before
+  building. New platform combinations need independent device qualification.
+
 - **The worker pool = 1 HMX + 6 HVX.** The producer/consumer model: the 6 HVX units
   run pack/unpack/softmax/copies in parallel; the 1 HMX MAC is serialized by a
   `memw_locked` spinlock around the accumulator sequence. Each HMX-using pool thread
@@ -311,21 +336,22 @@ and explicit HMX atoms.
   a delayed ACK between small writes.
 - **Sessions** (`tilelang.hexagon.runtime.session.Session`) serve models.
   - **Kernels.** Several kernels build into one skel and share one agent and one
-    FastRPC session: one PD and one persistent worker pool. Each lowers under its
+    FastRPC session: one persistent worker pool per DSP process. Each lowers under its
     own pass configs (`T.annotate_pass_configs`), as `tilelang.compile` lowers it, so a
     prefill can have fast math while the decode beside it keeps its arithmetic. Lowered
     sources are cached on disk (`$TILELANG_CACHE_DIR/hexagon_lowered`), keyed by the
     kernel's script, the target, its pass configs and the compiler (tilelang's version,
     native libraries and Python sources): the LFM2 decode lowers in 36 s, and in 2 s
     from the cache.
-  - **Resource policy.** `TILELANG_HEXAGON_RESOURCE_LIFETIME=session` is the default:
-    the Session holds its required VTCM/HMX resources until close. With `call`, it
-    acquires them on the execution thread before each kernel invocation and releases
-    them on that thread before returning, including kernel-error paths. The DSP
-    power vote, execution threads, worker pool, and resident DDR buffers retain their
-    Session lifetime. VTCM state is not preserved between call-scoped invocations.
-    This explicit policy is part of the build-cache identity; it is not inferred
-    from the DSP architecture or selected automatically by `run_sequence`.
+  - **Resource policy.** `TILELANG_HEXAGON_RESOURCE_LIFETIME=cached` is the default:
+    each run takes and gives the process's cached VTCM/HMX context. Explicit `call`
+    uses full acquire/release without cached-resource imports for compatible BSPs.
+    Both release on the execution thread after workers finish, including kernel
+    errors. The DSP power vote, execution threads, worker pool, and resident DDR
+    retain their Session lifetime. VTCM contents are not preserved between runs;
+    only `cached` retains the context's address. The build cache includes the
+    policy; neither the DSP ISA nor `run_sequence` selects it automatically. The
+    earlier draft's `session` value now fails with an explicit migration message.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
@@ -345,10 +371,10 @@ and explicit HMX atoms.
     retains the Session's selected resource policy. With `call`, VTCM/HMX are
     acquired/released for each invocation. Neither policy nor this sequence API
     preempts a long Run or provides a 5 ms scheduling guarantee.
-    Each Run supplies every parameter, using resident buffers and int32 scalars;
+    Each Run targets process 0 and supplies every parameter, using resident buffers and int32 scalars;
     inline tensors are unsupported. A Run buffer remains 128-byte aligned and must
     contain the kernel's full static extent. Copy uses arbitrary byte offsets
-    relative to its views, checks DSP cache synchronization, and supports overlap
+    relative to its views, checks cache synchronization in every mapping process, and supports overlap
     via `memmove`. No loop, branch, automatic retry, or model logic is implicit.
     Both Python and the agent validate the entire list before execution (at most
     4096 operations and a 1 MiB encoded payload). Invalid Python descriptors raise

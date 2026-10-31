@@ -13,12 +13,12 @@ if TYPE_CHECKING:
 
 MAX_OPERATIONS = 4096
 MAX_BYTES = 1 << 20
-OP_SEQUENCE = 9
+OP_SEQUENCE = 10  # 9 is the upstream DSP pipeline operation.
 
 
 @dataclass(frozen=True)
 class Run:
-    """One existing kernel invocation, with all arguments resident or int32."""
+    """One kernel invocation on process 0, with all arguments resident or int32."""
 
     kernel: SessionKernel
     args: tuple
@@ -108,7 +108,7 @@ def encode(session, operations):
             if len(op.args) != len(kernel.plans):
                 raise ValueError(f"{kernel.name} needs all {len(kernel.plans)} arguments")
             payload += struct.pack("<III", 0, kernel.index, len(op.args))
-            for plan, value in zip(kernel.plans, op.args):
+            for i, (plan, value) in enumerate(zip(kernel.plans, op.args)):
                 if plan.is_scalar:
                     scalar = _integer(value, "a Run scalar")
                     if plan.ctype != "int32_t" or not -(1 << 31) <= scalar < 1 << 31:
@@ -116,6 +116,7 @@ def encode(session, operations):
                     payload += struct.pack("<IIQQ", 3, scalar & 0xFFFFFFFF, 0, 0)
                 else:
                     allocation = buffer(value)
+                    session._check_resident(kernel, i, value, 0)
                     if value.offset % 128 or value.nbytes < plan.nbytes:
                         raise ValueError(f"{kernel.name} requires a 128-byte aligned buffer of at least {plan.nbytes} bytes")
                     payload += struct.pack("<IIQQ", 0, value.id, value.offset, allocation.generation)
@@ -266,7 +267,7 @@ static int tl_serve_sequence(int cli) {
           if (kind != 3 || offset || generation) goto done;
           op->args[3 * j + 1] = (int32_t)value;
         } else {
-          if (kind != 0 || offset % 128 || !tl_seq_range(value, generation, offset, tl_seq_params[param].bytes)) goto done;
+          if (kind != 0 || offset % 128 || !tl_seq_range(value, generation, offset, tl_seq_params[param].bytes) || !(g_buffers[value].procs & 1)) goto done;
           op->args[3 * j + 1] = g_buffers[value].fd;
           op->args[3 * j + 2] = (int32_t)offset;
         }
@@ -292,13 +293,13 @@ static int tl_serve_sequence(int cli) {
     int e = AEE_SUCCESS;
     if (op->kind == 0) {
       int64_t begin = tl_seq_now();
-      e = TL_IFACE_run(g_handle, (int32_t)op->kernel, op->args, 3 * (int)op->nargs, g_inputs, 0, g_outputs, 0);
+      e = TL_IFACE_run(g_handles[0], (int32_t)op->kernel, op->args, 3 * (int)op->nargs, g_inputs, 0, g_outputs, 0);
       g_last_run_ns = tl_seq_now() - begin;
       times[nruns++] = (struct tl_seq_time){i, op->kernel, g_last_run_ns};
     } else if (op->size) {
-      e = TL_IFACE_sync(g_handle, g_buffers[op->src].fd, (uint32_t)op->source, (uint32_t)op->size, 1);
+      e = sync_buffer((int)op->src, op->source, op->size, 1);
       if (e == AEE_SUCCESS)
-        e = TL_IFACE_sync(g_handle, g_buffers[op->dst].fd, (uint32_t)op->target, (uint32_t)op->size, 0);
+        e = sync_buffer((int)op->dst, op->target, op->size, 0);
       if (e == AEE_SUCCESS)
         memmove(g_buffers[op->dst].ptr + op->target, g_buffers[op->src].ptr + op->source, (size_t)op->size);
     }

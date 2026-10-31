@@ -44,6 +44,40 @@ def deep(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
             out[i] = local[i] + local[i + N]
 
 
+@T.prim_func
+def dma_step(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
+    """out = a + 1 through VTCM, its DDR buffers moved by DMA alone: data that
+    crosses DSP processes, whose caches are their own."""
+    with T.Kernel(1):
+        T.annotate_dma_only(a, out)
+        s = T.alloc_shared((N,), "float32")
+        T.dma_copy(a, s)
+        T.dma_wait()
+        for i in T.Parallel(N):
+            s[i] = s[i] + T.float32(1)
+        T.dma_copy(s, out)
+        T.dma_wait()
+
+
+@T.prim_func
+def hmx_gemm(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 32), "float16"), C: T.Tensor((64, 32), "float32")):
+    with T.Kernel(1):
+        a = T.alloc_shared((64, 64), "float16")
+        b = T.alloc_shared((64, 32), "float16")
+        c = T.alloc_shared((64, 32), "float32")
+        T.copy(A, a)
+        T.copy(B, b)
+        T.gemm(a, b, c, clear_accum=True)
+        T.copy(c, C)
+
+
+@T.prim_func
+def stamp(step: T.int32, out: T.Tensor((64,), "int32")):
+    """out[step] = step + 1: a pipeline stage's step index."""
+    with T.Kernel(1):
+        out[step] = step + 1
+
+
 def _exp(fast: bool):
     @T.prim_func
     def kernel(a: T.Tensor((N,), "float32"), out: T.Tensor((N,), "float32")):
@@ -103,13 +137,81 @@ def test_session_skel_dispatches_by_kernel():
     assert "HAP_mmap_get(fd, &vaddr, &paddr)" in source
 
 
-def test_session_agent_maps_buffers_into_the_dsp_once():
+def test_every_run_takes_the_processes_resources_and_gives_them_back():
+    plans = fastrpc._plan([], [])
+    source = session.gen_dsp("tl_session_x", [("fill_kernel", "int32_t fill_kernel(float* a) { return 0; }", plans)])
+    assert "return tl_hexagon_run_kernel([&]() { return tl_session_kernel_0(" in source
+    run = source[source.index("static AEEResult tl_hexagon_run_kernel(") :]
+    assert run.index("tl_hexagon_take()") < run.index("fn()") < run.index("tl_hexagon_give()")
+
+
+def test_a_pipeline_stage_runs_its_steps_in_turns():
+    plans = fastrpc._plan([], [])
+    source = session.gen_dsp("tl_session_x", [("fill_kernel", "int32_t fill_kernel(float* a) { return 0; }", plans)])
+    stage = source[source.index("AEEResult tl_session_x_pipeline(") :]
+    assert (
+        stage.index("tl_turn_wait(word, mine)")
+        < stage.index("tl_session_dispatch_run(kernel, a)")
+        < stage.index("tl_turn_write(word, mine + 1)")
+    )
+    # The processes' caches are their own: the turn word's line is dropped
+    # before a read and cleaned after a write.
+    assert 'asm volatile("dcinva(%0)"' in source and 'asm volatile("dccleaninva(%0)"' in source
+
+
+def test_pipeline_stages_take_resident_buffers_and_scalars_on_their_processes():
+    s = session.Session.__new__(session.Session)
+    s.processes = 2
+    s._closed = False
+    s._allocations, s._buffer_generations = {}, {}
+    ((name, _, params, out_idx),) = session.lower_kernels([(dma_step, [1])])
+    k = session.SessionKernel(s, 0, name, params, out_idx)
+    a0 = session._BufferAllocation(0, N * 4, 1, processes=(0,))
+    a1 = session._BufferAllocation(1, N * 4, 1, processes=(1,))
+    s._allocations = {0: a0, 1: a1}
+    on0 = session.DeviceBuffer(s, 0, N * 4, processes=(0,), _allocation=a0)
+    on1 = session.DeviceBuffer(s, 1, N * 4, processes=(1,), _allocation=a1)
+    with pytest.raises(ValueError, match="distinct processes"):
+        s.pipeline([(k, 0, [on0, on0]), (k, 0, [on0, on0])], 1)
+    with pytest.raises(ValueError, match=r"runs on process 1, its buffer is mapped into \[0\]"):
+        s.pipeline([(k, 1, [on0, on1])], 1)
+    with pytest.raises(ValueError, match="Session.STEP stands for a scalar"):
+        s.pipeline([(k, 0, [session.Session.STEP, on0])], 1)
+    with pytest.raises(TypeError, match="resident buffers and scalars"):
+        s.pipeline([(k, 0, [torch.zeros(N), on0])], 1)
+
+
+def test_session_agent_maps_a_buffer_into_the_processes_it_names():
     agent = session.gen_agent("tl_session_x")
     assert "rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED" in agent
-    assert "fastrpc_mmap(g_domain, fd, p, 0, size, FASTRPC_MAP_FD)" in agent
+    # Processes past the first are reserved sessions of the cDSP.
+    assert "remote_session_control(FASTRPC_RESERVE_NEW_SESSION" in agent
+    assert "fastrpc_mmap(g_domains[q], fd, p, 0, size, FASTRPC_MAP_FD)" in agent
+    # A host access syncs the lines every process caches.
+    assert "if (ok) ok = sync_buffer(id, offset, size, 1) == AEE_SUCCESS;" in agent
 
 
-@pytest.mark.parametrize("lifetime", ["session", "call"])
+def test_a_session_runs_on_one_to_four_processes():
+    for processes in (0, 5):
+        with pytest.raises(ValueError, match="1 to 4 DSP processes"):
+            session.Session.of_lowered([], processes=processes)
+
+
+def test_buffers_and_runs_name_processes_of_their_session():
+    s = session.Session.__new__(session.Session)
+    s.processes = 2
+    s._closed = False
+    s._allocations, s._buffer_generations = {}, {}
+    with pytest.raises(ValueError, match="processes 0 to 1"):
+        s.buffer(64, processes=[2])
+    with pytest.raises(ValueError, match="processes 0 to 1"):
+        s.buffer(64, processes=[])
+    kernel = session.SessionKernel(s, 0, "fill", [], [])
+    with pytest.raises(ValueError, match="fill runs on one of processes 0 to 1, not 2"):
+        kernel(process=2)
+
+
+@pytest.mark.parametrize("lifetime", ["cached", "call"])
 def test_session_dispatch_lifecycle_on_host(tmp_path, monkeypatch, lifetime):
     compiler = shutil.which("c++")
     if compiler is None:
@@ -117,22 +219,20 @@ def test_session_dispatch_lifecycle_on_host(tmp_path, monkeypatch, lifetime):
     # Exercise the generated implementation with real host synchronization.
     # This checks resource ownership/error cleanup, not DSP stack capacity.
     monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", lifetime)
-    monkeypatch.setattr(fastrpc, "SKEL_RESOURCES_OPEN", "  return resources_open();\n")
-    monkeypatch.setattr(fastrpc, "SKEL_RESOURCES_CLOSE", "  resources_close();\n")
-    dispatch = session._dispatch_source("  case 0: return test_kernel(a);\n")
+    dispatch = fastrpc.RUN_KERNEL + session._dispatch_source("  case 0: return tl_hexagon_run_kernel([&]() { return test_kernel(a); });\n")
     harness = Path(__file__).with_name("session_dispatch_host.cc").read_text()
     source, executable = tmp_path / "dispatch.cc", tmp_path / "dispatch"
     source.write_text(harness.replace("// GENERATED_DISPATCH", dispatch))
     subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(executable)], check=True, timeout=30)
     for mode, failures in [
-        ("direct", ["none", "query", "resources"]),
-        ("worker", ["none", "query", "allocate", "create", "resources", "join"]),
+        ("direct", ["none", "query", "resources", "take"]),
+        ("worker", ["none", "query", "allocate", "create", "resources", "take", "join"]),
     ]:
         for failure in failures:
             subprocess.run([str(executable), mode, failure], check=True, timeout=10)
 
 
-@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session "])
+@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session ", "session"])
 def test_invalid_resource_lifetime_fails_before_lowering_or_build(monkeypatch, value):
     monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", value)
     monkeypatch.setattr(session, "lower_kernels", lambda *args: pytest.fail("must reject before lowering"))
@@ -170,6 +270,7 @@ def _start(monkeypatch, agent):
     s = session.Session.__new__(session.Session)
     s._conn, s._closed, s._holds_device = _LocalAgent(agent), False, False
     s._device_dir, s._domain = "/tmp/session", 3
+    s.processes = 1
     s._artifacts = SimpleNamespace(dsp_skel="skel.so", agent_exe="agent")
     try:
         s._start(5.0)
@@ -320,3 +421,143 @@ def test_a_large_resident_argument_adds_no_cost(sess):
     assert per_call(big) < 1.5 * per_call(small) + 0.002
     big.free()
     small.free()
+
+
+def _f32(buf):
+    return torch.frombuffer(bytearray(buf.read()), dtype=torch.float32)
+
+
+@DEVICE
+def test_processes_have_their_own_addresses():
+    # The same 2.5 GiB mapped into two processes: 5 GiB of mappings, more than
+    # one process's 4 GB of addresses hold.
+    with session.Session([(fill, [1])], processes=2) as s:
+        bufs = [s.buffer(512 << 20) for _ in range(5)]
+        for buf in bufs:
+            buf.free()
+
+
+@DEVICE
+def test_the_host_sees_what_another_process_wrote():
+    with session.Session([(fill, [1]), (add, [2])], processes=2) as s:
+        k_fill, k_add = s.kernels
+        buf = s.buffer(N * 4)
+        # Process 1's kernel leaves its lines dirty; the read syncs process 1 too.
+        k_fill(torch.tensor([2.5]), buf, process=1)
+        torch.testing.assert_close(_f32(buf), torch.full((N,), 2.5))
+        # The host's write reaches process 1's kernel, not lines it cached.
+        buf.write(torch.ones(N))
+        x = torch.randn(N)
+        torch.testing.assert_close(k_add(x, buf, process=1), x + 1)
+        buf.free()
+
+
+@DEVICE
+def test_processes_take_turns_at_vtcm_and_pass_data_by_dma():
+    with session.Session([(dma_step, [1])], processes=2) as s:
+        (k,) = s.kernels
+        a, b = s.buffer(N * 4), s.buffer(N * 4)
+        x = torch.randn(N)
+        a.write(x)
+        for _ in range(5):
+            k(a, b, process=0)
+            k(b, a, process=1)
+        torch.testing.assert_close(_f32(a), x + 10)
+        a.free()
+        b.free()
+
+
+@DEVICE
+def test_processes_take_turns_at_hmx():
+    with session.Session([(hmx_gemm, [2])], processes=2) as s:
+        (k,) = s.kernels
+        for i in range(6):
+            a = (torch.randn(64, 64) * 0.25).half()
+            b = (torch.randn(64, 32) * 0.25).half()
+            torch.testing.assert_close(k(a, b, process=i % 2), a.float() @ b.float(), atol=2e-2, rtol=2e-2)
+
+
+@DEVICE
+@pytest.mark.parametrize("processes", [1, 2, 4])
+def test_a_pipeline_hands_data_on_by_dma(processes):
+    with session.Session([(dma_step, [1])], processes=processes) as s:
+        (k,) = s.kernels
+        bufs = [s.buffer(N * 4) for _ in range(processes)]
+        x = torch.randn(N)
+        bufs[0].write(x)
+        # Stage p adds 1 to what stage p - 1 left, and the last hands on to the first.
+        stages = [(k, p, [bufs[p], bufs[(p + 1) % processes]]) for p in range(processes)]
+        s.pipeline(stages, 100 // processes)
+        torch.testing.assert_close(_f32(bufs[0]), x + 100)
+        for buf in bufs:
+            buf.free()
+
+
+@DEVICE
+def test_steps_reach_the_stages():
+    with session.Session([(stamp, [])], processes=2) as s:
+        (k,) = s.kernels
+        out = [s.buffer(64 * 4, processes=[p]) for p in (0, 1)]
+        s.pipeline([(k, 0, [session.Session.STEP, out[0]]), (k, 1, [session.Session.STEP, out[1]])], 64)
+        for buf in out:
+            torch.testing.assert_close(torch.frombuffer(bytearray(buf.read()), dtype=torch.int32), torch.arange(1, 65, dtype=torch.int32))
+            buf.free()
+
+
+@DEVICE
+def test_a_failing_stage_ends_the_pipeline():
+    with session.Session([(dma_step, [1])], processes=2) as s:
+        (k,) = s.kernels
+        a, b = s.buffer(N * 4), s.buffer(N * 4)
+        # The skel has no kernel 9: stage 0 fails at its first step, and stage 1
+        # gives up waiting for its turn.
+        missing = session.SessionKernel(s, 9, "missing", [], [])
+        with pytest.raises(RuntimeError, match="a pipeline failed"):
+            s.pipeline([(missing, 0, []), (k, 1, [a, b])], 4)
+        # The session carries on.
+        x = torch.randn(N)
+        a.write(x)
+        s.pipeline([(k, 0, [a, b]), (k, 1, [b, a])], 2)
+        torch.testing.assert_close(_f32(a), x + 4)
+        a.free()
+        b.free()
+
+
+@pytest.mark.parametrize("hlos,domain,lifetime", [("linux", "3", "cached"), ("android", "4", "cached"), ("android", "3", "call")])
+def test_unsupported_multi_process_profiles_fail_before_build(monkeypatch, hlos, domain, lifetime):
+    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", hlos)
+    monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", domain)
+    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", lifetime)
+    monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
+    with pytest.raises(NotImplementedError, match="multiple DSP processes require cached"):
+        session.Session.of_lowered([], processes=2)
+
+
+@pytest.mark.parametrize("cached", [0, 1])
+def test_vtcm_profiles_release_partial_grants_on_host(tmp_path, cached):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a host C++ compiler is required")
+    # The harness supplies HAP declarations; call deliberately omits cached APIs.
+    (tmp_path / "HAP_compute_res.h").write_text("")
+    source = Path(__file__).with_name("vtcm_lifetime_host.cc")
+    root = Path(__file__).resolve().parents[3]
+    binary = tmp_path / "vtcm"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            f"-DTL_HEXAGON_CACHED_RESOURCES={cached}",
+            "-I",
+            str(tmp_path),
+            "-I",
+            str(root / "src"),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        timeout=30,
+    )
+    subprocess.run([str(binary)], check=True, timeout=10)

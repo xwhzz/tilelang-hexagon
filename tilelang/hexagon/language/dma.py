@@ -9,7 +9,7 @@ from tilelang._typing import BufferLikeType
 from tilelang.language.copy_op import _normalize_copy_regions
 from tilelang.utils.language import to_buffer_region
 
-__all__ = ["annotate_dma_only", "dma_copy", "dma_wait"]
+__all__ = ["annotate_dma_only", "annotate_write_through", "dma_copy", "dma_wait"]
 
 
 def dma_copy(src: BufferLikeType, dst: BufferLikeType) -> tirx.PrimExpr:
@@ -65,3 +65,28 @@ def annotate_dma_only(*buffers: tirx.Buffer):
     if not buffers:
         return None
     return sblock_attr({"tl.hexagon_dma_only": [buffer.data for buffer in buffers]})
+
+
+def annotate_write_through(*buffers: tirx.Buffer):
+    """Declare DDR buffer parameters whose every write by the DSP is written
+    back to DDR right away, so that DMA reads them with no writeback first.
+
+    The DSP's stores to DDR stay in its caches, which DMA does not read, so a
+    DMA load first writes its source's lines back, about a cycle every 16
+    bytes it moves. For a buffer declared here the compiler writes back what
+    each write wrote instead, right after it: after a ``T.copy`` into the
+    buffer, a ``T.Parallel`` loop that stores into it, or another store (of a
+    buffer in Crouton tiles, the whole tiles a write touches). Its DMA loads
+    then skip their writeback. That pays for a buffer that DMA reads many
+    times after each write, such as a KV cache.
+
+    Every kernel of the session that writes such a buffer must declare it,
+    which the compiler cannot check across kernels. Other tile ops that write
+    the buffer are rejected.
+    """
+    for buffer in buffers:
+        if not isinstance(buffer, tirx.Buffer):
+            raise TypeError(f"annotate_write_through takes buffers, got {type(buffer).__name__}")
+    if not buffers:
+        return None
+    return sblock_attr({"tl.hexagon_write_through": [buffer.data for buffer in buffers]})

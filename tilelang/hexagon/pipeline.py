@@ -83,6 +83,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.VerifyReducerEpoch()(mod)
 
     mod = tilelang.transform.IfStmtBinding()(mod)
+    mod = tilelang.hexagon.transform.InsertWriteThroughWritebacks()(mod)
     mod = tilelang.hexagon.transform.StageHMXOperandCopies()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
@@ -92,7 +93,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
-    mod = tilelang.hexagon.transform.MarkDMAOnlyBuffers()(mod)
+    mod = tilelang.hexagon.transform.MarkDMACacheDirections()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
     mod = tilelang.transform.DecoupleTypeCast()(mod)

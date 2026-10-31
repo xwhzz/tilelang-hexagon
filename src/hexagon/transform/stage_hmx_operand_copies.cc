@@ -16,6 +16,7 @@
 
 #include "hexagon/op/dma.h"
 #include "hexagon/op/gemm.h"
+#include "hexagon/op/utils.h"
 #include "op/builtin.h"
 #include "op/copy.h"
 #include "op/operator.h"
@@ -41,20 +42,6 @@ namespace {
 
 constexpr int kRead = 1;
 constexpr int kWrite = 2;
-
-// tl.region(BufferLoad(buffer, mins), access_mask, extents...): a T.copy
-// operand.
-PrimExpr Region(const Buffer &buffer, const Array<Range> &ranges, int mask) {
-  Array<PrimExpr> mins;
-  Array<PrimExpr> args;
-  for (const Range &r : ranges)
-    mins.push_back(r->min);
-  args.push_back(BufferLoad(buffer, mins));
-  args.push_back(IntImm(DataType::Int(32), mask));
-  for (const Range &r : ranges)
-    args.push_back(r->extent);
-  return Call(DataType::Handle(), region(), args);
-}
 
 // The A and B of the gemms in `body` that run on HMX.
 std::unordered_set<const BufferNode *> HMXOperands(const Stmt &body) {
@@ -108,10 +95,11 @@ private:
                                  copy->dst->name + "_dma", copy->dst.scope());
     staging_[copy->dst.get()].push_back(staging);
     Call transfer(call->dtype, call->op,
-                  {call->args[0], Region(staging, whole, kWrite)},
+                  {call->args[0], hexagon::RegionArg(staging, whole, kWrite)},
                   call->annotations, call->span);
     Call pack(call->dtype, call->op,
-              {Region(staging, whole, kRead), call->args[1]}, {}, call->span);
+              {hexagon::RegionArg(staging, whole, kRead), call->args[1]}, {},
+              call->span);
     return SeqStmt({Evaluate(transfer), Evaluate(pack)});
   }
 

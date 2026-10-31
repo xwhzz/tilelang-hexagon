@@ -32,8 +32,16 @@ def native_agent(tmp_path_factory):
         patch.setattr(fastrpc, "PD_SETUP", "")
         (root / "agent.c").write_text(session.gen_agent("seq_test", contracts))
     headers = {
-        "AEEStdErr.h": "#define AEE_SUCCESS 0\n#define AEE_EBADPARM 14\n#define AEE_ENOMEMORY 2\n",
-        "remote.h": "#pragma once\n#include <stdint.h>\ntypedef uint64_t remote_handle64;\n",
+        "AEEStdErr.h": "typedef int AEEResult;\n#define AEE_SUCCESS 0\n#define AEE_EBADPARM 14\n#define AEE_ENOMEMORY 2\n",
+        "remote.h": """#pragma once
+#include <stdint.h>
+typedef uint64_t remote_handle64;
+#define FASTRPC_RESERVE_NEW_SESSION 1
+#define FASTRPC_GET_URI 2
+typedef struct { char *domain_name, *session_name; int domain_name_len, session_name_len, session_id, effective_domain_id; } remote_rpc_reserve_new_session_t;
+typedef struct { char *domain_name, *module_uri, *uri; int domain_name_len, module_uri_len, uri_len, session_id; } remote_rpc_get_uri_t;
+int remote_session_control(int, void*, unsigned int);
+""",
         "rpcmem.h": """#include <stdint.h>
 #define RPCMEM_HEAP_ID_SYSTEM 0
 #define RPCMEM_DEFAULT_FLAGS 0
@@ -46,6 +54,7 @@ int fastrpc_mmap(int, int, void*, int, uint64_t, int);
 int fastrpc_munmap(int, int, void*, uint64_t);
 """,
         "dsp_capabilities_utils.h": """#define CDSP_DOMAIN_ID 3
+#define CDSP_DOMAIN_NAME "cdsp"
 #define MAX_DOMAIN_URI_SIZE 32
 typedef struct { const char* uri; } domain;
 static domain* get_domain(int id) { static domain d = {"domain"}; (void)id; return &d; }
@@ -53,6 +62,7 @@ static domain* get_domain(int id) { static domain d = {"domain"}; (void)id; retu
         "seq_test.h": """#include <stdint.h>
 #include "remote.h"
 #define seq_test_URI "sequence"
+int seq_test_pipeline(remote_handle64, int32_t, const int32_t*, int, int32_t, int32_t, int32_t, int32_t);
 int seq_test_open(const char*, remote_handle64*);
 int seq_test_close(remote_handle64);
 int seq_test_release(remote_handle64, int32_t);
@@ -66,7 +76,19 @@ int seq_test_run(remote_handle64, int32_t, const int32_t*, int, const uint8_t*, 
     executable = root / "agent"
     flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if os.environ.get("TL_SEQUENCE_SANITIZERS") == "1" else []
     result = subprocess.run(
-        [compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", *flags, "-I", str(root), str(harness), "-o", str(executable)],
+        [
+            compiler,
+            "-std=c11",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-O1",
+            "-pthread",
+            *flags,
+            "-I",
+            str(root),
+            str(harness),
+            "-o",
+            str(executable),
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -76,8 +98,9 @@ int seq_test_run(remote_handle64, int32_t, const int32_t*, int, const uint8_t*, 
 
 
 @pytest.fixture
-def agent(native_agent):
-    proc = subprocess.Popen([str(native_agent), "0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def agent(native_agent, request):
+    processes = getattr(request, "param", 1)
+    proc = subprocess.Popen([str(native_agent), "0", str(processes)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     # The generated main flushes this line only after its real TCP listener is ready.
     if not select.select([proc.stdout], [], [], 5)[0]:
         proc.kill()
@@ -91,6 +114,7 @@ def agent(native_agent):
     connection = socket.create_connection(("127.0.0.1", int(ready.split(b"=")[1])), timeout=5)
     connection.settimeout(5)
     instance = session.Session.__new__(session.Session)
+    instance.processes = processes
     instance._sock, instance._proc = connection, proc
     instance._closed, instance._holds_device = False, False
     instance._allocations, instance._buffer_generations = {}, {}
@@ -374,7 +398,7 @@ def test_invalid_allocation_size_does_not_close_session(agent):
 
 @pytest.mark.parametrize("size", [0, 1 << 31, 1 << 32, (1 << 64) - 1])
 def test_agent_rejects_oversized_alloc_before_narrowing_and_preserves_generations(agent, size):
-    agent._sock.sendall(bytes([session._OP_ALLOC]) + struct.pack("<Q", size))
+    agent._sock.sendall(bytes([session._OP_ALLOC]) + struct.pack("<QI", size, 1))
     assert struct.unpack("<i", agent._recv(4)) == (-1,)
     buffer = agent.buffer(128)
     assert buffer.id == 0 and buffer._allocation.generation == 1
@@ -443,3 +467,42 @@ int32_t fail_after_write(int32_t* values, int32_t status) {
         # Reuse the same synchronized connection after a kernel failure.
         assert device.run_sequence([Copy(tokens, history, 4)]).completed_operations == 1
         assert _ints(history)[0] == 46
+
+
+@pytest.mark.parametrize("agent", [2], indirect=True)
+def test_sequence_copies_sync_all_mapped_processes(agent):
+    # Process 1 dirties its own cache. ARM Copy must publish it and invalidate
+    # process 0's old destination line before process 0 consumes the copy.
+    source = agent.buffer(128, processes=[1])
+    target = agent.buffer(128)
+    agent.kernels[0](target, 99, process=0)
+    agent.kernels[0](source, 17, process=1)
+    result = agent.run_sequence([Copy(source, target, 4, src_offset=4), Run(agent.kernels[0], (target, 3))])
+    assert result.completed_operations == 2
+    assert _ints(target)[:2] == [17, 20]
+    with pytest.raises(ValueError, match="mapped into"):
+        agent.run_sequence([Run(agent.kernels[0], (source, 1))])
+
+
+@pytest.mark.parametrize("agent", [2], indirect=True)
+def test_agent_sequence_rejects_unmapped_run_before_execution(agent):
+    shared = agent.buffer(128)
+    private = agent.buffer(128, processes=[1])
+    operations, wire = sequence.encode(agent, [Run(agent.kernels[0], (shared, 1))])
+    bad = bytearray(wire)
+    struct.pack_into("<I", bad, 25, private.id)
+    agent._sock.sendall(bad)
+    with pytest.raises(SequenceError) as error:
+        sequence.receive(agent, operations)
+    assert error.value.failure_stage == "validation"
+    assert error.value.result.completed_operations == 0
+    assert _stats(agent) == [0, 0, 0]
+
+
+def test_pipeline_and_sequence_have_distinct_wire_operations(agent):
+    buffer = agent.buffer(128)
+    # The fake DSP only accepts zero pipeline steps; this checks framing and
+    # dispatch coexistence, not DSP pipeline execution or synchronization.
+    agent.pipeline([(agent.kernels[0], 0, (buffer, 1))], 0)
+    assert agent.run_sequence([Run(agent.kernels[0], (buffer, 7))]).completed_operations == 1
+    assert _ints(buffer)[1] == 7

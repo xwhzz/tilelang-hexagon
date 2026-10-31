@@ -23,17 +23,28 @@ def _session(source):
     return body("tl_probe_open"), body("tl_probe_close")
 
 
+def _helper(name):
+    """The body of a resource helper every skel carries (fastrpc.RUN_KERNEL)."""
+    start = fastrpc.RUN_KERNEL.index(f"static inline {'int' if name == 'tl_hexagon_open' else 'void'} {name}(void) {{")
+    return fastrpc.RUN_KERNEL[start : fastrpc.RUN_KERNEL.index("\n}\n", start)]
+
+
 def test_every_session_votes_for_clocks():
     opening, closing = _session("int32_t probe_kernel() { return 0; }")
-    assert "tl_power_vote();" in opening
-    assert "tl_power_unvote();" in closing
+    assert "tl_hexagon_open()" in opening
+    assert "tl_hexagon_close();" in closing
+    assert "tl_power_vote();" in _helper("tl_hexagon_open")
+    assert "tl_power_unvote();" in _helper("tl_hexagon_close")
 
 
 def test_hmx_sessions_start_after_the_vote_and_end_before_its_removal():
-    # The kernel's source says that it uses HMX; the session then takes it.
-    opening, closing = _session("#define TL_HEXAGON_USES_HMX 1\nint32_t probe_kernel() { return 0; }")
+    # For kernels that use HMX, the skel takes it after the vote and gives it
+    # up before the vote goes.
+    opening, closing = _helper("tl_hexagon_open"), _helper("tl_hexagon_close")
     assert opening.index("tl_power_vote();") < opening.index("#if defined(TL_HEXAGON_USES_HMX)") < opening.index("tl_hmx_session_init();")
     assert closing.index("tl_hmx_session_deinit();") < closing.index("tl_power_unvote();")
+    # A failed open gives up what it took.
+    assert opening.index("tl_hexagon_take() == TL_OK") < opening.rindex("tl_hexagon_close();")
 
 
 def _clock_probe(with_hmx):
