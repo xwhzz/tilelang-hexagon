@@ -577,10 +577,23 @@ class Decoder:
         assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos and 0 <= seed < 1 << 24
         self.tokens.write(torch.tensor(list(tokens[:n_forced]), dtype=torch.int32))
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
-        self.session.kernels[0](
-            *self.args, *self.rope, self.kv_k, self.kv_v, self.conv_state, *self.scratch, self.tokens, self.logits,
-            self.scores, self.sampling, pos0, n, n_forced,
-        )  # fmt: skip
+        args = [
+            *self.args,
+            *self.rope,
+            self.kv_k,
+            self.kv_v,
+            self.conv_state,
+            *self.scratch,
+            self.tokens,
+            self.logits,
+            self.scores,
+            self.sampling,
+        ]
+        if self.fp16:
+            # A token a step, a call for all of them (decode_fp16.make_decode).
+            self.session.pipeline([(self.session.kernels[0], 0, [*args, pos0, n_forced, self.session.STEP])], n)
+        else:
+            self.session.kernels[0](*args, pos0, n, n_forced)
         out = torch.frombuffer(bytearray(self.tokens.read((n + 1) * 4)), dtype=torch.int32).tolist()
         logits = torch.frombuffer(bytearray(self.logits.read()), dtype=torch.float32)
         return out, logits
@@ -593,7 +606,9 @@ class Decoder:
         self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
         state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
         if self.fp16:
-            self.session.kernels[1](*self.prefill_args, *state, *self.prefill_scratch, self.tokens, pos0, n)
+            # A chunk a step, a call for all of them (prefill_fp16.make_prefill).
+            args = [*self.prefill_args, *state, *self.prefill_scratch, self.tokens, pos0, n, self.session.STEP]
+            self.session.pipeline([(self.session.kernels[1], 0, args)], -(-n // R))
         else:
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
 

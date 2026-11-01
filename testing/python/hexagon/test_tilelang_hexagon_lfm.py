@@ -231,7 +231,7 @@ def _fp16_bundle(tmp_path, model: str) -> str:
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_decode_is_one_cycle_of_phases(model, tmp_path):
+def test_fp16_decode_is_one_step_of_phases(model, tmp_path):
     c = Config.from_dict(bundle.read_header(_fp16_bundle(tmp_path, model))["config"])
     target = determine_target("hexagon", return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):

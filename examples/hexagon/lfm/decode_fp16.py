@@ -327,7 +327,9 @@ def add_branch(xf, branch, bf, sums, s, post, D: int, nw: int, sandwich: bool, e
 
 
 def make_decode(c: Config, max_pos: int, max_tokens: int):
-    """The fp16 decode kernel of config c (convert.py's bundle)."""
+    """The fp16 decode kernel of config c (convert.py's bundle): step t of a
+    generation, position pos0 + t, a call. The Decoder runs the steps as a
+    pipeline (Session.pipeline)."""
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
     H, KVH, taps = c.heads, c.kv_heads, c.conv_taps
     conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]
@@ -381,8 +383,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
         scores: T.Tensor((max_tokens,), "float32"),
         sampling: T.Tensor((2,), "float32"),
         pos0: T.int32,
-        n: T.int32,
         n_forced: T.int32,
+        t: T.int32,
     ):
         with T.Kernel(NW, num_workers=NW) as w:
             p_in = Weights(in_w, TILE, slice_cols(D))
@@ -460,117 +462,114 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             T.annotate_write_through(kv_k, kv_v)
             st.prologue()
 
-            for t in T.serial(n):
-                pos = pos0 + t
-                st.begin(t)
+            pos = pos0 + t
 
-                # The token's embedding, which every worker reads whole: its
-                # pairs from the head's tiles.
-                token = T.max(T.min(T.if_then_else(t < n_forced, tokens[t], nxt[0]), V - 1), 0)
-                T.dma_copy(
-                    head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow
-                )
-                T.dma_wait(0)
-                for i, k in T.Parallel(1, D):
-                    xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
+            # The step's token, forced or the one the step before generated,
+            # and its embedding, which every worker reads whole: its pairs
+            # from the head's tiles.
+            token = T.max(T.min(tokens[t], V - 1), 0)
+            T.dma_copy(head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow)
+            T.dma_wait(0)
+            for i, k in T.Parallel(1, D):
+                xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
 
-                i_ph = 0
-                ci = ai = 0
-                for layer in list(range(L)):
-                    rms_norm(xf, lambda k, layer=layer: op_norm[layer, k], h16, sq, s1, D, eps)
-                    if c.is_attention(layer):
-                        ki = kind[c.layer_types[layer]]
-                        first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
-                        # The layer's cache row of a position.
-                        row = lambda p, ai=ai: kv_row(c, kv_first[ai], kv_ring[ai], p)  # noqa: E731
-                        st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, qkv, 0))
-                        i_ph += 1
-                        rope = (rope_cos, rope_sin, ki, pos, t_hd, sq_hd, s1, HD, eps)
-                        for h in list(range(KH)):
-                            base = h * g.width
-                            kvh = w * KH + h
-                            for q in list(range(group)):
-                                norm_rope(qkv, base + q * HD, lambda d, ai=ai: q_norm[ai, d], *rope)
-                            norm_rope(qkv, base + g.k, lambda d, ai=ai: k_norm[ai, d], *rope)
-                            for d in T.Parallel(HD):
-                                kv_k[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.k + d])
-                                kv_v[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.v + d])
-                            if c.head_gate:
-                                gate = lambda q, base=base: T.sigmoid(qkv[0, base + g.gate + q])  # noqa: E731
-                            else:
-                                gate = lambda q: T.float32(1)  # noqa: E731
-                            attend(
-                                qkv, base, kv_k, kv_v, row, kvh, pos, first, att, h * group * HD, gate, group, HD,
-                                qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha,
-                            )  # fmt: skip
-                        T.copy(att, mix[0:1, w * DW : (w + 1) * DW])
-                        ai += 1
-                    else:
-                        st.run(
-                            i_ph,
-                            lambda b, ring, k, ci=ci: conv_block(b, ring, k, h16, acc, D, bcx, conv_w, conv_state, mix, ci, w * DW, taps),
-                        )
-                        i_ph += 1
-                        ci += 1
-                    T.sync_grid()
-                    # The operator's output projection: worker w's slice.
-                    T.copy(mix, h16)
-                    st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, own, 0))
+            i_ph = 0
+            ci = ai = 0
+            for layer in list(range(L)):
+                rms_norm(xf, lambda k, layer=layer: op_norm[layer, k], h16, sq, s1, D, eps)
+                if c.is_attention(layer):
+                    ki = kind[c.layer_types[layer]]
+                    first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
+                    # The layer's cache row of a position.
+                    row = lambda p, ai=ai: kv_row(c, kv_first[ai], kv_ring[ai], p)  # noqa: E731
+                    st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, qkv, 0))
                     i_ph += 1
-                    publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
-                    T.sync_grid()
-                    add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_op_norm[layer, k], D, NW, c.sandwich_norm, eps)
-                    # The FFN: worker w's hidden units, then its slice of their
-                    # projection, K in S2 slices.
-                    rms_norm(xf, lambda k, layer=layer: ffn_norm[layer, k], h16, sq, s1, D, eps)
-                    st.run(i_ph, lambda b, ring, k: glu_block(b, ring, k, h16, acc, D, ga, ffo))
+                    rope = (rope_cos, rope_sin, ki, pos, t_hd, sq_hd, s1, HD, eps)
+                    for h in list(range(KH)):
+                        base = h * g.width
+                        kvh = w * KH + h
+                        for q in list(range(group)):
+                            norm_rope(qkv, base + q * HD, lambda d, ai=ai: q_norm[ai, d], *rope)
+                        norm_rope(qkv, base + g.k, lambda d, ai=ai: k_norm[ai, d], *rope)
+                        for d in T.Parallel(HD):
+                            kv_k[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.k + d])
+                            kv_v[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.v + d])
+                        if c.head_gate:
+                            gate = lambda q, base=base: T.sigmoid(qkv[0, base + g.gate + q])  # noqa: E731
+                        else:
+                            gate = lambda q: T.float32(1)  # noqa: E731
+                        attend(
+                            qkv, base, kv_k, kv_v, row, kvh, pos, first, att, h * group * HD, gate, group, HD,
+                            qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha,
+                        )  # fmt: skip
+                    T.copy(att, mix[0:1, w * DW : (w + 1) * DW])
+                    ai += 1
+                else:
+                    st.run(
+                        i_ph,
+                        lambda b, ring, k, ci=ci: conv_block(b, ring, k, h16, acc, D, bcx, conv_w, conv_state, mix, ci, w * DW, taps),
+                    )
                     i_ph += 1
-                    T.copy(ffo, hidden[0:1, w * FW : (w + 1) * FW])
-                    T.sync_grid()
-                    T.copy(hidden, f16)
-                    st.run(i_ph, lambda b, ring, k: sliced_block(b, ring, k, f16, acc, p_2.cols, S2, own))
-                    i_ph += 1
-                    publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
-                    T.sync_grid()
-                    add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_ffn_norm[layer, k], D, NW, c.sandwich_norm, eps)
-
-                # The LM head: worker w's logits, their maximum and sum of
-                # exponentials (for the scores), and its proposal.
-                rms_norm(xf, lambda k: final_norm[k], h16, sq, s1, D, eps)
-                run_m[0] = T.float32(-3.0e38)
-                run_s[0] = T.float32(0)
-                best[0] = T.float32(-3.0e38)
-                besti[0] = T.float32(0)
-                st.run(
-                    i_ph,
-                    lambda b, ring, k, pos=pos: head_block(
-                        b, ring, k, h16, acc, D, logits, w * VW, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy
-                    ),
-                )
-                cand[w, 0] = best[0]
-                cand[w, 1] = besti[0]
-                cand[w, 2] = run_m[0]
-                cand[w, 3] = run_s[0]
+                    ci += 1
                 T.sync_grid()
-                # Every worker takes the first of the largest proposals.
-                best[0] = cand[0, 0]
-                besti[0] = cand[0, 1]
+                # The operator's output projection: worker w's slice.
+                T.copy(mix, h16)
+                st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, own, 0))
+                i_ph += 1
+                publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
+                T.sync_grid()
+                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_op_norm[layer, k], D, NW, c.sandwich_norm, eps)
+                # The FFN: worker w's hidden units, then its slice of their
+                # projection, K in S2 slices.
+                rms_norm(xf, lambda k, layer=layer: ffn_norm[layer, k], h16, sq, s1, D, eps)
+                st.run(i_ph, lambda b, ring, k: glu_block(b, ring, k, h16, acc, D, ga, ffo))
+                i_ph += 1
+                T.copy(ffo, hidden[0:1, w * FW : (w + 1) * FW])
+                T.sync_grid()
+                T.copy(hidden, f16)
+                st.run(i_ph, lambda b, ring, k: sliced_block(b, ring, k, f16, acc, p_2.cols, S2, own))
+                i_ph += 1
+                publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
+                T.sync_grid()
+                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_ffn_norm[layer, k], D, NW, c.sandwich_norm, eps)
+
+            # The LM head: worker w's logits, their maximum and sum of
+            # exponentials (for the scores), and its proposal.
+            rms_norm(xf, lambda k: final_norm[k], h16, sq, s1, D, eps)
+            run_m[0] = T.float32(-3.0e38)
+            run_s[0] = T.float32(0)
+            best[0] = T.float32(-3.0e38)
+            besti[0] = T.float32(0)
+            st.run(
+                i_ph,
+                lambda b, ring, k, pos=pos: head_block(
+                    b, ring, k, h16, acc, D, logits, w * VW, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy
+                ),
+            )
+            cand[w, 0] = best[0]
+            cand[w, 1] = besti[0]
+            cand[w, 2] = run_m[0]
+            cand[w, 3] = run_s[0]
+            T.sync_grid()
+            # Every worker takes the first of the largest proposals.
+            best[0] = cand[0, 0]
+            besti[0] = cand[0, 1]
+            for v in list(range(1, NW)):
+                better = cand[v, 0] > best[0]
+                besti[0] = T.if_then_else(better, cand[v, 1], besti[0])
+                best[0] = T.if_then_else(better, cand[v, 0], best[0])
+            nxt[0] = T.Cast("int32", besti[0])
+            if w == 0 and t + 1 >= n_forced and t + 1 < max_tokens:
+                tokens[t + 1] = nxt[0]
+            # The log-probability of a forced next token.
+            if w == 0 and t + 1 < n_forced:
+                top = cand[0, 2]
                 for v in list(range(1, NW)):
-                    better = cand[v, 0] > best[0]
-                    besti[0] = T.if_then_else(better, cand[v, 1], besti[0])
-                    best[0] = T.if_then_else(better, cand[v, 0], best[0])
-                nxt[0] = T.Cast("int32", besti[0])
-                if w == 0 and t + 1 >= n_forced and t + 1 < max_tokens:
-                    tokens[t + 1] = nxt[0]
-                # The log-probability of a forced next token.
-                if w == 0 and t + 1 < n_forced:
-                    top = cand[0, 2]
-                    for v in list(range(1, NW)):
-                        top = T.max(top, cand[v, 2])
-                    total = cand[0, 3] * T.exp(cand[0, 2] - top)
-                    for v in list(range(1, NW)):
-                        total = total + cand[v, 3] * T.exp(cand[v, 2] - top)
-                    scores[t] = logits[0, tokens[t + 1]] - top - T.log(total)
+                    top = T.max(top, cand[v, 2])
+                total = cand[0, 3] * T.exp(cand[0, 2] - top)
+                for v in list(range(1, NW)):
+                    total = total + cand[v, 3] * T.exp(cand[v, 2] - top)
+                scores[t] = logits[0, tokens[t + 1]] - top - T.log(total)
 
     return decode
 
