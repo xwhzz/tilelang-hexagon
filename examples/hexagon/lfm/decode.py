@@ -529,7 +529,9 @@ class Decoder:
         if fp16:
             self.args = decode_fp16.bundle_args(c, self.weights)
             cos, sin = decode_fp16.rope_tables(c, max_pos)
-            kv = La * c.kv_heads * max_pos * HD * 2
+            # Keys and values [kv heads, rows, head dim] each: a run of rows a
+            # layer, a sliding window's a ring (decode_fp16.kv_plan).
+            kv = c.kv_heads * decode_fp16.kv_plan(c, max_pos)[2] * HD * 2
             self.conv_state = resident(nbytes=Lc * (c.conv_taps - 1) * D * 4)
             # The workers' slices of a branch's input and output, of the FFN's
             # hidden units, their sums of squares, and the head's proposals.
@@ -539,7 +541,7 @@ class Decoder:
                 R = self.prefill_rows
                 self.prefill_args = prefill_fp16.prefill_args(c, self.weights)
                 self.prefill_scratch = [resident(nbytes=R * D * 4), resident(nbytes=c.heads * R * HD * 2)]
-                self.kinds = resident(torch.tensor(prefill_fp16.kinds_table(c), dtype=torch.int32))
+                self.kinds = resident(torch.tensor(prefill_fp16.kinds_table(c, max_pos), dtype=torch.int32))
         else:
             self.args = [self.weights[n] for n in BUNDLE_ARGS]
             self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]

@@ -45,6 +45,7 @@ from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import decode_fp16  # noqa: E402
 from convert import TILE, qkv_group  # noqa: E402
 from decode_fp16 import NW, kv_layouts, slice_cols  # noqa: E402
 from model import SLIDING, Config  # noqa: E402
@@ -59,15 +60,19 @@ NEG16 = -65504.0  # the scores' mask, in fp16
 LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 
 
-def kinds_table(c: Config) -> list:
+def kinds_table(c: Config, max_pos: int) -> list:
     """Per layer: whether it is attention, its index among the layers of its
-    kind, its RoPE table (decode_fp16.kinds) and its window (0: none)."""
+    kind, its RoPE table (decode_fp16.kinds), its window (0: none) and, for an
+    attention layer, its first row of the KV cache (decode_fp16.kv_plan) in
+    blocks of KEYS rows, which DMA moves whole tiles of."""
     attn = [int(c.is_attention(i)) for i in range(c.layers)]
     tables = {k: i for i, k in enumerate(c.rope)}
+    kv_first = decode_fp16.kv_plan(c, max_pos)[0]
     rows = []
     for i, a in enumerate(attn):
         kind = c.layer_types[i]
-        rows.append([a, sum(attn[:i]) if a else i - sum(attn[:i]), tables.get(kind, 0), c.window if kind == SLIDING else 0])
+        index = sum(attn[:i]) if a else i - sum(attn[:i])
+        rows.append([a, index, tables.get(kind, 0), c.window if kind == SLIDING else 0, kv_first[index] // KEYS if a else 0])
     return rows
 
 
@@ -90,6 +95,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
     NK = len(c.rope)
     half = HD // 2
     assert R % ROWS == 0 and RW % (2 * RB) == 0 and max_pos % KEYS == 0 and FQW % TILE == 0
+    # A chunk's write runs past a ring's end by at most its rows, into the pad
+    # (store_kv); the ring holds a block of keys, a chunk and the window.
+    RING = decode_fp16.ring(c)
+    KV_ROWS = decode_fp16.kv_plan(c, max_pos)[2]
+    assert R <= decode_fp16.RING_PAD and RING % KEYS == 0 and decode_fp16.RING_PAD % KEYS == 0
     assert D <= 64 * TILE, "a slot of the ring holds a projection's whole K"
     eps = c.eps
     HID = max(D, FQ)
@@ -251,7 +261,18 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             T.copy(bf.cc[0, :, :], bf.hid[:, ch : ch + TILE])
 
     @T.macro
-    def qkv_block(bf, b, ring, k, ai, table, base):
+    def store_kv(bf, cache, kvh, kv0, window, base, src):
+        """src's R rows, positions base + i, into the layer's rows of the cache
+        from block kv0 (decode_fp16.kv_row). A ring's write that runs past its
+        end writes again RING rows back, which puts the rows past the end at
+        its start: either copy leaves the rest in a pad no read sees."""
+        row = kv0 * KEYS + T.if_then_else(window > 0, decode_fp16.RING_PAD + base % RING, base)
+        T.copy(src, cache[kvh, row : row + R, :])
+        if window > 0 and base % RING + R > RING:
+            T.copy(src, cache[kvh, row - RING : row - RING + R, :])
+
+    @T.macro
+    def qkv_block(bf, b, ring, k, ai, kv0, window, table, base):
         """Block b of the worker's attn.qkv columns: per KV head, 4 panels a
         head of queries, of the key and of the value, then (LFM3) the panel of
         gates. A head's last panel normalizes and rotates it (queries also
@@ -270,25 +291,28 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     T.copy(bf.rot, bf.qs[kvh, part, :, :])
                 elif part == group:
                     norm_rope(bf, lambda d, ai=ai: bf.k_norm[ai, d], table, T.float32(1))
-                    T.copy(bf.rot, bf.kv_k[ai, kvh, base : base + R, :])
+                    store_kv(bf, bf.kv_k, kvh, kv0, window, base, bf.rot)
                 else:
-                    T.copy(bf.hd, bf.kv_v[ai, kvh, base : base + R, :])
+                    store_kv(bf, bf.kv_v, kvh, kv0, window, base, bf.hd)
         else:
             gemm(bf, bf.a, D, ring, k, bf.cc[0, :, :], True)
             for i, q in T.Parallel(R, group):
                 bf.gates[kvh % KH, q, i] = T.sigmoid(bf.cc[0, i, q])
 
     @T.macro
-    def fetch(bf, ai, kvh, kb, slot):
-        """Block kb of the KV head's keys and values into a slot of HMX's
-        operands, by DMA, the cache's tiles as they are: clamped, so that the
-        copies are provably in the cache, as a block past it is never used."""
-        at = T.max(T.min(kb, max_pos // KEYS - 1), 0) * KEYS
-        T.dma_copy(bf.kv_k[ai, kvh, at : at + KEYS, :], bf.kblk[slot, :, :])
-        T.dma_copy(bf.kv_v[ai, kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
+    def fetch(bf, kv0, window, kvh, kb, slot):
+        """Block kb of the KV head's keys and values, in the layer's rows from
+        block kv0, into a slot of HMX's operands, by DMA, the cache's tiles as
+        they are: in blocks and clamped, so that the copies are provably whole
+        tiles in the cache, as a block past it is never used. A ring's blocks
+        do not wrap."""
+        blk = kv0 + T.if_then_else(window > 0, decode_fp16.RING_PAD // KEYS + kb % (RING // KEYS), T.max(T.min(kb, max_pos // KEYS - 1), 0))
+        at = T.max(T.min(blk, KV_ROWS // KEYS - 1), 0) * KEYS
+        T.dma_copy(bf.kv_k[kvh, at : at + KEYS, :], bf.kblk[slot, :, :])
+        T.dma_copy(bf.kv_v[kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
 
     @T.macro
-    def attention(bf, ai, base, window):
+    def attention(bf, kv0, base, window):
         """The worker's query heads, ROWS rows at a time: softmax(q K^T) V
         over the cache's positions [base + i - window + 1 (or 0), base + i]
         for row i, gated, into hid, in base 2 (the queries carry log2 e).
@@ -313,11 +337,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     span = T.if_then_else(window > 0, window, max_pos + R)
                     first = T.max(row0 - span + 1, 0) // KEYS
                     last = T.ceildiv(row0 + ROWS, KEYS)
-                    fetch(bf, ai, kvh, first, 0)
+                    fetch(bf, kv0, window, kvh, first, 0)
                     for kb in T.serial(first, last):
                         slot = (kb - first) % 2
                         if kb + 1 < last:
-                            fetch(bf, ai, kvh, kb + 1, 1 - slot)
+                            fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
                             T.dma_wait(2)
                         else:
                             T.dma_wait()
@@ -398,10 +422,10 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
         conv_w: T.Tensor((Lc, taps, D), "float32"),
         rope_cos: T.Tensor((NK, max_pos, half), "float32"),
         rope_sin: T.Tensor((NK, max_pos, half), "float32"),
-        kv_k: T.Tensor((La, KVH, max_pos, HD), "float16"),
-        kv_v: T.Tensor((La, KVH, max_pos, HD), "float16"),
+        kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
+        kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         conv_state: T.Tensor((Lc, taps - 1, D), "float32"),
-        kinds: T.Tensor((L, 4), "int32"),
+        kinds: T.Tensor((L, 5), "int32"),
         x: T.Tensor((R, D), "float32"),
         qs: T.Tensor((KVH, group, R, HD), "float16"),
         tokens: T.Tensor((max_tokens,), "int32"),
@@ -513,6 +537,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     ai = clamped(kinds[layer, 1], La)
                     table = clamped(kinds[layer, 2], NK)
                     window = kinds[layer, 3]
+                    kv0 = kinds[layer, 4]
                     # The layer's phases, worker w's blocks of each, in order:
                     # its operator's (the short conv's or attention's), then the
                     # output projection and the FFN's, each part's w1/w3
@@ -533,8 +558,13 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     # a holds the layer's normalized input.
                     if kinds[layer, 0] == 1:
                         st_attn.prologue()
-                        st_attn.run(0, lambda b, ring, k, ai=ai, table=table, base=base: qkv_block(bf, b, ring, k, ai, table, base))
-                        attention(bf, ai, base, window)
+                        st_attn.run(
+                            0,
+                            lambda b, ring, k, ai=ai, kv0=kv0, window=window, table=table, base=base: qkv_block(
+                                bf, b, ring, k, ai, kv0, window, table, base
+                            ),
+                        )
+                        attention(bf, kv0, base, window)
                     else:
                         st_conv.prologue()
                         st_conv.run(0, lambda b, ring, k, ci=ci, valid=valid: in_proj_block(bf, b, ring, k, ci, valid))

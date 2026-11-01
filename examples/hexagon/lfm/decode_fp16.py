@@ -39,6 +39,7 @@ from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import convert  # noqa: E402
 from convert import TILE, qkv_group  # noqa: E402
 from decode import NOISE_KEYS  # noqa: E402
 from model import CONV, SLIDING, Config, Model, rope_angles  # noqa: E402
@@ -47,6 +48,11 @@ from stream import Phase, Stream, Weights  # noqa: E402
 NW = 4  # workers
 DEPTH = 4  # blocks in flight per worker
 POS_BLOCK = 64  # KV positions per attention step
+# A sliding-window layer's cache is a ring of positions: position p in row
+# RING_PAD + p % ring(c) of the layer's rows. The pad, a chunk of prefill
+# rows either side, takes the rows a chunk's write runs past either end of
+# the ring (prefill_fp16.store_kv), which no read sees.
+RING_PAD = 512
 SLICE_TILES = 64  # a block's K tiles at most: 128 KB of weights
 
 
@@ -61,6 +67,55 @@ def rope_tables(c: Config, max_pos: int) -> tuple:
     positions = torch.arange(max_pos)
     angles = torch.stack([rope_angles(positions, c.head_dim, *c.rope[k]) for k in kinds(c)])
     return angles.cos().float().contiguous(), angles.sin().float().contiguous()
+
+
+def ring(c: Config) -> int:
+    """The positions of a sliding-window layer's ring: a power of two at least
+    its window, a prefill chunk (RING_PAD) and a block of the prefill's keys
+    (prefill_fp16.KEYS, 128) apart, so that no chunk overwrites a key a row
+    of it still sees."""
+    need = c.window + RING_PAD + 128
+    return 1 << (need - 1).bit_length()
+
+
+def kv_plan(c: Config, max_pos: int) -> tuple:
+    """The KV cache's rows, [kv heads, rows, head dim] for keys and values each:
+    every attention layer a run of them, a full-attention layer's max_pos
+    positions or a sliding-window layer's ring with its pads. Returns each
+    attention layer's first row and whether it is a ring, and the rows."""
+    first, rings, rows = [], [], 0
+    for layer in c.attention_layers:
+        sliding = c.layer_types[layer] == SLIDING
+        first.append(rows)
+        rings.append(sliding)
+        rows += ring(c) + 2 * RING_PAD if sliding else max_pos
+    return first, rings, rows
+
+
+def kv_row(c: Config, first: int, sliding: bool, pos):
+    """The cache row of position pos in an attention layer whose first row is
+    `first`, a ring's if `sliding`."""
+    return first + (RING_PAD + pos % ring(c) if sliding else pos)
+
+
+def kv_positions(c: Config, max_pos: int, k_raw: bytes, v_raw: bytes, n: int) -> list:
+    """For tests: each attention layer's keys and values, [kv heads, positions,
+    head dim] in fp32, of the positions of [0, n) its cache still holds, with
+    those positions. A ring holds the last ring(c) - RING_PAD of them at
+    least: a prefill's last chunk writes its padding rows too, over older
+    positions, which the window no longer sees."""
+    first, rings, rows = kv_plan(c, max_pos)
+    KVH, HD = c.kv_heads, c.head_dim
+    # The tiles of kv_layouts: keys as the weight operand [head dim, rows] of
+    # q K^T, values as that of P V.
+    k = convert.from_crouton_weight(torch.frombuffer(bytearray(k_raw), dtype=torch.float16), (KVH, HD, rows))
+    v = convert.from_crouton_weight(torch.frombuffer(bytearray(v_raw), dtype=torch.float16), (KVH, rows, HD)).transpose(-1, -2)
+    out = []
+    for f, r in zip(first, rings):
+        positions = torch.arange(max(0, n - (ring(c) - RING_PAD)) if r else 0, n)
+        idx = torch.tensor([kv_row(c, f, r, int(p)) for p in positions])
+        out.append((k[:, idx].float(), v[:, idx].float(), positions))
+    return out
 
 
 def kv_layouts(kv_k, kv_v) -> dict:
@@ -110,10 +165,14 @@ def norm_rope(v, o, weight, cos, sin, kind: int, pos, t, sq, s, HD: int, eps: fl
 
 
 @T.macro
-def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, first, out, out0, gate, group: int, HD: int, qg, kb, vb, sc, p, p16, o, m, mb, ls, lb, alpha):
+def attend(
+    qkv, q0, kv_k, kv_v, row, kvh, pos, first, out, out0, gate, group: int, HD: int, qg, kb, vb, sc, p, p16, o, m, mb, ls, lb, alpha
+):
     """out[0, out0 + g * HD + d] = gate(g) softmax(q_g K^T / sqrt(HD)) V over
     positions [first, pos] of KV head kvh, for the `group` query heads at
-    qkv[0, q0 + ...]: blocks of POS_BLOCK positions with an online softmax."""
+    qkv[0, q0 + ...]: blocks of POS_BLOCK positions with an online softmax.
+    row(p) is the layer's cache row of position p, whose block's rows follow
+    it (a ring's blocks do not wrap)."""
     for g, d in T.Parallel(group, HD):
         qg[g, d] = T.Cast("float16", qkv[0, q0 + g * HD + d] * T.float32(HD**-0.5))
     for g in T.Parallel(group):
@@ -122,8 +181,9 @@ def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, first, out, out0, gate, group: int
     for g, d in T.Parallel(group, HD):
         o[g, d] = T.float32(0)
     for pb in T.serial(first // POS_BLOCK, T.ceildiv(pos + 1, POS_BLOCK)):
-        T.copy(kv_k[ai, kvh, pb * POS_BLOCK : (pb + 1) * POS_BLOCK, :], kb)
-        T.copy(kv_v[ai, kvh, pb * POS_BLOCK : (pb + 1) * POS_BLOCK, :], vb)
+        r = row(pb * POS_BLOCK)
+        T.copy(kv_k[kvh, r : r + POS_BLOCK, :], kb)
+        T.copy(kv_v[kvh, r : r + POS_BLOCK, :], vb)
         T.gemm(qg, kb, sc, transpose_B=True, clear_accum=True)
         for g, j in T.Parallel(group, POS_BLOCK):
             key = pb * POS_BLOCK + j
@@ -284,6 +344,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
     NK = len(c.rope)
     kind = {k: i for i, k in enumerate(kinds(c))}
     eps = c.eps
+    kv_first, kv_ring, KV_ROWS = kv_plan(c, max_pos)
+    assert ring(c) % POS_BLOCK == 0
 
     @T.prim_func
     def decode(
@@ -306,8 +368,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
         final_norm: T.Tensor((D,), "float32"),
         rope_cos: T.Tensor((NK, max_pos, HD // 2), "float32"),
         rope_sin: T.Tensor((NK, max_pos, HD // 2), "float32"),
-        kv_k: T.Tensor((La, KVH, max_pos, HD), "float16"),
-        kv_v: T.Tensor((La, KVH, max_pos, HD), "float16"),
+        kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
+        kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         conv_state: T.Tensor((Lc, taps - 1, D), "float32"),
         mix: T.Tensor((1, D), "float16"),
         branch: T.Tensor((1, D), "float32"),
@@ -419,6 +481,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                     if c.is_attention(layer):
                         ki = kind[c.layer_types[layer]]
                         first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
+                        # The layer's cache row of a position.
+                        row = lambda p, ai=ai: kv_row(c, kv_first[ai], kv_ring[ai], p)  # noqa: E731
                         st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, qkv, 0))
                         i_ph += 1
                         rope = (rope_cos, rope_sin, ki, pos, t_hd, sq_hd, s1, HD, eps)
@@ -429,14 +493,14 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                                 norm_rope(qkv, base + q * HD, lambda d, ai=ai: q_norm[ai, d], *rope)
                             norm_rope(qkv, base + g.k, lambda d, ai=ai: k_norm[ai, d], *rope)
                             for d in T.Parallel(HD):
-                                kv_k[ai, kvh, pos, d] = T.Cast("float16", qkv[0, base + g.k + d])
-                                kv_v[ai, kvh, pos, d] = T.Cast("float16", qkv[0, base + g.v + d])
+                                kv_k[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.k + d])
+                                kv_v[kvh, row(pos), d] = T.Cast("float16", qkv[0, base + g.v + d])
                             if c.head_gate:
                                 gate = lambda q, base=base: T.sigmoid(qkv[0, base + g.gate + q])  # noqa: E731
                             else:
                                 gate = lambda q: T.float32(1)  # noqa: E731
                             attend(
-                                qkv, base, kv_k, kv_v, ai, kvh, pos, first, att, h * group * HD, gate, group, HD,
+                                qkv, base, kv_k, kv_v, row, kvh, pos, first, att, h * group * HD, gate, group, HD,
                                 qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha,
                             )  # fmt: skip
                         T.copy(att, mix[0:1, w * DW : (w + 1) * DW])
