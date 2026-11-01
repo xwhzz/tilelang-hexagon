@@ -158,8 +158,8 @@ Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
            kPanelBlockBytes;
   };
   int64_t ss = stride(op.src), ds = stride(op.dst);
-  ICHECK(row_bytes <= kField && ss <= kField && ds <= kField)
-      << "a panel copy's panels must fit the 24-bit DMA descriptor fields";
+  ICHECK(row_bytes <= kField)
+      << "a panel copy's panels must fit the 24-bit DMA descriptor's row size";
   int64_t bits = op.src->dtype.bits();
   auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
   // A pointer at the region's logical start, `first` panels in: LowerTileOp
@@ -178,24 +178,29 @@ Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
   };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
-  // Contiguous panels go in chunks of whole panels.
+  // Contiguous panels go in chunks of whole panels; panels further apart than
+  // a descriptor's 24-bit stride, a descriptor each.
   bool dense = ss == row_bytes && ds == row_bytes;
-  int64_t per = dense ? std::max<int64_t>(1, kChunk / row_bytes) : kRows;
+  bool apart = !dense && (ss > kField || ds > kField);
+  int64_t per = dense   ? std::max<int64_t>(1, kChunk / row_bytes)
+                : apart ? 1
+                        : kRows;
   for (int64_t first = 0; first < panels; first += per) {
     int64_t count = std::min(per, panels - first);
     PrimExpr sp = at(op.src, op.src_range, 1, first, count, ss);
     PrimExpr dp = at(op.dst, op.dst_range, 2, first, count, ds);
     Array<PrimExpr> args =
-        dense ? Array<PrimExpr>{dp,
-                                sp,
-                                u32(count * row_bytes),
-                                u32(count * row_bytes),
-                                u32(count * row_bytes),
-                                u32(1),
-                                direction}
-              : Array<PrimExpr>{
-                    dp,         sp,       u32(ds), u32(ss), u32(row_bytes),
-                    u32(count), direction};
+        dense || apart
+            ? Array<PrimExpr>{dp,
+                              sp,
+                              u32(count * row_bytes),
+                              u32(count * row_bytes),
+                              u32(count * row_bytes),
+                              u32(1),
+                              direction}
+            : Array<PrimExpr>{
+                  dp,         sp,       u32(ds), u32(ss), u32(row_bytes),
+                  u32(count), direction};
     seq.push_back(
         Evaluate(Call(DataType::Int(32), hexagon_dma_submit(), args)));
   }
@@ -283,9 +288,9 @@ Stmt LowerCroutonTransfer(const CopyNode &op, const LowerArgs &T,
            tile_bytes;
   };
   int64_t ss = stride(src), ds = stride(dst);
-  ICHECK(run_bytes <= kField && ss <= kField && ds <= kField)
-      << "a Crouton copy's runs of tiles must fit the 24-bit DMA descriptor "
-         "fields";
+  ICHECK(run_bytes <= kField)
+      << "a Crouton copy's runs of tiles must fit the 24-bit DMA descriptor's "
+         "row size";
   int64_t bytes = op.src->dtype.bytes();
   auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
   // A pointer at the region's logical start, `first` runs in: LowerTileOp
@@ -306,24 +311,29 @@ Stmt LowerCroutonTransfer(const CopyNode &op, const LowerArgs &T,
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
   // One run, or runs that follow each other on both sides, go in chunks of
-  // whole runs.
+  // whole runs; runs further apart than a descriptor's 24-bit stride (a large
+  // matrix's), a descriptor each.
   bool dense = runs == 1 || (ss == run_bytes && ds == run_bytes);
-  int64_t per = dense ? std::max<int64_t>(1, kChunk / run_bytes) : kRows;
+  bool apart = !dense && (ss > kField || ds > kField);
+  int64_t per = dense   ? std::max<int64_t>(1, kChunk / run_bytes)
+                : apart ? 1
+                        : kRows;
   for (int64_t first = 0; first < runs; first += per) {
     int64_t count = std::min(per, runs - first);
     PrimExpr sp = at(op.src, src, op.src_range, 1, first, count, ss);
     PrimExpr dp = at(op.dst, dst, op.dst_range, 2, first, count, ds);
     Array<PrimExpr> args =
-        dense ? Array<PrimExpr>{dp,
-                                sp,
-                                u32(count * run_bytes),
-                                u32(count * run_bytes),
-                                u32(count * run_bytes),
-                                u32(1),
-                                direction}
-              : Array<PrimExpr>{
-                    dp,         sp,       u32(ds), u32(ss), u32(run_bytes),
-                    u32(count), direction};
+        dense || apart
+            ? Array<PrimExpr>{dp,
+                              sp,
+                              u32(count * run_bytes),
+                              u32(count * run_bytes),
+                              u32(count * run_bytes),
+                              u32(1),
+                              direction}
+            : Array<PrimExpr>{
+                  dp,         sp,       u32(ds), u32(ss), u32(run_bytes),
+                  u32(count), direction};
     seq.push_back(
         Evaluate(Call(DataType::Int(32), hexagon_dma_submit(), args)));
   }
@@ -370,9 +380,9 @@ std::string DMARejection(const CopyNode &op, const LowerArgs &T,
   int64_t bytes = op.src->dtype.bytes();
   if (rows == 1 || (ss == cols && ds == cols))
     return "";
-  if (cols * bytes > kField || ss * bytes > kField || ds * bytes > kField)
-    return "Hexagon T.dma_copy rows and strides must fit the 24-bit DMA "
-           "descriptor fields (16 MiB)";
+  if (cols * bytes > kField)
+    return "Hexagon T.dma_copy rows must fit the 24-bit DMA descriptor's row "
+           "size (16 MiB)";
   // The runtime builds the v75+ type-9 2D descriptor; older architectures
   // would need another descriptor format.
   const int arch = HexagonArchVersion(T.target);
@@ -447,6 +457,11 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
       int64_t n = std::min(kChunk, total - done);
       seq.push_back(submit(done / bytes, done / bytes, 1, n, n, n));
     }
+  } else if (ss * bytes > kField || ds * bytes > kField) {
+    // Rows further apart than a descriptor's 24-bit stride: a descriptor each.
+    for (int64_t row = 0; row < rows; ++row)
+      seq.push_back(submit(row * ss, row * ds, 1, cols * bytes, cols * bytes,
+                           cols * bytes));
   } else {
     for (int64_t row = 0; row < rows; row += kRows) {
       seq.push_back(submit(row * ss, row * ds, std::min(kRows, rows - row),

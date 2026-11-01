@@ -370,6 +370,10 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                         for i, d in T.Parallel(ROWS, HD):
                             bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
                         T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
+                    # The loop's last step drained the queue; the wait tells the
+                    # DMA queue's bound (PlanDMAQueue), which cannot prove that
+                    # the loop runs at all and keeps the first fetch in flight.
+                    T.dma_wait()
                     for i in T.Parallel(ROWS):
                         bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
                     for i, d in T.Parallel(ROWS, HD):
