@@ -629,10 +629,11 @@ alignas(128) static const uint16_t tl_crouton_nibble_tables[2][64] = {
 // vlut16 looks up the low nibbles of the even bytes into one register and of
 // the odd bytes into another, the high nibbles after a shift; vshuffe and
 // vshuffo pair the two nibbles of each byte.
-template <int R>
-TL_DEVICE void tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
-                                         const HVX_Vector *__restrict__ src,
-                                         HVX_Vector table, HVX_Vector scale) {
+template <int R, bool Normal = false>
+__attribute__((target("hvx-ieee-fp"))) TL_DEVICE void
+tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
+                          const HVX_Vector *__restrict__ src, HVX_Vector table,
+                          HVX_Vector scale) {
   HVX_Vector v[R];
   // All loads first, so the stores of one register do not wait behind the
   // loads of the next.
@@ -651,20 +652,57 @@ TL_DEVICE void tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
         Q6_Vh_vshuffo_VhVh(Q6_V_hi_W(hi), Q6_V_hi_W(lo)), // 6, 7
     };
 #pragma clang loop unroll(full)
-    for (int j = 0; j < 4; ++j)
-      dst[4 * i + j] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(k[j], scale));
+    for (int j = 0; j < 4; ++j) {
+#if __HVX_ARCH__ >= 79
+      if constexpr (Normal) {
+        // The non-widening v79 operation is exact for finite normal scales.
+        dst[4 * i + j] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(k[j], scale));
+      } else {
+        // Widen to preserve subnormal scales. Keep qfloat register state
+        // inside one asm: spilling loses information with the toolchain's
+        // --disable-handle-qfp workaround.
+        HVX_VectorPair product;
+        HVX_Vector result;
+        asm("%0.qf32 = vmpy(%2.hf,%3.hf)\n%1.hf = %0.qf32"
+            : "=&v"(product), "=v"(result)
+            : "v"(k[j]), "v"(scale));
+        dst[4 * i + j] = result;
+      }
+#else
+      // Legacy qf16 has an implicit fractional LSB. Use IEEE half multiply
+      // only in this dequantizer, without changing other kernels' features.
+      dst[4 * i + j] = Q6_Vhf_vmpy_VhfVhf(k[j], scale);
+#endif
+    }
+  }
+}
+
+// Inline the selected arithmetic through the group and remainder loops.
+template <bool Normal>
+__attribute__((target("hvx-ieee-fp"))) TL_DEVICE void
+tl_crouton_dequant4_groups(HVX_Vector *dst, const HVX_Vector *src,
+                           const half *sfb, HVX_Vector table, int ld_sfb,
+                           int per_group, int v0, int n, int g) {
+  for (int v = v0, end = v0 + n; v < end; ++g) {
+    const int stop = end < (g + 1) * per_group ? end : (g + 1) * per_group;
+    HVX_Vector s = tl_hvx_load_bytes(sfb + g * ld_sfb, 64);
+    s = Q6_V_lo_W(Q6_W_vshuff_VVR(s, s, -2));
+    for (; v + 8 <= stop; v += 8)
+      tl_crouton_dequant4_block<8, Normal>(dst + 4 * v, src + v, table, s);
+    for (; v < stop; ++v)
+      tl_crouton_dequant4_block<1, Normal>(dst + 4 * v, src + v, table, s);
   }
 }
 
 // Dequantizes panel registers [v0, v0 + n) of one 32-row panel of a 4-bit B
 // into `w`, its weight tiles: register v covers columns [8v, 8v + 8) of K and
 // becomes registers 4v..4v + 3 of the tiles, tile kt at w + kt * 1024.
-// `sfb` holds the panel's fp16 scales, factor (g, i) for group g of gb
+// `sfb` holds the panel's finite fp16 scales, factor (g, i) for group g of gb
 // columns of K and row i at sfb[g * ld_sfb + i]; gb is a multiple of 8. A
 // function of its own, as the GEMMs are (TL_GEMM): inlined into a kernel's
 // loop it competes for registers and spills its lookup table.
 template <bool Signed>
-static __attribute__((noinline)) void
+__attribute__((target("hvx-ieee-fp"))) static __attribute__((noinline)) void
 tl_crouton_dequant4(half *__restrict__ w, const void *__restrict__ panel,
                     const half *__restrict__ sfb, int ld_sfb, int gb, int v0,
                     int n) {
@@ -672,18 +710,28 @@ tl_crouton_dequant4(half *__restrict__ w, const void *__restrict__ panel,
       *reinterpret_cast<const HVX_Vector *>(tl_crouton_nibble_tables[Signed]);
   const HVX_Vector *src = reinterpret_cast<const HVX_Vector *>(panel);
   HVX_Vector *dst = reinterpret_cast<HVX_Vector *>(w);
-  const int per_group = gb >> 3; // panel registers per group of factors
-  // One division a call: Hexagon divides in software, and a caller's gb is
-  // not always a constant here.
-  int g = v0 / per_group;
-  for (int v = v0, end = v0 + n; v < end; ++g) {
-    const int stop = end < (g + 1) * per_group ? end : (g + 1) * per_group;
-    // The group's 32 factors, each in both lanes of its row's pair.
+  const int per_group = gb >> 3;
+  const int first_group = v0 / per_group;
+#if __HVX_ARCH__ >= 79
+  // Scales are finite: exponent zero selects the precise path for zeros
+  // and subnormals. Classify only groups touched by this slice, once per
+  // call. Duplicate the 32 valid lanes to exclude partial-load padding.
+  const HVX_Vector mask = Q6_Vh_vsplat_R(0x7c00);
+  HVX_Vector minimum = mask;
+  for (int g = first_group; n > 0 && g * per_group < v0 + n; ++g) {
     HVX_Vector s = tl_hvx_load_bytes(sfb + g * ld_sfb, 64);
     s = Q6_V_lo_W(Q6_W_vshuff_VVR(s, s, -2));
-    for (; v + 8 <= stop; v += 8)
-      tl_crouton_dequant4_block<8>(dst + 4 * v, src + v, table, s);
-    for (; v < stop; ++v)
-      tl_crouton_dequant4_block<1>(dst + 4 * v, src + v, table, s);
+    minimum = Q6_Vuh_vmin_VuhVuh(minimum, Q6_V_vand_VV(s, mask));
   }
+#pragma clang loop unroll(full)
+  for (int shift = 4; shift <= 64; shift *= 2)
+    minimum = Q6_Vuh_vmin_VuhVuh(minimum, Q6_V_vror_VR(minimum, shift));
+  if ((Q6_R_vextract_VR(minimum, 0) & 0xffff) != 0) {
+    tl_crouton_dequant4_groups<true>(dst, src, sfb, table, ld_sfb, per_group,
+                                     v0, n, first_group);
+    return;
+  }
+#endif
+  tl_crouton_dequant4_groups<false>(dst, src, sfb, table, ld_sfb, per_group, v0,
+                                    n, first_group);
 }
