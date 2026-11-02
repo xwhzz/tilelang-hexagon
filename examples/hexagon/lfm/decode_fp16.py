@@ -50,7 +50,7 @@ from stream import Phase, Stream, Weights  # noqa: E402
 
 NW = 4  # workers
 DEPTH = 4  # blocks in flight per worker
-POS_BLOCK = 64  # KV positions per attention step
+POS_BLOCK = 256  # KV positions per attention step
 # A sliding-window layer's cache is a ring of positions: position p in row
 # RING_PAD + p % ring(c) of the layer's rows. The pad, a chunk of prefill
 # rows either side, takes the rows a chunk's write runs past either end of
@@ -99,6 +99,13 @@ def kv_plan(c: Config, max_pos: int, layers: range | None = None) -> tuple:
         rings.append(sliding)
         rows += ring(c) + 2 * RING_PAD if sliding else max_pos
     return first, rings, rows
+
+
+def kv_block(c: Config, first: int, sliding: bool, b):
+    """The cache block, POS_BLOCK rows, of the positions [b * POS_BLOCK,
+    (b + 1) * POS_BLOCK) in an attention layer whose first row is `first`, a
+    ring's if `sliding` (kv_row): a ring's blocks do not wrap."""
+    return first // POS_BLOCK + (RING_PAD // POS_BLOCK + b % (ring(c) // POS_BLOCK) if sliding else b)
 
 
 def kv_row(c: Config, first: int, sliding: bool, pos):
@@ -245,14 +252,51 @@ def norm_rope(v, o, weight, cos, sin, kind: int, pos, t, sq, s, HD: int, eps: fl
 
 
 @T.macro
+def fetch_kv(kv_k, kv_v, kb, vb, block, blocks: int, kvh, b, slot):
+    """Block b of KV head kvh's keys and values (attend) into slot `slot` of
+    kb and vb, by DMA: in blocks and clamped, so that the copies are provably
+    whole tiles in the cache, as a block past it is never used."""
+    at = T.max(T.min(block(b), blocks - 1), 0) * POS_BLOCK
+    T.dma_copy(kv_k[kvh, at : at + POS_BLOCK, :], kb[slot, :, :])
+    T.dma_copy(kv_v[kvh, at : at + POS_BLOCK, :], vb[slot, :, :])
+
+
+@T.macro
 def attend(
-    qkv, q0, kv_k, kv_v, row, kvh, pos, first, out, out0, gate, group: int, HD: int, qg, kb, vb, sc, p, p16, o, m, mb, ls, lb, alpha
+    qkv,
+    q0,
+    kv_k,
+    kv_v,
+    block,
+    blocks: int,
+    kvh,
+    pos,
+    first,
+    out,
+    out0,
+    gate,
+    group: int,
+    HD: int,
+    qg,
+    kb,
+    vb,
+    sc,
+    p,
+    p16,
+    o,
+    m,
+    mb,
+    ls,
+    lb,
+    alpha,
 ):
     """out[0, out0 + g * HD + d] = gate(g) softmax(q_g K^T / sqrt(HD)) V over
     positions [first, pos] of KV head kvh, for the `group` query heads at
     qkv[0, q0 + ...]: blocks of POS_BLOCK positions with an online softmax.
-    row(p) is the layer's cache row of position p, whose block's rows follow
-    it (a ring's blocks do not wrap)."""
+    block(b) is the layer's cache block (of `blocks`) of positions block b.
+    The blocks come into two slots of kb and vb by DMA, a block ahead, the
+    cache's tiles as they are: DMA streams them at its rate, where HVX loads
+    from DDR read a third of it."""
     for g, d in T.Parallel(group, HD):
         qg[g, d] = T.Cast("float16", qkv[0, q0 + g * HD + d] * T.float32(HD**-0.5))
     for g in T.Parallel(group):
@@ -260,11 +304,18 @@ def attend(
         ls[g] = T.float32(0)
     for g, d in T.Parallel(group, HD):
         o[g, d] = T.float32(0)
-    for pb in T.serial(first // POS_BLOCK, T.ceildiv(pos + 1, POS_BLOCK)):
-        r = row(pb * POS_BLOCK)
-        T.copy(kv_k[kvh, r : r + POS_BLOCK, :], kb)
-        T.copy(kv_v[kvh, r : r + POS_BLOCK, :], vb)
-        T.gemm(qg, kb, sc, transpose_B=True, clear_accum=True)
+    b0 = first // POS_BLOCK
+    b1 = T.ceildiv(pos + 1, POS_BLOCK)
+    fetch_kv(kv_k, kv_v, kb, vb, block, blocks, kvh, b0, 0)
+    for pb in T.serial(b0, b1):
+        slot = (pb - b0) % 2
+        if pb + 1 < b1:
+            fetch_kv(kv_k, kv_v, kb, vb, block, blocks, kvh, pb + 1, 1 - slot)
+            # This block's keys and values are in; the next's are on their way.
+            T.dma_wait(2)
+        else:
+            T.dma_wait()
+        T.gemm(qg, kb[slot, :, :], sc, transpose_B=True, clear_accum=True)
         for g, j in T.Parallel(group, POS_BLOCK):
             key = pb * POS_BLOCK + j
             sc[g, j] = T.if_then_else(key <= pos and key >= first, sc[g, j], T.float32(-3.0e38))
@@ -280,7 +331,10 @@ def attend(
             ls[g] = ls[g] * alpha[g] + lb[g]
         for g, d in T.Parallel(group, HD):
             o[g, d] = o[g, d] * alpha[g]
-        T.gemm(p16, vb, o, clear_accum=False)
+        T.gemm(p16, vb[slot, :, :], o, clear_accum=False)
+    # The loop's last step drained the queue; the wait tells the DMA queue's
+    # bound (PlanDMAQueue), which cannot prove that the loop runs at all.
+    T.dma_wait()
     for g, d in T.Parallel(group, HD):
         out[0, out0 + g * HD + d] = T.Cast("float16", o[g, d] / ls[g] * gate(g))
 
@@ -436,7 +490,8 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
     kind = {k: i for i, k in enumerate(kinds(c))}
     eps = c.eps
     kv_first, kv_ring, KV_ROWS = kv_plan(c, max_pos, layers)
-    assert ring(c) % POS_BLOCK == 0
+    # Every layer's rows, and a ring's, start on a block (kv_block).
+    assert ring(c) % POS_BLOCK == 0 and RING_PAD % POS_BLOCK == 0 and max_pos % POS_BLOCK == 0 and KV_ROWS % POS_BLOCK == 0
     # The extents of placeholders: of the layers of a kind the stage has none
     # of, and of the head and its outputs away from the ends.
     Lc1, La1 = max(Lc, 1), max(La, 1)
@@ -515,8 +570,9 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
             t_hd = T.alloc_shared((1, HD), "float32")
             sq_hd = T.alloc_fragment((1, HD), "float32")
             qg = T.alloc_fragment((group, HD), "float16")
-            kb = T.alloc_shared((POS_BLOCK, HD), "float16")
-            vb = T.alloc_shared((POS_BLOCK, HD), "float16")
+            # Two slots of a block of the KV head's keys and values.
+            kb = T.alloc_shared((2, POS_BLOCK, HD), "float16")
+            vb = T.alloc_shared((2, POS_BLOCK, HD), "float16")
             sc = T.alloc_fragment((group, POS_BLOCK), "float32")
             pr = T.alloc_fragment((group, POS_BLOCK), "float32")
             pr16 = T.alloc_fragment((group, POS_BLOCK), "float16")
@@ -608,8 +664,9 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
                 if c.is_attention(layer):
                     ki = kind[c.layer_types[layer]]
                     first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
-                    # The layer's cache row of a position.
+                    # The layer's cache row of a position, and block of a block of them.
                     row = lambda p, ai=ai: kv_row(c, kv_first[ai], kv_ring[ai], p)  # noqa: E731
+                    block = lambda b, ai=ai: kv_block(c, kv_first[ai], kv_ring[ai], b)  # noqa: E731
                     st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, qkv, 0))
                     i_ph += 1
                     rope = (rope_cos, rope_sin, ki, pos, t_hd, sq_hd, s1, HD, eps)
@@ -627,7 +684,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
                         else:
                             gate = lambda q: T.float32(1)  # noqa: E731
                         attend(
-                            qkv, base, kv_k, kv_v, row, kvh, pos, first, att, h * group * HD, gate, group, HD,
+                            qkv, base, kv_k, kv_v, block, KV_ROWS // POS_BLOCK, kvh, pos, first, att, h * group * HD, gate, group, HD,
                             qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha,
                         )  # fmt: skip
                     T.copy(att, mix[0:1, w * DW : (w + 1) * DW])
