@@ -378,13 +378,31 @@ cycles).
   HVX loads from DDR beside it lowered the total.
 - **VTCM capacity.** At 256 rows a chunk takes 7.82 of the 8 MiB. 384 rows do
   not fit.
+- **4 GB a process.** A DSP process has 4 GB of addresses, on every Hexagon,
+  and v79's DMA has no wider ones (v81 adds 40-bit DMA addresses). LFM3's
+  bundle leaves one process room for 48K positions of KV cache. A session
+  opens up to 4 processes, each with its own 4 GB (#210):
+  - each caches its own lines, so data crosses them by DMA alone;
+  - the VTCM changes hands between them in about 72 µs (the resource manager
+    zeroes it).
+
+  The layers split into a stage per process (#219): at 32K, two processes
+  against one cost the prefill nothing measurable and a token 0.8 ms (0.9%).
 
 ### LFM3: what is next
+
+- **The decode's attention at long contexts.** A token reads the
+  full-attention layers' whole KV cache: at 128K positions, 1.6 GB on top of
+  the 3.46 GB of weights, so 11.4 t/s at the DMA's rate. The decode does
+  6.4 t/s there (#219), because its attention copies 64 positions at a time
+  and waits for each, about 17 GB/s. Copies a block ahead, like the
+  prefill's, would give most of that back (#223).
 
 - **Attention's HVX work.** exp2 (already the fp16 fast path, in qf16) and
   the row sums take 14.4M cycles a worker at pp1024, most of attention's 36M.
 - **The embedding.** A token's row is a column of the head's tiles, which the
   DMA gathers as 1024 rows of 4 bytes: 7.3M cycles a worker at pp1024. A
   row-major copy of the 524 MB embedding would make it one 4 KB transfer a
-  token, but would bring the session's buffers to about 3.99 GB, at the edge
-  of what the DSP's address space maps.
+  token, but would bring one process's buffers to about 3.99 GB, at the edge
+  of what its address space maps. Split over two processes (#219), the
+  first stage has room for it.

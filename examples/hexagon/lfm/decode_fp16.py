@@ -1,5 +1,7 @@
 """The fp16 decode on Hexagon: LFM2 or LFM3 from the fp16 bundle (convert.py),
-every token of a generation in one kernel call.
+a token of a generation a kernel call, the Decoder running the calls as a
+pipeline (Session.pipeline). Past one DSP process's 4 GB of addresses, the
+layers split into stages, a kernel and a process each (``plan_stages``).
 
 As in the 4-bit decode (decode.py), NW worker programs meet at
 ``T.sync_grid()`` between the phases of a token, each streaming its share of
@@ -30,6 +32,7 @@ running argmax (or the sample, at a temperature) and the running sum of
 exponentials, writing the logits to DDR.
 """
 
+import itertools
 import os
 import sys
 
@@ -54,6 +57,9 @@ POS_BLOCK = 64  # KV positions per attention step
 # the ring (prefill_fp16.store_kv), which no read sees.
 RING_PAD = 512
 SLICE_TILES = 64  # a block's K tiles at most: 128 KB of weights
+# The rows of a stage's KV cache and RoPE tables when none of its layers
+# attends (make_decode): placeholders, never read.
+EMPTY_ROWS = 128
 
 
 def kinds(c: Config) -> list:
@@ -78,13 +84,16 @@ def ring(c: Config) -> int:
     return 1 << (need - 1).bit_length()
 
 
-def kv_plan(c: Config, max_pos: int) -> tuple:
-    """The KV cache's rows, [kv heads, rows, head dim] for keys and values each:
-    every attention layer a run of them, a full-attention layer's max_pos
-    positions or a sliding-window layer's ring with its pads. Returns each
-    attention layer's first row and whether it is a ring, and the rows."""
+def kv_plan(c: Config, max_pos: int, layers: range | None = None) -> tuple:
+    """The KV cache's rows, [kv heads, rows, head dim] for keys and values each,
+    of the attention layers among `layers` (all by default): every attention
+    layer a run of them, a full-attention layer's max_pos positions or a
+    sliding-window layer's ring with its pads. Returns each attention layer's
+    first row and whether it is a ring, and the rows."""
     first, rings, rows = [], [], 0
     for layer in c.attention_layers:
+        if layers is not None and layer not in layers:
+            continue
         sliding = c.layer_types[layer] == SLIDING
         first.append(rows)
         rings.append(sliding)
@@ -98,13 +107,13 @@ def kv_row(c: Config, first: int, sliding: bool, pos):
     return first + (RING_PAD + pos % ring(c) if sliding else pos)
 
 
-def kv_positions(c: Config, max_pos: int, k_raw: bytes, v_raw: bytes, n: int) -> list:
-    """For tests: each attention layer's keys and values, [kv heads, positions,
-    head dim] in fp32, of the positions of [0, n) its cache still holds, with
-    those positions. A ring holds the last ring(c) - RING_PAD of them at
-    least: a prefill's last chunk writes its padding rows too, over older
-    positions, which the window no longer sees."""
-    first, rings, rows = kv_plan(c, max_pos)
+def kv_positions(c: Config, max_pos: int, k_raw: bytes, v_raw: bytes, n: int, layers: range | None = None) -> list:
+    """For tests: each attention layer's (among `layers`) keys and values, [kv
+    heads, positions, head dim] in fp32, of the positions of [0, n) its cache
+    still holds, with those positions. A ring holds the last ring(c) -
+    RING_PAD of them at least: a prefill's last chunk writes its padding rows
+    too, over older positions, which the window no longer sees."""
+    first, rings, rows = kv_plan(c, max_pos, layers)
     KVH, HD = c.kv_heads, c.head_dim
     # The tiles of kv_layouts: keys as the weight operand [head dim, rows] of
     # q K^T, values as that of P V.
@@ -116,6 +125,77 @@ def kv_positions(c: Config, max_pos: int, k_raw: bytes, v_raw: bytes, n: int) ->
         idx = torch.tensor([kv_row(c, f, r, int(p)) for p in positions])
         out.append((k[:, idx].float(), v[:, idx].float(), positions))
     return out
+
+
+# The bundle's tensors stacked over layers: over every layer, the attention
+# layers or the conv layers. A stage of a model split over DSP processes maps
+# its layers' slices of each.
+STACKS = {
+    "conv.in_proj": "conv",
+    "conv": "conv",
+    "attn.qkv": "attention",
+    "q_norm": "attention",
+    "k_norm": "attention",
+    "out_proj": "layer",
+    "ffn.w13": "layer",
+    "ffn.w2": "layer",
+    "op_norm": "layer",
+    "ffn_norm": "layer",
+    "post_op_norm": "layer",
+    "post_ffn_norm": "layer",
+}
+
+# The bytes of a stage's buffers (stage_bytes) a DSP process maps, of its 4
+# GB of addresses: LFM3-1.7B's at 48K positions, 3947 MiB, mapped in one;
+# at 64K, 4155 MiB, they did not.
+PROCESS_BUDGET = 3960 << 20
+
+
+def stack_range(c: Config, kind: str, layers: range) -> tuple:
+    """The first index and the count, in a stack of `kind`, of the slices of
+    `layers`."""
+
+    def of(i: int) -> bool:
+        return kind == "layer" or (kind == "attention") == c.is_attention(i)
+
+    return sum(of(i) for i in range(layers.start)), sum(of(i) for i in layers)
+
+
+def stage_bytes(c: Config, header: dict, max_pos: int, layers: range) -> int:
+    """The bytes a stage of `layers` maps that grow with the model and the
+    context: its slices of the weights, the head at either end, its KV cache
+    and the RoPE tables."""
+    total = sum(
+        stack_range(c, STACKS[name], layers)[1] * (t["nbytes"] // t["shape"][0]) for name, t in header["tensors"].items() if name in STACKS
+    )
+    if layers.start == 0 or layers.stop == c.layers:
+        total += header["tensors"]["head"]["nbytes"]
+    total += 2 * c.kv_heads * kv_plan(c, max_pos, layers)[2] * c.head_dim * 2
+    if any(c.is_attention(i) for i in layers):
+        total += 2 * len(c.rope) * max_pos * (c.head_dim // 2) * 4
+    return total
+
+
+def plan_stages(c: Config, header: dict, max_pos: int, processes="auto") -> list:
+    """The layers of each stage, runs of them in order: `processes` stages,
+    or ("auto") the fewest whose stages each fit a process. Of the ways to
+    cut the layers, the one whose largest stage is the smallest."""
+    from tilelang.hexagon.runtime.session import Session
+
+    most = min(c.layers, Session.MAX_PROCESSES)
+    if processes != "auto" and not 1 <= processes <= most:
+        raise ValueError(f"LFM's {c.layers} layers run on 1 to {most} DSP processes, not {processes}")
+    for p in range(1, most + 1) if processes == "auto" else [processes]:
+        best = None
+        for cuts in itertools.combinations(range(1, c.layers), p - 1):
+            bounds = [0, *cuts, c.layers]
+            stages = [range(a, b) for a, b in zip(bounds, bounds[1:])]
+            largest = max(stage_bytes(c, header, max_pos, st) for st in stages)
+            if best is None or largest < best[0]:
+                best = (largest, stages)
+        if processes != "auto" or best[0] <= PROCESS_BUDGET:
+            return best[1]
+    raise ValueError(f"LFM at {max_pos} positions takes more than {most} DSP processes")
 
 
 def kv_layouts(kv_k, kv_v) -> dict:
@@ -326,15 +406,24 @@ def add_branch(xf, branch, bf, sums, s, post, D: int, nw: int, sandwich: bool, e
             xf[i, k] = xf[i, k] + bf[i, k]
 
 
-def make_decode(c: Config, max_pos: int, max_tokens: int):
+def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None = None):
     """The fp16 decode kernel of config c (convert.py's bundle): step t of a
     generation, position pos0 + t, a call. The Decoder runs the steps as a
-    pipeline (Session.pipeline)."""
+    pipeline (Session.pipeline).
+
+    A model split over DSP processes has a kernel for each run of `layers`
+    (all of them by default), a stage of the pipeline: the first embeds the
+    step's token, the last runs the head and samples, and the residual goes
+    from each to the next through `xs` by DMA, which crosses processes. A
+    stage's tensors are its layers' slices; those of a kind it has none of,
+    and the head away from the ends, are placeholders."""
+    layers = range(c.layers) if layers is None else layers
+    has_embedding, has_head = layers.start == 0, layers.stop == c.layers
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
     H, KVH, taps = c.heads, c.kv_heads, c.conv_taps
-    conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]
-    attn_layers = list(c.attention_layers)
-    Lc, La, L = len(conv_layers), len(attn_layers), c.layers
+    conv_layers = [i for i in layers if not c.is_attention(i)]
+    attn_layers = [i for i in layers if c.is_attention(i)]
+    Lc, La, L = len(conv_layers), len(attn_layers), len(layers)
     g = qkv_group(c)
     group = H // KVH
     assert H * HD == D and KVH % NW == 0 and HD % TILE == 0
@@ -346,42 +435,52 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
     NK = len(c.rope)
     kind = {k: i for i, k in enumerate(kinds(c))}
     eps = c.eps
-    kv_first, kv_ring, KV_ROWS = kv_plan(c, max_pos)
+    kv_first, kv_ring, KV_ROWS = kv_plan(c, max_pos, layers)
     assert ring(c) % POS_BLOCK == 0
+    # The extents of placeholders: of the layers of a kind the stage has none
+    # of, and of the head and its outputs away from the ends.
+    Lc1, La1 = max(Lc, 1), max(La, 1)
+    KV_ROWS, ROPE = (KV_ROWS, max_pos) if La else (EMPTY_ROWS, EMPTY_ROWS)
+    HEAD = (D, V) if has_head else (TILE, TILE)
+    HEAD_ROWS = (V // TILE * D // 2, 2 * TILE) if has_embedding else (TILE, 2 * TILE)
+    VL = V if has_head else TILE
+    l0 = layers.start
 
     @T.prim_func
     def decode(
-        in_w: T.Tensor((Lc, D, 3 * D), "float16"),
-        qkv_w: T.Tensor((La, D, KVH * g.width), "float16"),
+        in_w: T.Tensor((Lc1, D, 3 * D), "float16"),
+        qkv_w: T.Tensor((La1, D, KVH * g.width), "float16"),
         out_w: T.Tensor((L, D, D), "float16"),
         w13_w: T.Tensor((L, D, 2 * F), "float16"),
         w2_w: T.Tensor((L, F, D), "float16"),
-        head: T.Tensor((D, V), "float16"),
+        head: T.Tensor(HEAD, "float16"),
         # The head's bytes again, row-major: a token's embedding is D / 2 of
         # its pairs, a register of 32 tokens' apart (convert.embedding).
-        head_rows: T.Tensor((V // TILE * D // 2, 2 * TILE), "float16"),
+        head_rows: T.Tensor(HEAD_ROWS, "float16"),
         op_norm: T.Tensor((L, D), "float32"),
         ffn_norm: T.Tensor((L, D), "float32"),
         post_op_norm: T.Tensor((L, D), "float32"),
         post_ffn_norm: T.Tensor((L, D), "float32"),
-        q_norm: T.Tensor((La, HD), "float32"),
-        k_norm: T.Tensor((La, HD), "float32"),
-        conv_w: T.Tensor((Lc, taps, D), "float32"),
+        q_norm: T.Tensor((La1, HD), "float32"),
+        k_norm: T.Tensor((La1, HD), "float32"),
+        conv_w: T.Tensor((Lc1, taps, D), "float32"),
         final_norm: T.Tensor((D,), "float32"),
-        rope_cos: T.Tensor((NK, max_pos, HD // 2), "float32"),
-        rope_sin: T.Tensor((NK, max_pos, HD // 2), "float32"),
+        rope_cos: T.Tensor((NK, ROPE, HD // 2), "float32"),
+        rope_sin: T.Tensor((NK, ROPE, HD // 2), "float32"),
         kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
-        conv_state: T.Tensor((Lc, taps - 1, D), "float32"),
+        conv_state: T.Tensor((Lc1, taps - 1, D), "float32"),
         mix: T.Tensor((1, D), "float16"),
         branch: T.Tensor((1, D), "float32"),
         hidden: T.Tensor((1, F), "float16"),
         sums: T.Tensor((NW,), "float32"),
         cand: T.Tensor((NW, 4), "float32"),
         tokens: T.Tensor((max_tokens,), "int32"),
-        logits: T.Tensor((1, V), "float32"),
+        logits: T.Tensor((1, VL), "float32"),
         scores: T.Tensor((max_tokens,), "float32"),
         sampling: T.Tensor((2,), "float32"),
+        # The residual from the stage before, and to the next.
+        xs: T.Tensor((1, D), "float32"),
         pos0: T.int32,
         n_forced: T.int32,
         t: T.int32,
@@ -392,7 +491,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             p_out = Weights(out_w, TILE, slice_cols(D))
             p_13 = Weights(w13_w, TILE, slice_cols(D))
             p_2 = Weights(w2_w, TILE, slice_cols(F))
-            p_head = Weights(head, TILE, slice_cols(D))
+            p_head = Weights(head, TILE, slice_cols(D)) if has_head else None
 
             xf = T.alloc_fragment((1, D), "float32")
             sq = T.alloc_fragment((1, D), "float32")
@@ -407,6 +506,10 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             ffo = T.alloc_fragment((1, FW), "float16")
             bcx = T.alloc_shared((3, TILE), "float32")
             erow = T.alloc_shared((D // 2, 2), "float16")
+            # The DMA ends of the residual between stages, and of the token
+            # the first stage reads.
+            xv = T.alloc_shared((1, D), "float32") if not (has_embedding and has_head) else None
+            tv = T.alloc_shared((TILE,), "int32") if has_embedding and not has_head else None
             qkv = T.alloc_shared((1, QW), "float32")
             att = T.alloc_fragment((1, KH * group * HD), "float16")
             t_hd = T.alloc_shared((1, HD), "float32")
@@ -443,7 +546,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
             # of the stream's cycle.
             phases = []
             ci = ai = 0
-            for layer in list(range(L)):
+            for layer in list(layers):
                 if c.is_attention(layer):
                     phases.append(Phase.rows(p_qkv, ai, w * QW, QW // TILE))
                     ai += 1
@@ -451,32 +554,57 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                     # B, C and x of each of the worker's channel panels.
                     phases.append(Phase.rows(p_in, ci, w * 3 * DW, 3 * DW // TILE))
                     ci += 1
-                phases.append(Phase.rows(p_out, layer, w * DW, DW // TILE))
-                phases.append(Phase.rows(p_13, layer, w * 2 * FW, 2 * FW // TILE))
-                phases.append(Phase.rows(p_2, layer, w * DW, DW // TILE))
-            phases.append(Phase.rows(p_head, 0, w * VW, VW // TILE))
+                phases.append(Phase.rows(p_out, layer - l0, w * DW, DW // TILE))
+                phases.append(Phase.rows(p_13, layer - l0, w * 2 * FW, 2 * FW // TILE))
+                phases.append(Phase.rows(p_2, layer - l0, w * DW, DW // TILE))
+            if has_head:
+                phases.append(Phase.rows(p_head, 0, w * VW, VW // TILE))
             st = Stream(phases, DEPTH)
             T.annotate_layout({**st.layouts(), **kv_layouts(kv_k, kv_v), **kv_layouts(kb, vb)})
             # The prefill reads the KV cache by DMA, so each key and value
-            # written here goes back to DDR at once (prefill_fp16).
-            T.annotate_write_through(kv_k, kv_v)
+            # written here goes back to DDR at once (prefill_fp16). Each
+            # process caches its own lines, so what crosses processes goes
+            # by DMA: the residual, which only DMA moves, and the token the
+            # last stage generates, written back to DDR as it is written,
+            # which the first stage reads.
+            T.annotate_dma_only(xs)
+            if has_head and not has_embedding:
+                T.annotate_write_through(kv_k, kv_v, tokens)
+            else:
+                T.annotate_write_through(kv_k, kv_v)
             st.prologue()
 
             pos = pos0 + t
 
-            # The step's token, forced or the one the step before generated,
-            # and its embedding, which every worker reads whole: its pairs
-            # from the head's tiles.
-            token = T.max(T.min(tokens[t], V - 1), 0)
-            T.dma_copy(head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow)
-            T.dma_wait(0)
-            for i, k in T.Parallel(1, D):
-                xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
+            if has_embedding:
+                # The step's token, forced or the one the step before
+                # generated (by DMA, from the last stage on another process),
+                # and its embedding, which every worker reads whole: its pairs
+                # from the head's tiles.
+                if has_head:
+                    token = T.max(T.min(tokens[t], V - 1), 0)
+                else:
+                    at = T.max(T.min(t, max_tokens - 1), 0)
+                    T.dma_copy(tokens[at : at + 1], tv[0:1])
+                    T.dma_wait(0)
+                    token = T.max(T.min(tv[0], V - 1), 0)
+                T.dma_copy(
+                    head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow
+                )
+                T.dma_wait(0)
+                for i, k in T.Parallel(1, D):
+                    xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
+            else:
+                # The residual the stage before left.
+                T.dma_copy(xs, xv)
+                T.dma_wait(0)
+                for i, k in T.Parallel(1, D):
+                    xf[i, k] = xv[i, k]
 
             i_ph = 0
             ci = ai = 0
-            for layer in list(range(L)):
-                rms_norm(xf, lambda k, layer=layer: op_norm[layer, k], h16, sq, s1, D, eps)
+            for layer in list(layers):
+                rms_norm(xf, lambda k, layer=layer: op_norm[layer - l0, k], h16, sq, s1, D, eps)
                 if c.is_attention(layer):
                     ki = kind[c.layer_types[layer]]
                     first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
@@ -518,10 +646,10 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                 i_ph += 1
                 publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
                 T.sync_grid()
-                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_op_norm[layer, k], D, NW, c.sandwich_norm, eps)
+                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_op_norm[layer - l0, k], D, NW, c.sandwich_norm, eps)
                 # The FFN: worker w's hidden units, then its slice of their
                 # projection, K in S2 slices.
-                rms_norm(xf, lambda k, layer=layer: ffn_norm[layer, k], h16, sq, s1, D, eps)
+                rms_norm(xf, lambda k, layer=layer: ffn_norm[layer - l0, k], h16, sq, s1, D, eps)
                 st.run(i_ph, lambda b, ring, k: glu_block(b, ring, k, h16, acc, D, ga, ffo))
                 i_ph += 1
                 T.copy(ffo, hidden[0:1, w * FW : (w + 1) * FW])
@@ -531,45 +659,53 @@ def make_decode(c: Config, max_pos: int, max_tokens: int):
                 i_ph += 1
                 publish(own, branch, w, DW, sums, sq_own, s1, c.sandwich_norm)
                 T.sync_grid()
-                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_ffn_norm[layer, k], D, NW, c.sandwich_norm, eps)
+                add_branch(xf, branch, bf, sums, s1, lambda k, layer=layer: post_ffn_norm[layer - l0, k], D, NW, c.sandwich_norm, eps)
 
-            # The LM head: worker w's logits, their maximum and sum of
-            # exponentials (for the scores), and its proposal.
-            rms_norm(xf, lambda k: final_norm[k], h16, sq, s1, D, eps)
-            run_m[0] = T.float32(-3.0e38)
-            run_s[0] = T.float32(0)
-            best[0] = T.float32(-3.0e38)
-            besti[0] = T.float32(0)
-            st.run(
-                i_ph,
-                lambda b, ring, k, pos=pos: head_block(
-                    b, ring, k, h16, acc, D, logits, w * VW, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy
-                ),
-            )
-            cand[w, 0] = best[0]
-            cand[w, 1] = besti[0]
-            cand[w, 2] = run_m[0]
-            cand[w, 3] = run_s[0]
-            T.sync_grid()
-            # Every worker takes the first of the largest proposals.
-            best[0] = cand[0, 0]
-            besti[0] = cand[0, 1]
-            for v in list(range(1, NW)):
-                better = cand[v, 0] > best[0]
-                besti[0] = T.if_then_else(better, cand[v, 1], besti[0])
-                best[0] = T.if_then_else(better, cand[v, 0], best[0])
-            nxt[0] = T.Cast("int32", besti[0])
-            if w == 0 and t + 1 >= n_forced and t + 1 < max_tokens:
-                tokens[t + 1] = nxt[0]
-            # The log-probability of a forced next token.
-            if w == 0 and t + 1 < n_forced:
-                top = cand[0, 2]
+            if has_head:
+                # The LM head: worker w's logits, their maximum and sum of
+                # exponentials (for the scores), and its proposal.
+                rms_norm(xf, lambda k: final_norm[k], h16, sq, s1, D, eps)
+                run_m[0] = T.float32(-3.0e38)
+                run_s[0] = T.float32(0)
+                best[0] = T.float32(-3.0e38)
+                besti[0] = T.float32(0)
+                st.run(
+                    i_ph,
+                    lambda b, ring, k, pos=pos: head_block(
+                        b, ring, k, h16, acc, D, logits, w * VW, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy
+                    ),
+                )
+                cand[w, 0] = best[0]
+                cand[w, 1] = besti[0]
+                cand[w, 2] = run_m[0]
+                cand[w, 3] = run_s[0]
+                T.sync_grid()
+                # Every worker takes the first of the largest proposals.
+                best[0] = cand[0, 0]
+                besti[0] = cand[0, 1]
                 for v in list(range(1, NW)):
-                    top = T.max(top, cand[v, 2])
-                total = cand[0, 3] * T.exp(cand[0, 2] - top)
-                for v in list(range(1, NW)):
-                    total = total + cand[v, 3] * T.exp(cand[v, 2] - top)
-                scores[t] = logits[0, tokens[t + 1]] - top - T.log(total)
+                    better = cand[v, 0] > best[0]
+                    besti[0] = T.if_then_else(better, cand[v, 1], besti[0])
+                    best[0] = T.if_then_else(better, cand[v, 0], best[0])
+                nxt[0] = T.Cast("int32", besti[0])
+                if w == 0 and t + 1 >= n_forced and t + 1 < max_tokens:
+                    tokens[t + 1] = nxt[0]
+                # The log-probability of a forced next token.
+                if w == 0 and t + 1 < n_forced:
+                    top = cand[0, 2]
+                    for v in list(range(1, NW)):
+                        top = T.max(top, cand[v, 2])
+                    total = cand[0, 3] * T.exp(cand[0, 2] - top)
+                    for v in list(range(1, NW)):
+                        total = total + cand[v, 3] * T.exp(cand[v, 2] - top)
+                    scores[t] = logits[0, tokens[t + 1]] - top - T.log(total)
+            else:
+                # The residual, for the next stage.
+                if w == 0:
+                    for i, k in T.Parallel(1, D):
+                        xv[i, k] = xf[i, k]
+                    T.dma_copy(xv, xs)
+                    T.dma_wait(0)
 
     return decode
 

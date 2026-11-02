@@ -25,6 +25,7 @@ is written to ``tokens[t + 1]`` and feeds the next.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -481,7 +482,13 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step)."""
+    the decode, a token a step).
+
+    The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
+    weights and its cache of max_pos positions fit), each a stage of the
+    layers (decode_fp16.plan_stages) with its slices of the weights and its
+    own KV cache and conv state, and each step goes through the stages in
+    turn (Session.pipeline)."""
 
     def __init__(
         self,
@@ -490,9 +497,8 @@ class Decoder:
         max_pos: int = 4096,
         max_tokens: int = 4096,
         prefill_rows: int | str | None = "auto",
+        processes: int | str = "auto",
     ):
-        from tilelang.hexagon.runtime.session import Session
-
         header = bundle.read_header(bundle_path)
         c = Config.from_dict(header["config"])
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
@@ -501,17 +507,21 @@ class Decoder:
         self.prefill_rows = (256 if fp16 else 128) if prefill_rows == "auto" else prefill_rows
         assert max_pos % POS_BLOCK == 0
         if fp16:
-            import decode_fp16
-            import prefill_fp16
-
-            kernels = [(decode_fp16.make_decode(c, max_pos, max_tokens), [])]
-            if self.prefill_rows:
-                kernels.append((prefill_fp16.make_prefill(c, self.prefill_rows, max_pos, max_tokens), []))
+            self._open_fp16(bundle_path, device_path, processes)
         else:
-            shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
-            kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
-            if self.prefill_rows:
-                kernels.append((make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens), []))
+            self._open_4bit(bundle_path, device_path)
+        self.reset()
+
+    def _open_4bit(self, bundle_path: str, device_path: str | None) -> None:
+        """The 4-bit bundle's session, on one DSP process: LFM2's decode and
+        prefill kernels, and their buffers."""
+        from tilelang.hexagon.runtime.session import Session
+
+        c, header, max_pos, max_tokens = self.c, self.header, self.max_pos, self.max_tokens
+        shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
+        kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
+        if self.prefill_rows:
+            kernels.append((make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens), []))
         self.session = Session(kernels)
         self.weights = bundle.load(self.session, bundle_path, device_path)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)
@@ -526,47 +536,188 @@ class Decoder:
 
         # A step writes its position of the KV cache before it attends, and the
         # positions past it are masked: zeros, never NaNs, before the first.
-        if fp16:
-            self.args = decode_fp16.bundle_args(c, self.weights)
-            cos, sin = decode_fp16.rope_tables(c, max_pos)
-            # Keys and values [kv heads, rows, head dim] each: a run of rows a
-            # layer, a sliding window's a ring (decode_fp16.kv_plan).
-            kv = c.kv_heads * decode_fp16.kv_plan(c, max_pos)[2] * HD * 2
-            self.conv_state = resident(nbytes=Lc * (c.conv_taps - 1) * D * 4)
-            # The workers' slices of a branch's input and output, of the FFN's
-            # hidden units, their sums of squares, and the head's proposals.
-            sizes = (D * 2, D * 4, F * 2, decode_fp16.NW * 4, decode_fp16.NW * 4 * 4)
-            if self.prefill_rows:
-                # A chunk's residual and its queries.
-                R = self.prefill_rows
-                self.prefill_args = prefill_fp16.prefill_args(c, self.weights)
-                self.prefill_scratch = [resident(nbytes=R * D * 4), resident(nbytes=c.heads * R * HD * 2)]
-                self.kinds = resident(torch.tensor(prefill_fp16.kinds_table(c, max_pos), dtype=torch.int32))
-        else:
-            self.args = [self.weights[n] for n in BUNDLE_ARGS]
-            self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
-            cos, sin = rope_tables(c, max_pos)
-            kv = La * c.kv_heads * max_pos * HD * 4
-            self.conv_state = resident(nbytes=Lc * 2 * D * 4)
-            sizes = (D * 4, D * 4, F * 4, NW * 4 * 4)
+        self.args = [self.weights[n] for n in BUNDLE_ARGS]
+        self.prefill_args = [self.weights[n] for n in PREFILL_ARGS]
+        cos, sin = rope_tables(c, max_pos)
+        kv = La * c.kv_heads * max_pos * HD * 4
+        self.conv_state = resident(nbytes=Lc * 2 * D * 4)
+        sizes = (D * 4, D * 4, F * 4, NW * 4 * 4)
         self.rope = [resident(cos), resident(sin)]
         self.kv_k, self.kv_v = resident(nbytes=kv), resident(nbytes=kv)
         self.scratch = [resident(nbytes=n) for n in sizes]
         self.tokens = resident(nbytes=max_tokens * 4)
-        if not fp16:
-            # The prefill's table of layers: whether each is attention, and
-            # its index among the layers of its kind.
-            attn = [int(c.is_attention(i)) for i in range(c.layers)]
-            kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
-            self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
+        # The prefill's table of layers: whether each is attention, and its
+        # index among the layers of its kind.
+        attn = [int(c.is_attention(i)) for i in range(c.layers)]
+        kinds = [[a, sum(attn[:i]) if a else i - sum(attn[:i])] for i, a in enumerate(attn)]
+        self.kinds = resident(torch.tensor(kinds, dtype=torch.int32))
         self.logits = resident(nbytes=c.vocab * 4)
         self.scores = resident(nbytes=max_tokens * 4)
         self.sampling = resident(nbytes=2 * 4)
-        self.reset()
+
+    def _open_fp16(self, bundle_path: str, device_path: str | None, processes) -> None:
+        """The fp16 bundle's session: a stage of the layers on each DSP
+        process, with its decode and prefill kernels and its buffers."""
+        import decode_fp16
+        import prefill_fp16
+        from tilelang.hexagon.runtime.session import Session
+
+        c, header, max_pos, R = self.c, self.header, self.max_pos, self.prefill_rows
+        D, F, HD, NK = c.dim, c.ff, c.head_dim, len(c.rope)
+        ranges = decode_fp16.plan_stages(c, header, max_pos, processes)
+        P = len(ranges)
+        kernels = [(decode_fp16.make_decode(c, max_pos, self.max_tokens, r), []) for r in ranges]
+        if R:
+            kernels += [(prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r), []) for r in ranges]
+        self.session = Session(kernels, processes=P)
+
+        # The buffers, asked for by name and then allocated the largest first,
+        # as bundle.load allocates the tensors: a process's 4 GB of addresses
+        # fragment under large buffers (Session.buffer). Each starts zeroed,
+        # then takes its bytes, if any.
+        asked = {}
+
+        def ask(key, nbytes: int, processes=None, fill=None):
+            asked[key] = (nbytes, processes, fill)
+
+        def data(key, t: torch.Tensor, processes=None):
+            ask(key, t.numel() * t.element_size(), processes, lambda buf: buf.write(t))
+
+        def tensor(key, name: str, processes=None, start: int = 0, count: int | None = None):
+            # A tensor of the bundle, or slices of its first axis; for none, a
+            # placeholder of one (decode_fp16.make_decode).
+            nbytes = bundle.part_nbytes(header, name, count)
+            fill = lambda buf: bundle.load_part(buf, bundle_path, header, name, start, count, device_path)  # noqa: E731
+            ask(key, nbytes or bundle.part_nbytes(header, name, 1), processes, fill if nbytes else None)
+
+        # Every process maps what the stages share: the tokens, the head's
+        # outputs, the residual one stage hands the next (the decode's and a
+        # prefill chunk's), and the final norm; the head, at either end, for
+        # the first stage's embedding and the last's LM head; and the RoPE
+        # tables, in each stage that attends.
+        ends = sorted({0, P - 1})
+        attends = [p for p, layers in enumerate(ranges) if any(c.is_attention(i) for i in layers)]
+        for key, nbytes in (
+            ("tokens", self.max_tokens * 4),
+            ("logits", c.vocab * 4),
+            ("scores", self.max_tokens * 4),
+            ("sampling", 2 * 4),
+            ("xs", D * 4),
+        ):
+            ask(key, nbytes)
+        if R:
+            ask("x", R * D * 4)
+        tensor("final_norm", "final_norm")
+        tensor("head", "head", ends)
+        for key, t in zip(("cos", "sin"), decode_fp16.rope_tables(c, max_pos)):
+            data(key, t, attends)
+        for p, layers in enumerate(ranges):
+            # The stage's slices of the tensors stacked over layers, its KV
+            # cache [kv heads, rows, head dim] for keys and values each (a
+            # run of rows an attention layer, a sliding window's a ring:
+            # decode_fp16.kv_plan), its conv state, and its scratch: the
+            # workers' slices of a branch's input and output, of the FFN's
+            # hidden units, their sums of squares, and the head's proposals;
+            # the prefill's table of the layers and a chunk's queries.
+            for name, kind in decode_fp16.STACKS.items():
+                if name in header["tensors"]:
+                    tensor((p, name), name, [p], *decode_fp16.stack_range(c, kind, layers))
+            if p not in ends:
+                ask((p, "head"), decode_fp16.TILE * 2 * decode_fp16.TILE * 2, [p])
+            if p not in attends:
+                for key in ("cos", "sin"):
+                    ask((p, key), NK * decode_fp16.EMPTY_ROWS * HD // 2 * 4, [p])
+            rows = decode_fp16.kv_plan(c, max_pos, layers)[2] if p in attends else decode_fp16.EMPTY_ROWS
+            for key in ("kv_k", "kv_v"):
+                ask((p, key), c.kv_heads * rows * HD * 2, [p])
+            convs = max(decode_fp16.stack_range(c, "conv", layers)[1], 1)
+            ask((p, "conv_state"), convs * (c.conv_taps - 1) * D * 4, [p])
+            for i, nbytes in enumerate((D * 2, D * 4, F * 2, decode_fp16.NW * 4, decode_fp16.NW * 4 * 4)):
+                ask((p, "scratch", i), nbytes, [p])
+            if R:
+                data((p, "kinds"), torch.tensor(prefill_fp16.kinds_table(c, max_pos, layers), dtype=torch.int32), [p])
+                ask((p, "qs"), c.heads * R * HD * 2, [p])
+        bufs = {}
+        for key in sorted(asked, key=lambda k: -asked[k][0]):
+            nbytes, procs, fill = asked[key]
+            bufs[key] = self.session.buffer(nbytes, procs)
+            if fill is not None:
+                fill(bufs[key])
+
+        self.tokens, self.logits, self.scores, self.sampling = (bufs[k] for k in ("tokens", "logits", "scores", "sampling"))
+        shared = [self.tokens, self.logits, self.scores, self.sampling, bufs["xs"]]
+        self.stages = []
+        for p, layers in enumerate(ranges):
+            w = {name: bufs[p, name] for name in decode_fp16.STACKS if name in header["tensors"]}
+            w["final_norm"] = bufs["final_norm"]
+            w["head"] = bufs["head"] if p in ends else bufs[p, "head"]
+            tables = [bufs[k] if p in attends else bufs[p, k] for k in ("cos", "sin")]
+            kv = [bufs[p, "kv_k"], bufs[p, "kv_v"]]
+            stage = SimpleNamespace(layers=layers, kv=kv, conv_state=bufs[p, "conv_state"])
+            scratch = [bufs[p, "scratch", i] for i in range(5)]
+            stage.decode = [*decode_fp16.bundle_args(c, w), *tables, *kv, stage.conv_state, *scratch, *shared]
+            if R:
+                stage.prefill = [
+                    *prefill_fp16.prefill_args(c, w),
+                    *tables,
+                    *kv,
+                    stage.conv_state,
+                    bufs[p, "kinds"],
+                    bufs["x"],
+                    bufs[p, "qs"],
+                    self.tokens,
+                ]
+            self.stages.append(stage)
+
+    # A call to the agent may take Session's CALL_TIMEOUT (600 s), so a long
+    # prompt's chunks, or a long generation's steps, go in several calls of at
+    # most this many steps: at 256K positions, 128 chunks take about 150 s.
+    CALL_STEPS = 128
+
+    def _pipeline(self, first: int, args: list, steps: int) -> None:
+        """`steps` steps through the fp16 stages, stage p's kernel first + p
+        on its arguments args[p] and the step's index, in calls of at most
+        CALL_STEPS steps; their time on the DSP into self.seconds."""
+        STEP = self.session.STEP
+        self.seconds = 0.0
+        for s0 in range(0, steps, self.CALL_STEPS):
+            stages = [(self.session.kernels[first + p], p, [*a, STEP + s0]) for p, a in enumerate(args)]
+            self.session.pipeline(stages, min(self.CALL_STEPS, steps - s0))
+            self.seconds += self.session.last_run_seconds()
+
+    def last_run_seconds(self) -> float:
+        """How long the last run or prefill took on the DSP: its FastRPC
+        calls, each timed by the agent on the device, without the host's
+        round trips."""
+        return self.seconds
+
+    def kv_positions(self, n: int) -> list:
+        """For tests: each attention layer's keys and values, in order, at the
+        positions of [0, n) its cache holds (decode_fp16.kv_positions)."""
+        import decode_fp16
+
+        out = []
+        for st in self.stages:
+            if any(self.c.is_attention(i) for i in st.layers):
+                k, v = (buf.read() for buf in st.kv)
+                out += decode_fp16.kv_positions(self.c, self.max_pos, k, v, n, st.layers)
+        return out
+
+    def conv_states(self) -> torch.Tensor:
+        """For tests: the conv layers' states [layers, taps - 1, dim], in order."""
+        import decode_fp16
+
+        parts = []
+        for st in self.stages:
+            count = decode_fp16.stack_range(self.c, "conv", st.layers)[1]
+            state = torch.frombuffer(bytearray(st.conv_state.read()), dtype=torch.float32)
+            parts.append(state.view(-1, self.c.conv_taps - 1, self.c.dim)[:count])
+        return torch.cat(parts)
 
     def reset(self) -> None:
         """Forget the context: the conv state starts from zeros."""
-        self.conv_state.write(bytes(self.conv_state.nbytes))
+        for state in [st.conv_state for st in self.stages] if self.fp16 else [self.conv_state]:
+            state.write(bytes(state.nbytes))
 
     def run(self, tokens: list, pos0: int, n: int, n_forced: int, temperature: float = 0.0, seed: int = 0) -> tuple:
         """Steps pos0 .. pos0 + n - 1 from tokens[0 .. n_forced): the tokens of all
@@ -577,23 +728,24 @@ class Decoder:
         assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos and 0 <= seed < 1 << 24
         self.tokens.write(torch.tensor(list(tokens[:n_forced]), dtype=torch.int32))
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
-        args = [
-            *self.args,
-            *self.rope,
-            self.kv_k,
-            self.kv_v,
-            self.conv_state,
-            *self.scratch,
-            self.tokens,
-            self.logits,
-            self.scores,
-            self.sampling,
-        ]
         if self.fp16:
-            # A token a step, a call for all of them (decode_fp16.make_decode).
-            self.session.pipeline([(self.session.kernels[0], 0, [*args, pos0, n_forced, self.session.STEP])], n)
+            # A token a step, through the stages in turn (decode_fp16.make_decode).
+            self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
         else:
+            args = [
+                *self.args,
+                *self.rope,
+                self.kv_k,
+                self.kv_v,
+                self.conv_state,
+                *self.scratch,
+                self.tokens,
+                self.logits,
+                self.scores,
+                self.sampling,
+            ]
             self.session.kernels[0](*args, pos0, n, n_forced)
+            self.seconds = self.session.last_run_seconds()
         out = torch.frombuffer(bytearray(self.tokens.read((n + 1) * 4)), dtype=torch.int32).tolist()
         logits = torch.frombuffer(bytearray(self.logits.read()), dtype=torch.float32)
         return out, logits
@@ -604,13 +756,13 @@ class Decoder:
         n, R = len(tokens), self.prefill_rows
         assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
         self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
-        state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
         if self.fp16:
-            # A chunk a step, a call for all of them (prefill_fp16.make_prefill).
-            args = [*self.prefill_args, *state, *self.prefill_scratch, self.tokens, pos0, n, self.session.STEP]
-            self.session.pipeline([(self.session.kernels[1], 0, args)], -(-n // R))
+            # A chunk a step, through the stages in turn (prefill_fp16.make_prefill).
+            self._pipeline(len(self.stages), [[*st.prefill, pos0, n] for st in self.stages], -(-n // R))
         else:
+            state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
+            self.seconds = self.session.last_run_seconds()
 
     def score(self, tokens: list) -> list:
         """From an empty context, log p(tokens[i + 1] | tokens[: i + 1]) for
@@ -629,7 +781,7 @@ class Decoder:
 
         def timed(kernel: str, tokens: int) -> None:
             if timings is not None:
-                timings.append((kernel, tokens, self.session.last_run_seconds()))
+                timings.append((kernel, tokens, self.last_run_seconds()))
 
         self.reset()
         if self.prefill_rows and len(prompt) > 1:

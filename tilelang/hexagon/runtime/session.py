@@ -61,7 +61,7 @@ _RESIDENT = 0  # (fd, byte offset)
 _INPUT = 1  # (byte offset into the inputs, 0)
 _OUTPUT = 2  # (byte offset into the outputs, 0)
 _SCALAR = 3  # (value, 0)
-_STEP = 4  # a pipeline stage's step index, filled in at each step: (0, 0)
+_STEP = 4  # a pipeline stage's step index plus `first`, filled in at each step: (first, 0)
 
 # Agent operations.
 _OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_LOAD, _OP_TIMING, _OP_PIPELINE = range(10)
@@ -235,13 +235,13 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
 }}
 
 // A stage of a pipeline: `steps` runs of the kernel, each in its turn, with
-// its _STEP arguments set to the step's index.
+// its _STEP arguments set to the step's index plus their first.
 AEEResult {iface}_pipeline(remote_handle64 h, int32 kernel, const int32* args, int argsLen, int32 steps, int32 stage, int32 stages, int32 turn) {{
   (void)h;
   volatile uint32_t* word = (volatile uint32_t*)tl_session_address(turn);
   if (!word) return AEE_EBADPARM;
   void* a[{max_params}];
-  int at_step[{max_params}], nstep = 0;
+  int at_step[{max_params}], first[{max_params}], nstep = 0;
   int n = argsLen / 3, ok = n <= {max_params};
   for (int i = 0; ok && i < n; ++i) {{
     int kind = args[3 * i], v = args[3 * i + 1], o = args[3 * i + 2];
@@ -250,6 +250,7 @@ AEEResult {iface}_pipeline(remote_handle64 h, int32 kernel, const int32* args, i
       ok = base != 0;
       a[i] = base + (unsigned int)o;
     }} else if (kind == {_STEP}) {{
+      first[nstep] = v;
       at_step[nstep++] = i;
     }} else if (kind == {_SCALAR}) {{
       a[i] = (void*)(intptr_t)v;
@@ -264,7 +265,7 @@ AEEResult {iface}_pipeline(remote_handle64 h, int32 kernel, const int32* args, i
   for (int step = 0; step < steps; ++step) {{
     uint32_t mine = (uint32_t)step * (uint32_t)stages + (uint32_t)stage;
     if (tl_turn_wait(word, mine) != 0) return {_TURN_GAVE_UP:#x};
-    for (int j = 0; j < nstep; ++j) a[at_step[j]] = (void*)(intptr_t)step;
+    for (int j = 0; j < nstep; ++j) a[at_step[j]] = (void*)(intptr_t)(first[j] + step);
     AEEResult r = tl_session_dispatch(kernel, a);
     if (r != AEE_SUCCESS) {{
       tl_turn_write(word, TL_TURN_FAILED);
@@ -639,10 +640,17 @@ def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tup
 
 
 class _Step:
-    """Session.STEP: a pipeline stage's step index, an argument."""
+    """Session.STEP: a pipeline stage's step index, an argument; plus `first`
+    (``Session.STEP + first``)."""
+
+    def __init__(self, first: int = 0):
+        self.first = first
+
+    def __add__(self, first: int) -> _Step:
+        return _Step(self.first + int(first))
 
     def __repr__(self) -> str:
-        return "Session.STEP"
+        return f"Session.STEP + {self.first}" if self.first else "Session.STEP"
 
 
 @dataclass
@@ -1006,7 +1014,9 @@ class Session:
         In every step the stages run in order, each its kernel on its own
         process. ``args`` give every parameter: resident buffers the process
         maps, scalars, and ``Session.STEP``, which stands for the step's
-        index. Each process gets one FastRPC call for all the steps, and the
+        index (``Session.STEP + k``, the index plus k: so that a run longer
+        than a call may take, CALL_TIMEOUT, goes on in the next call from
+        step k). Each process gets one FastRPC call for all the steps, and the
         stages take their turns on the DSP: a turn costs 0.2 µs, and the VTCM
         changing hands between processes about 72 µs more on a v79 (the
         resource manager zeroes the 8 MiB), against about 300 µs for a call.
@@ -1025,10 +1035,10 @@ class Session:
                 raise TypeError(f"{kernel.name} takes all its {len(kernel.plans)} arguments in a pipeline, got {len(args)}")
             words = []
             for i, (plan, value) in enumerate(zip(kernel.plans, args)):
-                if value is Session.STEP:
+                if isinstance(value, _Step):
                     if not plan.is_scalar:
                         raise ValueError(f"argument {i} of {kernel.name} is a buffer; Session.STEP stands for a scalar")
-                    words += [_STEP, 0, 0]
+                    words += [_STEP, value.first, 0]
                 elif plan.is_scalar:
                     words += [_SCALAR, int(value), 0]
                 elif isinstance(value, DeviceBuffer):

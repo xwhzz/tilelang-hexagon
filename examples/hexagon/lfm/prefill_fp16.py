@@ -1,5 +1,7 @@
 """The fp16 prefill on Hexagon: a prompt of LFM2 or LFM3 in chunks of R rows on
-HMX, in one call, from the fp16 bundle (convert.py).
+HMX, from the fp16 bundle (convert.py): a chunk a kernel call, the Decoder
+running the calls as a pipeline (Session.pipeline), a kernel for each stage of
+the layers (decode_fp16.plan_stages).
 
 The kernel shares the decode's bundle, KV cache and conv state
 (``decode_fp16``, ``Decoder``) and runs on its NW worker programs, which meet
@@ -60,31 +62,40 @@ NEG16 = -65504.0  # the scores' mask, in fp16
 LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 
 
-def kinds_table(c: Config, max_pos: int) -> list:
-    """Per layer: whether it is attention, its index among the layers of its
-    kind, its RoPE table (decode_fp16.kinds), its window (0: none) and, for an
-    attention layer, its first row of the KV cache (decode_fp16.kv_plan) in
-    blocks of KEYS rows, which DMA moves whole tiles of."""
-    attn = [int(c.is_attention(i)) for i in range(c.layers)]
+def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
+    """Per layer of `layers` (all by default): whether it is attention, its
+    index among the stage's layers of its kind, its RoPE table
+    (decode_fp16.kinds), its window (0: none) and, for an attention layer, its
+    first row of the stage's KV cache (decode_fp16.kv_plan) in blocks of KEYS
+    rows, which DMA moves whole tiles of."""
+    layers = range(c.layers) if layers is None else layers
+    attn = [int(c.is_attention(i)) for i in layers]
     tables = {k: i for i, k in enumerate(c.rope)}
-    kv_first = decode_fp16.kv_plan(c, max_pos)[0]
+    kv_first = decode_fp16.kv_plan(c, max_pos, layers)[0]
     rows = []
     for i, a in enumerate(attn):
-        kind = c.layer_types[i]
+        kind = c.layer_types[layers.start + i]
         index = sum(attn[:i]) if a else i - sum(attn[:i])
         rows.append([a, index, tables.get(kind, 0), c.window if kind == SLIDING else 0, kv_first[index] // KEYS if a else 0])
     return rows
 
 
-def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
+def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None):
     """The fp16 prefill kernel of config c, in chunks of R rows: chunk `chunk`
     of the n tokens from pos0 a call. The Decoder runs the chunks as a
-    pipeline (Session.pipeline)."""
+    pipeline (Session.pipeline).
+
+    A model split over DSP processes has a kernel for each run of `layers`
+    (all of them by default), a stage of the pipeline, its tensors the
+    layers' slices (decode_fp16.make_decode): the first embeds the chunk,
+    the others normalize the residual x the stage before left in DDR."""
+    layers = range(c.layers) if layers is None else layers
+    has_embedding, has_last_layer = layers.start == 0, layers.stop == c.layers
     D, F, HD = c.dim, c.ff, c.head_dim
     H, KVH, taps = c.heads, c.kv_heads, c.conv_taps
-    conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]
-    attn_layers = list(c.attention_layers)
-    Lc, La, L = len(conv_layers), len(attn_layers), c.layers
+    conv_layers = [i for i in layers if not c.is_attention(i)]
+    attn_layers = [i for i in layers if c.is_attention(i)]
+    Lc, La, L = len(conv_layers), len(attn_layers), len(layers)
     g = qkv_group(c)
     group = H // KVH
     KH = KVH // NW  # a worker's KV heads
@@ -100,7 +111,12 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
     # A chunk's write runs past a ring's end by at most its rows, into the pad
     # (store_kv); the ring holds a block of keys, a chunk and the window.
     RING = decode_fp16.ring(c)
-    KV_ROWS = decode_fp16.kv_plan(c, max_pos)[2]
+    KV_ROWS = decode_fp16.kv_plan(c, max_pos, layers)[2]
+    # The extents of placeholders (decode_fp16.make_decode): of the layers of
+    # a kind the stage has none of, and of the embedding away from the first.
+    Lc1, La1 = max(Lc, 1), max(La, 1)
+    KV_ROWS, ROPE = (KV_ROWS, max_pos) if La else (decode_fp16.EMPTY_ROWS, decode_fp16.EMPTY_ROWS)
+    HEAD_ROWS = (c.vocab // TILE * D // 2, 2 * TILE) if has_embedding else (TILE, 2 * TILE)
     assert R <= decode_fp16.RING_PAD and RING % KEYS == 0 and decode_fp16.RING_PAD % KEYS == 0
     assert D <= 64 * TILE, "a slot of the ring holds a projection's whole K"
     eps = c.eps
@@ -150,6 +166,19 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             normalize(bf, 0)
             T.copy(bf.rows, bf.a[r : r + RB, :])
         T.dma_wait(0)
+
+    @T.macro
+    def stage_input(bf, weight):
+        """a = x normalized by weight[k], the worker's rows, RB at a time: the
+        first layer's input in a stage after the first, from the residual the
+        stage before left in DDR, by DMA, which crosses processes."""
+        T.copy(weight, bf.nw)
+        for rb in T.serial(RW // RB):
+            r = bf.w * RW + rb * RB
+            T.dma_copy(bf.x[r : r + RB, :], bf.xr[0, :, :])
+            T.dma_wait(0)
+            normalize(bf, 0)
+            T.copy(bf.rows, bf.a[r : r + RB, :])
 
     @T.macro
     def add_branch(bf, post, sandwich: bool, weight, normed):
@@ -413,24 +442,24 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
 
     @T.prim_func
     def prefill(
-        in_w: T.Tensor((Lc, D, 3 * D), "float16"),
-        qkv_w: T.Tensor((La, D, KVH * g.width), "float16"),
+        in_w: T.Tensor((Lc1, D, 3 * D), "float16"),
+        qkv_w: T.Tensor((La1, D, KVH * g.width), "float16"),
         out_w: T.Tensor((L, D, D), "float16"),
         w13_w: T.Tensor((L, D, 2 * F), "float16"),
         w2_w: T.Tensor((L, F, D), "float16"),
-        head_rows: T.Tensor((c.vocab // TILE * D // 2, 2 * TILE), "float16"),
+        head_rows: T.Tensor(HEAD_ROWS, "float16"),
         op_norm: T.Tensor((L, D), "float32"),
         ffn_norm: T.Tensor((L, D), "float32"),
         post_op_norm: T.Tensor((L, D), "float32"),
         post_ffn_norm: T.Tensor((L, D), "float32"),
-        q_norm: T.Tensor((La, HD), "float32"),
-        k_norm: T.Tensor((La, HD), "float32"),
-        conv_w: T.Tensor((Lc, taps, D), "float32"),
-        rope_cos: T.Tensor((NK, max_pos, half), "float32"),
-        rope_sin: T.Tensor((NK, max_pos, half), "float32"),
+        q_norm: T.Tensor((La1, HD), "float32"),
+        k_norm: T.Tensor((La1, HD), "float32"),
+        conv_w: T.Tensor((Lc1, taps, D), "float32"),
+        rope_cos: T.Tensor((NK, ROPE, half), "float32"),
+        rope_sin: T.Tensor((NK, ROPE, half), "float32"),
         kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
-        conv_state: T.Tensor((Lc, taps - 1, D), "float32"),
+        conv_state: T.Tensor((Lc1, taps - 1, D), "float32"),
         kinds: T.Tensor((L, 5), "int32"),
         x: T.Tensor((R, D), "float32"),
         qs: T.Tensor((KVH, group, R, HD), "float16"),
@@ -527,12 +556,16 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
             valid = T.min(R, n - chunk * R)
             # The chunk's rows of the RoPE tables, into VTCM: worker w's
             # rows. Rows past the tables, the padding's, take their last.
-            for t, i, d in T.Parallel(NK, RW, half):
-                r = w * RW + i
-                cos_rows[t, r, d] = rope_cos[t, T.min(base + r, max_pos - 1), d]
-                sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
+            if La:
+                for t, i, d in T.Parallel(NK, RW, half):
+                    r = w * RW + i
+                    cos_rows[t, r, d] = rope_cos[t, T.min(base + r, max_pos - 1), d]
+                    sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
 
-            embed(bf, chunk, n, tokens, head_rows, op_norm[0, :])
+            if has_embedding:
+                embed(bf, chunk, n, tokens, head_rows, op_norm[0, :])
+            else:
+                stage_input(bf, op_norm[0, :])
             T.sync_grid()
 
             for layer in T.serial(L):
@@ -575,9 +608,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                     st_conv.prologue()
                     st_conv.run(0, lambda b, ring, k, ci=ci, valid=valid: in_proj_block(bf, b, ring, k, ci, valid))
                 T.sync_grid()
-                # The last layer's output projection and FFN feed nothing the
-                # prefill leaves: the decode runs the prompt's last token.
-                if layer < L - 1:
+                # The model's last layer's output projection and FFN feed
+                # nothing the prefill leaves: the decode runs the prompt's
+                # last token. A stage before the last runs all of its last
+                # layer, whose residual the next stage reads.
+                if not has_last_layer or layer < L - 1:
                     st_rest.prologue()
                     st_rest.run(0, lambda b, ring, k: branch_block(bf, b, ring, k, hid[:, 0:D], D, True, c.sandwich_norm))
                     T.sync_grid()
@@ -594,7 +629,9 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int):
                         )
                         T.sync_grid()
                     # The residual, and the next layer's normalized input.
-                    add_branch(bf, post_ffn_norm[layer, :], c.sandwich_norm, op_norm[layer + 1, :], True)
+                    # (A stage's last layer normalizes with its own weights, for
+                    # nothing: the next stage normalizes x again.)
+                    add_branch(bf, post_ffn_norm[layer, :], c.sandwich_norm, op_norm[T.min(layer + 1, L - 1), :], True)
                     T.sync_grid()
 
     return prefill

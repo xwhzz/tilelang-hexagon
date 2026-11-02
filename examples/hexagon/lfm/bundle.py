@@ -87,6 +87,28 @@ def read_tensor(path: str, header: dict, name: str) -> torch.Tensor:
     return raw
 
 
+def part_nbytes(header: dict, name: str, count: int | None = None) -> int:
+    """The bytes of `count` slices of tensor `name`'s first axis (all of it
+    by default)."""
+    t = header["tensors"][name]
+    return t["nbytes"] if count is None else t["nbytes"] // t["shape"][0] * count
+
+
+def load_part(buf, path: str, header: dict, name: str, start: int = 0, count: int | None = None, device_path: str | None = None) -> None:
+    """Slices [start, start + count) of tensor `name`'s first axis (all of it
+    by default) into the resident buffer `buf`: read from the bundle at
+    `device_path` on the device when given, else written from `path`."""
+    t = header["tensors"][name]
+    count = t["shape"][0] - start if count is None else count
+    at, nbytes = header["data_offset"] + t["offset"] + part_nbytes(header, name, start), part_nbytes(header, name, count)
+    if device_path is None:
+        with open(path, "rb") as f:
+            f.seek(at)
+            buf.write(f.read(nbytes))
+    elif buf.at(0, nbytes).load(device_path, at) != nbytes:
+        raise ValueError(f"{device_path} on the device ends inside {name}: not the bundle {path} heads")
+
+
 def load(session, path: str, device_path: str | None = None) -> dict:
     """The bundle's tensors in resident buffers of `session`, a buffer each
     (name -> DeviceBuffer), allocated the largest first: a buffer is under
@@ -100,10 +122,6 @@ def load(session, path: str, device_path: str | None = None) -> dict:
     tensors = header["tensors"]
     buffers = {}
     for name in sorted(tensors, key=lambda n: -tensors[n]["nbytes"]):
-        t = tensors[name]
-        buf = buffers[name] = session.buffer(t["nbytes"])
-        if device_path is None:
-            buf.write(read_tensor(path, header, name))
-        elif buf.load(device_path, header["data_offset"] + t["offset"]) != t["nbytes"]:
-            raise ValueError(f"{device_path} on the device ends inside {name}: not the bundle {path} heads")
+        buffers[name] = session.buffer(tensors[name]["nbytes"])
+        load_part(buffers[name], path, header, name, device_path=device_path)
     return {name: buffers[name] for name in tensors}
