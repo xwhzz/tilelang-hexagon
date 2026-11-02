@@ -289,6 +289,17 @@ and explicit HMX atoms.
   only the tile program uses back into it; without that, the workers of a
   `num_workers` kernel would share one copy.
 
+- **Two of hexagon-clang 19's passes are off** in every skel's build (`fastrpc.py`):
+  - its rewrite of qfloat spills and refills after register allocation
+    (`--disable-handle-qfp`), which corrupted spilled qf32 registers (an HVX GEMM's
+    accumulators turned NaN);
+  - HexagonGenInsert (`-hexagon-insert=false`), which forms scalar bit-field inserts
+    and ran for over 30 minutes on one LFM3 decode megakernel that compiles in a
+    minute without it (#221).
+
+  To see which pass a slow compile is in, send the compiler `SIGABRT`: its crash
+  handler prints the pass and function it was running.
+
 ---
 
 ## 8. Extending the backend (a recipe for the next developer)
