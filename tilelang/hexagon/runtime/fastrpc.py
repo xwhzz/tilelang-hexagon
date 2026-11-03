@@ -370,8 +370,11 @@ else()
     # --disable-handle-qfp: hexagon-clang 19's rewrite of qfloat spills and
     # refills after register allocation corrupts spilled qf32 registers (an
     # HVX GEMM's accumulators turned NaN); the registers spill as they are.
-    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error -mllvm --disable-handle-qfp")
-    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions -mllvm --disable-handle-qfp")
+    # -hexagon-insert=false: HexagonGenInsert, which forms scalar bit-field
+    # inserts, ran for over 30 minutes on one LFM3 decode megakernel that
+    # compiles in a minute without it (#221).
+    set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} -mhmx -mhvx -Wno-error -mllvm --disable-handle-qfp -mllvm -hexagon-insert=false")
+    set(CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}} -mhmx -mhvx -Wno-error -fno-exceptions -mllvm --disable-handle-qfp -mllvm -hexagon-insert=false")
     copy_binaries({iface}_skel)
 endif()
 """

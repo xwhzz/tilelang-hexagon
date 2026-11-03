@@ -14,14 +14,15 @@ other sections are LFM2's.
 | `convert.py` | The fp16 bundle of an LFM2 or LFM3 checkpoint: its projections in HMX's Crouton tiles. |
 | `bundle.py` | The bundle file: one header and every tensor the kernels read, in their layouts. |
 | `stream.py` | The weight streams of the kernels (4-bit panels or fp16 Crouton tiles), and the decode's w4a16 GEMV blocks. |
-| `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds a bundle's kernels. |
-| `decode_fp16.py` | The fp16 bundle's decode kernel, LFM2's or LFM3's. |
-| `prefill_fp16.py` | The fp16 bundle's prefill kernel: a prompt in chunks of 256 rows on HMX, in one call. |
+| `decode.py` | The decode kernel: every token of a generation in one call; and `Decoder`, which holds a bundle's kernels, the fp16 one's over as many DSP processes as its context needs. |
+| `decode_fp16.py` | The fp16 bundle's decode kernel, LFM2's or LFM3's: a token a call, a kernel for each stage of the layers; and the stages' plan. |
+| `prefill_fp16.py` | The fp16 bundle's prefill kernel: a chunk of 256 rows of a prompt a call, on HMX, a kernel for each stage of the layers. |
 | `prefill.py` | The prefill kernel: a prompt in chunks of 128 rows on HMX, in one call. |
 | `text.py` | The checkpoint's tokenizer and chat template, on the host, without transformers. |
 | `generate.py` | Chat on the device: the reply streams as it is generated. |
 | `bench.py` | Prompt processing and token generation on the device, in the style of llama-bench. |
 | `ppl.py` | The bundle's perplexity on the device. |
+| `passkey.py` | Passkey retrieval at a long context on the device. |
 | `tiny.py` | Small random LFM2 and LFM3 models with the real ones' structures, for tests. |
 | `OPTIMIZATION.md` | How the decode and the prefill got fast: each step's measured gain, what did not help, where the time goes, and what is left. |
 
@@ -230,11 +231,11 @@ for one.
 
 ### LFM3's prefill
 
-`prefill_fp16.py` runs a prompt in chunks of 256 rows, all in one kernel call,
-as `prefill.py` runs LFM2's. The bundle's fp16 tiles are HMX's weight operand
-as they are: each worker streams the decode's share of every projection, a
-panel of 32 channels a block, and multiplies it by the whole chunk on HMX,
-with nothing to dequantize.
+`prefill_fp16.py` runs a prompt in chunks of 256 rows: a chunk a kernel call,
+all of them in one FastRPC call (`Session.pipeline`). The bundle's fp16 tiles
+are HMX's weight operand as they are: each worker streams the decode's share
+of every projection, a panel of 32 channels a block, and multiplies it by the
+whole chunk on HMX, with nothing to dequantize.
 
 - **VTCM.** A chunk's activations stay in VTCM the workers share:
   - the normalized input and the hidden units, which HMX reads;
@@ -324,3 +325,71 @@ The device scores every token with the decode (`Decoder.score`). Besides the
 fp16 inputs of its projections, its attention multiplies the fp16 KV cache by
 queries and probabilities rounded to fp16, which the host reference keeps in
 fp32.
+
+### LFM3's long contexts
+
+LFM3-1.7B's checkpoint goes to 262144 positions. Its KV cache is fp16, a run
+of rows for each attention layer (`decode_fp16.kv_plan`):
+- max_pos rows for each of the 6 full-attention layers;
+- a ring of 1024 positions for each of the 5 sliding-window layers, which see
+  the last 256, with a pad of 512 rows on either side for the prefill's
+  chunks.
+
+At 256K positions that is 3 GiB of keys and values, plus 256 MiB of RoPE
+tables.
+
+A DSP process has 4 GB of addresses, and the bundle takes 3.3 GiB of them. One
+process holds 48K positions (3947 MiB of buffers), but not 64K. Past that,
+the Decoder splits the layers into stages, one per DSP process of its session
+(`processes="auto"`, `decode_fp16.plan_stages`):
+- Each process maps its stage's slices of the weights, its own KV cache and
+  conv state, and the RoPE tables if it attends.
+- The head is mapped at both ends: the first stage embeds the token, and the
+  last runs the LM head.
+- The cut keeps the largest stage as small as can be. From 64K to 256K that
+  is two stages, layers [0, 12) and [12, 24).
+
+A decode step or a prefill chunk goes through the stages in turn
+(`Session.pipeline`). Each process caches its own lines, so what crosses
+processes goes by DMA:
+- the residual, through a buffer only DMA moves;
+- the last stage's token, written back to DDR as it is written, which the
+  first stage reads.
+
+The VTCM and HMX change hands on the DSP at each turn. A call to the device
+may take 600 s, so a long prompt's chunks, and a long generation's steps, go
+in calls of at most 128 (`Decoder.CALL_STEPS`).
+
+On v79 (`bench.py`, one run each, timed on the phone around the FastRPC
+calls). pp is a prompt of that length from position 0; tg128 is 128 tokens
+right after a prefilled context of that length:
+
+| positions | processes | pp | tg128 |
+|---|---:|---:|---:|
+| 32768 | 1 | 15.24 s, 2150 t/s | 11.7 t/s |
+| 32768 | 2 | 15.22 s, 2153 t/s | 11.6 t/s |
+| 65280 | 2 | 46.2 s, 1412 t/s | 9.1 t/s |
+| 130816 | 2 | 172.8 s, 757 t/s | 6.4 t/s |
+| 261888 | 2 | 679.5 s, 385 t/s | 4.0 t/s |
+
+At 32K, two processes against one cost the prefill nothing measurable. A
+token takes 0.8 ms more (11001 against 10900 ms for 128 tokens); 0.14 ms of
+that is the VTCM's two handoffs, which the resource manager zeroes.
+
+The decode reads the full-attention layers' whole cache every token. At 128K
+that is 1.6 GB on top of the 3.46 GB of weights, so 11.4 t/s at the DMA's
+rate; at 256K it is 3.2 GB, so 8.6 t/s. Its attention copies 64 positions at a
+time and waits for each, about 17 GB/s; that is what is left to win at long
+contexts (#223).
+
+`passkey.py` hides a five-digit key at 10% of a filler text and asks for it
+at the end:
+- At 48K, one process and two give the same reply with the key, `60494`.
+  Their last logits are within 0.013 of each other (the prefill's results
+  move by an fp16 step with its kernels, #220).
+- At 250561 tokens, over two processes, the greedy reply starts with the key:
+  `60494    60494The`. The prompt's prefill takes 698 s (359 t/s), and the
+  reply decodes at 4.1 t/s.
+
+    python bench.py lfm3.head /data/local/tmp/lfm3.bundle --max-pos 262144 --pp 261888 --tg 0 --runs 1
+    python passkey.py lfm3.head /data/local/tmp/lfm3.bundle LFM3-1.7B --max-pos 262144 --tokens 261000

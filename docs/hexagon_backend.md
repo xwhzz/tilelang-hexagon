@@ -306,6 +306,17 @@ and explicit HMX atoms.
   only the tile program uses back into it; without that, the workers of a
   `num_workers` kernel would share one copy.
 
+- **Two of hexagon-clang 19's passes are off** in every skel's build (`fastrpc.py`):
+  - its rewrite of qfloat spills and refills after register allocation
+    (`--disable-handle-qfp`), which corrupted spilled qf32 registers (an HVX GEMM's
+    accumulators turned NaN);
+  - HexagonGenInsert (`-hexagon-insert=false`), which forms scalar bit-field inserts
+    and ran for over 30 minutes on one LFM3 decode megakernel that compiles in a
+    minute without it (#221).
+
+  To see which pass a slow compile is in, send the compiler `SIGABRT`: its crash
+  handler prints the pass and function it was running.
+
 ---
 
 ## 8. Extending the backend (a recipe for the next developer)
@@ -423,6 +434,10 @@ output. LFM2-1.2B ([`examples/hexagon/lfm`](../examples/hexagon/lfm/)) decodes a
 [`OPTIMIZATION.md`](../examples/hexagon/lfm/OPTIMIZATION.md)). It chats from text
 to text (`generate.py`), sampling on the device, and its WikiText-2 perplexity on the
 device (16.684) is that of the host reference with the device's arithmetic (16.683).
+LFM3-1.7B, unquantized in fp16, decodes at 16.6 t/s, the DMA's rate for its 3.46 GB a
+token. It runs to its checkpoint's 262144 positions over two DSP processes, which a
+model past one process's 4 GB of addresses splits its layers over: a 261888-token
+prompt prefills in 680 s, and decodes at 4.0 t/s at that depth.
 
 **Not yet:** autotuning (`num_workers` and tile sizes as knobs).
 

@@ -453,6 +453,57 @@ def test_crouton_tiles_move_as_runs():
     assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[2]
 
 
+# An HMX weight of this many rows has its panels 8193 tiles, more than the
+# 24-bit descriptor stride (16 MiB), apart.
+FAR_ROWS = 262176
+
+
+def _far_block(cols: int, r0: int):
+    @T.prim_func
+    def probe(W: T.Tensor((FAR_ROWS, cols), "float16"), O: T.Tensor((128, cols), "float16")):
+        with T.Kernel(1):
+            w = T.alloc_shared((128, cols), "float16")
+            T.annotate_layout({W: make_hmx_weight_layout(W), w: make_hmx_weight_layout(w), O: make_hmx_weight_layout(O)})
+            T.dma_copy(W[r0 : r0 + 128, :], w)
+            T.dma_wait()
+            T.dma_copy(w, O)
+            T.dma_wait()
+
+    return probe
+
+
+def test_crouton_runs_far_apart_go_a_descriptor_each():
+    calls = [line for line in lower(_far_block(128, 0)).splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    # The load: a 4-tile run of each of the 4 panels, a descriptor each; the
+    # store: VTCM's panels follow each other, one run.
+    assert len(calls) == 5
+    for p in range(4):
+        assert f"(&(W[{p * 8193 * 1024}]))" in calls[p]
+        assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[p]
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_crouton_runs_far_apart_move_on_the_device():
+    import torch
+
+    r0 = 128000  # tile 4000 of each panel
+    kernel = tilelang.compile(_far_block(64, r0), out_idx=[1], target="hexagon")
+    try:
+        torch.manual_seed(0)
+        w = torch.randn(FAR_ROWS, 64).half()
+        o = kernel(w).flatten()
+        # The block's tiles, panel by panel: 4 of the 8193 in each of W's, all
+        # 4 of O's.
+        w = w.flatten()
+        for p in range(2):
+            for i in range(4):
+                got = o[(p * 4 + i) * 1024 : (p * 4 + i + 1) * 1024]
+                at = (p * 8193 + r0 // 32 + i) * 1024
+                torch.testing.assert_close(got, w[at : at + 1024], rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_reject_out_of_bounds():
     @T.prim_func
     def probe(A: T.Tensor((256,), "float16")):

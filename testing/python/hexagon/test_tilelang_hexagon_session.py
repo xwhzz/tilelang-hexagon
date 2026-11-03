@@ -72,7 +72,7 @@ def hmx_gemm(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 32), "float16"),
 
 
 @T.prim_func
-def stamp(step: T.int32, out: T.Tensor((64,), "int32")):
+def stamp(step: T.int32, out: T.Tensor((128,), "int32")):
     """out[step] = step + 1: a pipeline stage's step index."""
     with T.Kernel(1):
         out[step] = step + 1
@@ -544,10 +544,13 @@ def test_a_pipeline_hands_data_on_by_dma(processes):
 def test_steps_reach_the_stages():
     with session.Session([(stamp, [])], processes=2) as s:
         (k,) = s.kernels
-        out = [s.buffer(64 * 4, processes=[p]) for p in (0, 1)]
-        s.pipeline([(k, 0, [session.Session.STEP, out[0]]), (k, 1, [session.Session.STEP, out[1]])], 64)
+        out = [s.buffer(128 * 4, processes=[p]) for p in (0, 1)]
+        # Steps 0-63, then 64-127 in a second call.
+        for first in (0, 64):
+            step = session.Session.STEP + first
+            s.pipeline([(k, 0, [step, out[0]]), (k, 1, [step, out[1]])], 64)
         for buf in out:
-            torch.testing.assert_close(torch.frombuffer(bytearray(buf.read()), dtype=torch.int32), torch.arange(1, 65, dtype=torch.int32))
+            torch.testing.assert_close(torch.frombuffer(bytearray(buf.read()), dtype=torch.int32), torch.arange(1, 129, dtype=torch.int32))
             buf.free()
 
 

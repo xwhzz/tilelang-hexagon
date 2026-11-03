@@ -222,17 +222,25 @@ def test_a_decoder_reads_its_bundle_on_the_device(tiny_bundle, tmp_path):
         subprocess.run(adb + ["shell", f"rm -f {on_device}.bundle {on_device}.head"], capture_output=True)
 
 
-def _fp16_bundle(tmp_path, model: str) -> str:
-    """The fp16 bundle of the tiny LFM2 or LFM3."""
-    c, w = tiny_lfm3() if model == "lfm3" else tiny()[:2]
-    path = str(tmp_path / f"{model}.bundle")
-    bundle.write(path, c.to_dict(), convert.build_tensors(c, w), {})
+@pytest.fixture(scope="module")
+def fp16_bundle(tmp_path_factory):
+    """The fp16 bundle of the tiny LFM2 or LFM3 (`fp16_bundle(model)`), written
+    once for the module: each is a few hundred MB."""
+    paths = {}
+
+    def path(model: str) -> str:
+        if model not in paths:
+            c, w = tiny_lfm3() if model == "lfm3" else tiny()[:2]
+            paths[model] = str(tmp_path_factory.mktemp(f"fp16_{model}") / f"{model}.bundle")
+            bundle.write(paths[model], c.to_dict(), convert.build_tensors(c, w), {})
+        return paths[model]
+
     return path
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_decode_is_one_cycle_of_phases(model, tmp_path):
-    c = Config.from_dict(bundle.read_header(_fp16_bundle(tmp_path, model))["config"])
+def test_fp16_decode_is_one_step_of_phases(model, fp16_bundle):
+    c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
     target = determine_target("hexagon", return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
         art = tilelang.lower(decode_fp16.make_decode(c, 256, 64), target=target, enable_host_codegen=False, enable_device_compile=False)
@@ -243,10 +251,38 @@ def test_fp16_decode_is_one_cycle_of_phases(model, tmp_path):
     assert "tl_hvx_gemm_weight<" in source and "TL_GEMM" not in source
 
 
+def test_fp16_stages_split_the_layers(fp16_bundle):
+    """A model over several DSP processes: each stage a run of the layers, the
+    largest as small as can be; the embedding in the first, the head in the
+    last, and the residual handed on between."""
+    path = fp16_bundle("lfm3")
+    header = bundle.read_header(path)
+    c = Config.from_dict(header["config"])
+    assert decode_fp16.plan_stages(c, header, 256) == [range(4)]
+    assert decode_fp16.plan_stages(c, header, 256, 2) == [range(2), range(2, 4)]
+    assert decode_fp16.plan_stages(c, header, 256, 4) == [range(i, i + 1) for i in range(4)]
+    target = determine_target("hexagon", return_object=True)
+    for layers in (range(2), range(1, 3), range(2, 4)):
+        with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
+            art = tilelang.lower(
+                decode_fp16.make_decode(c, 256, 64, layers), target=target, enable_host_codegen=False, enable_device_compile=False
+            )
+        # Four barriers a layer, and one after the head in the last stage.
+        assert art.kernel_source.count("tl_grid_sync(") == 4 * len(layers) + (layers.stop == c.layers)
+    ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64, range(1, 3)), [])])
+    assert source.count("for (int32_t layer = 0; layer < 2; ++layer)") == 1
+
+
+# Runs over DSP processes: the tiny LFM3's layers two a stage, and the tiny
+# LFM2's one a stage, of which the first and the last have no attention and
+# the middle one neither the embedding nor the head.
+STAGES = [("lfm2", 1), ("lfm3", 1), ("lfm3", 2), ("lfm2", 3)]
+
+
 @DEVICE
-@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_decode_matches_the_reference(model, tmp_path):
-    path = _fp16_bundle(tmp_path, model)
+@pytest.mark.parametrize(("model", "processes"), STAGES)
+def test_fp16_decode_matches_the_reference(model, processes, fp16_bundle):
+    path = fp16_bundle(model)
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
     torch.manual_seed(2)
@@ -255,7 +291,8 @@ def test_fp16_decode_matches_the_reference(model, tmp_path):
     n_forced, n = len(prompt), len(prompt) + 8 - 1
     with torch.no_grad():
         ref_tokens, ref_logits, ref_scores = _reference(ref, prompt, n, n_forced)
-    decoder = Decoder(path, max_pos=256, max_tokens=128)
+    decoder = Decoder(path, max_pos=256, max_tokens=128, processes=processes)
+    assert len(decoder.stages) == processes
     try:
         tokens, logits = decoder.run(prompt, 0, n, n_forced)
         assert tokens == ref_tokens
@@ -268,8 +305,8 @@ def test_fp16_decode_matches_the_reference(model, tmp_path):
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_prefill_is_one_loop_over_the_layers(model, tmp_path):
-    c = Config.from_dict(bundle.read_header(_fp16_bundle(tmp_path, model))["config"])
+def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
+    c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
     ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64), [])])
     # A loop at run time, whatever the depth; the projections are calls of
     # the HMX GEMM.
@@ -277,18 +314,27 @@ def test_fp16_prefill_is_one_loop_over_the_layers(model, tmp_path):
     assert "tl_hexagon_hmx_gemm<" in source
 
 
+def _kv_errors(decoder, state, n, rel) -> list:
+    """The relative errors of each attention layer's keys and values in the
+    device's caches against the reference's, at the positions of [0, n) the
+    caches hold: all of them, or a sliding window's ring's."""
+    errors = []
+    for ai, (k, v, positions) in enumerate(decoder.kv_positions(n)):
+        errors += [rel(k, state.k[ai][:, positions]), rel(v, state.v[ai][:, positions])]
+    return errors
+
+
 @DEVICE
-@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_prefill_matches_the_reference(model, tmp_path):
-    path = _fp16_bundle(tmp_path, model)
+@pytest.mark.parametrize(("model", "processes"), STAGES)
+def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
+    path = fp16_bundle(model)
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
     torch.manual_seed(1)
     # A chunk of 128 rows and part of another, past the tiny LFM3's window.
     n, max_pos = 200, 512
     prompt = torch.randint(0, c.vocab, (n,))
-    La, KVH, HD = len(c.attention_layers), c.kv_heads, c.head_dim
-    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes)
     try:
         decoder.reset()
         decoder.prefill(prompt.tolist())
@@ -299,14 +345,8 @@ def test_fp16_prefill_matches_the_reference(model, tmp_path):
         def rel(a, b):
             return ((a - b).abs().max() / b.abs().max()).item()
 
-        # The cache's tiles (decode_fp16.kv_layouts): keys as the weight
-        # operand [head_dim, positions] of q K^T, values as that of P V.
-        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16)
-        k = convert.from_crouton_weight(k, (La, KVH, HD, max_pos)).float()
-        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16)
-        v = convert.from_crouton_weight(v, (La, KVH, max_pos, HD)).transpose(-1, -2).float()
-        conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, c.conv_taps - 1, c.dim)
-        errors = [rel(k[ai, :, :n], state.k[ai]) for ai in range(La)] + [rel(v[ai, :, :n], state.v[ai]) for ai in range(La)]
+        errors = _kv_errors(decoder, state, n, rel)
+        conv = decoder.conv_states()
         errors += [rel(conv[ci], state.conv[ci]) for ci in range(conv.shape[0])]
         assert max(errors) < 1e-2, errors
         # The decode goes on from the prefilled context.
@@ -318,20 +358,20 @@ def test_fp16_prefill_matches_the_reference(model, tmp_path):
 
 
 @DEVICE
-@pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_prefill_after_decode_steps(model, tmp_path):
+@pytest.mark.parametrize(("model", "processes"), STAGES[:3])
+def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):
     """A chat's second turn: a prefill, decode steps, then a prefill from where
     they stopped. The second prefill's attention reads by DMA the keys and
     values the decode wrote with scalar stores, which the write-through cache
     wrote back as they were written."""
-    path = _fp16_bundle(tmp_path, model)
+    path = fp16_bundle(model)
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
     torch.manual_seed(3)
     seq = torch.randint(0, c.vocab, (150,))
     first, steps = 60, 20
-    La, KVH, HD, max_pos = len(c.attention_layers), c.kv_heads, c.head_dim, 512
-    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    max_pos = 512
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes)
     try:
         decoder.reset()
         decoder.prefill(seq[:first].tolist())
@@ -345,13 +385,109 @@ def test_fp16_prefill_after_decode_steps(model, tmp_path):
             return ((a - b).abs().max() / b.abs().max()).item()
 
         n = len(seq)
-        k = torch.frombuffer(bytearray(decoder.kv_k.read()), dtype=torch.float16)
-        k = convert.from_crouton_weight(k, (La, KVH, HD, max_pos)).float()
-        v = torch.frombuffer(bytearray(decoder.kv_v.read()), dtype=torch.float16)
-        v = convert.from_crouton_weight(v, (La, KVH, max_pos, HD)).transpose(-1, -2).float()
-        conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32).view(-1, c.conv_taps - 1, c.dim)
-        errors = [rel(k[ai, :, :n], state.k[ai]) for ai in range(La)] + [rel(v[ai, :, :n], state.v[ai]) for ai in range(La)]
+        errors = _kv_errors(decoder, state, n, rel)
+        conv = decoder.conv_states()
         errors += [rel(conv[ci], state.conv[ci]) for ci in range(conv.shape[0])]
+        assert max(errors) < 1e-2, errors
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_fp16_stages_compute_what_one_process_does(fp16_bundle):
+    """The tiny LFM3 over two DSP processes against one, after a prefill and
+    greedy decode steps, and through forced decode steps: the same tokens,
+    and caches and logits within about an fp16 step of each other, where a
+    residual or a token that crossed wrong would move them by its whole size.
+    The prefill's are not bit for bit the same: they move by an fp16 step
+    with the order in which its workers leave a barrier, which a stage's
+    kernel changes, as a barrier added to one process's kernel does (#220)."""
+    path = fp16_bundle("lfm3")
+    c = Config.from_dict(bundle.read_header(path)["config"])
+    torch.manual_seed(7)
+    prompt = torch.randint(0, c.vocab, (200,)).tolist()
+    steps = 8
+    runs = []
+    for processes in (1, 2):
+        decoder = Decoder(path, max_pos=512, max_tokens=512, prefill_rows=128, processes=processes)
+        try:
+            decoder.prefill(prompt[:-1])
+            tokens, _ = decoder.run(prompt[-1:], len(prompt) - 1, steps, 1)
+            caches = [t for k, v, _ in decoder.kv_positions(len(prompt) + steps - 1) for t in (k, v)]
+            caches.append(decoder.conv_states())
+            decoder.reset()
+            _, logits = decoder.run(prompt[:41], 0, 40, 41)
+            runs.append((tokens, caches, logits))
+        finally:
+            decoder.close()
+    (tokens, caches, logits), (tokens2, caches2, logits2) = runs
+    assert tokens == tokens2
+
+    def rel(a, b):
+        return ((a - b).abs().max() / b.abs().max()).item()
+
+    errors = [rel(a, b) for a, b in zip(caches2, caches)] + [rel(logits2, logits)]
+    assert len(caches) == 2 * len(c.attention_layers) + 1 and max(errors) < 2e-3, errors
+
+
+@DEVICE
+def test_fp16_prefill_and_decode_run_past_the_ring(fp16_bundle):
+    """The sliding-window layers' caches are rings of 1024 positions
+    (decode_fp16.ring): a prompt past one, and decode steps after it, read
+    the window from the ring."""
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    assert decode_fp16.ring(c) == 1024
+    torch.manual_seed(5)
+    n, max_pos = 1300, 2048
+    prompt = torch.randint(0, c.vocab, (n,))
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    try:
+        decoder.reset()
+        decoder.prefill(prompt.tolist())
+        state = ref.new_state()
+        with torch.no_grad():
+            ref.run(prompt, state)
+
+        def rel(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        errors = _kv_errors(decoder, state, n, rel)
+        assert max(errors) < 1e-2, errors
+        with torch.no_grad():
+            want = ref.generate(prompt, 8)
+        assert decoder.generate(prompt.tolist(), 8) == want
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_fp16_prefill_from_decode_steps_wraps_the_ring(fp16_bundle):
+    """A prefill that starts where decode steps stopped, at a position no
+    chunk boundary: its first chunk's rows run past the ring's end, and its
+    write goes again from the ring's start (prefill_fp16.store_kv)."""
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    torch.manual_seed(6)
+    seq = torch.randint(0, c.vocab, (1310,))
+    first, steps, max_pos = 1000, 10, 2048
+    assert (first + steps) % decode_fp16.ring(c) + 128 > decode_fp16.ring(c)
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128)
+    try:
+        decoder.reset()
+        decoder.prefill(seq[:first].tolist())
+        decoder.run(seq[first : first + steps].tolist(), first, steps, steps)
+        decoder.prefill(seq[first + steps :].tolist(), first + steps)
+        state = ref.new_state()
+        with torch.no_grad():
+            ref.run(seq, state)
+
+        def rel(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        errors = _kv_errors(decoder, state, len(seq), rel)
         assert max(errors) < 1e-2, errors
     finally:
         decoder.close()
