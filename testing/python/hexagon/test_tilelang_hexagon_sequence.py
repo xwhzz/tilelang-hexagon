@@ -80,6 +80,7 @@ int seq_test_run(remote_handle64, int32_t, const int32_t*, int, const uint8_t*, 
             compiler,
             "-std=c11",
             "-D_POSIX_C_SOURCE=200809L",
+            "-D_DARWIN_C_SOURCE",
             "-O1",
             "-pthread",
             *flags,
@@ -138,6 +139,35 @@ def agent(native_agent, request):
 
 def _ints(buffer):
     return list(struct.unpack(f"<{buffer.nbytes // 4}i", buffer.read()))
+
+
+@pytest.mark.parametrize("partial_request", [False, True])
+def test_control_socket_eof_exits_even_while_launcher_stdin_stays_open(agent, partial_request):
+    # A legacy adbd PTY need not propagate the launcher's stdin EOF. Losing
+    # the sole control socket must still release buffers and close FastRPC.
+    buffer = agent.buffer(128)
+    agent.kernels[0](buffer, 7)
+    if partial_request:
+        agent._sock.sendall(bytes([session._OP_ALLOC]) + b"\x80\0")
+    agent._sock.close()
+    assert not agent._proc.stdin.closed
+    assert agent._proc.wait(timeout=5) == 0
+
+
+def test_agent_exits_if_no_control_connection_arrives(native_agent):
+    proc = subprocess.Popen(
+        [str(native_agent), "0", "1", "3", "100"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        # Keep stdin open throughout: the startup deadline owns this cleanup.
+        assert select.select([proc.stdout], [], [], 5)[0]
+        assert re.fullmatch(rb"AGENT_READY port=\d+\n", proc.stdout.readline())
+        assert proc.wait(timeout=5) == 0
+        assert not proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()
 
 
 def _stats(agent):

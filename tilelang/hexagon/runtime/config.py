@@ -29,8 +29,8 @@ def remote_dir(os_name: str) -> str:
 
 def ssh_host() -> str | None:
     """An explicit SSH destination selects SSH exclusively, never ADB fallback."""
-    host = os.environ.get("TILELANG_HEXAGON_SSH_HOST")
-    if host is not None and (not host or host.startswith("-") or any(c.isspace() for c in host)):
+    host = os.environ.get("TILELANG_HEXAGON_SSH_HOST") or None
+    if host is not None and (host.startswith("-") or any(c.isspace() for c in host)):
         raise ValueError("TILELANG_HEXAGON_SSH_HOST must be a nonempty SSH host or user@host")
     return host
 

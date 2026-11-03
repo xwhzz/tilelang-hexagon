@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
-from .config import device_serial, remote_dir, ssh_host, ssh_transfer_timeout
+from .config import device_serial, domain_id, remote_dir, ssh_host, ssh_transfer_timeout
 
 
 def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
@@ -267,6 +267,7 @@ class OneShotKernel:
         from .build import build_cmake_fastrpc
 
         self.params, self.result_idx = list(params), list(result_idx)
+        self._domain = domain_id()
         # The kernel's FastRPC project, build tree and argument files.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_")
         weakref.finalize(self, shutil.rmtree, self._workdir, True)
@@ -297,7 +298,7 @@ class OneShotKernel:
             else:
                 t = next(it)
                 values[i] = t if p.is_scalar() else t.detach().to("cpu").contiguous()
-        argv, pulls = [], []
+        argv, pulls = [str(self._domain)], []
         for i, p in enumerate(params):
             if p.is_scalar():
                 argv.append(str(int(values[i])))

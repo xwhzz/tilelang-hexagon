@@ -445,7 +445,7 @@ def test_session_transport_cleans_up_agent_on_shutdown(monkeypatch, tmp_path):
     agent.write_text(
         f"#!{sys.executable}\n"
         "import socket, sys\n"
-        "assert sys.argv[1:] == ['0', '1', '4'], sys.argv\n"
+        "assert sys.argv[1:] == ['0', '1', '4', '30000'], sys.argv\n"
         "s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\n"
         "print('AGENT_READY port=%d' % s.getsockname()[1], flush=True)\n"
         "conn, _=s.accept()\n"
@@ -590,3 +590,110 @@ def test_cleanup_error_never_retains_the_device_lock(monkeypatch):
     assert released == [True]
     instance.close()
     assert released == [True]
+
+
+def test_concurrent_android_sessions_have_private_directories(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from tilelang.hexagon.runtime import config, session
+
+    # Both constructors yield in device discovery after the old shared
+    # counter's increment. A shared late read used to select the same suffix.
+    discovery = Barrier(2)
+
+    def discover():
+        discovery.wait(timeout=5)
+        return "phone"
+
+    monkeypatch.setattr(config, "device_serial", discover)
+    monkeypatch.setattr(build, "build_cmake_fastrpc", lambda *a, **kw: build.FastRPCArtifacts("skel", agent_exe="agent"))
+    monkeypatch.setattr(session.Session, "_start", lambda *a: None)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        sessions = list(threads.map(lambda _: session.Session.of_lowered([], sdk=FakeSDK()), range(2)))
+    try:
+        assert len({s._device_dir for s in sessions}) == 2
+        assert all(s._conn.serial == "phone" for s in sessions)
+    finally:
+        for instance in sessions:
+            instance.close()
+
+
+@pytest.mark.parametrize("diagnostic", ["* daemon started successfully\n", "ADB_TRACE: forward succeeded\n"])
+def test_adb_forward_parses_stdout_and_cleanup_owns_the_forward(monkeypatch, diagnostic):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="43210\n", stderr=diagnostic)
+
+    monkeypatch.setattr(device.subprocess, "run", run)
+    conn = device.AdbConnection(serial="phone")
+    assert conn.forward_port(1234) == 43210
+    # Cleanup also owns forwardings if startup fails before Session stores
+    # the returned port (or an interruption lands at that boundary).
+    conn.cleanup()
+    assert calls[-1][-3:] == ["forward", "--remove", "tcp:43210"]
+    assert not conn._forwards
+
+
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("removal_fails", [False, True])
+def test_failed_adb_forward_removes_only_its_private_mapping(monkeypatch, failure, removal_fails):
+    calls = []
+    removals = 0
+
+    def run(argv, **kwargs):
+        nonlocal removals
+        calls.append(argv)
+        if argv[-3:] == ["forward", "tcp:0", "tcp:1234"]:
+            if failure is KeyboardInterrupt:
+                raise KeyboardInterrupt()
+            return SimpleNamespace(returncode=0, stdout="invalid port\n", stderr="")
+        if argv[-2:] == ["forward", "--list"]:
+            return SimpleNamespace(
+                returncode=0, stdout="phone tcp:43210 tcp:1234\nother tcp:43211 tcp:1234\nphone tcp:43212 tcp:1235\n", stderr=""
+            )
+        if "--remove" in argv:
+            removals += 1
+            if removal_fails and removals == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="temporary ADB failure")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(device.subprocess, "run", run)
+    conn = device.AdbConnection(serial="phone")
+    with pytest.raises(failure):
+        conn.forward_port(1234)
+    if removal_fails:
+        assert conn._forwards == {43210}
+        conn.cleanup()
+    removed = [argv[-1] for argv in calls if "--remove" in argv]
+    assert removed == ["tcp:43210"] * (2 if removal_fails else 1)
+    assert not conn._forwards
+
+
+def test_empty_ssh_host_uses_adb(monkeypatch):
+    from tilelang.hexagon.runtime import config
+
+    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", "linux")
+    monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "")
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "board-adb")
+    assert config.ssh_host() is None
+    assert config.device_serial() == "board-adb"
+    connection = linux_runtime.LinuxConnection.from_environment()
+    assert connection.ssh_host is None and connection.serial == "board-adb"
+
+
+def test_oneshot_captures_domain_for_every_call(monkeypatch):
+    monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", "4")
+    calls = []
+    conn = SimpleNamespace(push=lambda path: path, run_host_binary=lambda exe, args, **kw: calls.append(args) or (0, ""))
+    monkeypatch.setattr(linux_runtime.LinuxConnection, "from_environment", classmethod(lambda cls: conn))
+    monkeypatch.setattr(build, "build_cmake_fastrpc", lambda *a, **kw: build.FastRPCArtifacts("skel", host_exe="host"))
+    kernel = linux_runtime.OneShotKernel("empty", "void empty() {}", [], [], sdk=FakeSDK(), dsp_arch="v73")
+    try:
+        kernel()
+        monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", "3")
+        kernel()
+        assert calls == [["4"], ["4"]]
+    finally:
+        kernel.close()

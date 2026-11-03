@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import time
 from types import SimpleNamespace
@@ -273,7 +274,7 @@ def test_session_dispatch_lifecycle_on_host(tmp_path):
     subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(executable)], check=True, timeout=30)
     for mode, failures in [
         ("direct", ["none", "query", "resources", "take"]),
-        ("worker", ["none", "query", "allocate", "create", "resources", "take", "join"]),
+        ("worker", ["none", "query", "allocate", "create", "resources", "take", "join", "exited"]),
     ]:
         for failure in failures:
             subprocess.run([str(executable), mode, failure], check=True, timeout=10)
@@ -322,9 +323,10 @@ def test_a_session_reports_what_its_agent_printed_when_it_exits(monkeypatch):
         _start(monkeypatch, "echo 'cannot load the skel'; exit 3")
 
 
-def test_a_session_sees_its_agent_ready_after_other_output(monkeypatch):
+@pytest.mark.parametrize("newline", ["\\n", "\\r\\n"])
+def test_a_session_sees_its_agent_ready_after_other_output(monkeypatch, newline):
     # Both lines reach the pipe at once.
-    s = _start(monkeypatch, "printf 'loading\\nAGENT_READY port=1\\n'; sleep 30")
+    s = _start(monkeypatch, f"printf 'loading{newline}AGENT_READY port=1{newline}'; sleep 30")
     s._proc.kill()
     s.close()
 
@@ -598,3 +600,157 @@ def test_vtcm_cached_context_releases_partial_grants_on_host(tmp_path):
         timeout=30,
     )
     subprocess.run([str(binary)], check=True, timeout=10)
+
+
+class _WireSocket:
+    def __init__(self, reply=b"", failure=None, fail_send=False):
+        self.reply, self.failure, self.fail_send = reply, failure, fail_send
+        self.sent, self.timeouts = [], []
+        self.timeout, self.closed = session.CALL_TIMEOUT, False
+
+    def sendall(self, data):
+        self.sent.append(data)
+        if self.fail_send:
+            raise self.failure
+
+    def recv(self, count):
+        if self.reply:
+            data, self.reply = self.reply[:count], self.reply[count:]
+            return data
+        if self.failure is not None:
+            raise self.failure
+        return b""
+
+    def close(self):
+        self.closed = True
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+        self.timeouts.append(timeout)
+
+
+def _wire_session(sock):
+    instance = session.Session.__new__(session.Session)
+    instance._closed, instance._holds_device, instance.processes = False, False, 1
+    instance._conn = SimpleNamespace(cleanup=lambda: None)
+    instance._sock = sock
+    allocation = session._BufferAllocation(0, 128, 1)
+    instance._allocations = {0: allocation}
+    instance._buffer_generations = {0: 1}
+    instance.kernels = [session.SessionKernel(instance, 0, "empty", [], [])]
+    return instance, session.DeviceBuffer(instance, 0, 128, _allocation=allocation)
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, KeyboardInterrupt])
+@pytest.mark.parametrize(
+    "operation,phase",
+    [
+        (op, phase)
+        for op in ("run", "pipeline", "write", "read", "load", "timing", "allocate", "free", "sequence")
+        for phase in ("send", "reply")
+        if (op, phase) != ("free", "reply")
+    ],
+)
+def test_interrupted_wire_operation_invalidates_session_and_buffers(operation, phase, failure):
+    # For multibyte replies, consume a prefix before failing. No future
+    # allocation may mistake the missing reply's tail for a buffer ID.
+    prefix = b"\0" if phase == "reply" and operation in ("read", "load", "timing", "allocate", "sequence") else b""
+    sock = _WireSocket(prefix, failure("interrupted exchange"), phase == "send")
+    instance, buffer = _wire_session(sock)
+    kernel = instance.kernels[0]
+    invoke = {
+        "run": lambda: kernel(),
+        "pipeline": lambda: instance.pipeline([(kernel, 0, [])], 1),
+        "write": lambda: buffer.write(b"test"),
+        "read": lambda: buffer.read(4),
+        "load": lambda: buffer.load("/model"),
+        "timing": instance.last_run_seconds,
+        "allocate": lambda: instance.buffer(128),
+        "free": buffer.free,
+        "sequence": lambda: instance.run_sequence([session.Run(kernel, ())]),
+    }[operation]
+    with pytest.raises(failure, match="interrupted exchange"):
+        invoke()
+    assert instance._closed and sock.closed
+    assert len(sock.sent) == 1  # Do not append SHUTDOWN to an incomplete frame.
+    with pytest.raises(ValueError, match="no longer live"):
+        buffer.read(4)
+    with pytest.raises(ValueError, match="closed"):
+        instance.buffer(128)
+    assert len(sock.sent) == 1
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_sequence_timeout_is_scoped_and_complete_errors_keep_session(failed):
+    # A complete failure has the failed Run's timing too; it leaves framing
+    # intact and permits a subsequent request on the same Session.
+    reply = struct.pack("<IIIIIq", 0 if failed else 1, 0 if failed else 0xFFFFFFFF, 2 if failed else 0, 0x1001 if failed else 0, 1, 7)
+    reply += struct.pack("<IIq", 0, 0, 5)
+    sock = _WireSocket(reply)
+    instance, _ = _wire_session(sock)
+    try:
+        if failed:
+            with pytest.raises(session.SequenceError):
+                instance.run_sequence([session.Run(instance.kernels[0], ())], timeout=1800)
+        else:
+            assert instance.run_sequence([session.Run(instance.kernels[0], ())], timeout=1800).completed_operations == 1
+        assert not instance._closed
+        assert sock.timeouts == [1800, session.CALL_TIMEOUT]
+        sock.reply = struct.pack("<q", 250000000)
+        assert instance.last_run_seconds() == 0.25
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), None, "invalid"])
+def test_invalid_sequence_timeout_sends_nothing(timeout):
+    sock = _WireSocket()
+    instance, _ = _wire_session(sock)
+    try:
+        with pytest.raises(ValueError, match="finite and positive"):
+            instance.run_sequence([session.Run(instance.kernels[0], ())], timeout=timeout)
+        assert not sock.sent and not instance._closed
+    finally:
+        instance.close()
+
+
+def test_sequence_timeout_cleanup_does_not_mask_original_exception(monkeypatch):
+    sock = _WireSocket(failure=KeyboardInterrupt("original interruption"))
+    instance, _ = _wire_session(sock)
+    calls = []
+
+    def timeout(value):
+        calls.append(value)
+        if len(calls) > 1:
+            raise RuntimeError("must not restore a closed socket")
+
+    monkeypatch.setattr(sock, "settimeout", timeout)
+    with pytest.raises(KeyboardInterrupt, match="original interruption"):
+        instance.run_sequence([session.Run(instance.kernels[0], ())], timeout=1800)
+    assert instance._closed and calls == [1800]
+
+
+def test_sequence_timeout_restore_failure_preserves_complete_error(monkeypatch):
+    reply = struct.pack("<IIIIIq", 0, 0, 2, 0x1001, 1, 7) + struct.pack("<IIq", 0, 0, 5)
+    sock = _WireSocket(reply)
+    instance, _ = _wire_session(sock)
+
+    def timeout(value):
+        if value == session.CALL_TIMEOUT:
+            raise RuntimeError("timeout restore failed")
+
+    monkeypatch.setattr(sock, "settimeout", timeout)
+    with pytest.raises(session.SequenceError) as error:
+        instance.run_sequence([session.Run(instance.kernels[0], ())], timeout=1800)
+    assert error.value.raw_status == 0x1001
+    assert instance._closed and sock.closed
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), 1e308])
+def test_invalid_startup_timeout_fails_before_build(monkeypatch, timeout):
+    monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before build"))
+    with pytest.raises(ValueError, match="ready_timeout"):
+        session.Session.of_lowered([], ready_timeout=timeout)

@@ -3,7 +3,6 @@ bundles, and the 4-bit decode and prefill kernels, on small random models
 with the real ones' structures (tiny.py)."""
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +12,9 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
-from tilelang.hexagon.runtime.config import device_serial, remote_dir
+from tilelang.hexagon.runtime.config import device_serial, hlos, remote_dir
+from tilelang.hexagon.runtime.device import AdbConnection
+from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
 from tilelang.hexagon.runtime.session import lower_kernels
 
 LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
@@ -23,10 +24,10 @@ import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
-from model import Config, Model, load_hf_weights  # noqa: E402
+from model import CONV, FULL, Config, Model, load_hf_weights  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
-from tiny import tiny, tiny_lfm3  # noqa: E402
+from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 
@@ -50,6 +51,48 @@ def test_bundle_scale_classification_and_header_only(tmp_path, scale):
     with open(path, "r+b") as f:
         f.truncate(header["data_offset"])
     assert not bundle.has_normal_scales(path, header)
+
+
+@pytest.mark.parametrize("scale", [1e-12, 2**-24, 2**-14, 0.1])
+def test_quantization_records_stored_scale_classification(tmp_path, scale):
+    # A small shape sufficient for packing; no device kernel is instantiated.
+    c = Config(vocab=128, dim=128, ff=128, heads=2, kv_heads=1, head_dim=64, layer_types=(CONV, FULL))
+    weights = random_weights(c)
+    q = {name: rtn(t, 4, 64) for name, t in weights.items() if name.endswith("_proj.weight") or ".feed_forward." in name}
+    q["lm_head.weight"] = rtn(weights["lm_head.weight"], 8, None)
+    q["model.layers.0.conv.in_proj.weight"][1][0, 0] = scale
+    tensors, quant = build_tensors(c, weights, q)
+    expected = scale >= 2**-14
+    assert quant["conv.in_proj"]["normal_scales"] is expected
+    assert all(v["normal_scales"] for name, v in quant.items() if name != "conv.in_proj")
+    path = str(tmp_path / "quantized.bundle")
+    bundle.write(path, c.to_dict(), tensors, quant)
+    header = bundle.read_header(path)
+    assert bundle.has_normal_scales(path, header) is expected
+    with open(path, "r+b") as f:
+        f.truncate(header["data_offset"])
+    assert bundle.has_normal_scales(path, bundle.read_header(path)) is expected
+
+
+@pytest.mark.parametrize("recorded", [{}, {"a": True}, {"a": True, "b": True}, {"a": False, "b": True}, {"a": True, "b": False}])
+def test_bundle_accepts_mixed_new_and_legacy_scale_metadata(tmp_path, recorded):
+    path = str(tmp_path / "mixed.bundle")
+    tensors = {name + ".scale": (torch.ones(2).half(), "float16", (2,), "row_major") for name in ("a", "b")}
+    quant = {name: {"bits": 4, **({"normal_scales": recorded[name]} if name in recorded else {})} for name in ("a", "b")}
+    bundle.write(path, {}, tensors, quant)
+    header = bundle.read_header(path)
+    assert bundle.has_normal_scales(path, header) is all(recorded.values())
+    with open(path, "r+b") as f:
+        f.truncate(header["data_offset"])
+    assert bundle.has_normal_scales(path, header) is (len(recorded) == 2 and all(recorded.values()))
+
+
+@pytest.mark.parametrize("recorded", ["true", 1, None, []])
+def test_bundle_scale_metadata_requires_a_boolean(tmp_path, recorded):
+    path = str(tmp_path / "invalid.bundle")
+    header = bundle.write(path, {}, {}, {"w": {"bits": 4, "normal_scales": recorded}})
+    with pytest.raises(ValueError, match="normal_scales must be a JSON boolean"):
+        bundle.has_normal_scales(path, header)
 
 
 def test_bundle_holds_the_quantized_weights(tiny_bundle):
@@ -209,28 +252,29 @@ def test_decode_samples_at_a_temperature(tiny_bundle):
 
 @DEVICE
 def test_a_decoder_reads_its_bundle_on_the_device(tiny_bundle, tmp_path):
-    """With the bundle on the device, the host needs only its header."""
+    """Header-only metadata selects normal-scale prefill before device decode."""
     _, _, _, path = tiny_bundle
     head = tmp_path / "head.bundle"
     with open(path, "rb") as f:
         head.write_bytes(f.read(bundle.read_header(path)["data_offset"]))
-    adb = ["adb", "-s", device_serial()]
-    on_device = f"{remote_dir('android')}/test_lfm_{os.getpid()}"
-    subprocess.run(adb + ["push", path, f"{on_device}.bundle"], check=True, capture_output=True)
-    subprocess.run(adb + ["push", str(head), f"{on_device}.head"], check=True, capture_output=True)
+    assert bundle.has_normal_scales(str(head), bundle.read_header(str(head)))
+    connection_cls = LinuxConnection if hlos() == "linux" else AdbConnection
+    connection = connection_cls(serial=device_serial(), workdir=f"{remote_dir(hlos())}/test_lfm_{os.getpid()}_{tmp_path.name}")
     prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000]
     with torch.no_grad():
         want = BundleModel(path).generate(torch.tensor(prompt), 8)
     try:
-        decoder = Decoder(str(head), f"{on_device}.bundle", max_pos=256, max_tokens=64)
+        on_device = connection.push(path, "weights.bundle")
+        on_device_head = connection.push(str(head), "header.bundle")
+        decoder = Decoder(str(head), on_device, max_pos=256, max_tokens=256, prefill_rows=128)
         try:
             assert decoder.generate(prompt, 8) == want
             with pytest.raises(ValueError, match="ends inside"):
-                bundle.load(decoder.session, str(head), f"{on_device}.head")
+                bundle.load(decoder.session, str(head), on_device_head)
         finally:
             decoder.close()
     finally:
-        subprocess.run(adb + ["shell", f"rm -f {on_device}.bundle {on_device}.head"], capture_output=True)
+        connection.cleanup()
 
 
 @pytest.fixture(scope="module")

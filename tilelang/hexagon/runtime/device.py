@@ -7,6 +7,7 @@ ADB and SSH from the resident session's buffer and kernel protocol.
 from __future__ import annotations
 
 import abc
+import contextlib
 import fcntl
 import os
 import shlex
@@ -139,10 +140,15 @@ class AdbConnection(HexagonConnection):
         self._transport_env = dict(os.environ)
         self._ensured = False
         self._workdir_attempted = False
+        self._forwards = set()
 
     # ---- helpers ----------------------------------------------------------
     def _run(self, argv: list[str], timeout: float | None = None) -> tuple[int, str]:
-        proc = subprocess.run(
+        proc = self._run_process(argv, timeout)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    def _run_process(self, argv: list[str], timeout: float | None = None):
+        return subprocess.run(
             self._base + argv,
             env=self._transport_env,
             capture_output=True,
@@ -150,7 +156,6 @@ class AdbConnection(HexagonConnection):
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
     def _ensure_workdir(self, timeout: float | None = None) -> None:
         if not self._ensured:
@@ -207,13 +212,45 @@ class AdbConnection(HexagonConnection):
 
     def forward_port(self, remote_port: int) -> int:
         """Forward a device loopback port; close it with ``remove_forward``."""
-        rc, out = self._run(["forward", "tcp:0", f"tcp:{remote_port}"])
-        if rc:
-            raise HexagonConnectionError(f"adb forward failed: {out}")
-        return int(out.split()[-1])
+        # ADB diagnostics (daemon startup and ADB_TRACE) belong to stderr.
+        # Only stdout is the allocated port's protocol reply.
+        try:
+            proc = self._run_process(["forward", "tcp:0", f"tcp:{remote_port}"])
+            if proc.returncode:
+                raise HexagonConnectionError(f"adb forward failed: {proc.stdout}{proc.stderr}")
+            port = int(proc.stdout.strip())
+            if not 0 < port < 65536:
+                raise ValueError("port out of range")
+            self._forwards.add(port)
+            return port
+        except BaseException:
+            # A successful command may already own a forwarding even if its
+            # reply was malformed/interrupted. The remote port belongs to this
+            # private agent; do not remove forwardings of other devices/agents.
+            with contextlib.suppress(Exception):
+                serial = self.serial
+                if serial is None:
+                    selected = self._run_process(["get-serialno"])
+                    if selected.returncode == 0:
+                        serial = selected.stdout.strip()
+                listing = self._run_process(["forward", "--list"])
+                for line in listing.stdout.splitlines():
+                    fields = line.split()
+                    if len(fields) != 3 or fields[2] != f"tcp:{remote_port}":
+                        continue
+                    if not serial or fields[0] != serial:
+                        continue
+                    if fields[1].startswith("tcp:"):
+                        port = int(fields[1][4:])
+                        self._forwards.add(port)
+                        self.remove_forward(port)
+            raise
 
     def remove_forward(self, local_port: int) -> None:
-        self._run(["forward", "--remove", f"tcp:{local_port}"])
+        rc, output = self._run(["forward", "--remove", f"tcp:{local_port}"])
+        if rc:
+            raise HexagonConnectionError(f"adb forward removal failed: {output}")
+        self._forwards.discard(local_port)
 
     def _host_command(self, exe_remote_path, args, adsp_library_path=None):
         exe_dir = os.path.dirname(exe_remote_path)
@@ -250,6 +287,8 @@ class AdbConnection(HexagonConnection):
         )
 
     def cleanup(self) -> None:
+        for port in list(self._forwards):
+            self.remove_forward(port)
         if self._workdir_attempted:
             rc, out = self.shell(f"rm -rf -- {shlex.quote(self.workdir)}", timeout=10)
             if rc:

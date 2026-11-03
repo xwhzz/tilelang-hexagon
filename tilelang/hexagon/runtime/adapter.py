@@ -64,8 +64,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         n = len(self._param_list)
         ri = list(result_idx) if isinstance(result_idx, (list, tuple)) else ([] if result_idx is None else [result_idx])
         self._result_idx = [i if i >= 0 else n + i for i in ri]
-        # The kernel on the device (a session, or a Linux one-shot kernel),
-        # and the callable that runs it.
+        # The resident device session and the callable that runs its kernel.
         self._device = None
         self._run = None
         # Up now, so that a build error surfaces at compile time.

@@ -19,7 +19,11 @@ Tensors stack layers along a leading dimension. Two writers fill it:
   operand [L, K, N] in Crouton tiles (layout ``hmx_weight``).
 
     header["tensors"][name] = {"dtype", "shape", "offset", "nbytes", "layout"}
-    header["quant"][name] = {"bits", "group", "block"}   (quantized ones)
+    header["quant"][name] = {"bits", "group", "block", "normal_scales"?}
+
+``normal_scales`` is an optional boolean for finite normal fp16 scales,
+recorded after their conversion to the stored dtype. It survives a
+header-only copy; older bundles without it remain readable.
 """
 
 from __future__ import annotations
@@ -87,11 +91,18 @@ def read_tensor(path: str, header: dict, name: str) -> torch.Tensor:
     return raw
 
 
-def has_normal_scales(path: str, header: dict) -> bool:
-    """Classify Q4 scales once before compiling the prefill, never per GEMM.
+def scales_are_normal(scales: torch.Tensor) -> bool:
+    """Whether every stored fp16 scale is finite and normal, including signs."""
+    if scales.dtype != torch.float16:
+        return False
+    exponent = scales.view(torch.int16) & 0x7C00
+    return bool(((exponent != 0) & (exponent != 0x7C00)).all())
 
-    A header-only host file cannot prove the property of device weights: keep
-    the exact general path in that case. The bundle format is unchanged.
+
+def has_normal_scales(path: str, header: dict) -> bool:
+    """Use the writer's Q4 scale classification, or scan an older bundle once.
+
+    A legacy header-only file without classification keeps the general path.
     When weights are loaded from a device path, they must be the same bundle
     whose host scales are classified here, as required by load_part.
     """
@@ -101,6 +112,13 @@ def has_normal_scales(path: str, header: dict) -> bool:
         for name, q in header["quant"].items():
             if q["bits"] != 4:
                 continue
+            if "normal_scales" in q:
+                normal = q["normal_scales"]
+                if type(normal) is not bool:
+                    raise ValueError(f"{name}: normal_scales must be a JSON boolean")
+                if not normal:
+                    return False
+                continue
             t = header["tensors"][name + ".scale"]
             start = header["data_offset"] + t["offset"]
             if t["dtype"] != "float16" or size < start + t["nbytes"]:
@@ -109,9 +127,7 @@ def has_normal_scales(path: str, header: dict) -> bool:
             # At most 1 MiB at once; no unpacking of projection weights.
             for offset in range(0, t["nbytes"], 1 << 20):
                 data = bytearray(f.read(min(1 << 20, t["nbytes"] - offset)))
-                bits = torch.frombuffer(data, dtype=torch.int16)
-                exponent = bits & 0x7C00
-                if not bool(((exponent != 0) & (exponent != 0x7C00)).all()):
+                if not scales_are_normal(torch.frombuffer(data, dtype=torch.float16)):
                     return False
     return True
 

@@ -9,7 +9,14 @@
 #include <type_traits>
 
 using AEEResult = int;
-enum { AEE_SUCCESS, AEE_EFAILED, AEE_ENOMEMORY, AEE_EBADPARM, QURT_EOK = 0 };
+enum {
+  AEE_SUCCESS,
+  AEE_EFAILED,
+  AEE_ENOMEMORY,
+  AEE_EBADPARM,
+  QURT_EOK = 0,
+  QURT_ENOTHREAD = 99
+};
 using qurt_thread_t = std::thread *;
 struct qurt_thread_attr_t {
   unsigned stack_size;
@@ -79,7 +86,7 @@ static int qurt_thread_join(qurt_thread_t thread, int *status) {
   delete thread;
   ++joined;
   *status = 0;
-  return QURT_EOK;
+  return failure == "exited" ? QURT_ENOTHREAD : QURT_EOK;
 }
 static void *test_malloc(size_t bytes) {
   if (failure == "allocate")
@@ -152,8 +159,8 @@ int main(int argc, char **argv) {
     failure = "none";
   int status = tl_session_dispatch_open();
   failure = requested;
-  bool startup_failure =
-      failure != "none" && failure != "join" && failure != "take";
+  bool startup_failure = failure != "none" && failure != "join" &&
+                         failure != "take" && failure != "exited";
   if (startup_failure) {
     assert(status == (failure == "allocate" ? AEE_ENOMEMORY : AEE_EFAILED));
   } else {

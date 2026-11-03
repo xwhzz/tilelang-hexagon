@@ -185,7 +185,7 @@ def build_tensors(c: Config, weights: dict, q: dict):
         levels, sc = sliced(codes.to(torch.int64) - 2 ** (bits - 1), scales, BLOCK, group)
         tensors[name] = (pack_panel(levels, bits), f"int{bits}", tuple(levels.shape), "panel")
         tensors[name + ".scale"] = (sc, "float16", tuple(sc.shape), "row_major")
-        quant[name] = {"bits": bits, "group": group, "block": BLOCK}
+        quant[name] = {"bits": bits, "group": group, "block": BLOCK, "normal_scales": bundle.scales_are_normal(sc)}
 
     every = range(c.layers)
     projection("conv.in_proj", conv, lambda i: ["conv.in_proj"])
@@ -202,7 +202,7 @@ def build_tensors(c: Config, weights: dict, q: dict):
     levels, sc = sliced(hq[None], hs[None], HEAD_BLOCK, D)
     tensors["head"] = (pack_panel(levels, hb), f"int{hb}", tuple(levels.shape), "panel")
     tensors["head.scale"] = (sc, "float16", tuple(sc.shape), "row_major")
-    quant["head"] = {"bits": hb, "group": D, "block": HEAD_BLOCK}
+    quant["head"] = {"bits": hb, "group": D, "block": HEAD_BLOCK, "normal_scales": bundle.scales_are_normal(sc)}
     tensors["embed"] = (hq.to(torch.int8).contiguous(), "int8", (V, D), "row_major")
     tensors["embed.scale"] = (hs[:, 0].float().contiguous(), "float32", (V,), "row_major")
 

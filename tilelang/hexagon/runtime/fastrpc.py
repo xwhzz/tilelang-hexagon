@@ -247,9 +247,10 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
 
 
 def gen_host(iface: str, plans: list[BufferPlan]) -> str:
-    # argv order == kernel param order: buffers -> file path, scalars -> int value.
+    # Domain is a runtime argument, followed by the kernel's parameter order:
+    # buffers -> file path, scalars -> int value.
     reads, calls, writes, frees = [], ["g_handle"], [], []
-    argv = 1
+    argv = 2
     for pl in plans:
         if pl.is_scalar:
             calls.append(f"atoi(argv[{argv}])")
@@ -270,6 +271,7 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
     return (
         "// Auto-generated HLOS host driver for a tilelang Hexagon kernel.\n"
         "#include <AEEStdErr.h>\n#include <remote.h>\n"
+        "#include <errno.h>\n#include <limits.h>\n"
         "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
         '#include "dsp_capabilities_utils.h"\n'
         f'#include "{iface}.h"\n\n'
@@ -294,8 +296,11 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
         '  if (e != AEE_SUCCESS) { fprintf(stderr, "open failed: 0x%x\\n", e); return -1; }\n'
         "  return 0;\n}\n\n"
         "int main(int argc, char** argv) {\n"
-        "  (void)argc;\n"
-        "  if (open_session(CDSP_DOMAIN_ID) != 0) return 1;\n" + "\n".join(reads) + "\n" + f"  int e = {iface}_run({', '.join(calls)});\n"
+        f'  if (argc != {argv}) {{ fprintf(stderr, "expected a domain and {argv - 2} kernel arguments\\n"); return 2; }}\n'
+        "  char* end; errno = 0; long domain_id = strtol(argv[1], &end, 10);\n"
+        "  if (errno || end == argv[1] || *end || domain_id < 0 || domain_id > INT_MAX) {\n"
+        '    fprintf(stderr, "invalid FastRPC domain\\n"); return 2;\n  }\n'
+        "  if (open_session((int)domain_id) != 0) return 1;\n" + "\n".join(reads) + "\n" + f"  int e = {iface}_run({', '.join(calls)});\n"
         '  if (e != AEE_SUCCESS) { fprintf(stderr, "run failed: 0x%x\\n", e); }\n'
         "  else {\n" + "\n".join(writes) + "\n  }\n" + "\n".join(frees) + "\n"
         f"  {iface}_close(g_handle);\n"

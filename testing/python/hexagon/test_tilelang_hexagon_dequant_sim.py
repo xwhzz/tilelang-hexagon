@@ -2,9 +2,10 @@
 
 Opt in with TL_HEXAGON_SIMULATOR_TEST=1 and HEXAGON_TOOLS_ROOT. Host simulator
 dependencies belong on LD_LIBRARY_PATH. No device or native TileLang import
-is required by the simulator fixture. Both architectures compile with ordinary
-flags: only v73 supplies a local IEEE feature boundary; v79 uses qfloat.
-Both architectures require exact RNE across all finite scales and groups
+is required by the simulator fixture. All targets compile with ordinary
+flags: only v73 supplies a local IEEE feature boundary; v75 uses exact
+integer arithmetic and v79 isolates qfloat products in a small noinline leaf.
+All architectures require exact RNE across all finite scales and groups
 with one exceptional scale in each lane position. The old
 qfloat expression is retained only as diagnostic output, not as an oracle.
 For all-normal groups the fixture also compares the compile-time fast path
@@ -37,32 +38,42 @@ def _tool(name):
 
 
 @SIMULATOR
-@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_q4_half_dequantization_on_simulator(arch, tmp_path, record_property):
     root = Path(__file__).resolve().parents[3]
     fixture = Path(__file__).with_name("hvx_dequant4_sim.cc")
     executable, output = tmp_path / f"dequant-{arch}", tmp_path / "output.bin"
+    command = [
+        _tool("hexagon-clang++"),
+        f"-m{arch}",
+        "-mhvx",
+        "-mhvx-length=128B",
+        "-O2",
+        "-std=c++17",
+        "-mllvm",
+        "--disable-handle-qfp",
+        "-mllvm",
+        "-hexagon-insert=false",
+        "-I",
+        str(root / "src"),
+        str(fixture),
+        "-o",
+        str(executable),
+    ]
     compiled = subprocess.run(
-        [
-            _tool("hexagon-clang++"),
-            f"-m{arch}",
-            "-mhvx",
-            "-mhvx-length=128B",
-            "-O2",
-            "-std=c++17",
-            "-mllvm",
-            "--disable-handle-qfp",
-            "-I",
-            str(root / "src"),
-            str(fixture),
-            "-o",
-            str(executable),
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=180,
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    # Simulator success alone cannot qualify IEEE arithmetic on a cDSP:
+    # some real devices return zeros. Only the device-tested v73 path may
+    # enable that target feature, including through local function attributes.
+    ir = tmp_path / "dequant.ll"
+    emitted = subprocess.run(command[:-2] + ["-S", "-emit-llvm", "-o", str(ir)], capture_output=True, text=True, timeout=180)
+    assert emitted.returncode == 0, emitted.stdout + emitted.stderr
+    assert ("+hvx-ieee-fp" in ir.read_text()) == (arch == "v73")
     simulated = subprocess.run(
         [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(output)],
         cwd=tmp_path,

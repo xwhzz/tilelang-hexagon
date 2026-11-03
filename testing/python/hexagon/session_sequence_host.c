@@ -111,6 +111,8 @@ int seq_test_close(remote_handle64 h) {
   (void)h;
   assert(!lease && acquires == releases);
   assert(threads_created == threads_joined);
+  for (int i = 0; i < 1024; ++i)
+    assert(!memory[i].host);
   return 0;
 }
 int seq_test_release(remote_handle64 h, int32_t fd) {

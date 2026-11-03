@@ -211,12 +211,23 @@ and explicit HMX atoms.
   compile-time promise, not a runtime check: v79 uses its original qf16 fast
   path. Without the annotation, the dequantizer rounds integer × finite half
   products to half exactly, including zero and subnormal scales. Neither path
-  scans scales during a GEMM. The LFM Q4 Decoder classifies the host bundle's
-  scales once before compiling prefill; a header-only bundle conservatively
-  uses the general path. No bundle format change is required.
+  scans scales during a GEMM. The LFM quantizer records the classification of
+  the stored fp16 scales as optional `normal_scales` metadata, retained in a
+  header-only copy. Older full bundles are classified once before compiling
+  prefill; older header-only bundles without metadata use the general path.
+  Existing bundles remain readable. IEEE half arithmetic is enabled locally
+  only on device-validated v73; other older architectures use integer
+  dequantization. The v79 general path isolates each block in a noinline leaf
+  so the supported toolchain can schedule its qfloat intrinsics without
+  spilling qfloat intermediates. The normal path remains inlined. Exhaustive
+  simulator tests exercise the complete helper with the production qfloat
+  compiler workaround enabled; v75 has simulator coverage, not device
+  qualification.
 
 - **v73 Crouton arithmetic.** Unscaled half-to-float copies, reduction inputs,
-  and unscaled float epilogues use exact widening on older HVX. Scaling and
+  and unscaled float epilogues use exact widening on older HVX. Float-to-half
+  activation packing also uses integer conversion with round-to-nearest-even,
+  preserving signed zero and infinity. Scaling and
   accumulation remain qfloat arithmetic: this includes the scaled float
   epilogue and the half row/tile add and multiply paths. These are approximate
   arithmetic operations, not an exact IEEE GEMM contract. HMX already rounds
@@ -370,12 +381,22 @@ and explicit HMX atoms.
     kernel's script, the target, its pass configs and the compiler (tilelang's version,
     native libraries and Python sources): the LFM2 decode lowers in 36 s, and in 2 s
     from the cache.
+  - **Connection ownership.** One control socket owns the resident agent. Socket
+    EOF or a truncated request releases its buffers and FastRPC handles and
+    exits, including over legacy Linux ADB where shell stdin may remain open.
+    An executing synchronous FastRPC call must return before EOF is observed;
+    this does not preempt a stuck kernel. Before the first control connection,
+    the agent waits at most `ready_timeout` seconds (30 by default). Each Session
+    uses a private device directory, including concurrent Android sessions.
+    An interrupted or failed wire exchange closes the Session and invalidates
+    its buffers; a complete kernel-error reply remains recoverable. No partial
+    exchange is retried on the same stream.
   - **Resources.** Each run takes and gives the process's cached VTCM/HMX context,
     on the execution thread after workers finish, including kernel errors. DSP
     power votes, execution threads, the worker pool, and resident DDR retain their
     Session lifetime. The context's VTCM address stays fixed; its contents are not
-    preserved between runs. The earlier draft's `session` and `call` settings now
-    fail with a migration message; unset the setting or use `cached`.
+    preserved between runs. Cached take/give is the only resource lifecycle;
+    there is no separate resource-lifetime setting.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
@@ -394,6 +415,11 @@ and explicit HMX atoms.
     in one round trip; the ARM agent invokes FastRPC separately for each Run and
     takes/gives the cached VTCM/HMX context for each invocation. The sequence API
     does not preempt a long Run or provide a 5 ms scheduling guarantee.
+    Socket operations, including waiting for the entire sequence's reply,
+    default to a 600-second timeout. Use `run_sequence(..., timeout=seconds)`
+    for a longer sequence; the timeout must be finite and positive. A timeout
+    closes the Session without replaying the list, and the ordinary socket
+    timeout is restored after a completed sequence.
     Each Run targets process 0 and supplies every parameter, using resident buffers and int32 scalars;
     inline tensors are unsupported. A Run buffer remains 128-byte aligned and must
     contain the kernel's full static extent. Copy uses arbitrary byte offsets

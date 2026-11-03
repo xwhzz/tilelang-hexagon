@@ -32,6 +32,17 @@ TL_DEVICE int tl_crouton_offset(int r, int c, int row_tiles, int col_tiles) {
   return (tile << 10) + ((r & 31) >> 1) * 64 + (c & 31) * 2 + (r & 1);
 }
 
+// Exact half narrowing on older HVX; keep v79's existing packing arithmetic.
+TL_DEVICE HVX_Vector tl_crouton_narrow(HVX_Vector even, HVX_Vector odd) {
+#if __HVX_ARCH__ < 79
+  return tl_hvx_convert_sf_to_hf(even, odd);
+#else
+  HVX_Vector zero = Q6_V_vzero();
+  return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(
+      Q6_Vqf32_vadd_VsfVsf(odd, zero), Q6_Vqf32_vadd_VsfVsf(even, zero)));
+#endif
+}
+
 // The first `n` (<= 32) elements of two rows, interleaved into one register:
 // lanes 2j and 2j + 1 are row0[j] and row1[j], as fp16.
 template <typename M>
@@ -44,21 +55,8 @@ TL_DEVICE HVX_Vector tl_crouton_interleave(const M *row0, const M *row1,
     return Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -2));
   } else {
     static_assert(std::is_same_v<M, float>, "fp16 or fp32 matrices");
-    HVX_Vector zero = Q6_V_vzero();
-    return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(
-        Q6_Vqf32_vadd_VsfVsf(hi, zero), Q6_Vqf32_vadd_VsfVsf(lo, zero)));
+    return tl_crouton_narrow(lo, hi);
   }
-}
-
-// Exact half widening on older HVX; retain v79's existing instruction path.
-TL_DEVICE HVX_VectorPair tl_crouton_widen(HVX_Vector v) {
-#if __HVX_ARCH__ < 79
-  return tl_hvx_convert_hf_to_sf(v);
-#else
-  HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(v, Q6_Vh_vsplat_R(0x3c00));
-  return Q6_W_vcombine_VV(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w)),
-                          Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w)));
-#endif
 }
 
 // The inverse: the first `n` lanes of each row of the row pair in `v` to two
@@ -72,9 +70,17 @@ TL_DEVICE void tl_crouton_deinterleave(HVX_Vector v, M *row0, M *row1, int n) {
     tl_hvx_store_bytes(row1, Q6_V_hi_W(d), n * B);
   } else {
     static_assert(std::is_same_v<M, float>, "fp16 or fp32 matrices");
-    HVX_VectorPair w = tl_crouton_widen(v);
+#if __HVX_ARCH__ < 79
+    HVX_VectorPair w = tl_hvx_convert_hf_to_sf(v);
     tl_hvx_store_bytes(row0, Q6_V_lo_W(w), n * B);
     tl_hvx_store_bytes(row1, Q6_V_hi_W(w), n * B);
+#else
+    // Preserve v79's conversion at each store: combining the converted
+    // vectors into a pair changes qfloat code generation in copy loops.
+    HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(v, Q6_Vh_vsplat_R(0x3c00));
+    tl_hvx_store_bytes(row0, Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w)), n * B);
+    tl_hvx_store_bytes(row1, Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w)), n * B);
+#endif
   }
 }
 
@@ -130,18 +136,21 @@ TL_DEVICE void tl_crouton_copy_tiles(half *crouton, int row_tiles,
           tl_hvx_store<Aligned>(row1 + j, Q6_V_hi_W(d));
         }
       } else if constexpr (Pack) {
-        HVX_Vector zero = Q6_V_vzero();
-        HVX_Vector q0 =
-            Q6_Vqf32_vadd_VsfVsf(tl_hvx_load<Aligned>(row0 + j), zero);
-        HVX_Vector q1 =
-            Q6_Vqf32_vadd_VsfVsf(tl_hvx_load<Aligned>(row1 + j), zero);
-        *reinterpret_cast<HVX_Vector *>(pair) =
-            Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
+        *reinterpret_cast<HVX_Vector *>(pair) = tl_crouton_narrow(
+            tl_hvx_load<Aligned>(row0 + j), tl_hvx_load<Aligned>(row1 + j));
       } else {
-        HVX_VectorPair w =
-            tl_crouton_widen(*reinterpret_cast<const HVX_Vector *>(pair));
+#if __HVX_ARCH__ < 79
+        HVX_VectorPair w = tl_hvx_convert_hf_to_sf(
+            *reinterpret_cast<const HVX_Vector *>(pair));
         tl_hvx_store<Aligned>(row0 + j, Q6_V_lo_W(w));
         tl_hvx_store<Aligned>(row1 + j, Q6_V_hi_W(w));
+#else
+        HVX_VectorPair w =
+            Q6_Wqf32_vmpy_VhfVhf(*reinterpret_cast<const HVX_Vector *>(pair),
+                                 Q6_Vh_vsplat_R(0x3c00));
+        tl_hvx_store<Aligned>(row0 + j, Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w)));
+        tl_hvx_store<Aligned>(row1 + j, Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w)));
+#endif
       }
     }
   }
@@ -240,10 +249,7 @@ TL_DEVICE HVX_Vector tl_crouton_load_column(const M *m) {
   } else {
     HVX_VectorPair d = Q6_W_vdeal_VVR(tl_hvx_load<Aligned>(m + 32),
                                       tl_hvx_load<Aligned>(m), -4);
-    HVX_Vector zero = Q6_V_vzero();
-    return Q6_Vhf_equals_Wqf32(
-        Q6_W_vcombine_VV(Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(d), zero),
-                         Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(d), zero)));
+    return tl_crouton_narrow(Q6_V_lo_W(d), Q6_V_hi_W(d));
   }
 }
 
@@ -374,9 +380,17 @@ template <int K, typename A>
 TL_DEVICE void tl_crouton_rows_of(HVX_Vector pair, tl_hvx_reg<A> *even,
                                   tl_hvx_reg<A> *odd) {
   static_assert(std::is_same_v<A, float>, "fp32 rows");
-  HVX_VectorPair w = tl_crouton_widen(pair);
+#if __HVX_ARCH__ < 79
+  HVX_VectorPair w = tl_hvx_convert_hf_to_sf(pair);
   *even = tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_lo_W(w)));
   *odd = tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_hi_W(w)));
+#else
+  HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pair, Q6_Vh_vsplat_R(0x3c00));
+  *even = tl_reduce_operand<K, A>(
+      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w))));
+  *odd = tl_reduce_operand<K, A>(
+      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w))));
+#endif
 }
 
 // Rows [2 q0, 2 q0 + 2N) of row tile r, every column tile combined, as one
@@ -628,9 +642,9 @@ TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
 // become the K / 32 fp16 weight tiles of 32 output columns.
 // ---------------------------------------------------------------------------
 
-// Only older HVX needs IEEE half arithmetic. v79 cDSP must not enable the
-// IEEE arithmetic feature, including through a function target attribute.
-#if __HVX_ARCH__ < 79
+// IEEE arithmetic is device-qualified only on v73. Other targets must not
+// enable the feature through a function attribute (v79 cDSP returns zeros).
+#if __HVX_ARCH__ == 73
 #define TL_CROUTON_IEEE __attribute__((target("hvx-ieee-fp")))
 #else
 #define TL_CROUTON_IEEE
@@ -651,6 +665,35 @@ alignas(128) static const uint16_t tl_crouton_nibble_tables[2][64] = {
      0xC400, 0xC400, 0xC200, 0xC200, 0xC000, 0xC000, 0xBC00, 0xBC00},
 };
 
+#if __HVX_ARCH__ < 79 && __HVX_ARCH__ != 73
+// Qfloat half multiplication on older architectures perturbs ties. Form the
+// exact integer significand product instead; it has at most 15 bits, so the
+// integer-to-float conversion and exponent adjustment are both exact. Finish
+// with the shared integer RNE narrowing, without enabling IEEE arithmetic.
+TL_DEVICE tl_hvx_u32 tl_crouton_q4_half_bits(tl_hvx_u32 code,
+                                             tl_hvx_u32 scale) {
+  tl_hvx_u32 magnitude =
+      ((code & 0x3ffu) | 0x400u) >> (25u - ((code >> 10) & 31u));
+  tl_hvx_u32 exponent = (scale >> 10) & 31u;
+  tl_hvx_u32 significand =
+      (scale & 0x3ffu) | (exponent == 0u ? tl_hvx_u32{} : tl_hvx_u32(0x400u));
+  tl_hvx_u32 product = magnitude * significand;
+  tl_hvx_u32 bits = tl_hvx_as_u32(Q6_Vsf_equals_Vw(tl_hvx_as_vector(product)));
+  exponent = exponent == 0u ? tl_hvx_u32(1u) : exponent;
+  bits += (exponent - 25u) << 23;
+  bits = product == 0u ? tl_hvx_u32{} : bits;
+  bits |= ((code ^ scale) & 0x8000u) << 16;
+  return tl_hvx_narrow_float_bits(bits);
+}
+
+TL_DEVICE HVX_Vector tl_crouton_q4_half_product(HVX_Vector code,
+                                                HVX_Vector scale) {
+  tl_hvx_u32 k = tl_hvx_as_u32(code), s = tl_hvx_as_u32(scale);
+  return tl_hvx_as_vector(tl_crouton_q4_half_bits(k & 0xffffu, s & 0xffffu) |
+                          (tl_crouton_q4_half_bits(k >> 16, s >> 16) << 16));
+}
+#endif
+
 // Panel registers src[0, R) to the weight-tile registers dst[0, 4R), scaled by
 // the row pairs' factors in `scale`. A panel register holds 32 rows (output
 // columns) by 8 columns of K, a row's 8 nibbles in one 32-bit lane; its four
@@ -660,9 +703,9 @@ alignas(128) static const uint16_t tl_crouton_nibble_tables[2][64] = {
 // vshuffo pair the two nibbles of each byte.
 template <int R, bool Normal = false>
 TL_CROUTON_IEEE TL_DEVICE void
-tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
-                          const HVX_Vector *__restrict__ src, HVX_Vector table,
-                          HVX_Vector scale) {
+tl_crouton_dequant4_block_impl(HVX_Vector *__restrict__ dst,
+                               const HVX_Vector *__restrict__ src,
+                               HVX_Vector table, HVX_Vector scale) {
   HVX_Vector v[R];
   // All loads first, so the stores of one register do not wait behind the
   // loads of the next.
@@ -680,30 +723,56 @@ tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
         Q6_Vh_vshuffo_VhVh(Q6_V_lo_W(hi), Q6_V_lo_W(lo)), // 4, 5
         Q6_Vh_vshuffo_VhVh(Q6_V_hi_W(hi), Q6_V_hi_W(lo)), // 6, 7
     };
+#if __HVX_ARCH__ == 73
 #pragma clang loop unroll(full)
-    for (int j = 0; j < 4; ++j) {
-#if __HVX_ARCH__ >= 79
-      if constexpr (Normal) {
+    for (int j = 0; j < 4; ++j)
+      dst[4 * i + j] = Q6_Vhf_vmpy_VhfVhf(k[j], scale);
+#elif __HVX_ARCH__ < 79
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j)
+      dst[4 * i + j] = tl_crouton_q4_half_product(k[j], scale);
+#else
+    if constexpr (Normal) {
+#pragma clang loop unroll(full)
+      for (int j = 0; j < 4; ++j) {
         // The non-widening v79 operation is exact for finite normal scales.
         dst[4 * i + j] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(k[j], scale));
-      } else {
-        // Widen to preserve subnormal scales. Keep qfloat register state
-        // inside one asm: spilling loses information with the toolchain's
-        // --disable-handle-qfp workaround.
-        HVX_VectorPair product;
-        HVX_Vector result;
-        asm("%0.qf32 = vmpy(%2.hf,%3.hf)\n%1.hf = %0.qf32"
-            : "=&v"(product), "=v"(result)
-            : "v"(k[j]), "v"(scale));
-        dst[4 * i + j] = result;
       }
-#else
-      // Legacy qf16 has an implicit fractional LSB. Use IEEE half multiply
-      // only in this dequantizer, without changing other kernels' features.
-      dst[4 * i + j] = Q6_Vhf_vmpy_VhfVhf(k[j], scale);
-#endif
+    } else {
+#pragma clang loop unroll(full)
+      for (int j = 0; j < 4; ++j)
+        dst[4 * i + j] = Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(k[j], scale));
     }
+#endif
   }
+}
+
+#if __HVX_ARCH__ >= 79
+// Keep the precise path out of the scale-group loop: with qfloat rewriting
+// disabled, its register pressure can spill qf32 products and corrupt zeros
+// and ties. This noinline leaf bounds live registers. The simulator oracle
+// covers both R8 and remainder calls with --disable-handle-qfp.
+template <int R>
+static __attribute__((noinline)) void
+tl_crouton_dequant4_general_block(HVX_Vector *__restrict__ dst,
+                                  const HVX_Vector *__restrict__ src,
+                                  HVX_Vector table, HVX_Vector scale) {
+  tl_crouton_dequant4_block_impl<R, false>(dst, src, table, scale);
+}
+#endif
+
+template <int R, bool Normal = false>
+TL_CROUTON_IEEE TL_DEVICE void
+tl_crouton_dequant4_block(HVX_Vector *__restrict__ dst,
+                          const HVX_Vector *__restrict__ src, HVX_Vector table,
+                          HVX_Vector scale) {
+#if __HVX_ARCH__ >= 79
+  if constexpr (!Normal) {
+    tl_crouton_dequant4_general_block<R>(dst, src, table, scale);
+    return;
+  }
+#endif
+  tl_crouton_dequant4_block_impl<R, Normal>(dst, src, table, scale);
 }
 
 // Inline the selected arithmetic through the group and remainder loops.

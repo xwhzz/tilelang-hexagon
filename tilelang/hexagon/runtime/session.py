@@ -34,6 +34,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import operator
 import os
 import re
@@ -43,6 +44,7 @@ import socket
 import struct
 import tempfile
 import time
+import uuid
 import weakref
 import warnings
 from collections.abc import Sequence
@@ -58,6 +60,21 @@ from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
+
+
+class _KernelError(RuntimeError):
+    """A complete error reply: the stream remains synchronized."""
+
+
+def _timeout_seconds(value, name):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be finite and positive") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return value
+
 
 # Parameter kinds of a run, with their two values.
 _RESIDENT = 0  # (fd, byte offset)
@@ -152,8 +169,9 @@ static void tl_session_worker(void*) {{
 
 static AEEResult tl_session_join_worker() {{
   int status;
-  // Never free a stack whose thread has not been joined successfully.
-  if (qurt_thread_join(tl_session_dispatch.thread, &status) != QURT_EOK) return AEE_EFAILED;
+  // An already-exited thread has no stack owner left either.
+  int joined = qurt_thread_join(tl_session_dispatch.thread, &status);
+  if (joined != QURT_EOK && joined != QURT_ENOTHREAD) return AEE_EFAILED;
   tl_session_dispatch.started = 0;
   qurt_sem_destroy(&tl_session_dispatch.go);
   qurt_sem_destroy(&tl_session_dispatch.done);
@@ -413,6 +431,7 @@ def gen_agent(iface: str, kernels=()) -> str:
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include "dsp_capabilities_utils.h"
 #include "{iface}.h"
 
@@ -718,6 +737,8 @@ int main(int argc, char** argv) {{
   // The port to listen on, 0 for one the kernel picks, which it reports.
   int port = (argc > 1) ? atoi(argv[1]) : 0;
   if (argc > 3) g_domain = atoi(argv[3]);
+  int connect_timeout_ms = argc > 4 ? atoi(argv[4]) : 30000;
+  if (connect_timeout_ms <= 0) return 1;
   g_processes = (argc > 2) ? atoi(argv[2]) : 1;
   if (g_processes < 1 || g_processes > MAX_PROCESSES) return 1;
   for (int p = 0; p < g_processes; ++p)
@@ -732,11 +753,15 @@ int main(int argc, char** argv) {{
   getsockname(srv, (struct sockaddr*)&addr, &len);
   listen(srv, 1);
   printf("AGENT_READY port=%d\\n", ntohs(addr.sin_port)); fflush(stdout);
-  int running = 1;
-  while (running) {{
-    int cli = accept(srv, 0, 0);
-    if (cli < 0) continue;
+  // One control connection owns this Session. Its EOF also handles legacy
+  // adbd, which may keep the shell's stdin open after the host disappears.
+  // A synchronous FastRPC call must return before EOF can be observed.
+  struct pollfd incoming = {{srv, POLLIN, 0}};
+  int cli = poll(&incoming, 1, connect_timeout_ms) > 0 && (incoming.revents & POLLIN) ? accept(srv, 0, 0) : -1;
+  close(srv);
+  if (cli >= 0) {{
     setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    int running = 1;
     for (;;) {{
       unsigned char op;
       if (read_full(cli, &op, 1) || serve(cli, op, &running)) break;
@@ -1007,8 +1032,6 @@ class Session:
     # In a pipeline stage's arguments, the step's index.
     STEP = _Step()
 
-    _port_seq = 0
-
     def __init__(
         self,
         kernels,
@@ -1055,6 +1078,9 @@ class Session:
         self._closed = True
         self._allocations = {}
         self._buffer_generations = {}
+        ready_timeout = _timeout_seconds(ready_timeout, "ready_timeout")
+        if ready_timeout > ((1 << 31) - 1) / 1000:
+            raise ValueError("ready_timeout exceeds the agent's millisecond limit")
         if not 1 <= processes <= Session.MAX_PROCESSES:
             raise ValueError(f"a session runs on 1 to {Session.MAX_PROCESSES} DSP processes, not {processes}")
         self.processes = processes
@@ -1074,10 +1100,9 @@ class Session:
 
             self._conn = LinuxConnection.from_environment(serial)
         else:
-            Session._port_seq += 1
             self._conn = AdbConnection(
                 serial=serial or device_serial(),
-                workdir=f"{remote_dir('android')}/session_{os.getpid()}_{Session._port_seq}",
+                workdir=f"{remote_dir('android')}/session_{uuid.uuid4().hex}",
             )
         self._device_dir = self._conn.workdir
         self._holds_device = DEVICE_LOCK.acquire()
@@ -1094,21 +1119,21 @@ class Session:
         for local in (self._artifacts.dsp_skel, self._artifacts.agent_exe):
             self._conn.push(local)
         exe = os.path.join(self._device_dir, os.path.basename(self._artifacts.agent_exe))
-        self._proc = self._conn.start_host_binary(exe, ["0", str(self.processes), str(self._domain)])
+        self._proc = self._conn.start_host_binary(exe, ["0", str(self.processes), str(self._domain), str(math.ceil(ready_timeout * 1000))])
         # select() keeps a silent agent from blocking past the deadline, and
         # the reads take what the pipe holds, unbuffered: a buffered readline
         # could leave AGENT_READY where select() does not see it. What the
         # agent prints before it is ready is its diagnosis, should it not get
         # there.
-        deadline = time.time() + ready_timeout
+        deadline = time.monotonic() + ready_timeout
         printed = b""
-        while (ready_line := re.search(rb"AGENT_READY port=(\d+)\n", printed)) is None:
+        while (ready_line := re.search(rb"AGENT_READY port=(\d+)\r?\n", printed)) is None:
             if self._proc.poll() is not None:
                 printed += self._proc.stdout.read()
                 raise RuntimeError(
                     f"Hexagon session agent exited ({self._proc.returncode}) before ready:\n{printed.decode(errors='replace')}"
                 )
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(f"Hexagon session agent did not report ready in time:\n{printed.decode(errors='replace')}")
             ready, _, _ = select.select([self._proc.stdout], [], [], min(0.2, remaining))
@@ -1138,9 +1163,10 @@ class Session:
         try:
             shutdown_sent = False
             if getattr(self, "_sock", None) is not None:
-                with contextlib.suppress(Exception):
-                    self._sock.sendall(bytes([_OP_SHUTDOWN]))
-                    shutdown_sent = True
+                if not getattr(self, "_broken", False):
+                    with contextlib.suppress(Exception):
+                        self._sock.sendall(bytes([_OP_SHUTDOWN]))
+                        shutdown_sent = True
                 with contextlib.suppress(Exception):
                     self._sock.close()
             if getattr(self, "_proc", None) is not None:
@@ -1191,6 +1217,42 @@ class Session:
             self.close()
 
     # ---- wire -------------------------------------------------------------
+    @contextlib.contextmanager
+    def _exchange(self, timeout=None):
+        """Never reuse a stream after an incomplete wire operation.
+
+        Kernel/sequence errors have complete replies and may be recovered
+        from. Transport failures and interruptions invalidate every buffer.
+        """
+        if self._closed:
+            raise ValueError("the Hexagon session is closed")
+        previous = None
+        changed_timeout = False
+        failure = None
+        try:
+            if timeout is not None:
+                previous = self._sock.gettimeout()
+                self._sock.settimeout(timeout)
+                changed_timeout = True
+            yield
+        except BaseException as error:
+            failure = error
+            if not isinstance(error, (_KernelError, SequenceError)):
+                self._broken = True
+                with contextlib.suppress(BaseException):
+                    self.close()
+            raise
+        finally:
+            if changed_timeout and not self._closed:
+                try:
+                    self._sock.settimeout(previous)
+                except BaseException:
+                    self._broken = True
+                    with contextlib.suppress(BaseException):
+                        self.close()
+                    if failure is None:
+                        raise
+
     def _recv(self, n: int) -> bytes:
         chunks, got = [], 0
         while got < n:
@@ -1252,14 +1314,15 @@ class Session:
                     raise TypeError(f"argument {i} of {kernel.name}: a pipeline takes resident buffers and scalars")
             wire.append(struct.pack(f"<iii{len(words)}i", kernel.index, process, len(words) // 3, *words))
         # One write: adb relays each as a packet (see the agent's reply()).
-        self._sock.sendall(b"".join(wire))
-        self._status("a pipeline")
+        with self._exchange():
+            self._sock.sendall(b"".join(wire))
+            self._status("a pipeline")
 
     def _status(self, what: str) -> None:
         status = self._recv(1)[0]
         if status != 0:
             reason = fastrpc.KERNEL_STATUS.get(status, f"status {status}") if status != 255 else "the FastRPC call failed"
-            raise RuntimeError(f"Hexagon session: {what} failed: {reason}")
+            raise _KernelError(f"Hexagon session: {what} failed: {reason}")
 
     # ---- buffers ----------------------------------------------------------
     def buffer(self, nbytes: int, processes=None) -> DeviceBuffer:
@@ -1282,61 +1345,60 @@ class Session:
             raise ValueError(f"a buffer is mapped into some of processes 0 to {self.processes - 1}, not {list(procs)}")
         mask = sum(1 << p for p in set(procs))
         request = bytes([_OP_ALLOC]) + struct.pack("<QI", nbytes, mask)
-        try:
+        with self._exchange():
             self._sock.sendall(request)
             (bid,) = struct.unpack("<i", self._recv(4))
-        except BaseException:
-            # An allocation reply lost in transit leaves generation counters
-            # unsynchronized. Do not retry on this session.
-            self.close()
-            raise
-        if bid < 0:
-            raise RuntimeError(f"Hexagon session: could not allocate and map {nbytes} bytes")
-        if bid >= _MAX_BUFFERS or bid in self._allocations:
-            self.close()
-            raise RuntimeError("invalid Hexagon session allocation reply")
-        # Freed by DeviceBuffer.free, or with the session.
-        generation = self._buffer_generations.get(bid, 0) + 1
-        self._buffer_generations[bid] = generation
-        allocation = _BufferAllocation(bid, nbytes, generation, processes=tuple(sorted(set(procs))))
-        self._allocations[bid] = allocation
-        return DeviceBuffer(self, bid, nbytes, processes=allocation.processes, _allocation=allocation)
+            if bid < 0:
+                raise _KernelError(f"Hexagon session: could not allocate and map {nbytes} bytes")
+            if bid >= _MAX_BUFFERS or bid in self._allocations:
+                raise RuntimeError("invalid Hexagon session allocation reply")
+            # Bookkeeping is part of the exchange: an interruption after the
+            # reply must not leave the agent's generation ahead of the host's.
+            generation = self._buffer_generations.get(bid, 0) + 1
+            self._buffer_generations[bid] = generation
+            allocation = _BufferAllocation(bid, nbytes, generation, processes=tuple(sorted(set(procs))))
+            self._allocations[bid] = allocation
+            return DeviceBuffer(self, bid, nbytes, processes=allocation.processes, _allocation=allocation)
 
     def _free(self, bid: int, allocation: _BufferAllocation) -> None:
-        try:
+        with self._exchange():
             self._sock.sendall(bytes([_OP_FREE]) + struct.pack("<i", bid))
-        except BaseException:
-            self.close()
-            raise
-        allocation.alive = False
-        del self._allocations[bid]
+            allocation.alive = False
+            del self._allocations[bid]
 
     def _write(self, bid: int, offset: int, raw: bytes) -> None:
-        self._sock.sendall(bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw)
-        self._status("a buffer write")
+        wire = bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw
+        with self._exchange():
+            self._sock.sendall(wire)
+            self._status("a buffer write")
 
     def _read(self, bid: int, offset: int, n: int) -> bytes:
-        self._sock.sendall(bytes([_OP_READ]) + struct.pack("<iQQ", bid, offset, n))
-        self._status("a buffer read")
-        return self._recv(n)
+        wire = bytes([_OP_READ]) + struct.pack("<iQQ", bid, offset, n)
+        with self._exchange():
+            self._sock.sendall(wire)
+            self._status("a buffer read")
+            return self._recv(n)
 
     def _load(self, bid: int, offset: int, nbytes: int, path: str, start: int) -> int:
         raw = path.encode()
-        self._sock.sendall(bytes([_OP_LOAD]) + struct.pack("<iQQQI", bid, offset, nbytes, start, len(raw)) + raw)
-        (got,) = struct.unpack("<q", self._recv(8))
-        if got < 0:
-            raise RuntimeError(f"Hexagon session: could not read {path} on the device")
-        return got
+        wire = bytes([_OP_LOAD]) + struct.pack("<iQQQI", bid, offset, nbytes, start, len(raw)) + raw
+        with self._exchange():
+            self._sock.sendall(wire)
+            (got,) = struct.unpack("<q", self._recv(8))
+            if got < 0:
+                raise _KernelError(f"Hexagon session: could not read {path} on the device")
+            return got
 
     def last_run_seconds(self) -> float:
         """How long the last kernel run's FastRPC call took, timed by the agent
         on the device: the run without the host's round trip."""
-        self._sock.sendall(bytes([_OP_TIMING]))
-        (ns,) = struct.unpack("<q", self._recv(8))
-        return ns * 1e-9
+        with self._exchange():
+            self._sock.sendall(bytes([_OP_TIMING]))
+            (ns,) = struct.unpack("<q", self._recv(8))
+            return ns * 1e-9
 
     # ---- runs -------------------------------------------------------------
-    def run_sequence(self, operations) -> SequenceResult:
+    def run_sequence(self, operations, *, timeout: float = CALL_TIMEOUT) -> SequenceResult:
         """Execute a bounded, explicit Run/Copy list with one agent round trip.
 
         All descriptors are validated before execution. A failed operation
@@ -1345,19 +1407,19 @@ class Session:
         remain and are never replayed automatically.
         Each Run retains the normal per-call DSP resource scope. Copies use
         byte offsets, while Run buffer arguments remain 128-byte aligned.
+
+        ``timeout`` bounds each socket operation, including the wait for the
+        entire sequence's reply (600 seconds by default). Increase it for
+        longer sequences. A timeout closes the Session without replaying the
+        list; it does not preempt a running FastRPC kernel.
         """
         if self._closed:
             raise ValueError("the Hexagon session is closed")
         operations, wire = sequence.encode(self, operations)
-        try:
+        timeout = _timeout_seconds(timeout, "sequence timeout")
+        with self._exchange(timeout):
             self._sock.sendall(wire)
             return sequence.receive(self, operations)
-        except SequenceError:
-            raise
-        except BaseException:
-            # Do not reuse a socket after a partial send or truncated reply.
-            self.close()
-            raise
 
     def _run(self, kernel: SessionKernel, given: list, process: int):
         args, inputs, outputs = [], bytearray(), []
@@ -1385,9 +1447,11 @@ class Session:
         outputs.sort(key=lambda output: rank.get(output[0], len(rank) + output[0]))
         head = struct.pack("<iiii", kernel.index, len(args) // 3, out_bytes, process)
         # One write: adb relays each as a packet (see the agent's reply()).
-        self._sock.sendall(b"".join([bytes([_OP_RUN]), head, struct.pack(f"<{len(args)}i", *args), struct.pack("<I", len(inputs)), inputs]))
-        self._status(f"kernel {kernel.name}")
-        raw = self._recv(out_bytes)
+        wire = b"".join([bytes([_OP_RUN]), head, struct.pack(f"<{len(args)}i", *args), struct.pack("<I", len(inputs)), inputs])
+        with self._exchange():
+            self._sock.sendall(wire)
+            self._status(f"kernel {kernel.name}")
+            raw = self._recv(out_bytes)
         results = []
         for i, offset in outputs:
             param = kernel.params[i]

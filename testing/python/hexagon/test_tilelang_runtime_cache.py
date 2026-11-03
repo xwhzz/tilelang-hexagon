@@ -265,8 +265,10 @@ def test_ssh_cache_identity_ignores_adb_and_tracks_host_keys(cache, monkeypatch)
     monkeypatch.setenv("TILELANG_HEXAGON_SSH_KNOWN_HOSTS", "/different/known_hosts")
     assert key(cache) != original
     monkeypatch.setenv("TILELANG_HEXAGON_SSH_HOST", "")
-    with pytest.raises(ValueError, match="nonempty SSH host"):
-        key(cache)
+    empty = key(cache)
+    monkeypatch.delenv("TILELANG_HEXAGON_SSH_HOST")
+    assert key(cache) == empty
+    assert empty != original
 
 
 def test_ssh_transfer_timeout_changes_only_live_cache_identity(cache, monkeypatch):

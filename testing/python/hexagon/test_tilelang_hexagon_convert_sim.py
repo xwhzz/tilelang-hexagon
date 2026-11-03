@@ -1,4 +1,4 @@
-"""IEEE half conversions on actual v73/v79 Hexagon instruction simulation.
+"""IEEE half conversions on actual v73/v75/v79 Hexagon instruction simulation.
 
 Opt in with TL_HEXAGON_SIMULATOR_TEST=1 and HEXAGON_TOOLS_ROOT set to the SDK
 toolchain. The simulator's host shared libraries must be on LD_LIBRARY_PATH.
@@ -30,13 +30,14 @@ def _tool(name):
     return str(path)
 
 
-def test_v73_crouton_unscaled_widening_is_exact(tmp_path):
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+def test_crouton_unscaled_widening_is_exact(arch, tmp_path):
     root = Path(__file__).resolve().parents[3]
     executable, output = tmp_path / "crouton", tmp_path / "crouton.bin"
     subprocess.run(
         [
             _tool("hexagon-clang++"),
-            "-mv73",
+            f"-m{arch}",
             "-mhvx",
             "-mhvx-length=128B",
             "-O2",
@@ -54,7 +55,7 @@ def test_v73_crouton_unscaled_widening_is_exact(tmp_path):
         timeout=180,
     )
     subprocess.run(
-        [_tool("hexagon-sim"), "-mv73", "--simulated_returnval", str(executable), "--", str(output)],
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(output)],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -101,6 +102,8 @@ def _float_inputs():
             0x38800000,
             0x477FE000,
             0x477FF000,
+            0x4788B800,  # 70000.0: finite overflow must become infinity
+            0xC788B800,
             0x7F7FFFFF,
             0x7F800000,
             0xFF800000,
@@ -121,7 +124,60 @@ def _float_inputs():
     return np.pad(bits, (0, (-len(bits)) % 64)).astype("<u4")
 
 
-@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+def test_crouton_float_packing_is_exact(arch, tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    executable = tmp_path / "crouton-pack"
+    compilation = subprocess.run(
+        [
+            _tool("hexagon-clang++"),
+            f"-m{arch}",
+            "-mhvx",
+            "-mhvx-length=128B",
+            "-O2",
+            "-std=c++17",
+            "-mllvm",
+            "--disable-handle-qfp",
+            "-mllvm",
+            "-hexagon-insert=false",
+            "-I",
+            str(root / "src"),
+            str(Path(__file__).with_name("hvx_crouton_pack_sim.cc")),
+            "-o",
+            str(executable),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert compilation.returncode == 0, compilation.stdout + compilation.stderr
+    # All adjacent-half midpoint ties and their float32 neighbours, plus
+    # signed zeros, infinities, NaNs, overflow boundaries and mixed lanes.
+    inputs = _float_inputs()
+    inputs = np.pad(inputs, (0, (-inputs.size) % 1024))
+    input_path, output_path = tmp_path / "input.bin", tmp_path / "output.bin"
+    input_path.write_bytes(struct.pack("<I", inputs.size) + inputs.tobytes())
+    simulation = subprocess.run(
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(input_path), str(output_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert simulation.returncode == 0, simulation.stdout + simulation.stderr
+    data = output_path.read_bytes()
+    assert struct.unpack_from("<4I", data) == (0x4352504B, int(arch[1:]), inputs.size, 3)
+    actual = np.frombuffer(data, dtype="<u2", offset=16).reshape(-1, 3, 1024)
+    with np.errstate(over="ignore", invalid="ignore"):
+        halves = inputs.view("<f4").astype(np.float16)
+    row_pairs = halves.reshape(-1, 16, 2, 32).transpose(0, 1, 3, 2).reshape(-1, 1024)
+    for mode, expected in enumerate((row_pairs, row_pairs, halves.reshape(-1, 1024))):
+        nonnan = ~np.isnan(expected)
+        np.testing.assert_array_equal(actual[:, mode][nonnan], expected[nonnan].view(np.uint16), err_msg=f"mode={mode}")
+        np.testing.assert_array_equal(np.isnan(actual[:, mode].view(np.float16)), np.isnan(expected))
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_ieee_conversion_and_math_on_simulator(arch, tmp_path):
     root = Path(__file__).resolve().parents[3]
     fixture = Path(__file__).with_name("hvx_convert_sim.cc")
@@ -173,7 +229,7 @@ def test_ieee_conversion_and_math_on_simulator(arch, tmp_path):
     expected_back = all_half.copy()
     if arch == "v79":
         # Native v79 vcvt turns an exact -0.0f into +0 half. Preserve this
-        # pre-existing instruction behavior; v73 promises IEEE signed zero.
+        # pre-existing instruction behavior; older targets preserve the sign.
         expected_back[0x8000] = 0
     np.testing.assert_array_equal(back[~half_nan], expected_back[~half_nan])
     assert np.isnan(wide[half_nan].view(np.float32)).all()
