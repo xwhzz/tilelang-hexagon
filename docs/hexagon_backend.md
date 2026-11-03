@@ -382,8 +382,9 @@ to text (`generate.py`), sampling on the device, and its WikiText-2 perplexity o
 device (16.684) is that of the host reference with the device's arithmetic (16.683).
 LFM3-1.7B, unquantized in fp16, decodes at 16.6 t/s, the DMA's rate for its 3.46 GB a
 token. It runs to its checkpoint's 262144 positions over two DSP processes, which a
-model past one process's 4 GB of addresses splits its layers over: a 261888-token
-prompt prefills in 680 s, and decodes at 4.0 t/s at that depth.
+model past one process's 4 GB of addresses splits its layers over. The
+[LFM example](../examples/hexagon/lfm/README.md#lfm3s-long-contexts) gives the
+long-context prefill and decode measurements.
 
 **Not yet:** autotuning (`num_workers` and tile sizes as knobs).
 

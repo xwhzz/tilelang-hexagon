@@ -280,7 +280,7 @@ Within W4A16, each of these would give about 0.5-1%:
 LFM3-1.7B runs unquantized: its projections in fp16, in a bundle of 3463.4 MB,
 of which a decoded token reads 3461.9 MB. The numbers are from the same phone
 and the same measurements as above, with `bench.py` taking the median of 3
-runs. #179 tracks this work.
+runs unless noted otherwise. #179 tracks this work.
 
 ### LFM3: where it stands
 
@@ -340,6 +340,17 @@ The barriers are mostly the first worker waiting, as in LFM2's prefill: it
 finishes its GEMM phases ahead of the others (w1/w3: 204.9M against 213.2M
 cycles).
 
+### LFM3's decode: the KV cache by DMA
+
+The decode used to copy 64 positions of K and V at a time with HVX loads
+from DDR, at about 17 GB/s. #225 fetches 256 positions by DMA, a block ahead,
+into two slots per operand. The Crouton tiles need no pack; the slots take
+256 KiB per worker.
+
+On the same v79 phone, `bench.py` tg128 at depth 130816 goes from 6.46 to
+10.67 t/s; at 261888, from 4.07 to 7.06 t/s (one run per table entry in the
+[comparison](https://github.com/xwhzz/tilelang-hexagon/pull/225)).
+
 ### LFM3: what did not work
 
 | tried | measured |
@@ -391,12 +402,10 @@ cycles).
 
 ### LFM3: what is next
 
-- **The decode's attention at long contexts.** A token reads the
-  full-attention layers' whole KV cache: at 128K positions, 1.6 GB on top of
-  the 3.46 GB of weights, so 11.4 t/s at the DMA's rate. The decode does
-  6.4 t/s there (#219), because its attention copies 64 positions at a time
-  and waits for each, about 17 GB/s. Copies a block ahead, like the
-  prefill's, would give most of that back (#223).
+- **The decode's remaining cost at long contexts.** At 256K, the 3.46 GB
+  of weights and 3.2 GB of KV cache give a bandwidth bound of 8.6 t/s,
+  against 7.06 measured. A phase profile of the copies, HVX work and process
+  handoffs would locate the remaining cost.
 
 - **Attention's HVX work.** exp2 (already the fp16 fast path, in qf16) and
   the row sums take 14.4M cycles a worker at pp1024, most of attention's 36M.

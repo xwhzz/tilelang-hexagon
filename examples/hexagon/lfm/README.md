@@ -217,9 +217,9 @@ Every worker keeps the residual stream in fp32 and adds each branch's whole
 output, normed over all of it (the sandwich norm needs the workers' sums of
 squares, which they write beside their slices). Projections take their inputs
 in fp16. The KV cache is fp16, in HMX's tiles (keys as the transposed weight
-operand of q K^T, values as the weight operand of P V), which the decode's
-attention multiplies on HVX as they are and the prefill's moves into HMX's
-operands by DMA. Both kernels declare it write-through
+operand of q K^T, values as the weight operand of P V). Both kernels bring
+its blocks into VTCM by DMA: decode multiplies them on HVX and prefill on
+HMX. Both kernels declare it write-through
 (`T.annotate_write_through`): each key and value goes back to DDR as it is
 written, so that the prefill's many DMA loads of it skip their writeback.
 
@@ -335,6 +335,7 @@ of rows for each attention layer (`decode_fp16.kv_plan`):
   the last 256, with a pad of 512 rows on either side for the prefill's
   chunks.
 
+`max_pos` must be a multiple of 256, the decode's cache block size.
 At 256K positions that is 3 GiB of keys and values, plus 256 MiB of RoPE
 tables.
 
@@ -360,30 +361,32 @@ The VTCM and HMX change hands on the DSP at each turn. A call to the device
 may take 600 s, so a long prompt's chunks, and a long generation's steps, go
 in calls of at most 128 (`Decoder.CALL_STEPS`).
 
-On v79 (`bench.py`, one run each, timed on the phone around the FastRPC
-calls). pp is a prompt of that length from position 0; tg128 is 128 tokens
-right after a prefilled context of that length:
+On v79 (`bench.py`, one run per table entry, timed on the phone around the
+FastRPC calls). pp is a prompt of that length from position 0; tg128 is 128
+tokens after an untimed prefill of that length. The prefill figures are from
+#224; the decode figures include the DMA cache loads of #225, on the same
+phone:
 
-| positions | processes | pp | tg128 |
+| positions | processes | pp (#224) | tg128 (#225) |
 |---|---:|---:|---:|
-| 32768 | 1 | 15.24 s, 2150 t/s | 11.7 t/s |
-| 32768 | 2 | 15.22 s, 2153 t/s | 11.6 t/s |
-| 65280 | 2 | 46.2 s, 1412 t/s | 9.1 t/s |
-| 130816 | 2 | 172.8 s, 757 t/s | 6.4 t/s |
-| 261888 | 2 | 679.5 s, 385 t/s | 4.0 t/s |
+| 32768 | 1 | 15.24 s, 2150 t/s | 14.22 t/s |
+| 65280 | 2 | 46.2 s, 1412 t/s | 12.84 t/s |
+| 130816 | 2 | 172.8 s, 757 t/s | 10.67 t/s |
+| 261888 | 2 | 679.5 s, 385 t/s | 7.06 t/s |
 
-At 32K, two processes against one cost the prefill nothing measurable. A
-token takes 0.8 ms more (11001 against 10900 ms for 128 tokens); 0.14 ms of
-that is the VTCM's two handoffs, which the resource manager zeroes.
+In #224's comparison at 32K, two processes against one cost the prefill
+nothing measurable (15.22 against 15.24 s). A token took 0.8 ms more (11001
+against 10900 ms for 128 tokens); 0.14 ms of that was the VTCM's two handoffs,
+which the resource manager zeroes.
 
 The decode reads the full-attention layers' whole cache every token. At 128K
 that is 1.6 GB on top of the 3.46 GB of weights, so 11.4 t/s at the DMA's
-rate; at 256K it is 3.2 GB, so 8.6 t/s. Its attention copies 64 positions at a
-time and waits for each, about 17 GB/s; that is what is left to win at long
-contexts (#223).
+rate; at 256K it is 3.2 GB, so 8.6 t/s. The
+[optimization record](OPTIMIZATION.md#lfm3s-decode-the-kv-cache-by-dma)
+describes the cache loads and their measured gain.
 
 `passkey.py` hides a five-digit key at 10% of a filler text and asks for it
-at the end:
+at the end. #224 measured:
 - At 48K, one process and two give the same reply with the key, `60494`.
   Their last logits are within 0.013 of each other (the prefill's results
   move by an fp16 step with its kernels, #220).
@@ -392,4 +395,5 @@ at the end:
   reply decodes at 4.1 t/s.
 
     python bench.py lfm3.head /data/local/tmp/lfm3.bundle --max-pos 262144 --pp 261888 --tg 0 --runs 1
+    python bench.py lfm3.head /data/local/tmp/lfm3.bundle --max-pos 262144 --depth 261888 --pp 0 --tg 128 --runs 1
     python passkey.py lfm3.head /data/local/tmp/lfm3.bundle LFM3-1.7B --max-pos 262144 --tokens 261000
