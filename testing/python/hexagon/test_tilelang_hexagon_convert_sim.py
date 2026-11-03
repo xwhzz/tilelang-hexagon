@@ -30,6 +30,47 @@ def _tool(name):
     return str(path)
 
 
+def test_v73_crouton_unscaled_widening_is_exact(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    executable, output = tmp_path / "crouton", tmp_path / "crouton.bin"
+    subprocess.run(
+        [
+            _tool("hexagon-clang++"),
+            "-mv73",
+            "-mhvx",
+            "-mhvx-length=128B",
+            "-O2",
+            "-std=c++17",
+            "-mllvm",
+            "--disable-handle-qfp",
+            "-I",
+            str(root / "src"),
+            str(Path(__file__).with_name("hvx_crouton_sim.cc")),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=180,
+    )
+    subprocess.run(
+        [_tool("hexagon-sim"), "-mv73", "--simulated_returnval", str(executable), "--", str(output)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        timeout=180,
+    )
+    actual = np.frombuffer(output.read_bytes(), dtype="<f4").reshape(64, 4, 1024)
+    halves = np.arange(65536, dtype=np.uint16).view(np.float16).reshape(64, 16, 32, 2)
+    expected = halves.transpose(0, 1, 3, 2).reshape(64, 1024).astype(np.float32)
+    # All finite values, signed zeros and infinities are exact. NaNs have no
+    # payload/quieting contract, but must stay NaN through every helper.
+    finite = ~np.isnan(expected)
+    for mode in range(4):
+        np.testing.assert_array_equal(actual[:, mode][finite].view(np.uint32), expected[finite].view(np.uint32))
+        np.testing.assert_array_equal(np.isnan(actual[:, mode]), np.isnan(expected))
+
+
 def _float_inputs():
     # Every positive adjacent finite-half pair has a midpoint exactly
     # representable in float32. Its immediate float32 neighbours distinguish

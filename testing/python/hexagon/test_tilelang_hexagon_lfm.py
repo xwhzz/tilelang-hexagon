@@ -41,6 +41,17 @@ def tiny_bundle(tmp_path_factory):
     return c, w, q, path
 
 
+@pytest.mark.parametrize("scale", [0x0000, 0x8000, 0x0001, 0x8001, 0x7C00, 0xFC00, 0x7E01, 0x3C00, 0xBC00])
+def test_bundle_scale_classification_and_header_only(tmp_path, scale):
+    path = str(tmp_path / "scales.bundle")
+    values = torch.tensor([0x3C00, 0xBC00, scale], dtype=torch.int32).to(torch.int16).view(torch.float16)
+    header = bundle.write(path, {}, {"w.scale": (values, "float16", (3,), "row_major")}, {"w": {"bits": 4}})
+    assert bundle.has_normal_scales(path, header) == (scale in (0x3C00, 0xBC00))
+    with open(path, "r+b") as f:
+        f.truncate(header["data_offset"])
+    assert not bundle.has_normal_scales(path, header)
+
+
 def test_bundle_holds_the_quantized_weights(tiny_bundle):
     c, w, q, path = tiny_bundle
     model = BundleModel(path)

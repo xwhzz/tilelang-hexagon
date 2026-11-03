@@ -221,7 +221,7 @@ class AdbConnection(HexagonConnection):
         configured = self._transport_env.get("TILELANG_HEXAGON_DSP_LIBRARY_PATH")
         if configured is not None:
             adsp_dirs = [self.workdir, exe_dir, *filter(None, configured.split(";"))]
-        adsp = os.pathsep.join(dict.fromkeys(adsp_library_path or adsp_dirs))
+        adsp = ";".join(dict.fromkeys(adsp_library_path or adsp_dirs))
         argstr = " ".join(shlex.quote(str(a)) for a in args)
         return (
             f"cd {shlex.quote(exe_dir)} && chmod 755 {shlex.quote(exe_remote_path)} && "

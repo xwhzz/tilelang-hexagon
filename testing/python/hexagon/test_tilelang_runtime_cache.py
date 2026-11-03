@@ -162,28 +162,6 @@ def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):
     assert len(builds.runs) == 2
 
 
-def test_cached_resource_setting_preserves_cache_and_rejects_removed_modes(builds, cache, monkeypatch):
-    from tilelang.hexagon.runtime import session
-
-    monkeypatch.delenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", raising=False)
-    original_key = key(cache)
-    source = session.gen_dsp("test", [])
-    first = builds.run(source)
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
-    assert key(cache) == original_key
-    assert session.gen_dsp("test", []) == source
-    assert builds.run(source) == first and len(builds.runs) == 1
-    for removed in ("call", "session"):
-        monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", removed)
-        with pytest.raises(ValueError, match="unset it .*cached"):
-            key(cache)
-        with pytest.raises(ValueError, match="unset it .*cached"):
-            session.gen_dsp("test", [])
-        with pytest.raises(ValueError, match="unset it .*cached"):
-            builds.run(source)
-    assert len(builds.runs) == 1
-
-
 def test_a_disabled_cache_always_builds(builds, monkeypatch):
     monkeypatch.setattr(builds.tl_env.env, "is_cache_enabled", lambda: False)
     builds.run()

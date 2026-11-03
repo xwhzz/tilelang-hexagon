@@ -205,6 +205,25 @@ and explicit HMX atoms.
   separate row-major staging operation: the DMA descriptor can move
   contiguous/row-strided rectangles but cannot express the Crouton permutation.
 
+- **Q4 scale specialization.** HMX `T.gemm_blockscaled` accepts
+  `annotations={"hexagon.normal_scales": True}` when the caller has established
+  that every B scale used by the call is a finite, normal fp16 value. This is a
+  compile-time promise, not a runtime check: v79 uses its original qf16 fast
+  path. Without the annotation, the dequantizer rounds integer × finite half
+  products to half exactly, including zero and subnormal scales. Neither path
+  scans scales during a GEMM. The LFM Q4 Decoder classifies the host bundle's
+  scales once before compiling prefill; a header-only bundle conservatively
+  uses the general path. No bundle format change is required.
+
+- **v73 Crouton arithmetic.** Unscaled half-to-float copies, reduction inputs,
+  and unscaled float epilogues use exact widening on older HVX. Scaling and
+  accumulation remain qfloat arithmetic: this includes the scaled float
+  epilogue and the half row/tile add and multiply paths. These are approximate
+  arithmetic operations, not an exact IEEE GEMM contract. HMX already rounds
+  its output to half; blockscaled GEMM tests check the combined result against
+  fp64 with `rtol=4e-3`, `atol=4e-3 * max(abs(reference))`. The separate Q4
+  dequantization contract above is exact and does not inherit that tolerance.
+
 - **DMA primitives are invoked explicitly.** `dma.h` provides raw User-DMA
   instruction wrappers, 1D/type-9 2D descriptor construction, cache maintenance,
   and a caller-owned descriptor ring with start/link/poll/wait/pop/flush operations.
@@ -280,10 +299,7 @@ and explicit HMX atoms.
   Resident DDR, workers, and DSP power votes stay alive across calls; grants are
   released only after the kernel has joined its workers and drained DMA. This
   does not preempt a long kernel or promise a release-callback deadline.
-  The earlier draft's `session` and `call` modes have been removed in favor of
-  the upstream cached lifecycle. Unset `TILELANG_HEXAGON_RESOURCE_LIFETIME`
-  (explicit `cached` is also accepted); obsolete values fail with a migration
-  error. The BSP's legacy resource-attribute initializer option remains independent.
+  The BSP's legacy resource-attribute initializer option remains independent.
   Multi-process sessions currently require Android's default cDSP domain;
   Linux and other domains fail before building. New platform combinations need
   independent device qualification.

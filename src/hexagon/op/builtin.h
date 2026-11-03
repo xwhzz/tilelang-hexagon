@@ -167,13 +167,13 @@ TVM_DLL const Op &hexagon_crouton_tile_store();
 // tiles without staging. The four flags print as template arguments.
 TVM_DLL const Op &hexagon_hmx_gemm();
 
-// tl_hexagon_hmx_gemm_blockscaled<signed, rows, aligned, scaled, shared>(M, N,
-// K, c, ldc, a, a_row_tile, b, panel_bytes, sfb, ld_sfb, gb, sfa, ld_sfa,
-// clear, w, stage, config) (hmx_gemm.h): C (+)= (A * SFA) (B * SFB)^T on HMX
-// for an fp16 A in the HMX activation layout and a 4-bit B in the panel
+// tl_hexagon_hmx_gemm_blockscaled<signed, rows, aligned, scaled, shared,
+// normal>(M, N, K, c, ldc, a, a_row_tile, b, panel_bytes, sfb, ld_sfb, gb, sfa,
+// ld_sfa, clear, w, stage, config) (hmx_gemm.h): C (+)= (A * SFA) (B * SFB)^T
+// on HMX for an fp16 A in the HMX activation layout and a 4-bit B in the panel
 // layout, B dequantized on HVX into the weight tiles `w`; `stage` and
-// `config` are its staging tiles and conversion config. The five flags print
-// as template arguments.
+// `config` are its staging tiles and conversion config. The six flags print
+// as template arguments; normal promises finite normal B scales.
 TVM_DLL const Op &hexagon_hmx_gemm_blockscaled();
 
 // tl_hvx_gemm<M, N, K, trans_A, trans_B, lda, ldb, ldc, align_a, align_b,

@@ -210,9 +210,6 @@ static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
 
 
 def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[BufferPlan]) -> str:
-    from .config import resource_lifetime
-
-    resource_lifetime()
     # qaic skel signature for run(), in the types of its header: in seq ->
     # (const uint8*, int); rout seq -> (uint8*, int); in int32 -> (int32), which
     # is not an int on the DSP.

@@ -51,7 +51,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from . import config, fastrpc
+from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
@@ -219,7 +219,6 @@ static AEEResult tl_session_dispatch_close() {{
 def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     """The skel of `kernels`, (name, source, plans) each: one translation unit,
     every kernel's entry renamed to its index."""
-    config.resource_lifetime()
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
         "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <type_traits>\n",
@@ -1022,7 +1021,6 @@ class Session:
     ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
         the DSP the target names, which ``processes`` DSP processes load."""
-        config.resource_lifetime()  # Reject obsolete launch settings before lowering.
         from tilelang.backend.target import determine_target
         from tilelang.hexagon.target import hexagon_arch
 
@@ -1049,7 +1047,6 @@ class Session:
         return session
 
     def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float, processes: int) -> None:
-        config.resource_lifetime()  # Also cover of_lowered, before build/deploy.
         from .build import build_cmake_fastrpc
         from .config import device_serial, domain_id, hlos, remote_dir
         from .device import AdbConnection

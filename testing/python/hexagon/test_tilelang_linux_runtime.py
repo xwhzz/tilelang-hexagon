@@ -558,17 +558,19 @@ def test_agent_watchdog_reaps_on_transport_eof(monkeypatch, tmp_path):
         conn.cleanup()
 
 
-def test_linux_domain_search_paths_are_configurable_and_captured(monkeypatch):
+@pytest.mark.parametrize("connection", [device.AdbConnection, linux_runtime.LinuxConnection])
+def test_domain_search_paths_are_configurable_and_captured(monkeypatch, connection):
     import shlex
 
     monkeypatch.setenv("TILELANG_HEXAGON_DSP_LIBRARY_PATH", "/bsp/cdsp1;/bsp/shared with spaces")
-    conn = linux_runtime.LinuxConnection(workdir="/private/session")
+    conn = connection(workdir="/private/session")
     monkeypatch.setenv("TILELANG_HEXAGON_DSP_LIBRARY_PATH", "/another/bsp")
     command = shlex.split(conn._host_command("/private/session/agent", ["0", "4"]))
     expected = "/private/session;/bsp/cdsp1;/bsp/shared with spaces"
     assert "ADSP_LIBRARY_PATH=" + expected in command
-    assert "CDSP_LIBRARY_PATH=" + expected in command
-    assert "CDSP1_LIBRARY_PATH=" + expected in command
+    if connection is linux_runtime.LinuxConnection:
+        assert "CDSP_LIBRARY_PATH=" + expected in command
+        assert "CDSP1_LIBRARY_PATH=" + expected in command
 
 
 def test_cleanup_error_never_retains_the_device_lock(monkeypatch):

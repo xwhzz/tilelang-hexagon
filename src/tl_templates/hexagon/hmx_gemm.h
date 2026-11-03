@@ -42,7 +42,7 @@ struct tl_hmx_weight_tiles {
 // a column of output tiles, into a column of fp16 weight tiles in w (two of
 // K / 32 tiles each, alternating): one column while HMX multiplies the
 // other, in slices, one alongside each row tile of A.
-template <bool Signed> struct tl_hmx_panel_weights {
+template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
   const uint8_t *panels;
   int panel_bytes;
   const half *sfb;
@@ -55,9 +55,9 @@ template <bool Signed> struct tl_hmx_panel_weights {
 
   const half *column(int nt) const { return w + (nt & 1) * column_halves; }
   void dequant(int nt, int v0, int n) const {
-    tl_crouton_dequant4<Signed>(w + (nt & 1) * column_halves,
-                                panels + nt * panel_bytes, sfb + nt * TL_HMX_T,
-                                ld_sfb, gb, v0, n);
+    tl_crouton_dequant4<Signed, Normal>(w + (nt & 1) * column_halves,
+                                        panels + nt * panel_bytes,
+                                        sfb + nt * TL_HMX_T, ld_sfb, gb, v0, n);
   }
   void prepare() const { dequant(0, 0, registers); }
   // Slice mt of column nt + 1, alongside tile (mt, nt).
@@ -190,7 +190,7 @@ tl_hexagon_hmx_gemm(int M, int N, int K, D *c, int ldc, const half *a,
 // T.gemm_blockscaled on HMX: C (+)= (A * sfa) (B * sfb)^T, B 4-bit weights in
 // the panel layout (tl_hmx_panel_weights), dequantized into w.
 template <bool Signed, bool Rows, bool Aligned, bool Scaled, bool Shared,
-          typename D>
+          bool Normal, typename D>
 TL_HMX_GEMM void tl_hexagon_hmx_gemm_blockscaled(
     int M, int N, int K, D *c, int ldc, const half *a, int a_row_tile,
     const void *b, int panel_bytes, const half *sfb, int ld_sfb, int gb,
@@ -199,16 +199,17 @@ TL_HMX_GEMM void tl_hexagon_hmx_gemm_blockscaled(
   const int MT = M / TL_HMX_T;
   // A column is K / 8 panel registers, dequantized in MT slices.
   const int registers = K / 8;
-  const tl_hmx_panel_weights<Signed> panels{static_cast<const uint8_t *>(b),
-                                            panel_bytes,
-                                            sfb,
-                                            ld_sfb,
-                                            gb,
-                                            w,
-                                            K * TL_HMX_T,
-                                            registers,
-                                            (registers + MT - 1) / MT,
-                                            N / TL_HMX_T};
+  const tl_hmx_panel_weights<Signed, Normal> panels{
+      static_cast<const uint8_t *>(b),
+      panel_bytes,
+      sfb,
+      ld_sfb,
+      gb,
+      w,
+      K * TL_HMX_T,
+      registers,
+      (registers + MT - 1) / MT,
+      N / TL_HMX_T};
   tl_hmx_gemm<Rows, Aligned, Scaled, Shared, false>(
       M, N, K, c, ldc, a, a_row_tile, panels, sfa, ld_sfa, clear, stage,
       config);

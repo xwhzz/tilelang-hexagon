@@ -38,7 +38,7 @@ static void legacy_row_major(uint16_t *out, const uint16_t *scales) {
   }
 }
 
-template <bool Signed>
+template <bool Signed, bool Normal = false>
 static void dequantize(uint16_t *out, const uint8_t *panel,
                        const uint16_t *scales) {
   // First panel exercises complete groups/R8. The remaining panels are
@@ -48,13 +48,13 @@ static void dequantize(uint16_t *out, const uint8_t *panel,
     const void *src = panel + nt * K * 16;
     const half *sfb = reinterpret_cast<const half *>(scales + nt * 32);
     if (nt == 0) {
-      tl_crouton_dequant4<Signed>(dst, src, sfb, N, GROUP, 0, K / 8);
+      tl_crouton_dequant4<Signed, Normal>(dst, src, sfb, N, GROUP, 0, K / 8);
     } else {
       // Includes a call crossing the group boundary at register 8, as well
       // as partial groups on both sides. The calls cover each register once.
-      tl_crouton_dequant4<Signed>(dst, src, sfb, N, GROUP, 0, 3);
-      tl_crouton_dequant4<Signed>(dst, src, sfb, N, GROUP, 3, 6);
-      tl_crouton_dequant4<Signed>(dst, src, sfb, N, GROUP, 9, 7);
+      tl_crouton_dequant4<Signed, Normal>(dst, src, sfb, N, GROUP, 0, 3);
+      tl_crouton_dequant4<Signed, Normal>(dst, src, sfb, N, GROUP, 3, 6);
+      tl_crouton_dequant4<Signed, Normal>(dst, src, sfb, N, GROUP, 9, 7);
     }
   }
 }
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     return 3;
   alignas(128) uint8_t panel[N * K / 2] = {};
   alignas(128) uint16_t scales[N * (K / GROUP)];
-  alignas(128) uint16_t result[N * K];
+  alignas(128) uint16_t result[N * K], fast[N * K];
   for (int row = 0; row < N; ++row)
     for (int col = 0; col < K; ++col) {
       int nibble = (row * 3 + col * 5) & 15;
@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
           scales[group * N + row] = index < 0x7c00 ? index : index + 0x400;
         } else {
           // One exceptional scale at each lane position, surrounded by
-          // normal scales. Other panels/groups retain the fast path.
+          // normal scales, testing mixed groups on the general path.
           int lane = iteration - FINITE_ITERATIONS;
           int panel = lane / 8;
           uint16_t bits = (row + group) & 1 ? 0x3c01 : 0xbc03;
@@ -104,6 +104,14 @@ int main(int argc, char **argv) {
       }
     memset(result, 0x7e, sizeof(result));
     dequantize<true>(result, panel, scales);
+    bool all_normal = true;
+    for (uint16_t scale : scales)
+      all_normal &= (scale & 0x7c00) != 0 && (scale & 0x7c00) != 0x7c00;
+    if (all_normal) {
+      dequantize<true, true>(fast, panel, scales);
+      if (memcmp(fast, result, sizeof(result)))
+        return 7;
+    }
     if (fwrite(result, sizeof(result), 1, out) != 1)
       return 4;
     legacy_row_major<true>(result, scales);
@@ -111,6 +119,11 @@ int main(int argc, char **argv) {
       return 4;
     memset(result, 0x7e, sizeof(result));
     dequantize<false>(result, panel, scales);
+    if (all_normal) {
+      dequantize<false, true>(fast, panel, scales);
+      if (memcmp(fast, result, sizeof(result)))
+        return 7;
+    }
     if (fwrite(result, sizeof(result), 1, out) != 1)
       return 5;
     legacy_row_major<false>(result, scales);

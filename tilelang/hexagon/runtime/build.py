@@ -70,7 +70,6 @@ def _find_one(patterns: list[str]) -> str | None:
 
 # Runtime settings that do not change the generated build inputs.
 _RUNTIME_ONLY = {
-    "TILELANG_HEXAGON_RESOURCE_LIFETIME",
     "TILELANG_HEXAGON_DEVICE",
     "TILELANG_HEXAGON_DOMAIN",
     "TILELANG_HEXAGON_DSP_LIBRARY_PATH",
@@ -175,7 +174,6 @@ def build_cmake_fastrpc(
     sdk         : a :class:`HexagonSDK` (constructed+validated if omitted).
     dsp_arch    : Hexagon arch (e.g. ``v73``); defaults to ``sdk.dsp_arch``.
     """
-    config.resource_lifetime()  # Reject obsolete modes even for pre-generated projects.
     sdk = (sdk or HexagonSDK()).validate()
     dsp_arch = dsp_arch or sdk.dsp_arch
     hlos = config.hlos()

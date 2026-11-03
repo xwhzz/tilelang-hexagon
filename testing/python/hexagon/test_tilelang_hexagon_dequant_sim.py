@@ -2,11 +2,13 @@
 
 Opt in with TL_HEXAGON_SIMULATOR_TEST=1 and HEXAGON_TOOLS_ROOT. Host simulator
 dependencies belong on LD_LIBRARY_PATH. No device or native TileLang import
-is required by this test. Both architectures compile with ordinary flags:
-the production helper must supply its own local IEEE feature boundary.
+is required by the simulator fixture. Both architectures compile with ordinary
+flags: only v73 supplies a local IEEE feature boundary; v79 uses qfloat.
 Both architectures require exact RNE across all finite scales and groups
 with one exceptional scale in each lane position. The old
 qfloat expression is retained only as diagnostic output, not as an oracle.
+For all-normal groups the fixture also compares the compile-time fast path
+with the exact general path, without a scale scan in the production helper.
 """
 
 import os

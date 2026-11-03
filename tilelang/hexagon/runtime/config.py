@@ -67,21 +67,6 @@ def domain_id() -> int:
     return domain
 
 
-def resource_lifetime() -> str:
-    """Validate old launch settings; resources use upstream cached take/give.
-
-    Accept explicit cached for existing scripts. The unpublished session/call
-    modes were removed, so reject them rather than silently changing behavior.
-    """
-    lifetime = os.environ.get("TILELANG_HEXAGON_RESOURCE_LIFETIME", "cached")
-    if lifetime != "cached":
-        raise ValueError(
-            f"TILELANG_HEXAGON_RESOURCE_LIFETIME={lifetime!r} is no longer supported; "
-            "unset it (or set cached) to use upstream per-call cached VTCM/HMX take/give"
-        )
-    return "cached"
-
-
 def cache_identity() -> dict:
     """Resolve before cache lookup, including the automatically selected device.
 
@@ -93,7 +78,6 @@ def cache_identity() -> dict:
     identity = {
         "hlos": hlos(),
         "domain": domain_id(),
-        "resource_lifetime": resource_lifetime(),
         "dsp_arch": sdk.dsp_arch,
         "sdk_root": sdk.sdk_root,
         "ndk_root": sdk.ndk_root,

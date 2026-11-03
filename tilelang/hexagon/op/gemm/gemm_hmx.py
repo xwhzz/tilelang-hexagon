@@ -320,7 +320,10 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
         c, ldc, aligned = self._c(kind)
         clear = self.clear_accum
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm_blockscaled")
-        flags = [_flag(signed), _flag(kind == "rows"), _flag(aligned), _flag(True), _flag(self._shared())]
+        normal = self.gemm_node.annotations.get("hexagon.normal_scales", False)
+        if not isinstance(normal, (bool, int, tirx.IntImm)) or int(normal) not in (0, 1):
+            raise ValueError("hexagon.normal_scales must be a compile-time boolean")
+        flags = [_flag(signed), _flag(kind == "rows"), _flag(aligned), _flag(True), _flag(self._shared()), _flag(bool(normal))]
 
         @T.prim_func
         def _gemm_hmx_blockscaled() -> None:

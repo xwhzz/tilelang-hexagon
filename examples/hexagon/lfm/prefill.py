@@ -60,14 +60,24 @@ LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 
 
 @T.macro
-def gemm(A, K: int, rw, rs, k, C, ones, clear):
+def gemm(A, K: int, rw, rs, k, C, ones, clear, normal_scales: bool):
     """C (+)= A @ (block k of the ring)^T on HMX, A [R, K] fp16."""
     T.gemm_blockscaled(
-        A, rw[k, :, :], C, ones, rs[k, :, :], transpose_B=True, clear_accum=clear, k_start=0, sf_a_granularity_k=K, sf_b_granularity_k=64
+        A,
+        rw[k, :, :],
+        C,
+        ones,
+        rs[k, :, :],
+        transpose_B=True,
+        clear_accum=clear,
+        k_start=0,
+        sf_a_granularity_k=K,
+        sf_b_granularity_k=64,
+        annotations={"hexagon.normal_scales": normal_scales},
     )
 
 
-def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int):
+def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int, normal_scales: bool = False):
     """The prefill kernel for config c, the bundle's tensor `shapes`, and
     chunks of R rows."""
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
@@ -136,7 +146,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
         its causal conv over time; after C, the gated output. B and C go to
         slot 0, x and the conv to slot 1."""
         ch = bf.w * DW + b // 3 * BLOCK
-        gemm(bf.a, D, rw, rs, k, bf.cc[b % 3 % 2, :, :], bf.ones, True)
+        gemm(bf.a, D, rw, rs, k, bf.cc[b % 3 % 2, :, :], bf.ones, True, normal_scales)
         if b % 3 == 1:
             for i, j in T.Parallel(R, BLOCK):
                 bf.cc[0, i, j] = bf.cc[0, i, j] * bf.cc[1, i, j]
@@ -163,7 +173,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
         """Query block b: two heads, normalized, rotated and scaled by
         log2(e) / 8, into their KV head's stacked queries: the scores are
         then in base 2, which the softmax raises 2 to."""
-        gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True)
+        gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True, normal_scales)
         for hh in T.serial(BLOCK // HD):
             local = b * (BLOCK // HD) + hh  # the worker's query head
             norm_rope(bf, hh * HD, lambda d, ai=ai: bf.q_norm[ai, d], T.float32(LOG2E / 8))
@@ -173,7 +183,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
     def kv_block(bf, b, rw, rs, k, ai, base, values: bool):
         """Key (or value) block b: the worker's KV heads, keys normalized
         and rotated, into the KV cache at positions base + i."""
-        gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True)
+        gemm(bf.a, D, rw, rs, k, bf.cc[0, :, :], bf.ones, True, normal_scales)
         for hh in T.serial(BLOCK // HD):
             kvh = bf.w * (KVH // NW) + b * (BLOCK // HD) + hh
             if values:
@@ -257,7 +267,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
     def glu_block(bf, b, rw, rs, k, slot):
         """w1 (even b) or w3 of hidden block b // 2 of the worker's part;
         after w3, silu(w1 a) * (w3 a) into hid's slot."""
-        gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True)
+        gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True, normal_scales)
         if b % 2 == 1:
             # In fp16, which hid holds: the sigmoid then takes 64 lanes a
             # register.
@@ -272,7 +282,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int)
         """x[:, channels] += hid[:, first:first + cols] @ block^T: the
         residual add in the GEMM itself."""
         ch = bf.w * DW + b * BLOCK
-        gemm(bf.hid[:, first : first + cols], cols, rw, rs, k, bf.x[:, ch : ch + BLOCK], bf.ones, False)
+        gemm(bf.hid[:, first : first + cols], cols, rw, rs, k, bf.x[:, ch : ch + BLOCK], bf.ones, False, normal_scales)
 
     @T.prim_func
     def prefill(

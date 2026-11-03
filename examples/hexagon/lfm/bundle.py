@@ -87,6 +87,35 @@ def read_tensor(path: str, header: dict, name: str) -> torch.Tensor:
     return raw
 
 
+def has_normal_scales(path: str, header: dict) -> bool:
+    """Classify Q4 scales once before compiling the prefill, never per GEMM.
+
+    A header-only host file cannot prove the property of device weights: keep
+    the exact general path in that case. The bundle format is unchanged.
+    When weights are loaded from a device path, they must be the same bundle
+    whose host scales are classified here, as required by load_part.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        for name, q in header["quant"].items():
+            if q["bits"] != 4:
+                continue
+            t = header["tensors"][name + ".scale"]
+            start = header["data_offset"] + t["offset"]
+            if t["dtype"] != "float16" or size < start + t["nbytes"]:
+                return False
+            f.seek(start)
+            # At most 1 MiB at once; no unpacking of projection weights.
+            for offset in range(0, t["nbytes"], 1 << 20):
+                data = bytearray(f.read(min(1 << 20, t["nbytes"] - offset)))
+                bits = torch.frombuffer(data, dtype=torch.int16)
+                exponent = bits & 0x7C00
+                if not bool(((exponent != 0) & (exponent != 0x7C00)).all()):
+                    return False
+    return True
+
+
 def part_nbytes(header: dict, name: str, count: int | None = None) -> int:
     """The bytes of `count` slices of tensor `name`'s first axis (all of it
     by default)."""

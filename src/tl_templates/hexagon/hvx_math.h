@@ -197,6 +197,7 @@ TL_DEVICE HVX_Vector tl_hvx_log2_vsf(HVX_Vector x) {
 
 TL_DEVICE HVX_Vector tl_hvx_log_vsf(HVX_Vector x) {
   HVX_Vector r = tl_hvx_log2_vsf(x);
+#if __HVX_ARCH__ < 79
   HVX_Vector magnitude = Q6_V_vand_VV(r, tl_hvx_bits(0x7fffffff));
   HVX_VectorPred nonfinite =
       Q6_Q_vcmp_gt_VwVw(magnitude, tl_hvx_bits(0x7f7fffff));
@@ -205,6 +206,9 @@ TL_DEVICE HVX_Vector tl_hvx_log_vsf(HVX_Vector x) {
   HVX_Vector finite = tl_hvx_select(nonfinite, Q6_V_vzero(), r);
   return tl_hvx_select(
       nonfinite, r, tl_hvx_mul_sf(finite, tl_hvx_splat_f(0.6931471805599453f)));
+#else
+  return tl_hvx_mul_sf(r, tl_hvx_splat_f(0.6931471805599453f));
+#endif
 }
 
 // The Newton-Raphson seed overflows for subnormals, so those are scaled by
@@ -407,8 +411,8 @@ TL_DEVICE HVX_Vector tl_hvx_log2_fast_vsf(HVX_Vector x) {
   m = tl_hvx_select(big, Q6_Vw_vsub_VwVw(m, tl_hvx_bits(0x00800000)), m);
   e = tl_hvx_select(big, Q6_Vw_vadd_VwVw(e, tl_hvx_bits(1)), e);
   HVX_Vector one = tl_hvx_splat_f(1.0f);
-  // Normalize the small difference through IEEE before the qfloat products;
-  // retaining the raw qfloat subtraction loses relative accuracy near m=1.
+  // Normalize before multiplying: on v79 too, the raw qfloat subtraction
+  // exceeds the fast-log error bound near one (covered by the simulator).
   HVX_Vector sq = Q6_Vqf32_vmpy_Vqf32Vqf32(
       tl_hvx_qf(tl_hvx_log_m_minus_one(m)),
       tl_hvx_qf(tl_hvx_recip_fast_vsf(tl_hvx_add_sf(m, one))));

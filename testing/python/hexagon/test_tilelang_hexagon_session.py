@@ -279,16 +279,6 @@ def test_session_dispatch_lifecycle_on_host(tmp_path):
             subprocess.run([str(executable), mode, failure], check=True, timeout=10)
 
 
-@pytest.mark.parametrize("value", ["", "CALL", "per_call", "session ", "session", "call"])
-def test_invalid_resource_lifetime_fails_before_lowering_or_build(monkeypatch, value):
-    monkeypatch.setenv("TILELANG_HEXAGON_RESOURCE_LIFETIME", value)
-    monkeypatch.setattr(session, "lower_kernels", lambda *args: pytest.fail("must reject before lowering"))
-    monkeypatch.setattr(session, "write_project", lambda *args: pytest.fail("must reject before building"))
-    for create in (session.Session, session.Session.of_lowered):
-        with pytest.raises(ValueError, match="TILELANG_HEXAGON_RESOURCE_LIFETIME"):
-            create([])
-
-
 class _LocalAgent:
     """A session transport whose agent is a local shell command."""
 

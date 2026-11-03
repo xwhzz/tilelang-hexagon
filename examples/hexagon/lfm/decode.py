@@ -521,7 +521,9 @@ class Decoder:
         shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
         kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
         if self.prefill_rows:
-            kernels.append((make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens), []))
+            kernels.append(
+                (make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens, bundle.has_normal_scales(bundle_path, header)), [])
+            )
         self.session = Session(kernels)
         self.weights = bundle.load(self.session, bundle_path, device_path)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)

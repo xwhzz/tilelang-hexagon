@@ -284,7 +284,7 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
         kernel.adapter.close()
 
 
-def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1):
+def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1, normal_scales=False):
     """C = C0 + SA * (A @ (B * SB)^T) on HMX, for an fp16 A, a factor per row
     of A and an fp16 one per G columns of each row of B (group-major).
     `workers` programs each multiply their own A, B and C."""
@@ -309,7 +309,17 @@ def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1):
             T.copy(SB[p, :, :], sb)
             T.copy(C0[p, :, :], c)
             T.gemm_blockscaled(
-                a, b, c, SA[p, :, :], sb, transpose_B=True, clear_accum=clear, k_start=0, sf_a_granularity_k=K, sf_b_granularity_k=G
+                a,
+                b,
+                c,
+                SA[p, :, :],
+                sb,
+                transpose_B=True,
+                clear_accum=clear,
+                k_start=0,
+                sf_a_granularity_k=K,
+                sf_b_granularity_k=G,
+                annotations={"hexagon.normal_scales": normal_scales},
             )
             T.copy(c, C[p, :, :])
 
@@ -321,17 +331,24 @@ def test_blockscaled_gemm_of_fp16_a_runs_on_hmx():
     # One call of the out-of-line HMX GEMM: A's row tiles 8 tiles of K apart,
     # B's panels 4096 bytes apart, groups of 64, a factor per row of A.
     assert (
-        "tl_hexagon_hmx_gemm_blockscaled<true, true, true, true, false>(64, 64, 256, (&(((float*)c)[0])), 64, "
+        "tl_hexagon_hmx_gemm_blockscaled<true, true, true, true, false, false>(64, 64, 256, (&(((float*)c)[0])), 64, "
         "(&(((half*)a)[0])), 8192, ((int8_t*)b + ((0) >> 1)), 4096, (&(((half*)sb)[0])), 64, 64, (&(SA[0])), 1, (bool)1, "
     ) in source
     assert "tl_hvx_gemm_int_scaled" not in source
+
+
+def test_blockscaled_normal_scales_specializes_the_dequantizer():
+    source = _lower(_blockscaled_hmx(64, 64, 256, 64, "int4", "float32", True, normal_scales=True)).kernel_source
+    assert "tl_hexagon_hmx_gemm_blockscaled<true, true, true, true, false, true>(" in source
+    with pytest.raises(Exception, match="compile-time boolean"):
+        _lower(_blockscaled_hmx(64, 64, 256, 64, "int4", "float32", True, normal_scales=2))
 
 
 def test_blockscaled_hmx_gemm_of_a_worker_pool_takes_turns_at_hmx():
     source = _lower(_blockscaled_hmx(64, 64, 256, 64, "uint4", "float32", True, workers=2)).kernel_source
     body = source[source.index("tl_parallel_for<tl_hmx_worker_scope") :]
     # The workers share HMX: a tile each at a time.
-    assert "tl_hexagon_hmx_gemm_blockscaled<false, true, true, true, true>(" in body
+    assert "tl_hexagon_hmx_gemm_blockscaled<false, true, true, true, true, false>(" in body
 
 
 @pytest.mark.parametrize(
@@ -358,9 +375,10 @@ def test_blockscaled_hmx_gemm_rejects_what_it_cannot_run(args, error):
         (96, 64, 512, 64, "int4", "float32", False, 2),
     ],
 )
-def test_blockscaled_hmx_gemms_match_torch(M, N, K, G, b_dtype, c_dtype, clear, workers):
+@pytest.mark.parametrize("normal_scales", [False, True])
+def test_blockscaled_hmx_gemms_match_torch(M, N, K, G, b_dtype, c_dtype, clear, workers, normal_scales):
     torch.manual_seed(M + N + K)
-    kernel = tilelang.compile(_blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers), out_idx=[5], target="hexagon")
+    kernel = tilelang.compile(_blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers, normal_scales), out_idx=[5], target="hexagon")
     try:
         a = (torch.randn(workers, M, K) * 0.5).half()
         sa = torch.rand(workers, M, 1) + 0.5
