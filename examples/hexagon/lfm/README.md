@@ -138,13 +138,13 @@ rounds its activation and weight operands to fp16 and also uses fp16
 intermediates for softmax and SwiGLU. Rounding differences between these
 arithmetic paths can accumulate across layers and affect their logits.
 
-The Q4 regression tests use separate references and comparisons.
+The tiny-model Q4 regression tests use separate references and comparisons.
 
 - `test_decode_matches_the_reference` checks greedy tokens and final logits
   against `BundleModel`, with `rtol=1e-3` and an absolute tolerance of
   `1e-3 * max(abs(reference_logits))`.
 - `test_prefill_matches_the_reference` checks valid KV entries and convolution
-  state against the plain `Model` with
+  state against the plain `Model` using the bundle's dequantized weights, with
   `max(abs(actual - reference)) / max(abs(reference)) < 5e-3`, then checks
   continuation tokens against `BundleModel`.
 - The WikiText-2 comparison above scores forced tokens through decode.
