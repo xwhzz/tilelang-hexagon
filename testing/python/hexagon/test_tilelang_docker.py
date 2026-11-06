@@ -99,7 +99,7 @@ def test_launcher_preserves_remote_override_and_image_name(tmp_path, launcher_en
 
 
 @pytest.mark.parametrize("hlos,uid", [("linux", 0), ("linux", 1001), ("android", 1001)])
-def test_launcher_mounts_ssh_credentials_only_for_linux(tmp_path, launcher_environment, hlos, uid):
+def test_launcher_mounts_ssh_credentials_only_for_linux(tmp_path, launcher_environment, monkeypatch, hlos, uid):
     environ, calls = launcher_environment
     ssh_dir = tmp_path / "ssh files"
     ssh_dir.mkdir()
@@ -116,8 +116,10 @@ def test_launcher_mounts_ssh_credentials_only_for_linux(tmp_path, launcher_envir
         SSH_AUTH_SOCK=str(agent_socket),
         LAUNCHER_UID=str(uid),
     )
-    with socket.socket(socket.AF_UNIX) as agent:
-        agent.bind(str(agent_socket))
+    with monkeypatch.context() as patch, socket.socket(socket.AF_UNIX) as agent:
+        # A relative bind keeps long pytest temporary paths within AF_UNIX limits.
+        patch.chdir(tmp_path)
+        agent.bind(agent_socket.name)
         subprocess.run(["bash", str(DOCKER / "enter-docker.sh"), "sample"], cwd=tmp_path, env=environ, check=True)
     commands = list(map(json.loads, calls.read_text().splitlines()))
     run = next(command for command in commands if command[0] == "run")
