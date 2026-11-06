@@ -48,7 +48,10 @@ COPY . /opt/tilelang
 COPY --from=hexagon-sdk --chown=1000:1000 . /opt/hexagon-sdk
 COPY --from=android-ndk --chown=1000:1000 . /opt/android-ndk
 COPY --from=board-runtime . /opt/board-runtime
-RUN groupadd -g 1000 builder && \
+# The SDK simulator's bundled libedit uses the ncurses 5 ABI.
+RUN apt-get update && apt-get install -y --no-install-recommends libncurses5 && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -g 1000 builder && \
     useradd -u 1000 -g 1000 -d /tmp/tilelang-home-1000 -M builder && \
     python /opt/tilelang/docker/hexagon/prepare-sdk.py && \
     mkdir -p /work /output /opt/tilelang/build/tvm && chmod 1777 /work /output

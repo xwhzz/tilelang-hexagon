@@ -150,7 +150,7 @@ sudo apt-get update
 sudo apt-get install -y \
   build-essential git ca-certificates python3 python3-dev python3-venv \
   gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross \
-  libtinfo5 libtinfo-dev zlib1g-dev libedit-dev libxml2-dev libgmp10 libatomic1 \
+  libncurses5 libtinfo5 libtinfo-dev zlib1g-dev libedit-dev libxml2-dev libgmp10 libatomic1 \
   unzip file pkg-config openssh-client adb
 
 python3 -m venv .venv
@@ -312,6 +312,23 @@ The host suite checks lowering and runtime orchestration against the reference
 v79 target, including architecture-gated DMA cases. The architecture override
 applies to this command only. Device and simulator cases are opt-in and appear
 as skipped in this run. The board checks below use your selected device architecture.
+
+### Simulator checks
+
+The SDK simulator runs on the development host. The reference environment
+includes its `libncurses.so.5` dependency. These opt-in tests cover conversions,
+HVX math and Q4 dequantization across v73, v75 and v79.
+
+```bash
+export HEXAGON_TOOLS_ROOT="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07"
+env -u TL_HEXAGON_DEVICE_TEST TL_HEXAGON_SIMULATOR_TEST=1 \
+  python -m pytest \
+  testing/python/hexagon/test_tilelang_hexagon_convert_sim.py \
+  testing/python/hexagon/test_tilelang_hexagon_math_sim.py \
+  testing/python/hexagon/test_tilelang_hexagon_dequant_sim.py -q
+```
+
+Device-only cases in these files are skipped by this command.
 
 ### Board smoke test
 
