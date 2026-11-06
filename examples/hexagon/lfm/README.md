@@ -130,6 +130,31 @@ The prefill's keys and values match the decode's, a token a step, to 4.3e-3
 at most (the last attention layer's keys), and the tokens generated after it
 match the decode's.
 
+### Numerical checks
+
+For the Q4 bundle, `BundleModel` rounds projection inputs to int16 with one
+scale per row and evaluates the dequantized weights in fp32. The HMX prefill
+rounds its activation and weight operands to fp16 and also uses fp16
+intermediates for softmax and SwiGLU. Rounding differences between these
+arithmetic paths can accumulate across layers and affect their logits.
+
+The Q4 regression tests use separate references and comparisons.
+
+- `test_decode_matches_the_reference` checks greedy tokens and final logits
+  against `BundleModel`, with `rtol=1e-3` and an absolute tolerance of
+  `1e-3 * max(abs(reference_logits))`.
+- `test_prefill_matches_the_reference` checks valid KV entries and convolution
+  state against the plain `Model` with
+  `max(abs(actual - reference)) / max(abs(reference)) < 5e-3`, then checks
+  continuation tokens against `BundleModel`.
+- The WikiText-2 comparison above scores forced tokens through decode.
+  `ppl.py` constructs its decoder with `prefill_rows=None`.
+
+Full-model cross-path logit diagnostics record the bundle, prompt, reference
+arithmetic and token prefix used at each comparison. The historical RTN
+long-prompt controls and their measured errors are recorded in the
+[prefill/decode numerical investigation](https://github.com/ColmaLiu/tilelang-hexagon/issues/17).
+
 ## On the device
 
     adb push lfm2.bundle /data/local/tmp/lfm2.bundle
