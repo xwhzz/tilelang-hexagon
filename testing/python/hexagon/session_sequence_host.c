@@ -21,6 +21,8 @@ struct allocation {
 static struct allocation memory[1024];
 static int next_fd = 100, runs, acquires, releases, lease, sync_failure;
 static int pipeline_calls, thread_attempts, threads_created, threads_joined;
+static int last_pipeline_process = -1;
+static int last_pipeline_scalar_kind, last_pipeline_scalar_value;
 static int test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                                void *(*entry)(void *), void *arg) {
   const char *fail_after = getenv("TL_TEST_FAIL_CREATE_AFTER");
@@ -186,6 +188,9 @@ int seq_test_run(remote_handle64 h, int32_t kernel, const int32_t *args, int n,
     values[3] = pipeline_calls;
     values[4] = threads_created;
     values[5] = threads_joined;
+    values[6] = __atomic_load_n(&last_pipeline_process, __ATOMIC_SEQ_CST);
+    values[7] = __atomic_load_n(&last_pipeline_scalar_kind, __ATOMIC_SEQ_CST);
+    values[8] = __atomic_load_n(&last_pipeline_scalar_value, __ATOMIC_SEQ_CST);
   }
   m->dirty[p][offset / 128] = 1;
   ++runs;
@@ -209,13 +214,15 @@ int remote_session_control(int op, void *arg, unsigned int size) {
 int seq_test_pipeline(remote_handle64 h, int32_t kernel, const int32_t *args,
                       int n, int32_t steps, int32_t stage, int32_t stages,
                       int32_t turn) {
-  (void)h;
   (void)kernel;
-  (void)args;
-  (void)n;
   (void)stage;
   (void)stages;
   (void)turn;
+  __atomic_store_n(&last_pipeline_process, (int)h, __ATOMIC_SEQ_CST);
+  if (n == 6) {
+    __atomic_store_n(&last_pipeline_scalar_kind, args[3], __ATOMIC_SEQ_CST);
+    __atomic_store_n(&last_pipeline_scalar_value, args[4], __ATOMIC_SEQ_CST);
+  }
   __atomic_add_fetch(&pipeline_calls, 1, __ATOMIC_SEQ_CST);
   return steps == 0 ? AEE_SUCCESS : AEE_EBADPARM;
 }

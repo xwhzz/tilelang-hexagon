@@ -544,6 +544,29 @@ def test_pipeline_and_sequence_have_distinct_wire_operations(agent):
     assert _ints(buffer)[1] == 7
 
 
+@pytest.mark.parametrize("agent,process", [((1, 0), 0), ((2, 0), 1)], indirect=["agent"])
+def test_single_stage_pipeline_reuses_the_calling_thread_and_recovers(agent, process):
+    # The first pthread_create would fail. A single stage calls FastRPC on
+    # the agent thread, including when it selects a non-default DSP process.
+    buffer = agent.buffer(128, processes=[process])
+    stages = [(agent.kernels[0], process, (buffer, 1))]
+    for _ in range(256):
+        agent.pipeline(stages, 0)
+    # The native fake DSP rejects nonzero steps. Its complete error reply
+    # leaves the same connection usable by the next pipeline and direct run.
+    with pytest.raises(RuntimeError, match="FastRPC call failed"):
+        agent.pipeline(stages, 1)
+    # The agent forwards STEP's offset for the DSP to expand on each step.
+    agent.pipeline([(agent.kernels[0], process, (buffer, session.Session.STEP + 17))], 0)
+    assert agent.last_run_seconds() >= 0
+    stats = agent.buffer(128)
+    agent.kernels[3](stats)
+    values = _ints(stats)
+    assert values[3:9] == [258, 0, 0, process, session._STEP, 17]
+    agent.kernels[0](buffer, 7, process=process)
+    assert _ints(buffer)[1] == 7
+
+
 @pytest.mark.parametrize("agent,created", [((3, 1), 1), ((3, 2), 2)], indirect=["agent"])
 def test_pipeline_thread_creation_failure_starts_no_stage_and_recovers(agent, created):
     buffer = agent.buffer(128)

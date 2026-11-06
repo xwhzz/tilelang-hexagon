@@ -633,17 +633,26 @@ static int serve(int cli, unsigned char op, int* running) {{
     for (int p = 0; p < g_processes; ++p) {iface}_sync(g_handles[p], g_turn_fd, 0, 128, 0);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    pthread_t threads[MAX_PROCESSES];
     struct launch_gate gate = {{PTHREAD_MUTEX_INITIALIZER, 0}};
-    pthread_mutex_lock(&gate.mutex);
     int started = 0;
-    for (; ok && started < head[0]; ++started) {{
-      st[started].gate = &gate;
-      if (pthread_create(&threads[started], 0, run_stage, &st[started]) != 0) break;
+    if (ok && head[0] == 1) {{
+      // Reuse this caller's FastRPC thread for a single stage. Repeatedly
+      // creating callers can exhaust the DSP's mirrored thread resources.
+      gate.run = 1;
+      st[0].gate = &gate;
+      run_stage(&st[0]);
+      started = 1;
+    }} else {{
+      pthread_t threads[MAX_PROCESSES];
+      pthread_mutex_lock(&gate.mutex);
+      for (; ok && started < head[0]; ++started) {{
+        st[started].gate = &gate;
+        if (pthread_create(&threads[started], 0, run_stage, &st[started]) != 0) break;
+      }}
+      gate.run = ok && started == head[0];
+      pthread_mutex_unlock(&gate.mutex);
+      for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
     }}
-    gate.run = ok && started == head[0];
-    pthread_mutex_unlock(&gate.mutex);
-    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
     pthread_mutex_destroy(&gate.mutex);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
