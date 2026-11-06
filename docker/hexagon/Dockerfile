@@ -21,8 +21,7 @@ RUN --mount=type=bind,from=python-wheels,target=/wheels \
       pip install --no-cache-dir torch==2.7.1+cpu --index-url https://download.pytorch.org/whl/cpu; \
     fi
 COPY docker/hexagon/requirements.lock /tmp/requirements.lock
-RUN pip install --no-cache-dir -r /tmp/requirements.lock && \
-    ln -s /opt/tilelang-venv/lib/python3.10/site-packages/cmake/data/bin/ctest /opt/tilelang-venv/bin/ctest-real
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
 ENV USE_CUDA=OFF USE_ROCM=OFF USE_METAL=OFF CMAKE_POLICY_VERSION_MINIMUM=3.5
 WORKDIR /opt/tilelang
@@ -31,6 +30,9 @@ COPY cmake ./cmake
 COPY src ./src
 COPY 3rdparty ./3rdparty
 COPY tilelang/jit/adapter/cython ./tilelang/jit/adapter/cython
+COPY tilelang/jit/adapter/pto/cython_wrapper.pyx ./tilelang/jit/adapter/pto/cython_wrapper.pyx
+COPY tilelang/ascend/torch_npu_exchange.pyx ./tilelang/ascend/torch_npu_exchange.pyx
+COPY examples/ascend/deepgemm/_heuristics.pyx ./examples/ascend/deepgemm/_heuristics.pyx
 ARG SOURCE_REVISION=unknown
 ARG BUILD_JOBS=4
 RUN printf '%s\n' "$SOURCE_REVISION" > /opt/tilelang/.git_commit.txt && \
@@ -50,10 +52,8 @@ RUN groupadd -g 1000 builder && \
     useradd -u 1000 -g 1000 -d /tmp/tilelang-home-1000 -M builder && \
     python /opt/tilelang/docker/hexagon/prepare-sdk.py && \
     mkdir -p /work /output /opt/tilelang/build/tvm && chmod 1777 /work /output
-COPY docker/hexagon/entrypoint.sh /usr/local/bin/tilelang-entrypoint
-COPY docker/hexagon/tilelang-user.py /usr/local/lib/tilelang-user.py
-COPY docker/hexagon/connect-board.sh /usr/local/bin/connect-board
-RUN chmod 755 /usr/local/bin/tilelang-entrypoint /usr/local/bin/connect-board
+COPY docker/hexagon/tilelang-user.py /usr/local/bin/tilelang-entrypoint
+RUN chmod 755 /usr/local/bin/tilelang-entrypoint
 
 ENV PYTHONPATH=/opt/tilelang \
     HEXAGON_SDK_ROOT=/opt/hexagon-sdk \

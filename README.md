@@ -23,7 +23,7 @@ Tile Language (**tile-lang**) is a concise domain-specific language designed to 
 
 ## Hexagon NPU backend
 
-This fork adds a TileLang backend for Qualcomm's Hexagon NPU, developed and tested on the v79 cDSP of a Snapdragon 8 Elite phone. Kernels written with TileLang's tile operations (`T.copy`, `T.gemm`, `T.Parallel`, `T.reduce_*`, `T.Pipelined`) compile to HVX vector code, HMX matrix multiplies, VTCM buffers and DMA streams, and run on the NPU through FastRPC. See the [backend guide](docs/hexagon_backend.md) and the [operator examples](examples/hexagon/README.md).
+This fork adds a TileLang backend for Qualcomm's Hexagon NPU, developed and tested on the v79 cDSP of a Snapdragon 8 Elite phone. Kernels written with TileLang's tile operations (`T.copy`, `T.gemm`, `T.Parallel`, `T.reduce_*`, `T.Pipelined`) compile to HVX vector code, HMX matrix multiplies, VTCM buffers and DMA streams, and run on the NPU through FastRPC. Start with the [environment setup](docs/hexagon_env_setup.md) for Docker, local builds and SA8650 Linux board settings, then see the [backend guide](docs/hexagon_backend.md) and the [operator examples](examples/hexagon/README.md).
 
 On it, [LFM2-1.2B](examples/hexagon/lfm/README.md) runs end to end at batch 1, with every operation written in TileLang: the prefill, the decode and the sampling all run on the NPU. Its projections are 4-bit (GPTQ, an fp16 scale per 64 columns) and its tied embedding and head 8-bit; its WikiText-2 perplexity on the device is 16.68, against 16.29 in bf16. On the phone:
 

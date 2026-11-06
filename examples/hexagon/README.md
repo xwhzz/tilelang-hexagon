@@ -18,15 +18,14 @@ for what makes a kernel fast.
 
 ## Prerequisites
 
-These examples run on **real hardware** (not an emulator), so they need:
+Follow the environment setup guide to build TileLang with the Hexagon SDK and
+CPU PyTorch, and configure either an Android device over ADB or a Linux BSP over
+SSH. It includes Docker and local installation, SA8650 firmware settings and a
+small board smoke test. See the [setup guide](../../docs/hexagon_env_setup.md).
 
-- A Hexagon device — developed/validated on a **OnePlus 13 (Snapdragon 8 Gen 4,
-  Hexagon v79)** — connected and **authorized over `adb`** (`adb devices` shows it).
-- The **Qualcomm Hexagon SDK** installed, with `HEXAGON_SDK_ROOT` / the SDK env set
-  (the build harness compiles a FastRPC skel with `hexagon-clang++ -mhmx -mhvx`); see
-  [`docs/hexagon_env_setup.md`](../../docs/hexagon_env_setup.md).
-- tilelang built from this repo with the Hexagon backend, and `torch` for the
-  reference check.
+The example configurations below were developed on a OnePlus 13 (Snapdragon 8
+Elite, Hexagon v79). Choose the DSP architecture and example shapes supported by
+your target when running on another board.
 
 The first run of each kernel builds and deploys a FastRPC skel and starts a small
 persistent on-device agent (kept warm across calls). Build products are cached on
@@ -73,4 +72,6 @@ TL_HEXAGON_DEVICE_TEST=1 TILELANG_HEXAGON_DEVICE_LOCK=/tmp/tl_hexagon_device.loc
   or modifying a source. Every tile program drains its queue before it ends, and the
   compiler sizes the queue for the most copies the program keeps in flight.
   `T.Pipelined` schedules copies the same way on its own.
-- If a run reports an agent or VTCM error, clear stale agents: `adb shell pkill -f _agent`.
+- If a run reports an agent or VTCM error, close its session and inspect its
+  deployment directory and logs. On a shared device, stop only the processes
+  owned by that run.
