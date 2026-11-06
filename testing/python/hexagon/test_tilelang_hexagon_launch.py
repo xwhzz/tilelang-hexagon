@@ -10,8 +10,8 @@ from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
 
 
-def _lower(func):
-    target = determine_target("hexagon", return_object=True)
+def _lower(func, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
         return tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
 
@@ -315,7 +315,8 @@ def test_global_vtcm_buffers_come_before_the_program_arenas():
     assert "tl_hexagon_hmx_gemm<true, true, true, false>(128, 64, 256, (&(((float*)c)[0])), 64, (&(a_w[0])), 8192, " in source
 
 
-def test_global_vtcm_buffers_must_fit_with_the_arenas():
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_global_vtcm_buffers_must_fit_with_the_arenas(arch):
     @T.prim_func
     def big(A: T.Tensor((4, 64), "float32"), B: T.Tensor((4, 64), "float32")):
         with T.Kernel(4, num_workers=4) as w:
@@ -330,7 +331,7 @@ def test_global_vtcm_buffers_must_fit_with_the_arenas():
                 B[w, j] = g[(w + 1) % 4, j, 0]
 
     with pytest.raises(Exception, match="leave after its 8388608 bytes of global.vtcm buffers"):
-        _lower(big)
+        _lower(big, {"kind": "hexagon", "mcpu": f"hexagon{arch}", "vtcm-capacity": 8 << 20})
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")

@@ -10,8 +10,8 @@ from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
 
 
-def _lower(func):
-    target = determine_target("hexagon", return_object=True)
+def _lower(func, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
         return tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
 
@@ -51,7 +51,8 @@ def test_copy_is_one_group():
     assert _queue(artifact) == (1, 1)
 
 
-def test_tall_copy_splits_into_one_group():
+@pytest.mark.parametrize("arch", ["v75", "v79"])
+def test_tall_copy_splits_into_one_group(arch):
     rows = 70000
 
     @T.prim_func
@@ -61,7 +62,7 @@ def test_tall_copy_splits_into_one_group():
             T.dma_copy(A[0:rows, 0:1], s)
             T.dma_wait()
 
-    artifact = _lower(column)
+    artifact = _lower(column, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # A 2D descriptor has at most 65535 rows.
     assert _ops(artifact) == ["queue", "submit", "submit", "commit", "wait"]
     assert _queue(artifact) == (2, 1)

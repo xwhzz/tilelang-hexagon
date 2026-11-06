@@ -61,8 +61,8 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
         kernel.adapter.close()
 
 
-def lower(func):
-    target = determine_target("hexagon", return_object=True)
+def lower(func, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
@@ -134,7 +134,8 @@ def test_async_manual_ping_pong():
     assert "ptx_" not in source
 
 
-def test_async_strided_load_store():
+@pytest.mark.parametrize("arch", ["v75", "v79"])
+def test_async_strided_load_store(arch):
     @T.prim_func
     def probe(A: T.Tensor((32, 128), "float16"), B: T.Tensor((32, 128), "float16")):
         with T.Kernel(1):
@@ -143,7 +144,7 @@ def test_async_strided_load_store():
             T.dma_wait()
             T.dma_copy(s, B[0:32, 32:96])
 
-    source = lower(probe)
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     assert len(calls) == 2
     # dst stride, src stride, row bytes, rows, direction: 3 loads from an
@@ -364,8 +365,9 @@ def test_write_through_round_trip():
         kernel.adapter.close()
 
 
-def test_async_hmx_dsl_schedule():
-    source = lower(make_dma_hmx_matmul())
+@pytest.mark.parametrize("arch", ["v75", "v79"])
+def test_async_hmx_dsl_schedule(arch):
+    source = lower(make_dma_hmx_matmul(), {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # Double buffering: two output blocks of two copies each are in flight.
     assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async;" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 2)" in source

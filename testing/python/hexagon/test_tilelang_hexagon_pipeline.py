@@ -13,8 +13,8 @@ from tilelang.hexagon import language as T
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 
 
-def _source(func):
-    target = determine_target("hexagon", return_object=True)
+def _source(func, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
@@ -103,12 +103,25 @@ def test_copies_into_row_major_buffers_are_dma_transfers():
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in loop[submit + 2]
 
 
-def test_copies_into_hmx_operands_stage_through_dma():
-    source = _source(_gemm(128, 128, 2048, 256, 2))
+@pytest.mark.parametrize("arch", ["v75", "v79"])
+def test_copies_into_hmx_operands_stage_through_dma(arch):
+    source = _source(_gemm(128, 128, 2048, 256, 2), {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     for operand, pack in (("a", "tl_crouton_copy<true, false>"), ("b", "tl_crouton_copy<true, true>")):
         assert f"void* {operand}_dma = " in source
         assert re.search(rf"tl_hexagon_dma_async_submit\(tl_dma_async, \(&\(\(\(half\*\){operand}_dma\)", source)
         # The operand's Crouton tiles are packed from the staging buffer in VTCM.
+        assert re.search(rf"{re.escape(pack)}\(\(&\(\(\(half\*\){operand}\)\[0\]\)\).*\(half\*\){operand}_dma\)", source)
+
+
+def test_v73_stages_the_strided_hmx_operand_with_hvx():
+    source = _source(_gemm(128, 128, 2048, 256, 2), {"kind": "hexagon", "mcpu": "hexagonv73"})
+    # A's strided rows use synchronous HVX copies. B's contiguous K block
+    # still uses the v73 one-dimensional DMA path.
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert submits and all("b_dma" in line for line in submits)
+    assert all("(uint32_t)1, 3)) return tl_status;" in line for line in submits)
+    assert any("((half*)a_dma)" in line and "= *(half64*)(A +" in line for line in source.splitlines())
+    for operand, pack in (("a", "tl_crouton_copy<true, false>"), ("b", "tl_crouton_copy<true, true>")):
         assert re.search(rf"{re.escape(pack)}\(\(&\(\(\(half\*\){operand}\)\[0\]\)\).*\(half\*\){operand}_dma\)", source)
 
 

@@ -13,8 +13,13 @@ import torch
 
 from tilelang.hexagon import language as T
 from tilelang.hexagon.runtime import fastrpc, session
+from tilelang.hexagon.runtime.config import domain_id, hlos
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+MULTI_PROCESS = pytest.mark.skipif(
+    hlos() != "android" or domain_id() != 3,
+    reason="multiple DSP processes require Android's default cDSP domain",
+)
 
 N = 4096
 
@@ -467,6 +472,7 @@ def _f32(buf):
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_processes_have_their_own_addresses():
     # The same 2.5 GiB mapped into two processes: 5 GiB of mappings, more than
     # one process's 4 GB of addresses hold.
@@ -477,6 +483,7 @@ def test_processes_have_their_own_addresses():
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_the_host_sees_what_another_process_wrote():
     with session.Session([(fill, [1]), (add, [2])], processes=2) as s:
         k_fill, k_add = s.kernels
@@ -492,6 +499,7 @@ def test_the_host_sees_what_another_process_wrote():
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_processes_take_turns_at_vtcm_and_pass_data_by_dma():
     with session.Session([(dma_step, [1])], processes=2) as s:
         (k,) = s.kernels
@@ -507,6 +515,7 @@ def test_processes_take_turns_at_vtcm_and_pass_data_by_dma():
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_processes_take_turns_at_hmx():
     with session.Session([(hmx_gemm, [2])], processes=2) as s:
         (k,) = s.kernels
@@ -517,7 +526,7 @@ def test_processes_take_turns_at_hmx():
 
 
 @DEVICE
-@pytest.mark.parametrize("processes", [1, 2, 4])
+@pytest.mark.parametrize("processes", [1, pytest.param(2, marks=MULTI_PROCESS), pytest.param(4, marks=MULTI_PROCESS)])
 def test_a_pipeline_hands_data_on_by_dma(processes):
     with session.Session([(dma_step, [1])], processes=processes) as s:
         (k,) = s.kernels
@@ -533,6 +542,7 @@ def test_a_pipeline_hands_data_on_by_dma(processes):
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_steps_reach_the_stages():
     with session.Session([(stamp, [])], processes=2) as s:
         (k,) = s.kernels
@@ -547,6 +557,7 @@ def test_steps_reach_the_stages():
 
 
 @DEVICE
+@MULTI_PROCESS
 def test_a_failing_stage_ends_the_pipeline():
     with session.Session([(dma_step, [1])], processes=2) as s:
         (k,) = s.kernels
@@ -565,13 +576,14 @@ def test_a_failing_stage_ends_the_pipeline():
         b.free()
 
 
-@pytest.mark.parametrize("hlos,domain", [("linux", "3"), ("android", "4")])
-def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, hlos, domain):
+@pytest.mark.parametrize("hlos,domain", [("linux", "3"), ("linux", "4"), ("android", "0"), ("android", "4")])
+@pytest.mark.parametrize("processes", [2, 3, 4])
+def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, hlos, domain, processes):
     monkeypatch.setenv("TILELANG_HEXAGON_HLOS", hlos)
     monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", domain)
     monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
     with pytest.raises(NotImplementedError, match="multiple DSP processes require Android"):
-        session.Session.of_lowered([], processes=2)
+        session.Session.of_lowered([], processes=processes)
 
 
 def test_vtcm_cached_context_releases_partial_grants_on_host(tmp_path):
