@@ -35,6 +35,11 @@ using half = __fp16;
 #define TL_DEVICE static inline __attribute__((always_inline))
 #endif
 
+#if defined(__HVX__) && __HVX_ARCH__ >= 73 && __HVX_ARCH__ < 79 &&             \
+    __HVX_LENGTH__ == 128
+#include <tl_templates/hexagon/hvx_convert.h>
+#endif
+
 // Fixed-width vector vocabulary backing the `floatN`/`halfN`/`intN` spellings
 // the C codegen emits (e.g. `*(float4*)(ptr + off)`, `(half4)(x)`, `a * b`).
 //
@@ -152,11 +157,21 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   explicit vec_type(const T &s) { v = (nat_t)s; }
   // Converting ctor for vector casts, e.g. (half4)float4_value when storing an
   // fp32 accumulator back as fp16 — a lane-wise numeric convert.
-  template <typename U> explicit vec_type(const vec_type<U, N> &o) {
+  // Keep wide conversions in the caller: an outlined aggregate constructor
+  // makes clang copy each input and result through out-of-line memcpy calls.
+  template <typename U>
+  __attribute__((always_inline)) explicit vec_type(const vec_type<U, N> &o) {
     if constexpr (tl_vec_converts_by_vconv<T, U, N>) {
       typedef int32_t wide_t __attribute__((ext_vector_type(N)));
       wide_t w = __builtin_convertvector(o.v, wide_t);
       tl_vec_vconv_sf_w<N>(&v, &w);
+#if defined(__HVX__) && __HVX_ARCH__ >= 73 && __HVX_ARCH__ < 79 &&             \
+    __HVX_LENGTH__ == 128
+    } else if constexpr (N >= 32 && tl_hvx_ieee_half_cast<T, U>) {
+      // Smaller vectors use exact scalar casts. HVX qfloat casts need the
+      // integer IEEE conversion even when native IEEE arithmetic is enabled.
+      tl_hvx_convert_vector<T, U, N>(&v, &o.v);
+#endif
     } else {
       v = __builtin_convertvector(o.v, nat_t);
     }

@@ -263,3 +263,94 @@ def test_ieee_conversion_and_math_on_simulator(arch, tmp_path):
     reference_reduce = np.array([row[:n].sum() for n in (63, 64, 65, 255, 256, 257)])
     np.testing.assert_allclose(reductions, reference_reduce, rtol=2e-5, atol=2e-5)
     assert offset + reductions.nbytes == len(data), "unexpected fixture output layout"
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_ordered_vector_casts_and_reduction_stores(arch, tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    executable = tmp_path / "vector-numeric"
+    command = [
+        _tool("hexagon-clang++"),
+        f"-m{arch}",
+        "-mhvx",
+        "-mhvx-length=128B",
+        "-O2",
+        "-std=c++17",
+        "-mllvm",
+        "--disable-handle-qfp",
+        "-mllvm",
+        "-hexagon-insert=false",
+        "-I",
+        str(root / "src"),
+        str(Path(__file__).with_name("hvx_vector_numeric_sim.cc")),
+        "-o",
+        str(executable),
+    ]
+    compiled = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    inputs = _float_inputs()
+    # Every width sees signed zeros, subnormals, infinities and NaNs, even
+    # though the smaller-width narrowing probes use only the first 1024 lanes.
+    specials = np.array(
+        [0, 0x80000000, 1, 0x80000001, 0x007FFFFF, 0x00800000, 0x7F800000, 0xFF800000, 0x7F800001, 0x7FC00000],
+        dtype=np.uint32,
+    )
+    inputs = np.concatenate([specials, inputs])
+    inputs = np.pad(inputs, (0, (-inputs.size) % 128))
+    input_path, output_path = tmp_path / "input.bin", tmp_path / "output.bin"
+    input_path.write_bytes(struct.pack("<I", inputs.size) + inputs.tobytes())
+    simulated = subprocess.run(
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(input_path), str(output_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert simulated.returncode == 0, simulated.stdout + simulated.stderr
+    data = output_path.read_bytes()
+    offset = 0
+
+    def read(dtype, count):
+        nonlocal offset
+        result = np.frombuffer(data, dtype=dtype, count=count, offset=offset)
+        offset += result.nbytes
+        return result
+
+    def exact(actual, expected):
+        nonnan = ~np.isnan(expected)
+        word = np.uint16 if expected.dtype.itemsize == 2 else np.uint32
+        np.testing.assert_array_equal(actual[nonnan].view(word), expected[nonnan].view(word))
+        np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+
+    halves = np.arange(65536, dtype=np.uint16).view(np.float16)
+    with np.errstate(over="ignore", invalid="ignore"):
+        narrowed = inputs.view(np.float32).astype(np.float16)
+    for width in (2, 4, 8, 16, 32, 64, 128):
+        exact(read("<f4", 65536), halves.astype(np.float32))
+        expected = narrowed[:1024].copy()
+        if arch == "v79" and width >= 32:
+            # Preserve the existing native vcvt signed-zero convention.
+            expected[inputs[:1024] == 0x80000000] = 0
+        exact(read("<f2", 1024), expected)
+    if arch == "v79":
+        narrowed[inputs == 0x80000000] = 0
+    exact(read("<f2", inputs.size), narrowed)
+
+    indices = np.arange(64)
+    values = (np.where(indices % 2, 0xBC01, 0x3C03) + 13 * indices).astype(np.uint16).view(np.float16)
+    for accum, dst in ((np.float16, np.float32), (np.float32, np.float16)):
+        lanes = 128 // np.dtype(accum).itemsize
+        for n in (1, 15, 31, 32, 33, 63, 64):
+            if n > lanes:
+                continue
+            for stride in (1, 2):
+                for clear in (True, False):
+                    expected = values[(np.arange(128) + 17) % 64].astype(dst)
+                    selected = np.arange(n) * stride
+                    x = values[:n].astype(accum)
+                    if not clear:
+                        x = np.maximum(x, expected[selected].astype(accum))
+                    expected[selected] = x
+                    exact(read(np.dtype(dst), 128), expected)
+
+    assert offset == len(data), "unexpected fixture output layout"

@@ -423,7 +423,7 @@ TL_DEVICE void tl_reduce_store(D *dst, int dst_stride, tl_hvx_reg<A> v, int n,
   constexpr int out_bytes = static_cast<int>(sizeof(out_t));
   const int bytes = n * static_cast<int>(sizeof(D));
   if (!clear) {
-    out_t old;
+    out_t old{};
 #pragma clang loop unroll(full)
     for (int b = 0; b < out_bytes; b += 128) {
       if (bytes > b) {
@@ -434,9 +434,11 @@ TL_DEVICE void tl_reduce_store(D *dst, int dst_stride, tl_hvx_reg<A> v, int n,
                          out_bytes - b < 128 ? out_bytes - b : 128);
       }
     }
-    v = tl_reduce_combine<K>(v, __builtin_convertvector(old, tl_hvx_reg<A>));
+    const vec_type<D, L> previous(old);
+    v = tl_reduce_combine<K>(v, vec_type<A, L>(previous).v);
   }
-  out_t out = __builtin_convertvector(v, out_t);
+  const vec_type<A, L> value(v);
+  out_t out = vec_type<D, L>(value).v;
 #pragma clang loop unroll(full)
   for (int b = 0; b < out_bytes; b += 128) {
     if (bytes > b) {

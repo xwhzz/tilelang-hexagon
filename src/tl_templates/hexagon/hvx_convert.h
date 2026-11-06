@@ -1,7 +1,11 @@
 #pragma once
 #include <hexagon_types.h>
 #include <stdint.h>
-#include <tl_templates/hexagon/common.h>
+#include <type_traits>
+
+#ifndef TL_DEVICE
+#define TL_DEVICE static inline __attribute__((always_inline))
+#endif
 
 // v73/v75 have qfloat conversions, but they do not implement IEEE casts:
 // multiplying a half by 1.0 changes finite values and treats Inf/NaN as finite.
@@ -50,6 +54,40 @@ TL_DEVICE tl_hvx_u32 tl_hvx_narrow_float_bits(tl_hvx_u32 bits) {
   out = mag >= 0x477ff000u ? tl_hvx_u32(0x7c00u) : out;
   out = mag > 0x7f800000u ? ((mag >> 13) & 0x3ffu) | 0x7e00u : out;
   return out | sign;
+}
+
+// Generic vector casts keep their lanes in logical order. The HVX conversion
+// entry points below instead return even/odd lanes for Crouton and math users.
+template <typename To, typename From>
+constexpr bool tl_hvx_ieee_half_cast =
+    (std::is_same_v<To, float> && std::is_same_v<From, __fp16>) ||
+    (std::is_same_v<To, __fp16> && std::is_same_v<From, float>);
+
+template <typename To, typename From, int N>
+TL_DEVICE void tl_hvx_convert_vector(void *dst, const void *src) {
+  static_assert(tl_hvx_ieee_half_cast<To, From>, "half/float vector cast");
+  using input_word = std::conditional_t<sizeof(From) == 2, uint16_t, uint32_t>;
+  using output_word = std::conditional_t<sizeof(To) == 2, uint16_t, uint32_t>;
+  typedef input_word input_vec __attribute__((ext_vector_type(N)));
+  typedef output_word output_vec __attribute__((ext_vector_type(N)));
+  typedef uint32_t wide_vec __attribute__((ext_vector_type(N)));
+  input_vec input;
+  __builtin_memcpy(&input, src, sizeof(input));
+  wide_vec bits = __builtin_convertvector(input, wide_vec);
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N; i += 32) {
+    const int lanes = N - i < 32 ? N - i : 32;
+    tl_hvx_u32 part{};
+    __builtin_memcpy(&part, reinterpret_cast<const char *>(&bits) + i * 4,
+                     lanes * 4);
+    if constexpr (sizeof(From) == 2)
+      part = tl_hvx_widen_half_bits(part);
+    else
+      part = tl_hvx_narrow_float_bits(part);
+    __builtin_memcpy(reinterpret_cast<char *>(&bits) + i * 4, &part, lanes * 4);
+  }
+  output_vec output = __builtin_convertvector(bits, output_vec);
+  __builtin_memcpy(dst, &output, sizeof(output));
 }
 #endif
 
