@@ -150,11 +150,6 @@ The tiny-model Q4 regression tests use separate references and comparisons.
 - The WikiText-2 comparison above scores forced tokens through decode.
   `ppl.py` constructs its decoder with `prefill_rows=None`.
 
-Full-model cross-path logit diagnostics record the bundle, prompt, reference
-arithmetic and token prefix used at each comparison. The historical RTN
-long-prompt controls and their measured errors are recorded in the
-[prefill/decode numerical investigation](https://github.com/ColmaLiu/tilelang-hexagon/issues/17).
-
 ## On the device
 
     adb push lfm2.bundle /data/local/tmp/lfm2.bundle
