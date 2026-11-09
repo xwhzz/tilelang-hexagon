@@ -178,10 +178,13 @@ Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
   };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
-  // Contiguous panels go in chunks of whole panels; panels further apart than
-  // a descriptor's 24-bit stride, a descriptor each.
+  // Contiguous panels go in chunks of whole panels. Older targets cannot use
+  // the runtime's v75+ 2D descriptor; use one 1D descriptor per panel, as for
+  // panels further apart than a descriptor's 24-bit stride.
+  const int arch = HexagonArchVersion(T.target);
   bool dense = ss == row_bytes && ds == row_bytes;
-  bool apart = !dense && (ss > kField || ds > kField);
+  bool apart =
+      !dense && (ss > kField || ds > kField || (arch != 0 && arch < 75));
   int64_t per = dense   ? std::max<int64_t>(1, kChunk / row_bytes)
                 : apart ? 1
                         : kRows;
@@ -311,10 +314,12 @@ Stmt LowerCroutonTransfer(const CopyNode &op, const LowerArgs &T,
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
   // One run, or runs that follow each other on both sides, go in chunks of
-  // whole runs; runs further apart than a descriptor's 24-bit stride (a large
-  // matrix's), a descriptor each.
+  // whole runs. Use a descriptor per run when the stride exceeds 24 bits or
+  // the target cannot use the runtime's v75+ 2D descriptor.
+  const int arch = HexagonArchVersion(T.target);
   bool dense = runs == 1 || (ss == run_bytes && ds == run_bytes);
-  bool apart = !dense && (ss > kField || ds > kField);
+  bool apart =
+      !dense && (ss > kField || ds > kField || (arch != 0 && arch < 75));
   int64_t per = dense   ? std::max<int64_t>(1, kChunk / run_bytes)
                 : apart ? 1
                         : kRows;

@@ -421,7 +421,8 @@ def test_reject_crouton_from_row_major():
         lower(probe)
 
 
-def test_crouton_tiles_move_as_runs():
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_crouton_tiles_move_as_runs(arch):
     @T.prim_func
     def probe(W: T.Tensor((2, 256, 128), "float16"), X: T.Tensor((64, 96), "float16")):
         with T.Kernel(1):
@@ -444,15 +445,23 @@ def test_crouton_tiles_move_as_runs():
             T.dma_copy(X, x)
             T.dma_wait()
 
-    calls = [line for line in lower(probe).splitlines() if "tl_hexagon_dma_async_submit(" in line]
-    assert len(calls) == 3
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert len(calls) == (4 if arch == "v73" else 3)
     # dst stride, src stride, run bytes, runs, direction. W[1, 64, 32] is
     # tile (1, 2) of layer 1: 32768 + 10 * 1024 elements in.
-    assert "(uint32_t)8192, (uint32_t)16384, (uint32_t)8192, (uint32_t)2, 3)" in calls[0]
     assert "(&(W[43008]))" in calls[0] and "((half*)w)[8192]" in calls[0]
-    assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[1]
-    assert "W[16384]" in calls[1]
-    assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[2]
+    if arch == "v73":
+        for call in calls[:2]:
+            assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in call
+        assert "(&(W[51200]))" in calls[1] and "((half*)w)[12288]" in calls[1]
+        assert "tl_hexagon_dma_async_context<4, 3>" in source
+    else:
+        assert "(uint32_t)8192, (uint32_t)16384, (uint32_t)8192, (uint32_t)2, 3)" in calls[0]
+        assert "tl_hexagon_dma_async_context<3, 3>" in source
+    assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[-2]
+    assert "W[16384]" in calls[-2]
+    assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[-1]
 
 
 # An HMX weight of this many rows has its panels 8193 tiles, more than the
