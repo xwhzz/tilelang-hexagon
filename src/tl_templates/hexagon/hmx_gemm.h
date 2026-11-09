@@ -31,9 +31,11 @@ struct tl_hmx_weight_tiles {
   const half *tiles;
   int stride;
 
-  const half *column(int nt) const { return tiles + nt * stride; }
-  void prepare() const {}
-  void slice(int, int) const {}
+  TL_HEXAGON_VECTOR_INLINE const half *column(int nt) const {
+    return tiles + nt * stride;
+  }
+  TL_HEXAGON_VECTOR_INLINE void prepare() const {}
+  TL_HEXAGON_VECTOR_INLINE void slice(int, int) const {}
 };
 
 // The B of T.gemm_blockscaled: 4-bit weights [N, K] in the panel layout, 32
@@ -84,6 +86,21 @@ template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
 // tile's epilogue, and B's slice, while HMX multiplies each tile. Shared: the
 // workers of a pool take turns at HMX, a tile each, and each runs its epilogue
 // and slice outside its turn.
+// Keep panel epilogues under the original inlining heuristic. Only ordinary
+// fp16 weights need this call forced across a v73 IEEE caller boundary.
+#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+#define TL_HMX_EPILOGUE(...)                                                   \
+  do {                                                                         \
+    if constexpr (std::is_same_v<B, tl_hmx_weight_tiles>) {                    \
+      [[clang::always_inline]] epilogue(__VA_ARGS__);                          \
+    } else {                                                                   \
+      epilogue(__VA_ARGS__);                                                   \
+    }                                                                          \
+  } while (false)
+#else
+#define TL_HMX_EPILOGUE(...) epilogue(__VA_ARGS__)
+#endif
+
 template <bool Rows, bool Aligned, bool Scaled, bool Shared, bool Direct,
           typename D, typename B>
 TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
@@ -94,7 +111,7 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
                 "HMX stores only into Crouton tiles, as they are");
   const int MT = M / TL_HMX_T, NT = N / TL_HMX_T, KT = K / TL_HMX_T;
 
-  auto multiply = [&](int mt, int nt) {
+  auto multiply = [&](int mt, int nt) TL_HEXAGON_VECTOR_INLINE {
     const half *row = a + mt * a_row_tile;
     const half *col = b.column(nt);
     for (int k = 0; k < KT; k += 32)
@@ -102,7 +119,8 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
                        KT - k < 32 ? KT - k : 32);
   };
   // Where tile (mt, nt) leaves HMX: C's own tile, or staging tile `slot`.
-  auto target = [&](int mt, int nt, int slot) -> half * {
+  auto target = [&](int mt, int nt, int slot)
+                    TL_HEXAGON_VECTOR_INLINE -> half * {
     if constexpr (Direct)
       return reinterpret_cast<half *>(c) + (mt * ldc + nt) * TL_HMX_TILE_ELMS;
     return stage + slot * TL_HMX_TILE_ELMS;
@@ -139,18 +157,18 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
         tl_hmx_clear_acc();
         multiply(mt, nt);
         if (under && last_mt >= 0)
-          epilogue(last_mt, last_nt, slot ^ 1);
+          TL_HMX_EPILOGUE(last_mt, last_nt, slot ^ 1);
         tl_hmx_convert_acc(2);
         tl_hmx_store_cvt(target(mt, nt, slot));
         tl_hmx_unit_release();
         if (!under)
-          epilogue(mt, nt, slot);
+          TL_HMX_EPILOGUE(mt, nt, slot);
         b.slice(mt, nt);
         last_mt = mt;
         last_nt = nt;
       }
     if (under)
-      epilogue(last_mt, last_nt, slot ^ 1);
+      TL_HMX_EPILOGUE(last_mt, last_nt, slot ^ 1);
   } else {
     tl_hmx_unit_acquire();
     tl_hmx_set_scales(config);
@@ -164,16 +182,18 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
         // multiplies.
         b.slice(mt, nt);
         if (last_mt >= 0)
-          epilogue(last_mt, last_nt, slot ^ 1);
+          TL_HMX_EPILOGUE(last_mt, last_nt, slot ^ 1);
         tl_hmx_convert_acc(2);
         tl_hmx_store_cvt(target(mt, nt, slot));
         last_mt = mt;
         last_nt = nt;
       }
     tl_hmx_unit_release();
-    epilogue(last_mt, last_nt, slot ^ 1);
+    TL_HMX_EPILOGUE(last_mt, last_nt, slot ^ 1);
   }
 }
+
+#undef TL_HMX_EPILOGUE
 
 // T.gemm on HMX: C (+)= A B^T, B fp16 weight tiles, column nt's at
 // b + nt * b_column_tile.

@@ -62,9 +62,10 @@ def test_workers_run_the_linearized_grid():
     (loop,) = _parallel_loops(_device_func(artifact))
     assert int(loop.extent) == 32
     assert int(loop.annotations["hexagon.num_workers"]) == 6
-    assert "tl_parallel_for(32, 6, tl_vtcm_worker_arenas(256u), [&](int32_t bx_by_fused, uint8_t *tl_arena) -> int32_t {" in (
-        artifact.kernel_source
-    )
+    assert (
+        "tl_parallel_for(32, 6, tl_vtcm_worker_arenas(256u), [&](int32_t bx_by_fused, uint8_t *tl_arena) "
+        "TL_HEXAGON_IEEE_ARITHMETIC -> int32_t {"
+    ) in artifact.kernel_source
 
 
 def test_programs_own_their_buffers():
@@ -85,7 +86,7 @@ def test_a_vtcm_free_worker_takes_no_arena():
                 B[bx, j] = -A[bx, j]
 
     source = _lower(negate).kernel_source
-    assert "tl_parallel_for(12, 6, [&](int32_t bx) -> int32_t {" in source
+    assert "tl_parallel_for(12, 6, [&](int32_t bx) TL_HEXAGON_IEEE_ARITHMETIC -> int32_t {" in source
     assert "tl_vtcm" not in source
 
 
@@ -221,7 +222,7 @@ def test_programs_meet_at_sync_grid():
     source = _lower(_rotate(4, 3, 4)).kernel_source
     # The programs run coresident, one per worker, and wait at the barrier
     # with their own program index.
-    assert "tl_parallel_for<tl_worker_scope, true>(4, 4, [&](int32_t bx) -> int32_t {" in source
+    assert "tl_parallel_for<tl_worker_scope, true>(4, 4, [&](int32_t bx) TL_HEXAGON_IEEE_ARITHMETIC -> int32_t {" in source
     assert source.count("if (int32_t tl_status = tl_grid_sync(bx)) return tl_status;") == 1
 
 

@@ -35,6 +35,20 @@ using half = __fp16;
 #define TL_DEVICE static inline __attribute__((always_inline))
 #endif
 
+// Generic arithmetic on the device-qualified v73 path must not round through
+// Qfloat. Apply the feature only to generated function scopes that evaluate
+// floating operations; pure transfer/HMX scopes keep their helper policy.
+// The tested SM8750 v79 cDSP does not execute these instructions correctly.
+// Vector wrappers must inline across this feature boundary rather than become
+// Qfloat callees.
+#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+#define TL_HEXAGON_IEEE_ARITHMETIC __attribute__((target("hvx-ieee-fp")))
+#define TL_HEXAGON_VECTOR_INLINE __attribute__((always_inline))
+#else
+#define TL_HEXAGON_IEEE_ARITHMETIC
+#define TL_HEXAGON_VECTOR_INLINE
+#endif
+
 #if defined(__HVX__) && __HVX_ARCH__ >= 73 && __HVX_ARCH__ < 79 &&             \
     __HVX_LENGTH__ == 128
 #include <tl_templates/hexagon/hvx_convert.h>
@@ -146,15 +160,15 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   // Express copies as native vector loads/stores. The implicit aggregate copy
   // becomes llvm.memcpy (and an out-of-line 128-byte memcpy on Hexagon), even
   // for a full-register T.copy between VTCM and DDR.
-  vec_type(const vec_type &o) : v(o.v) {}
-  vec_type &operator=(const vec_type &o) {
+  TL_HEXAGON_VECTOR_INLINE vec_type(const vec_type &o) : v(o.v) {}
+  TL_HEXAGON_VECTOR_INLINE vec_type &operator=(const vec_type &o) {
     v = o.v;
     return *this;
   }
-  vec_type(nat_t n) : v(n) {} // wrap a native result (operator returns / loads)
+  TL_HEXAGON_VECTOR_INLINE vec_type(nat_t n) : v(n) {}
   // Broadcast ctor.  const-ref because __fp16 is not a valid by-value parameter
   // type on Hexagon.  `(nat_t)scalar` is clang's ext_vector splat.
-  explicit vec_type(const T &s) { v = (nat_t)s; }
+  TL_HEXAGON_VECTOR_INLINE explicit vec_type(const T &s) { v = (nat_t)s; }
   // Converting ctor for vector casts, e.g. (half4)float4_value when storing an
   // fp32 accumulator back as fp16 — a lane-wise numeric convert.
   // Keep wide conversions in the caller: an outlined aggregate constructor
@@ -165,6 +179,41 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
       typedef int32_t wide_t __attribute__((ext_vector_type(N)));
       wide_t w = __builtin_convertvector(o.v, wide_t);
       tl_vec_vconv_sf_w<N>(&v, &w);
+#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+                         std::is_same_v<U, half>) {
+      // A C/TIR cast truncates; IEEE half-to-integer instructions round.
+      // Decode the half magnitude in 16-bit lanes, widening only the integer
+      // result. The defined domain is finite values whose truncation fits T.
+      typedef uint16_t words __attribute__((ext_vector_type(N)));
+      words bits;
+      __builtin_memcpy(&bits, &o.v, sizeof(bits));
+      words exponent = (bits >> 10) & words(31);
+      words shift = words(30) - exponent;
+      shift = shift > words(15) ? words(15) : shift;
+      // (1024 + fraction) * 2^(exponent - 25), with a fixed left shift
+      // keeping all finite half magnitudes in one unsigned 16-bit lane.
+      words magnitude = (((bits & words(1023)) << 5) | words(0x8000)) >> shift;
+      magnitude = exponent < words(15) ? words(0) : magnitude;
+      words sign = bits >> 15;
+      if constexpr (sizeof(T) <= 2) {
+        words value = (magnitude ^ (words(0) - sign)) + sign;
+        if constexpr (std::is_signed_v<T>) {
+          typedef int16_t signed_words __attribute__((ext_vector_type(N)));
+          signed_words signed_value;
+          __builtin_memcpy(&signed_value, &value, sizeof(value));
+          v = __builtin_convertvector(signed_value, nat_t);
+        } else {
+          v = __builtin_convertvector(value, nat_t);
+        }
+      } else {
+        typedef int32_t wide_words __attribute__((ext_vector_type(N)));
+        wide_words value = __builtin_convertvector(magnitude, wide_words);
+        wide_words negative = __builtin_convertvector(sign, wide_words);
+        value = (value ^ -negative) + negative;
+        v = __builtin_convertvector(value, nat_t);
+      }
+#endif
 #if defined(__HVX__) && __HVX_ARCH__ >= 73 && __HVX_ARCH__ < 79 &&             \
     __HVX_LENGTH__ == 128
     } else if constexpr (N >= 32 && tl_hvx_ieee_half_cast<T, U>) {
@@ -180,7 +229,9 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   // instantiated lazily, so bit-ops on float aggregates (never emitted) never
   // get type-checked.
 #define TL_VEC_BINOP(op)                                                       \
-  vec_type operator op(const vec_type &o) const { return vec_type(v op o.v); }
+  TL_HEXAGON_VECTOR_INLINE vec_type operator op(const vec_type &o) const {     \
+    return vec_type(v op o.v);                                                 \
+  }
   TL_VEC_BINOP(+)
   TL_VEC_BINOP(-)
   TL_VEC_BINOP(*)
@@ -192,12 +243,12 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   TL_VEC_BINOP(<<)
   TL_VEC_BINOP(>>)
 #undef TL_VEC_BINOP
-  vec_type operator-() const { return vec_type(-v); }
-  vec_type operator~() const { return vec_type(~v); }
+  TL_HEXAGON_VECTOR_INLINE vec_type operator-() const { return vec_type(-v); }
+  TL_HEXAGON_VECTOR_INLINE vec_type operator~() const { return vec_type(~v); }
   // Comparisons and logical operators give lane masks. Masks of different
   // widths combine (`m && n` of fp32 and fp16 lanes) at the left one's width.
 #define TL_VEC_CMPOP(op)                                                       \
-  mask_t operator op(const vec_type &o) const {                                \
+  TL_HEXAGON_VECTOR_INLINE mask_t operator op(const vec_type &o) const {       \
     nat_t a = v;                                                               \
     if constexpr (is_float)                                                    \
       a = tl_vec_opaque(a);                                                    \
@@ -210,15 +261,17 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
   TL_VEC_CMPOP(>)
   TL_VEC_CMPOP(>=)
 #undef TL_VEC_CMPOP
-  mask_t operator!() const {
+  TL_HEXAGON_VECTOR_INLINE mask_t operator!() const {
     return mask_t(__builtin_convertvector(!v, typename mask_t::nat_t));
   }
-  template <typename U> mask_t operator&&(const vec_type<U, N> &o) const {
+  template <typename U>
+  TL_HEXAGON_VECTOR_INLINE mask_t operator&&(const vec_type<U, N> &o) const {
     using lanes_t = typename mask_t::nat_t;
     return mask_t(__builtin_convertvector(v != 0, lanes_t) &
                   __builtin_convertvector(o.v != 0, lanes_t));
   }
-  template <typename U> mask_t operator||(const vec_type<U, N> &o) const {
+  template <typename U>
+  TL_HEXAGON_VECTOR_INLINE mask_t operator||(const vec_type<U, N> &o) const {
     using lanes_t = typename mask_t::nat_t;
     return mask_t(__builtin_convertvector(v != 0, lanes_t) |
                   __builtin_convertvector(o.v != 0, lanes_t));

@@ -367,8 +367,9 @@ else()
         target_compile_definitions({iface}_skel PRIVATE TL_HEXAGON_LEGACY_COMPUTE_RES=1)
     endif()
     # No -mhvx-ieee-fp: the SM8750 (v79) cDSP returns zeros for the IEEE .sf/.hf
-    # HVX arithmetic it selects, although hexagon-sim computes it. Vector float
-    # ops stay a qfloat op plus a conversion.
+    # HVX arithmetic it selects, although hexagon-sim computes it. Generated
+    # v73 arithmetic scopes opt in locally; pure transfer/HMX scopes and other
+    # targets keep their existing instruction policy.
     # --disable-handle-qfp: hexagon-clang 19's rewrite of qfloat spills and
     # refills after register allocation corrupts spilled qf32 registers (an
     # HVX GEMM's accumulators turned NaN); the registers spill as they are.

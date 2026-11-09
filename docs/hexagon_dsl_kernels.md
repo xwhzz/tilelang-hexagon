@@ -30,9 +30,21 @@ offsets it proves multiples of their alignment as aligned `vmem`, and the others
 cycles, as fast as an aligned one, where it was a scalar loop of 3.7M to 4.0M. Backing this,
 `src/tl_templates/hexagon/common.h`'s `vec_type` is a native clang `ext_vector` (so
 `a * b`, `a & mask` become real HVX ops, not scalar struct loops), and `PrintType` emits
-vector spellings up to 128 lanes. fp16/fp32 vector arithmetic compiles to a qfloat op
-plus a conversion: `-mhvx-ieee-fp` would select single IEEE `.hf`/`.sf` instructions, but
-the SM8750 (v79) cDSP returns zeros for them, although hexagon-sim computes them correctly.
+vector spellings up to 128 lanes. On v73, generated function scopes that evaluate
+floating operations enable IEEE fp16/fp32 arithmetic with a local attribute.
+The entry and each worker body are checked separately: pure data transfer, DMA,
+and HMX scopes keep their existing instruction policy. Casts, comparisons, scalar
+arithmetic that clang may vectorize, reduction helpers, and unknown calls are
+handled conservatively. Vector wrappers
+inline into that scope, so ordinary add and multiply use IEEE `.hf`/`.sf` instructions
+without an intermediate qfloat rounding. Half-to-integer casts decode the exponent,
+significand, and sign with integer operations to truncate; the compiler's direct
+IEEE half conversion rounds instead. As with an ordinary C cast, the finite
+truncated value must fit the destination integer type.
+The build does not enable `-mhvx-ieee-fp` globally. v75/v79 retain qfloat arithmetic
+plus a conversion: the tested SM8750 (v79) cDSP returns zeros for the IEEE arithmetic
+instructions, although hexagon-sim computes them correctly. Explicit qfloat intrinsics
+in math, reduction, and GEMM helpers keep their existing algorithms and accuracy bounds.
 HVX has no divide, and clang scalarizes a vector `/`, so the codegen prints float vector
 division as `tl_hvx_div` (`hvx_math.h`): a times the Newton-Raphson reciprocal of b, in fp32.
 The fp16/fp32 math intrinsics (`T.exp`, `T.exp2`, `T.log`, `T.log2`, `T.sqrt`, `T.rsqrt`,
@@ -41,7 +53,7 @@ The fp16/fp32 math intrinsics (`T.exp`, `T.exp2`, `T.log`, `T.log2`, `T.sqrt`, `
 runs the same 32-lane kernel on a splat, so a result never depends on whether its loop
 vectorized, and fp16 computes in fp32 and rounds once. Vector `T.min`/`T.max` print as
 `tl_vec_min`/`tl_vec_max` (`common.h`), one HVX `vmin`/`vmax` for every lane type. HVX fp16
-arithmetic flushes subnormal results (below 2^-14) to zero.
+qfloat arithmetic flushes subnormal results (below 2^-14) to zero.
 
 The functions aim at fp32 accuracy. Under the `tl.enable_fast_math` pass config, `LowerMath`
 picks fast variants instead (`tl_hvx_<fn>_fast`), and a float division becomes

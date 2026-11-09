@@ -227,7 +227,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
   constexpr int E = tl_reduce_step<A, S>;
   // Out of the intrinsic macros: a template argument's comma splits theirs.
   constexpr int sign_off = std::is_same_v<S, half> ? 0x7fff7fff : 0x7fffffff;
-  auto load = [&](int s) {
+  auto load = [&](int s) TL_HEXAGON_VECTOR_INLINE {
     HVX_Vector x = tl_hvx_load<Aligned>(row + s * E);
     if constexpr (tl_reduce_is_abs<K>)
       x = Q6_V_vand_VV(x, Q6_V_vsplat_R(sign_off));
@@ -235,7 +235,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
   };
   // An accumulator's first step as qf32, then each next step added to it: an
   // fp32 register, or the two fp32 halves of a widened fp16 register.
-  auto first = [&](int s) {
+  auto first = [&](int s) TL_HEXAGON_VECTOR_INLINE {
     HVX_Vector x = load(s);
     if constexpr (std::is_same_v<S, float>) {
       return Q6_Vqf32_vadd_VsfVsf(x, Q6_V_vzero());
@@ -244,7 +244,7 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
       return Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w));
     }
   };
-  auto next = [&](HVX_Vector acc, int s) {
+  auto next = [&](HVX_Vector acc, int s) TL_HEXAGON_VECTOR_INLINE {
     HVX_Vector x = load(s);
     if constexpr (std::is_same_v<S, float>) {
       return Q6_Vqf32_vadd_Vqf32Vsf(acc, x);
@@ -270,6 +270,17 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
           Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1), Q6_Vqf32_vadd_Vqf32Vqf32(a2, a3))));
 }
 
+#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+// Keep half widening and the explicit Qfloat loop in one leaf across v73's
+// IEEE entry boundary. This avoids spilling the caller's live vectors around
+// individual widening steps without changing the FP32-source reduction path.
+template <int K, typename A, bool Aligned>
+static __attribute__((noinline)) tl_hvx_reg<A>
+tl_reduce_qf32_half_sum(const half *row, int steps) {
+  return tl_reduce_qf32_sum<K, A, half, Aligned>(row, steps);
+}
+#endif
+
 // Reduces the `cols` elements at `row` into one register of A. Long rows keep
 // four accumulators, so four combine chains overlap.
 template <int K, typename A, typename S, bool Aligned>
@@ -280,7 +291,12 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_row(const S *row, int cols) {
   tl_hvx_reg<A> acc;
   if (steps >= 4) {
     if constexpr (tl_reduce_qf32_row<K, A, S>) {
-      acc = tl_reduce_qf32_sum<K, A, S, Aligned>(row, steps);
+#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+      if constexpr (std::is_same_v<S, half>)
+        acc = tl_reduce_qf32_half_sum<K, A, Aligned>(row, steps);
+      else
+#endif
+        acc = tl_reduce_qf32_sum<K, A, S, Aligned>(row, steps);
     } else {
       tl_hvx_reg<A> a0 = tl_reduce_load_step<K, A, S, Aligned>(row);
       tl_hvx_reg<A> a1 = tl_reduce_load_step<K, A, S, Aligned>(row + E);

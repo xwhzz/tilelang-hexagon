@@ -131,6 +131,118 @@ bool IsWorkerLoop(const ForNode *loop) {
          loop->annotations.count(tl::attr::kHexagonNumWorkers);
 }
 
+// The local IEEE feature belongs to the function that evaluates floating
+// operations, not its dispatcher. Copies of floating data need no arithmetic
+// feature; giving it to a pure DMA/HMX worker prevents otherwise compatible
+// runtime helpers from inlining. Unknown calls remain conservative because a
+// void result does not imply that their template bodies contain no arithmetic.
+class FloatingArithmeticScope : public tirx::StmtExprVisitor {
+public:
+  bool Check(const Stmt &body) {
+    VisitStmt(body);
+    return found_;
+  }
+
+private:
+  bool found_ = false;
+
+  void VisitStmt_(const ForNode *op) final {
+    if (IsWorkerLoop(op)) {
+      // The bounds are evaluated by the caller. The worker body is checked
+      // independently when its lambda is emitted.
+      VisitExpr(op->min);
+      VisitExpr(op->extent);
+    } else {
+      StmtExprVisitor::VisitStmt_(op);
+    }
+  }
+
+  void VisitExpr(const PrimExpr &expr) final {
+    if (found_)
+      return;
+    // Include scalar operations: clang can vectorize a scalar or unrolled
+    // loop after TIR lowering. Ramp is arithmetic too (base + stride * lane).
+    if (expr.dtype().is_float() && !expr.as<FloatImmNode>() &&
+        !expr.as<VarNode>() && !expr.as<BufferLoadNode>() &&
+        !expr.as<BroadcastNode>() && !expr.as<ShuffleNode>() &&
+        !expr.as<CallNode>()) {
+      found_ = true;
+      return;
+    }
+    StmtExprVisitor::VisitExpr(expr);
+  }
+
+  void VisitExpr_(const CastNode *op) final {
+    found_ |= op->value.dtype().is_float();
+    ExprVisitor::VisitExpr_(op);
+  }
+
+#define TL_CHECK_FLOAT_OPERANDS(Node)                                          \
+  void VisitExpr_(const Node *op) final {                                      \
+    found_ |= op->a.dtype().is_float() || op->b.dtype().is_float();            \
+    ExprVisitor::VisitExpr_(op);                                               \
+  }
+  TL_CHECK_FLOAT_OPERANDS(EQNode)
+  TL_CHECK_FLOAT_OPERANDS(NENode)
+  TL_CHECK_FLOAT_OPERANDS(LTNode)
+  TL_CHECK_FLOAT_OPERANDS(LENode)
+  TL_CHECK_FLOAT_OPERANDS(GTNode)
+  TL_CHECK_FLOAT_OPERANDS(GENode)
+  TL_CHECK_FLOAT_OPERANDS(AndNode)
+  TL_CHECK_FLOAT_OPERANDS(OrNode)
+#undef TL_CHECK_FLOAT_OPERANDS
+
+  void VisitExpr_(const NotNode *op) final {
+    found_ |= op->a.dtype().is_float();
+    ExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    static const Op &type_annotation = Op::Get("tirx.type_annotation");
+    if (op->op.same_as(type_annotation))
+      return;
+    if (op->op.same_as(builtin::address_of())) {
+      if (const auto *load = op->args[0].as<BufferLoadNode>()) {
+        for (const auto &index : load->indices)
+          VisitExpr(index);
+        return;
+      }
+    }
+    // Preserve the audited instruction policy of data movement/conversion,
+    // resource, and HMX helpers. Recurse into their arguments: an index or a
+    // value computed by generic floating arithmetic still needs IEEE.
+    static const std::vector<Op> without_arithmetic = {
+        builtin::reinterpret(),
+        builtin::handle_add_byte_offset(),
+        tl::hexagon_exclusive_pointer(),
+        tl::hexagon_dma_queue(),
+        tl::hexagon_dma_submit(),
+        tl::hexagon_dma_commit(),
+        tl::hexagon_dma_wait(),
+        tl::hexagon_cache_writeback(),
+        tl::hexagon_crouton_copy(),
+        tl::hexagon_crouton_move_tiles(),
+        tl::hexagon_crouton_tile_store(),
+        tl::hexagon_hmx_gemm(),
+        tl::hexagon_hmx_gemm_blockscaled(),
+        tl::sync_grid()};
+    for (const auto &safe : without_arithmetic) {
+      if (op->op.same_as(safe)) {
+        ExprVisitor::VisitExpr_(op);
+        return;
+      }
+    }
+    // In particular, keep reduce_rows/crouton_reduce: they return void but
+    // inline floating operations. Do not infer arithmetic policy from the
+    // return type of an unknown intrinsic or external call either.
+    found_ = true;
+  }
+};
+
+bool UsesFloatingArithmetic(const Stmt &body) {
+  return FloatingArithmeticScope().Check(body);
+}
+
 bool IsSharedScope(const std::string &scope) {
   return scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
 }
@@ -349,6 +461,8 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // function void, so the codegen declares the status type and emits the
   // returns itself.
   this->PrintFuncPrefix(stream);
+  if (UsesFloatingArithmetic(f->body))
+    stream << "TL_HEXAGON_IEEE_ARITHMETIC\n";
   stream << "int32_t";
   this->PrintExtraAttrs(f, stream);
   stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
@@ -420,7 +534,10 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   stream << ' ' << AllocVarID(op->loop_var.get());
   if (arena_bytes > 0)
     stream << ", uint8_t *tl_arena";
-  stream << ") -> int32_t {\n";
+  stream << ")";
+  if (UsesFloatingArithmetic(op->body))
+    stream << " TL_HEXAGON_IEEE_ARITHMETIC";
+  stream << " -> int32_t {\n";
   int scope = BeginScope();
   in_worker_ = true;
   worker_program_ = op->loop_var;
