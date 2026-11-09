@@ -16,6 +16,9 @@ def dma_copy(src: BufferLikeType, dst: BufferLikeType) -> tirx.PrimExpr:
     """Submit one asynchronous Hexagon DDR <-> VTCM DMA transfer.
 
     Supports in-bounds 1D/2D row-major regions with identical scalar dtypes.
+    Strided regions use 16-bit descriptor fields before v75, 24-bit fields
+    thereafter. Wider strides use one 1D descriptor per row or tiled run.
+    The program may keep at most 256 descriptors in flight across its groups.
     Each call is one group of the tile program's DMA queue: its descriptors
     complete together. Use ``T.dma_wait(n)`` before consuming destinations or
     overwriting sources; no separate commit is needed. Every tile program owns

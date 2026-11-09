@@ -1,4 +1,4 @@
-"""Packed-layout slices retain async DMA semantics on older targets."""
+"""Packed-layout slices retain async DMA semantics across descriptor formats."""
 
 import os
 import re
@@ -51,16 +51,10 @@ def test_strided_layout_load_store_keeps_one_group_per_copy(arch, kind):
     run_bytes = {"int8": 2048, "uint4": 1024}.get(kind, 4096)
     column_runs = kind in ("weight", "activation_t")
     global_stride = run_bytes * (2 if column_runs else 3)
-    if arch == "v73":
-        assert len(calls) == 4
-        assert "tl_hexagon_dma_async_context<2, 1>" in source
-        expected = f"(uint32_t){run_bytes}, (uint32_t){run_bytes}, (uint32_t){run_bytes}, (uint32_t)1"
-        assert all(expected in call for call in calls)
-    else:
-        assert len(calls) == 2
-        assert "tl_hexagon_dma_async_context<1, 1>" in source
-        assert f"(uint32_t){run_bytes}, (uint32_t){global_stride}, (uint32_t){run_bytes}, (uint32_t)2" in calls[0]
-        assert f"(uint32_t){global_stride}, (uint32_t){run_bytes}, (uint32_t){run_bytes}, (uint32_t)2" in calls[-1]
+    assert len(calls) == 2
+    assert "tl_hexagon_dma_async_context<1, 1>" in source
+    assert f"(uint32_t){run_bytes}, (uint32_t){global_stride}, (uint32_t){run_bytes}, (uint32_t)2" in calls[0]
+    assert f"(uint32_t){global_stride}, (uint32_t){run_bytes}, (uint32_t){run_bytes}, (uint32_t)2" in calls[-1]
     assert source.count("tl_hexagon_dma_async_commit(") == 2
     assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 2
     assert all(re.search(r", 3\)\) return tl_status;", call) for call in calls[: len(calls) // 2])
@@ -71,7 +65,7 @@ def _many_panels(panels):
     rows = panels * 32
 
     @T.prim_func
-    def kernel(A: T.Tensor((rows, 8), "int8")):
+    def kernel(A: T.Tensor((rows, 2048), "int8")):
         with T.Kernel(1):
             stage = T.alloc_shared((rows, 4), "int8")
             T.annotate_layout({A: make_hvx_panel_layout(A), stage: make_hvx_panel_layout(stage)})
@@ -82,6 +76,8 @@ def _many_panels(panels):
 
 
 def test_v73_layout_split_respects_descriptor_capacity():
+    # Physical source panels are 65,536 bytes apart, beyond the original
+    # 2D format. Each selected four-column block needs one 1D descriptor.
     source = _lower(_many_panels(256), "v73")
     assert "tl_hexagon_dma_async_context<256, 1>" in source
     assert source.count("tl_hexagon_dma_async_submit(") == 256

@@ -82,6 +82,15 @@ constexpr int64_t kRows = 0xffff;
 // 1D chunks stay aligned for every element size.
 constexpr int64_t kChunk = int64_t(1) << 23;
 
+// Strided descriptors have 16-bit fields before v75, 24-bit fields from
+// v75 onward. Wider strides use one 1D descriptor per row.
+bool CanUse2DDescriptor(const Target &target, int64_t src_stride,
+                        int64_t dst_stride) {
+  const int arch = HexagonArchVersion(target);
+  const int64_t field = arch != 0 && arch < 75 ? 0xffff : kField;
+  return src_stride <= field && dst_stride <= field;
+}
+
 } // namespace
 
 const PanelLayoutNode *PanelOf(const Buffer &buffer,
@@ -178,13 +187,10 @@ Stmt LowerPanelTransfer(const CopyNode &op, const LowerArgs &T,
   };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
-  // Contiguous panels go in chunks of whole panels. Older targets cannot use
-  // the runtime's v75+ 2D descriptor; use one 1D descriptor per panel, as for
-  // panels further apart than a descriptor's 24-bit stride.
-  const int arch = HexagonArchVersion(T.target);
+  // Contiguous panels go in chunks of whole panels. Strided panels take one
+  // descriptor each when the target or their strides require the 1D form.
   bool dense = ss == row_bytes && ds == row_bytes;
-  bool apart =
-      !dense && (ss > kField || ds > kField || (arch != 0 && arch < 75));
+  bool apart = !dense && !CanUse2DDescriptor(T.target, ss, ds);
   int64_t per = dense   ? std::max<int64_t>(1, kChunk / row_bytes)
                 : apart ? 1
                         : kRows;
@@ -314,12 +320,10 @@ Stmt LowerCroutonTransfer(const CopyNode &op, const LowerArgs &T,
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);
   Array<Stmt> seq;
   // One run, or runs that follow each other on both sides, go in chunks of
-  // whole runs. Use a descriptor per run when the stride exceeds 24 bits or
-  // the target cannot use the runtime's v75+ 2D descriptor.
-  const int arch = HexagonArchVersion(T.target);
+  // whole runs. Strided runs take one descriptor each when the target or
+  // their strides require the 1D form.
   bool dense = runs == 1 || (ss == run_bytes && ds == run_bytes);
-  bool apart =
-      !dense && (ss > kField || ds > kField || (arch != 0 && arch < 75));
+  bool apart = !dense && !CanUse2DDescriptor(T.target, ss, ds);
   int64_t per = dense   ? std::max<int64_t>(1, kChunk / run_bytes)
                 : apart ? 1
                         : kRows;
@@ -388,13 +392,6 @@ std::string DMARejection(const CopyNode &op, const LowerArgs &T,
   if (cols * bytes > kField)
     return "Hexagon T.dma_copy rows must fit the 24-bit DMA descriptor's row "
            "size (16 MiB)";
-  // The runtime builds the v75+ type-9 2D descriptor; older architectures
-  // would need another descriptor format.
-  const int arch = HexagonArchVersion(T.target);
-  if (arch != 0 && arch < 75)
-    return "2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv" +
-           std::to_string(arch) +
-           ". Copy contiguous rows with 1D transfers instead.";
   return "";
 }
 
@@ -462,8 +459,8 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
       int64_t n = std::min(kChunk, total - done);
       seq.push_back(submit(done / bytes, done / bytes, 1, n, n, n));
     }
-  } else if (ss * bytes > kField || ds * bytes > kField) {
-    // Rows further apart than a descriptor's 24-bit stride: a descriptor each.
+  } else if (!CanUse2DDescriptor(T.target, ss * bytes, ds * bytes)) {
+    // The target or the strides require a 1D descriptor for each row.
     for (int64_t row = 0; row < rows; ++row)
       seq.push_back(submit(row * ss, row * ds, 1, cols * bytes, cols * bytes,
                            cols * bytes));

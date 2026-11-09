@@ -51,9 +51,9 @@ def test_copy_is_one_group():
     assert _queue(artifact) == (1, 1)
 
 
-@pytest.mark.parametrize("arch", ["v75", "v79"])
-def test_tall_copy_splits_into_one_group(arch):
-    rows = 70000
+@pytest.mark.parametrize("rows", [65535, 65536])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_tall_copy_splits_into_one_group(rows, arch):
 
     @T.prim_func
     def column(A: T.Tensor((rows, 2), "float16")):
@@ -63,13 +63,15 @@ def test_tall_copy_splits_into_one_group(arch):
             T.dma_wait()
 
     artifact = _lower(column, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
-    # A 2D descriptor has at most 65535 rows.
-    assert _ops(artifact) == ["queue", "submit", "submit", "commit", "wait"]
-    assert _queue(artifact) == (2, 1)
+    # A 2D descriptor has at most 65535 rows on both architectures.
+    descriptors = 1 if rows == 65535 else 2
+    assert _ops(artifact) == ["queue"] + ["submit"] * descriptors + ["commit", "wait"]
+    assert _queue(artifact) == (descriptors, 1)
     submits = re.findall(r"tl_hexagon_dma_async_submit\(tl_dma_async, (.*)\)\) return", artifact.kernel_source)
     assert submits[0].endswith("(uint32_t)65535, 3")
-    assert submits[1].endswith(f"(uint32_t){rows - 65535}, 3")
-    assert "A[131070]" in submits[1]
+    if descriptors == 2:
+        assert submits[1].endswith(f"(uint32_t){rows - 65535}, 3")
+        assert "A[131070]" in submits[1]
 
 
 def test_queue_is_sized_for_the_copies_in_flight():

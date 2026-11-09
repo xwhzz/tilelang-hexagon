@@ -3,6 +3,7 @@ bundles, and the 4-bit decode and prefill kernels, on small random models
 with the real ones' structures (tiny.py)."""
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -16,7 +17,6 @@ from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remo
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
 from tilelang.hexagon.runtime.session import lower_kernels
-from tilelang.hexagon.target import hexagon_arch
 
 LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
 sys.path.insert(0, str(LFM))
@@ -32,10 +32,6 @@ from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 FP16_SOURCE_TARGET = {"kind": "hexagon", "mcpu": "hexagonv79"}
-FP16_DMA = pytest.mark.skipif(
-    hexagon_arch(determine_target("hexagon", return_object=True)) == "v73",
-    reason="the FP16 LFM kernels require v75+ two-dimensional DMA",
-)
 MULTI_PROCESS = pytest.mark.skipif(
     hlos() != "android" or domain_id() != 3,
     reason="multiple DSP processes require Android's default cDSP domain",
@@ -350,7 +346,6 @@ STAGES = [
 
 
 @DEVICE
-@FP16_DMA
 @pytest.mark.parametrize(("model", "processes"), STAGES)
 def test_fp16_decode_matches_the_reference(model, processes, fp16_bundle):
     path = fp16_bundle(model)
@@ -387,11 +382,24 @@ def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
-def test_fp16_kernels_reject_v73_two_dimensional_dma(model, phase, fp16_bundle):
+def test_fp16_kernels_lower_v73_two_dimensional_dma(model, phase, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
     kernel = decode_fp16.make_decode(c, 256, 64) if phase == "decode" else prefill_fp16.make_prefill(c, 128, 256, 64)
-    with pytest.raises(tvm.error.InternalError, match="2D T.dma_copy needs Hexagon v75 or newer; the target is hexagonv73"):
-        lower_kernels([(kernel, [])], target={"kind": "hexagon", "mcpu": "hexagonv73"})
+    ((_, source, _, _),) = lower_kernels([(kernel, [])], target={"kind": "hexagon", "mcpu": "hexagonv73"})
+    calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    geometry = [
+        tuple(map(int, match.groups()))
+        for line in calls
+        if (match := re.search(r"\(uint32_t\)(\d+), \(uint32_t\)(\d+), \(uint32_t\)(\d+), \(uint32_t\)(\d+), \d+\)\)", line))
+    ]
+    assert len(geometry) == len(calls) and any(rows > 1 for _, _, _, rows in geometry)
+    for dst_stride, src_stride, width, rows in geometry:
+        if rows > 1:
+            assert 0 < width <= min(dst_stride, src_stride) <= max(dst_stride, src_stride) <= 65535
+            assert rows <= 65535
+        else:
+            assert rows == 1 and dst_stride == src_stride == width
+    assert "tl_hexagon_dma_async_wait(" in source
 
 
 def _kv_errors(decoder, state, n, rel) -> list:
@@ -405,7 +413,6 @@ def _kv_errors(decoder, state, n, rel) -> list:
 
 
 @DEVICE
-@FP16_DMA
 @pytest.mark.parametrize(("model", "processes"), STAGES)
 def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
     path = fp16_bundle(model)
@@ -439,7 +446,6 @@ def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
 
 
 @DEVICE
-@FP16_DMA
 @pytest.mark.parametrize(("model", "processes"), STAGES[:3])
 def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):
     """A chat's second turn: a prefill, decode steps, then a prefill from where
@@ -476,7 +482,6 @@ def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):
 
 
 @DEVICE
-@FP16_DMA
 @MULTI_PROCESS
 def test_fp16_stages_compute_what_one_process_does(fp16_bundle):
     """The tiny LFM3 over two DSP processes against one, after a prefill and
@@ -515,7 +520,6 @@ def test_fp16_stages_compute_what_one_process_does(fp16_bundle):
 
 
 @DEVICE
-@FP16_DMA
 def test_fp16_prefill_and_decode_run_past_the_ring(fp16_bundle):
     """The sliding-window layers' caches are rings of 1024 positions
     (decode_fp16.ring): a prompt past one, and decode steps after it, read
@@ -548,7 +552,6 @@ def test_fp16_prefill_and_decode_run_past_the_ring(fp16_bundle):
 
 
 @DEVICE
-@FP16_DMA
 def test_fp16_prefill_from_decode_steps_wraps_the_ring(fp16_bundle):
     """A prefill that starts where decode steps stopped, at a position no
     chunk boundary: its first chunk's rows run past the ring's end, and its

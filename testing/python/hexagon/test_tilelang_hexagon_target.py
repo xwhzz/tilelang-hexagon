@@ -89,12 +89,39 @@ def _dma_2d_kernel():
     return kernel
 
 
-def test_2d_dma_needs_v75():
-    source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": "hexagonv75"}).kernel_source)
-    # A 32-row descriptor: the v75+ 2D form.
-    assert "(uint32_t)32, 3)) return tl_status;" in source
-    with pytest.raises(Exception, match="2D T.dma_copy needs Hexagon v75"):
-        _lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": "hexagonv73"})
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_2d_dma_uses_one_descriptor_for_small_strides(arch):
+    source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert len(submits) == 1
+    assert "tl_hexagon_dma_async_context<1, 1>" in source
+    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
+    assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 3)" in submits[0]
+
+
+@pytest.mark.parametrize("stride", [65535, 65536])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_2d_dma_stride_field_boundary(arch, stride):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, stride), "uint8")):
+        with T.Kernel(1):
+            scratch = T.alloc_shared((2, 32), "uint8")
+            T.dma_copy(A[:, :32], scratch)
+            T.dma_wait()
+
+    source = str(_lower(kernel, {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    split = arch == "v73" and stride == 65536
+    assert len(submits) == (2 if split else 1)
+    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    if split:
+        for row, call in enumerate(submits):
+            assert f"(&(A[{row * stride}]))" in call
+            assert "(uint32_t)32, (uint32_t)32, (uint32_t)32, (uint32_t)1, 3)" in call
+        assert "tl_hexagon_dma_async_context<2, 1>" in source
+    else:
+        assert f"(uint32_t)32, (uint32_t){stride}, (uint32_t)32, (uint32_t)2, 3)" in submits[0]
 
 
 def test_vtcm_capacity_is_checked_at_compile_time():
@@ -121,3 +148,23 @@ def test_worker_arenas_must_fit_the_vtcm_together():
     _lower(kernel, "hexagon")  # six 1 MiB arenas fit 8 MiB
     with pytest.raises(Exception, match=r"num_workers=6\) needs a VTCM arena of 1048576 bytes per worker.*use num_workers=4 or fewer"):
         _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 4 << 20})
+
+
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_2d_dma_wide_rows_use_1d_on_v73(arch):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, 32769), "float16")):
+        with T.Kernel(1):
+            scratch = T.alloc_shared((2, 32768), "float16")
+            T.dma_copy(A[:, :32768], scratch)
+            T.dma_wait()
+
+    source = str(_lower(kernel, {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    assert len(submits) == (2 if arch == "v73" else 1)
+    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    if arch == "v73":
+        for call in submits:
+            assert "(uint32_t)65536, (uint32_t)65536, (uint32_t)65536, (uint32_t)1, 3)" in call
+    else:
+        assert "(uint32_t)65536, (uint32_t)65538, (uint32_t)65536, (uint32_t)2, 3)" in submits[0]

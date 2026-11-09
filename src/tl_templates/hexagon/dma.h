@@ -57,6 +57,11 @@ enum tl_hexagon_dma_engine_state {
 
 constexpr uint32_t TL_HEXAGON_DMA_STATUS_MASK = 0x3u;
 constexpr uint32_t TL_HEXAGON_DMA_FIELD24_MAX = 0x00ffffffu;
+#if __HEXAGON_ARCH__ < 75
+constexpr uint32_t TL_HEXAGON_DMA_FIELD2D_MAX = 0x0000ffffu;
+#else
+constexpr uint32_t TL_HEXAGON_DMA_FIELD2D_MAX = TL_HEXAGON_DMA_FIELD24_MAX;
+#endif
 constexpr uint32_t TL_HEXAGON_DMA_ROWS_MAX = 0x0000ffffu;
 constexpr uint32_t TL_HEXAGON_DMA_DONE_MASK = 0x80000000u;
 constexpr uint32_t TL_HEXAGON_DMA_DST_BYPASS_MASK = 0x10000000u;
@@ -64,8 +69,8 @@ constexpr uint32_t TL_HEXAGON_DMA_SRC_BYPASS_MASK = 0x20000000u;
 constexpr uint32_t TL_HEXAGON_DMA_ORDERED_MASK = 0x40000000u;
 
 // Hardware descriptor payload sizes are 16 bytes for 1D and 32 bytes for the
-// v75+ type-9 2D form.  Queue slots occupy a full cache line so adjacent live
-// descriptors cannot share one.
+// 2D forms (16-bit fields before v75, type 9 thereafter). Queue slots occupy
+// a full cache line so adjacent live descriptors cannot share one.
 struct alignas(16) tl_hexagon_dma_descriptor_1d {
   uint32_t word[4];
 };
@@ -271,9 +276,9 @@ TL_DMA_HOT int tl_hexagon_dma_descriptor_init_2d(
     tl_hexagon_dma_options options) {
   if (descriptor == nullptr)
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
-  if (row_bytes > TL_HEXAGON_DMA_FIELD24_MAX ||
-      src_stride > TL_HEXAGON_DMA_FIELD24_MAX ||
-      dst_stride > TL_HEXAGON_DMA_FIELD24_MAX || rows > TL_HEXAGON_DMA_ROWS_MAX)
+  if (row_bytes > TL_HEXAGON_DMA_FIELD2D_MAX ||
+      src_stride > TL_HEXAGON_DMA_FIELD2D_MAX ||
+      dst_stride > TL_HEXAGON_DMA_FIELD2D_MAX || rows > TL_HEXAGON_DMA_ROWS_MAX)
     return TL_HEXAGON_DMA_ERR_RANGE;
 
   tl_hexagon_dma_descriptor_clear(descriptor);
@@ -293,15 +298,22 @@ TL_DMA_HOT int tl_hexagon_dma_descriptor_init_2d(
     return TL_HEXAGON_DMA_ERR_RANGE;
 
   descriptor->word[0] = 0;
-  descriptor->word[1] = (dst_stride & TL_HEXAGON_DMA_FIELD24_MAX) | (1u << 24) |
-                        tl_hexagon_dma_option_bits(options);
   descriptor->word[2] = src_address;
   descriptor->word[3] = dst_address;
+#if __HEXAGON_ARCH__ < 75
+  descriptor->word[1] = (1u << 24) | tl_hexagon_dma_option_bits(options);
+  descriptor->word[4] = 0; // original 2D descriptor with 16-bit fields
+  descriptor->word[5] = row_bytes | (rows << 16);
+  descriptor->word[6] = src_stride | (dst_stride << 16);
+#else
+  descriptor->word[1] = (dst_stride & TL_HEXAGON_DMA_FIELD24_MAX) | (1u << 24) |
+                        tl_hexagon_dma_option_bits(options);
   descriptor->word[4] = 9u; // v75+ 2D descriptor with 24-bit fields
   descriptor->word[5] =
       (row_bytes & TL_HEXAGON_DMA_FIELD24_MAX) | ((rows & 0xffu) << 24);
   descriptor->word[6] =
       ((rows >> 8) & 0xffu) | ((src_stride & TL_HEXAGON_DMA_FIELD24_MAX) << 8);
+#endif
   descriptor->word[7] = 0; // zero source/destination width offset
   return TL_HEXAGON_DMA_OK;
 }

@@ -103,7 +103,7 @@ def test_copies_into_row_major_buffers_are_dma_transfers():
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in loop[submit + 2]
 
 
-@pytest.mark.parametrize("arch", ["v75", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_copies_into_hmx_operands_stage_through_dma(arch):
     source = _source(_gemm(128, 128, 2048, 256, 2), {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     for operand, pack in (("a", "tl_crouton_copy<true, false>"), ("b", "tl_crouton_copy<true, true>")):
@@ -113,14 +113,16 @@ def test_copies_into_hmx_operands_stage_through_dma(arch):
         assert re.search(rf"{re.escape(pack)}\(\(&\(\(\(half\*\){operand}\)\[0\]\)\).*\(half\*\){operand}_dma\)", source)
 
 
-def test_v73_stages_the_strided_hmx_operand_with_hvx():
+def test_v73_stages_the_strided_hmx_operand_with_original_2d_dma():
     source = _source(_gemm(128, 128, 2048, 256, 2), {"kind": "hexagon", "mcpu": "hexagonv73"})
-    # A's strided rows use synchronous HVX copies. B's contiguous K block
-    # still uses the v73 one-dimensional DMA path.
+    # A's 4,096-byte row stride fits the original 2D descriptor. B's
+    # contiguous K block keeps the one-dimensional DMA path.
     submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
-    assert submits and all("b_dma" in line for line in submits)
-    assert all("(uint32_t)1, 3)) return tl_status;" in line for line in submits)
-    assert any("((half*)a_dma)" in line and "= *(half64*)(A +" in line for line in source.splitlines())
+    a_submits = [line for line in submits if "a_dma" in line]
+    b_submits = [line for line in submits if "b_dma" in line]
+    assert a_submits and b_submits and len(submits) == len(a_submits) + len(b_submits)
+    assert all("(uint32_t)512, (uint32_t)4096, (uint32_t)512, (uint32_t)128, 3)" in line for line in a_submits)
+    assert all("(uint32_t)1, 3)) return tl_status;" in line for line in b_submits)
     for operand, pack in (("a", "tl_crouton_copy<true, false>"), ("b", "tl_crouton_copy<true, true>")):
         assert re.search(rf"{re.escape(pack)}\(\(&\(\(\(half\*\){operand}\)\[0\]\)\).*\(half\*\){operand}_dma\)", source)
 
