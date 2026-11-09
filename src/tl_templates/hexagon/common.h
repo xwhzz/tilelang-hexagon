@@ -214,12 +214,14 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
     return mask_t(__builtin_convertvector(!v, typename mask_t::nat_t));
   }
   template <typename U> mask_t operator&&(const vec_type<U, N> &o) const {
-    return mask_t(
-        __builtin_convertvector((v != 0) & (o.v != 0), typename mask_t::nat_t));
+    using lanes_t = typename mask_t::nat_t;
+    return mask_t(__builtin_convertvector(v != 0, lanes_t) &
+                  __builtin_convertvector(o.v != 0, lanes_t));
   }
   template <typename U> mask_t operator||(const vec_type<U, N> &o) const {
-    return mask_t(
-        __builtin_convertvector((v != 0) | (o.v != 0), typename mask_t::nat_t));
+    using lanes_t = typename mask_t::nat_t;
+    return mask_t(__builtin_convertvector(v != 0, lanes_t) |
+                  __builtin_convertvector(o.v != 0, lanes_t));
   }
 };
 
