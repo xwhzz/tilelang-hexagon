@@ -42,9 +42,9 @@ def _make(op, shape, dim, src_dtype, dst_dtype, clear=True, scope="shared"):
     return kernel
 
 
-def _source(func):
-    target = determine_target("hexagon", return_object=True)
-    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
+def _source(func, target="hexagon", pass_configs=None):
+    target = determine_target(target, return_object=True)
+    with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=pass_configs):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
 
@@ -152,11 +152,118 @@ def test_fp16_max_stays_in_fp16():
     assert "tl_hvx_reduce_rows<TL_REDUCE_MAX, float, true>(" in _source(_make("max", (64, 256), 1, "float16", "float32", clear=False))
 
 
-def test_accumulating_fp16_max_into_fp32_widens():
-    # The fp32 values already in the destination join the reduction.
-    source = _source(_make("max", (64, 256), 0, "float16", "float32", clear=False))
-    assert "*(float64*)(acc + 0) = tl_vec_max(*(float64*)(acc + 0), ((float64)" in source
+@pytest.mark.parametrize("op", ["max", "min"])
+def test_accumulating_fp16_extrema_widen_after_the_source_reduction(op):
+    # Preserve the fp32 destination while avoiding a widening of every row.
+    source = _source(_make(op, (48, 160), 0, "float16", "float32", clear=False))
+    assert "half acc[64]" in source
+    assert f"tl_vec_{op}(*(half64*)(acc + 0)," in source
+    assert "k < 47" in source
+    assert "((float64)*(half64*)(acc + 0))" in source
+    assert "float res[1]" in source  # The scalar tail keeps its fp32 initial value.
+
+
+@pytest.mark.parametrize("op", ["max", "min"])
+def test_scalar_accumulating_extrema_keep_the_ordered_float_path(op):
+    source = _source(
+        _make(op, (2, 70), 0, "float16", "float32", clear=False),
+        pass_configs={"tirx.disable_vectorize": True},
+    )
     assert "half acc" not in source
+    assert "float acc[64]" in source
+
+
+@pytest.mark.parametrize("layout", ["source", "destination"])
+def test_accumulating_extrema_in_other_layouts_keep_the_float_path(layout):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, 70), "float16"), Init: T.Tensor((70,), "float32"), B: T.Tensor((70,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((2, 70), "float16")
+            dst = T.alloc_shared((70,), "float32")
+            if layout == "source":
+                T.annotate_layout({src: T.Layout((2, 70), lambda i, j: [j, i])})
+            else:
+                T.annotate_layout({dst: T.Layout((70,), lambda j: [j % 2, j // 2])})
+            T.copy(A, src)
+            T.copy(Init, dst)
+            T.reduce_max(src, dst, dim=0, clear=False)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "half acc" not in source
+    assert "float acc[64]" in source
+
+
+@pytest.mark.parametrize("strided", ["source", "destination"])
+@pytest.mark.parametrize("op", ["max", "min"])
+def test_accumulating_extrema_with_strided_lanes_keep_the_float_path(op, strided):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, 70), "float16"), Init: T.Tensor((70,), "float32"), B: T.Tensor((70,), "float32")):
+        with T.Kernel(1):
+            src = T.sblock_alloc_buffer((2, 70), "float16", strides=(140, 2) if strided == "source" else (70, 1), scope="shared.dyn")
+            dst = T.sblock_alloc_buffer((70,), "float32", strides=(2,) if strided == "destination" else (1,), scope="shared.dyn")
+            T.copy(A, src)
+            T.copy(Init, dst)
+            getattr(T, f"reduce_{op}")(src, dst, dim=0, clear=False)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "half acc" not in source
+    assert "float acc[64]" in source
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_accumulating_extrema_require_a_proven_nonempty_axis(dynamic):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, 70), "float16"), Init: T.Tensor((70,), "float32"), B: T.Tensor((70,), "float32"), n: T.int32):
+        with T.Kernel(1):
+            src = T.alloc_shared((2, 70), "float16")
+            dst = T.alloc_shared((70,), "float32")
+            T.copy(A, src)
+            T.copy(Init, dst)
+            T.reduce_max(src[: n if dynamic else 0, :], dst, dim=0, clear=False)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "half acc" not in source
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {"min_vector_bits": 512, "max_vector_bits": 512},
+        {"min_vector_bits": 2048, "max_vector_bits": 2048},
+        {"supports_unaligned_vector_access": False},
+    ],
+)
+def test_accumulating_extrema_that_may_scalarize_keep_the_float_path(capabilities):
+    source = _source(
+        _make("max", (2, 70), 0, "float16", "float32", clear=False),
+        {"kind": "hexagon", "mcpu": "hexagonv73", **capabilities},
+    )
+    assert "half acc" not in source
+    assert "float acc[64]" in source
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_accumulating_extrema_preserve_outer_dimensions(keepdim):
+    shape = (3, 1, 70) if keepdim else (3, 70)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((3, 5, 70), "float16"), Init: T.Tensor(shape, "float32"), B: T.Tensor(shape, "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((3, 5, 70), "float16")
+            dst = T.alloc_shared(shape, "float32")
+            T.copy(A, src)
+            T.copy(Init, dst)
+            T.reduce_max(src, dst, dim=1, clear=False)
+            T.copy(dst, B)
+
+    source = _source(kernel)
+    assert "half acc[64]" in source
+    assert "for (int32_t i0 = 0; i0 < 3; ++i0)" in source
+    assert "(i0 * 350)" in source
+    assert "(i0 * 70)" in source
 
 
 def test_reduce_rejects_global_buffers():

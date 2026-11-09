@@ -5,8 +5,8 @@
  * One HVX thread reduces in place: the source and destination are shared
  * buffers or fragments, which are both VTCM, or locals. Float sums accumulate
  * in fp32 and integers in the destination type; the result rounds once. Max
- * and min are exact, so an fp16 source keeps them in fp16 unless an fp32
- * destination value joins in.
+ * and min are exact, so outer-axis fp16 reductions can finish in fp16 before
+ * widening once to combine with an fp32 destination value.
  *
  * Reducing the innermost axis is one tl_hvx_reduce_rows call (hvx_reduce.h)
  * per position of the outer axes: it reduces blocks of rows with HVX transpose
@@ -28,6 +28,7 @@
 #include "op/utils.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/transform.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
@@ -90,7 +91,8 @@ Stmt Loop(const Var &var, PrimExpr extent, ForKind kind, Stmt body) {
 
 class ReduceLowering {
 public:
-  ReduceLowering(const ReduceOpNode &op, const LayoutMap &layout_map)
+  ReduceLowering(const ReduceOpNode &op, const LayoutMap &layout_map,
+                 const Target &target)
       : op_(op), layout_map_(layout_map),
         ndim_(static_cast<int>(op.srcRegion_->region.size())),
         src_t_(op.src->dtype), dst_t_(op.dst->dtype), acc_t_(AccType(op)) {
@@ -99,7 +101,35 @@ public:
     if (!Innermost())
       bits = std::min(bits, dst_t_.bits());
     lanes_ = kVectorBits / bits;
-    acc_ = decl_buffer({lanes_}, acc_t_, "acc", "local");
+    // A source-only max/min preserves the fp32 destination without widening
+    // every source row. Start at the first row to preserve all-NaN inputs.
+    // Scalar comparisons have ordering-sensitive NaN behavior, so require
+    // contiguous vector lanes and retain the original scalar paths.
+    arith::Analyzer analyzer;
+    bool vectorize =
+        !tvm::transform::PassContext::Current()
+             ->GetConfig<Bool>("tirx.disable_vectorize", Bool(false))
+             .value();
+    bool hvx_vectors =
+        target->GetAttr<Integer>("min_vector_bits", Integer(0))
+                .value()
+                ->value == kVectorBits &&
+        target->GetAttr<Integer>("max_vector_bits", Integer(0))
+                .value()
+                ->value >= kVectorBits &&
+        target->GetAttr<Bool>("supports_unaligned_vector_access", Bool(false))
+            .value();
+    combine_after_ =
+        vectorize && hvx_vectors && !Innermost() && !op.clear &&
+        (op.type->IsMax() || op.type->IsMin()) &&
+        src_t_ == DataType::Float(16) && dst_t_ == DataType::Float(32) &&
+        RowMajor(op.src, layout_map) && RowMajor(op.dst, layout_map) &&
+        analyzer.CanProveEqual(Stride(op.src, ndim_ - 1), 1) &&
+        analyzer.CanProveEqual(
+            Stride(op.dst, static_cast<int>(op.dst->shape.size()) - 1), 1) &&
+        analyzer.CanProve(Extent(op.dim) > 0);
+    acc_ =
+        decl_buffer({lanes_}, combine_after_ ? src_t_ : acc_t_, "acc", "local");
     res_ = decl_buffer({1}, acc_t_, "res", "local");
   }
 
@@ -236,20 +266,30 @@ private:
     // Blocks of whole registers.
     Var j0("j0", DataType::Int(32)), k("k", DataType::Int(32));
     auto in_block = [&](const Var &v) { return j0 * lanes_ + v; };
+    PrimExpr first = make_const(DataType::Int(32), combine_after_ ? 1 : 0);
     Array<Stmt> block;
     block.push_back(Lanes(
-        [&](const Var &v) { return Start({{last, in_block(v)}}); }, acc_));
-    block.push_back(Loop(k, reduced, ForKind::kSerial,
+        [&](const Var &v) {
+          std::vector<std::pair<int, PrimExpr>> at{{last, in_block(v)}};
+          return combine_after_ ? Source(make_zero(DataType::Int(32)), at)
+                                : Start(at);
+        },
+        acc_));
+    block.push_back(Loop(k, reduced - first, ForKind::kSerial,
                          Lanes(
                              [&](const Var &v) {
                                return Accumulate(
                                    BufferLoad(acc_, {v}),
-                                   Source(k, {{last, in_block(v)}}));
+                                   Source(k + first, {{last, in_block(v)}}));
                              },
                              acc_)));
     Var v("v", DataType::Int(32));
-    block.push_back(Loop(v, lanes_, ForKind::kVectorized,
-                         Store({{last, in_block(v)}}, BufferLoad(acc_, {v}))));
+    std::vector<std::pair<int, PrimExpr>> output{{last, in_block(v)}};
+    PrimExpr value = BufferLoad(acc_, {v});
+    if (combine_after_)
+      value = Combine(BufferLoad(op_.dst, Output(output)), As(dst_t_, value));
+    block.push_back(
+        Loop(v, lanes_, ForKind::kVectorized, Store(output, value)));
 
     // The tail, one output at a time.
     Var j("j", DataType::Int(32)), kt("k", DataType::Int(32));
@@ -341,7 +381,7 @@ private:
 
   // An accumulator with one source element.
   PrimExpr Accumulate(PrimExpr acc, PrimExpr x) const {
-    x = As(acc_t_, std::move(x));
+    x = As(acc.dtype(), std::move(x));
     if (op_.type->IsAbsSum() || op_.type->IsAbsMax())
       x = Abs(x);
     return Combine(std::move(acc), std::move(x));
@@ -390,6 +430,7 @@ private:
   int ndim_;
   DataType src_t_, dst_t_, acc_t_;
   int lanes_ = 1;
+  bool combine_after_ = false;
   Buffer acc_, res_;
   std::vector<Var> vars_;
 };
@@ -412,7 +453,7 @@ struct Reduce {
       LOG(FATAL) << "Hexagon reduce does not propagate NaN: HVX max and min "
                     "return the other operand";
     }
-    return ReduceLowering(op, lower_args.layout_map).Lower();
+    return ReduceLowering(op, lower_args.layout_map, lower_args.target).Lower();
   }
 };
 
