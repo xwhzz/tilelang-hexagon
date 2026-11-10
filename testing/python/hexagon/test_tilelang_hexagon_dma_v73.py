@@ -113,7 +113,8 @@ def test_embedding_gather_uses_one_dma_group(arch):
     source = _lower(make_embedding_gather(), arch)
     assert source.count("tl_hexagon_dma_async_submit(") == 1
     assert "(uint32_t)4, (uint32_t)128, (uint32_t)4, (uint32_t)1024, 3)" in source
-    assert "tl_hexagon_dma_async_context<1, 1>" in source
+    policy = ", true" if arch == "v79" else ""
+    assert f"tl_hexagon_dma_async_context<1, 1{policy}>" in source
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
 
 

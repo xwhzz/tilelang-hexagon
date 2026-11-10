@@ -11,6 +11,7 @@
 #include "transform/common/storage_size.h"
 
 #include <tvm/ir/op.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -23,6 +24,8 @@ namespace tvm {
 namespace codegen {
 
 using namespace ffi;
+
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.hexagon_disable_dma_load_only", Bool);
 
 namespace {
 
@@ -297,9 +300,135 @@ bool UsesGridSync(const Stmt &body) {
   return found;
 }
 
+bool IsManagedDMA(const CallNode *call) {
+  return call->op.same_as(tl::hexagon_dma_queue()) ||
+         call->op.same_as(tl::hexagon_dma_submit()) ||
+         call->op.same_as(tl::hexagon_dma_commit()) ||
+         call->op.same_as(tl::hexagon_dma_wait());
+}
+
+// The generated queue has no TIR handle. Opaque calls or custom expression
+// text could nevertheless name its C++ local or manipulate the DMA engine.
+// Keep the whole function generic when such a call occurs, even outside the
+// queue's tile-program scope.
+bool HasOnlyManagedDMACalls(const Stmt &body) {
+  bool safe = true;
+  PostOrderVisit(body, [&safe](const ObjectRef &node) {
+    if (const auto *attr = node.as<AttrStmtNode>())
+      safe &= attr->attr_key != tirx::attr::pragma_import_c;
+    if (const auto *call = node.as<CallNode>()) {
+      safe &= IsManagedDMA(call) || call->op.same_as(builtin::address_of()) ||
+              call->op.same_as(Op::Get("tirx.type_annotation"));
+    }
+  });
+  return safe;
+}
+
+bool IsDMAEndpoint(const PrimExpr &expr) {
+  // LowerIntrin turns the planner's access_ptr into address_of of a flat,
+  // scalar BufferLoad before this emitter sees it. No custom pointer call.
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(builtin::address_of()) ||
+      call->args.size() != 1)
+    return false;
+  const auto *load = call->args[0].as<BufferLoadNode>();
+  return load && load->dtype.is_scalar() && load->indices.size() == 1 &&
+         load->indices[0].dtype().is_scalar();
+}
+
+// PlanDMAQueue declares one queue first in the tile program. Only direct
+// Evaluate calls can use its implicit C++ context: never a stored, returned,
+// let-bound or nested expression. Inspect every branch, not sampled paths.
+class LoadOnlyDMAScope : public StmtExprVisitor {
+public:
+  bool Check(const Stmt &body) {
+    const auto *seq = body.as<SeqStmtNode>();
+    if (!seq || seq->seq.empty())
+      return false;
+    const auto *first = seq->seq[0].as<EvaluateNode>();
+    queue_ = first ? first->value.as<CallNode>() : nullptr;
+    if (!queue_ || !queue_->op.same_as(tl::hexagon_dma_queue()))
+      return false;
+    VisitStmt(body);
+    return safe_ && queues_ == 1 && submits_ > 0;
+  }
+
+private:
+  bool safe_ = true;
+  int queues_ = 0, submits_ = 0;
+  const CallNode *queue_ = nullptr;
+  const CallNode *statement_ = nullptr;
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *outer = statement_;
+    statement_ = op->value.as<CallNode>();
+    StmtExprVisitor::VisitStmt_(op);
+    statement_ = outer;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    safe_ &= op->attr_key != tl::attr::kTileProgramScope;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *call) final {
+    if (IsManagedDMA(call)) {
+      // Check each occurrence, including a shared IR node used both as a
+      // statement and as an expression elsewhere.
+      safe_ &= call == statement_ && call->dtype == DataType::Int(32);
+      if (call->op.same_as(tl::hexagon_dma_queue())) {
+        ++queues_;
+        safe_ &= call == queue_ && call->args.size() == 2;
+        for (const PrimExpr &arg : call->args) {
+          const auto *n = arg.as<IntImmNode>();
+          safe_ &= n && n->value == 1; // Initially only D1/G1.
+        }
+      } else if (call->op.same_as(tl::hexagon_dma_submit())) {
+        ++submits_;
+        if (call->args.size() != 7) {
+          safe_ = false;
+        } else {
+          const auto *direction = call->args[6].as<IntImmNode>();
+          safe_ &= direction &&
+                   (direction->value == 0 || direction->value == 3) &&
+                   IsDMAEndpoint(call->args[0]) && IsDMAEndpoint(call->args[1]);
+          for (size_t i = 2; i < 6; ++i)
+            safe_ &= call->args[i].dtype().is_scalar() &&
+                     (call->args[i].dtype().is_int() ||
+                      call->args[i].dtype().is_uint());
+        }
+      } else if (call->op.same_as(tl::hexagon_dma_commit())) {
+        safe_ &= call->args.empty();
+      } else {
+        const auto *pending =
+            call->args.empty() ? nullptr : call->args[0].as<IntImmNode>();
+        safe_ &= pending && pending->value >= 0;
+        for (size_t i = 1; i < call->args.size(); ++i)
+          safe_ &= call->args[i].as<VarNode>() != nullptr;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(call);
+  }
+};
+
 } // namespace
 
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
+
+void CodeGenTileLangHexagon::CheckLoadOnlyDMAModule(const IRModule &module) {
+  dma_load_only_module_ =
+      !tvm::transform::PassContext::Current()
+           ->GetConfig<Bool>("tl.hexagon_disable_dma_load_only", Bool(false))
+           .value();
+  for (const auto &[gvar, base] : module->functions) {
+    const auto *func = base.as<PrimFuncNode>();
+    if (!func) {
+      dma_load_only_module_ = false;
+      continue;
+    }
+    dma_load_only_module_ &= HasOnlyManagedDMACalls(func->body);
+  }
+}
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
   preamble_stream_ << "// tilelang Hexagon (cDSP) kernel\n";
@@ -437,6 +566,13 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   exclusive_params_.clear();
 
   dma_in_scope_ = false;
+  dma_load_only_ = false;
+  in_dma_program_ = false;
+  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  dma_load_only_function_ =
+      dma_load_only_module_ && target.has_value() &&
+      target.value()->GetAttr<String>("mcpu").value_or("") == "hexagonv79" &&
+      HasOnlyManagedDMACalls(f->body);
   // Names the runtime calls bind; reserve them before the parameters so no
   // parameter can take them.
   for (const char *name : {"tl_dma_async", "tl_status", "tl_arena"})
@@ -749,7 +885,8 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     ICHECK(descriptors && groups) << "hexagon_dma_queue needs constant sizes";
     PrintIndent();
     stream << "tl_hexagon_dma_async_context<" << descriptors->value << ", "
-           << groups->value << "> tl_dma_async;\n";
+           << groups->value << (dma_load_only_ ? ", true" : "")
+           << "> tl_dma_async;\n";
     PrintIndent();
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
     dma_in_scope_ = true;
@@ -771,10 +908,17 @@ void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
     // A tile program declares its DMA queue and binds its VTCM arena in this
     // scope, which is the C block of its loop body, lambda or function.
     bool outer_dma = dma_in_scope_;
+    bool outer_load_only = dma_load_only_;
+    bool outer_program = in_dma_program_;
     bool outer_arena = arena_bound_;
+    dma_load_only_ = dma_load_only_function_ && !outer_program &&
+                     LoadOnlyDMAScope().Check(op->body);
+    in_dma_program_ = true;
     arena_bound_ = false;
     CodeGenC::VisitStmt_(op);
     dma_in_scope_ = outer_dma;
+    dma_load_only_ = outer_load_only;
+    in_dma_program_ = outer_program;
     arena_bound_ = outer_arena;
     return;
   }

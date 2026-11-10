@@ -94,7 +94,8 @@ def test_2d_dma_uses_one_descriptor_for_small_strides(arch):
     source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
     submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     assert len(submits) == 1
-    assert "tl_hexagon_dma_async_context<1, 1>" in source
+    policy = ", true" if arch == "v79" else ""
+    assert f"tl_hexagon_dma_async_context<1, 1{policy}>" in source
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
     assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
     assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 3)" in submits[0]

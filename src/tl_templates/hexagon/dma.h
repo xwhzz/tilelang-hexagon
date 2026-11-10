@@ -601,9 +601,10 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push(tl_hexagon_dma_queue *queue, void *dst,
                                       row_bytes, rows, direction);
 }
 
+template <bool LoadOnly>
 TL_DMA_HOT int
-tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
-                             tl_hexagon_dma_transfer *completed) {
+tl_hexagon_dma_queue_try_pop_impl(tl_hexagon_dma_queue *queue,
+                                  tl_hexagon_dma_transfer *completed) {
   if (queue == nullptr)
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   if (queue->count == 0)
@@ -618,9 +619,11 @@ tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
   }
 
   tl_hexagon_dma_transfer transfer = queue->transfers[queue->head];
-  int status = tl_hexagon_dma_finish_transfer(transfer);
-  if (status != TL_HEXAGON_DMA_OK)
-    return status;
+  if constexpr (!LoadOnly) {
+    int status = tl_hexagon_dma_finish_transfer(transfer);
+    if (status != TL_HEXAGON_DMA_OK)
+      return status;
+  }
   if (completed != nullptr)
     *completed = transfer;
 
@@ -635,12 +638,37 @@ tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
 }
 
 TL_DMA_HOT int
-tl_hexagon_dma_queue_pop(tl_hexagon_dma_queue *queue,
-                         tl_hexagon_dma_transfer *completed = nullptr) {
+tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
+                             tl_hexagon_dma_transfer *completed) {
+  return tl_hexagon_dma_queue_try_pop_impl<false>(queue, completed);
+}
+
+template <bool LoadOnly>
+TL_DMA_HOT int
+tl_hexagon_dma_queue_pop_impl(tl_hexagon_dma_queue *queue,
+                              tl_hexagon_dma_transfer *completed = nullptr) {
   int status = TL_HEXAGON_DMA_ERR_BUSY;
   while (status == TL_HEXAGON_DMA_ERR_BUSY)
-    status = tl_hexagon_dma_queue_try_pop(queue, completed);
+    status = tl_hexagon_dma_queue_try_pop_impl<LoadOnly>(queue, completed);
   return status;
+}
+
+TL_DMA_HOT int
+tl_hexagon_dma_queue_pop(tl_hexagon_dma_queue *queue,
+                         tl_hexagon_dma_transfer *completed = nullptr) {
+  return tl_hexagon_dma_queue_pop_impl<false>(queue, completed);
+}
+
+template <bool LoadOnly>
+TL_DMA_INLINE int tl_hexagon_dma_queue_flush_impl(tl_hexagon_dma_queue *queue) {
+  if (queue == nullptr)
+    return TL_HEXAGON_DMA_ERR_ARGUMENT;
+  while (queue->count != 0) {
+    int status = tl_hexagon_dma_queue_pop_impl<LoadOnly>(queue);
+    if (status != TL_HEXAGON_DMA_OK)
+      return status;
+  }
+  return TL_HEXAGON_DMA_OK;
 }
 
 TL_DMA_INLINE int tl_hexagon_dma_queue_flush(tl_hexagon_dma_queue *queue) {
@@ -654,6 +682,8 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_flush(tl_hexagon_dma_queue *queue) {
   return TL_HEXAGON_DMA_OK;
 }
 
+// LoadOnly is selected only for a compiler-owned queue with proven loads.
+// Handwritten contexts keep the generic completion policy by default.
 // The queue of one tile program, used by explicit T.dma_copy/T.dma_wait. The
 // calling thread owns the DMA instruction context for its lifetime.
 // Initialization never resets another queue's outstanding work on this thread.
@@ -667,7 +697,7 @@ TL_DMA_INLINE int tl_hexagon_dma_queue_flush(tl_hexagon_dma_queue *queue) {
 // unwinder). Stack storage survives until the program drains its queue,
 // including returns caused by another helper's error. No dynamic allocation or
 // global queue state.
-template <uint32_t Descriptors, uint32_t Groups>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly = false>
 struct tl_hexagon_dma_async_context {
   static_assert(Descriptors > 0 && Descriptors <= 256,
                 "DMA queue capacity out of range");
@@ -692,8 +722,15 @@ struct tl_hexagon_dma_async_context {
   ~tl_hexagon_dma_async_context() {
     // Only reset after an error while draining our own outstanding descriptors.
     // This stops DMA before descriptor storage and the VTCM lease can go away.
-    if (queue.count && tl_hexagon_dma_queue_flush(&queue) != TL_HEXAGON_DMA_OK)
-      tl_hexagon_dma_engine_reset();
+    if constexpr (LoadOnly) {
+      if (queue.count &&
+          tl_hexagon_dma_queue_flush_impl<true>(&queue) != TL_HEXAGON_DMA_OK)
+        tl_hexagon_dma_engine_reset();
+    } else {
+      if (queue.count &&
+          tl_hexagon_dma_queue_flush(&queue) != TL_HEXAGON_DMA_OK)
+        tl_hexagon_dma_engine_reset();
+    }
   }
   tl_hexagon_dma_async_context(const tl_hexagon_dma_async_context &) = delete;
   tl_hexagon_dma_async_context &
@@ -702,6 +739,11 @@ struct tl_hexagon_dma_async_context {
   __attribute__((always_inline)) int
   submit(void *dst, const void *src, uint32_t dst_stride, uint32_t src_stride,
          uint32_t row_bytes, uint32_t rows, int direction) {
+    if constexpr (LoadOnly) {
+      if (direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
+          direction != TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN)
+        return TL_HEXAGON_DMA_ERR_ARGUMENT;
+    }
     int result = tl_hexagon_dma_queue_push(
         &queue, dst, src, dst_stride, src_stride, row_bytes, rows, direction);
     if (result == TL_HEXAGON_DMA_OK)
@@ -719,7 +761,7 @@ struct tl_hexagon_dma_async_context {
     while (group_count > groups) {
       // Unsigned differences stay correct when the counters wrap.
       while (group_end[group_head] - retired != 0) {
-        int result = tl_hexagon_dma_queue_pop(&queue);
+        int result = tl_hexagon_dma_queue_pop_impl<LoadOnly>(&queue);
         if (result != TL_HEXAGON_DMA_OK)
           return result;
         ++retired;
@@ -754,10 +796,10 @@ TL_DMA_INLINE int tl_hexagon_cache_writeback(const void *ptr,
 }
 
 // The kernel-facing calls: a failure becomes the kernel status TL_ERR_DMA.
-template <uint32_t Descriptors, uint32_t Groups>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
 TL_DMA_INLINE int tl_hexagon_dma_async_submit(
-    tl_hexagon_dma_async_context<Descriptors, Groups> &context, void *dst,
-    const void *src, uint32_t dst_stride, uint32_t src_stride,
+    tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context,
+    void *dst, const void *src, uint32_t dst_stride, uint32_t src_stride,
     uint32_t row_bytes, uint32_t rows, int direction) {
   return context.submit(dst, src, dst_stride, src_stride, row_bytes, rows,
                         direction) == TL_HEXAGON_DMA_OK
@@ -765,15 +807,15 @@ TL_DMA_INLINE int tl_hexagon_dma_async_submit(
              : TL_ERR_DMA;
 }
 
-template <uint32_t Descriptors, uint32_t Groups>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
 TL_DMA_INLINE int tl_hexagon_dma_async_commit(
-    tl_hexagon_dma_async_context<Descriptors, Groups> &context) {
+    tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context) {
   return context.commit() == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
 }
 
-template <uint32_t Descriptors, uint32_t Groups>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
 TL_DMA_INLINE int tl_hexagon_dma_async_wait(
-    tl_hexagon_dma_async_context<Descriptors, Groups> &context,
+    tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context,
     uint32_t groups) {
   return context.wait(groups) == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
 }
