@@ -256,6 +256,60 @@ def test_k_loops_accumulate_across_calls(c_dtype, trans_b):
     _check(_gemm(2, 160, 512, 128, c_dtype=c_dtype, trans_b=trans_b), 2, 160, 512, c_dtype=c_dtype, trans_b=trans_b, calls=4)
 
 
+def _long_dot_region(M, N, ldb, offset, c_dtype, clear):
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, 1024), "float16"),
+        B: T.Tensor((N, ldb), "float16"),
+        Init: T.Tensor((M, N), c_dtype),
+        C: T.Tensor((M, N), c_dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, 1024), "float16")
+            b = T.alloc_shared((N, ldb), "float16")
+            c = T.alloc_fragment((M, N), c_dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            T.copy(Init, c)
+            T.gemm(a, b[:, offset : offset + 1024], c, transpose_B=True, clear_accum=clear)
+            T.copy(c, C)
+
+    return kernel
+
+
+@DEVICE
+@pytest.mark.parametrize("clear", [True, False])
+@pytest.mark.parametrize(
+    "M, N, ldb, offset, c_dtype",
+    [
+        (2, 64, 1024, 0, "float32"),
+        (3, 33, 1024, 0, "float32"),  # two-row tile followed by one row and one column
+        (4, 65, 1088, 0, "float32"),  # two row tiles, padded B rows and a column tail
+        (3, 33, 1025, 1, "float32"),  # unaligned B region keeps the general path
+        (2, 64, 1024, 0, "float16"),
+        (1, 64, 1024, 0, "float32"),  # single-row schedule control
+        (2, 31, 1024, 0, "float32"),  # partial-output schedule control
+    ],
+)
+def test_long_dot_regions_match_torch(M, N, ldb, offset, c_dtype, clear):
+    import torch
+
+    generator = torch.Generator().manual_seed(83)
+    a = torch.randn(M, 1024, generator=generator).half()
+    b = torch.full((N, ldb), float("nan"), dtype=torch.float16)
+    b[:, offset : offset + 1024] = (torch.randn(N, 1024, generator=generator) * 0.1).half()
+    b[5, offset : offset + 1024] = 0
+    init = torch.randn(M, N, generator=generator).to(getattr(torch, c_dtype))
+    ref = a.float() @ b[:, offset : offset + 1024].float().t()
+    if not clear:
+        ref += init.float()
+    out = _run(_long_dot_region(M, N, ldb, offset, c_dtype, clear), a, b, init).float()
+    assert torch.equal(out[:, 5], torch.zeros(M) if clear else init[:, 5].float())
+    # The existing GEMM contract: qf32 sums, then one rounding for an fp16 C.
+    rounding = 2.0**-10 if c_dtype == "float16" else 1e-5
+    torch.testing.assert_close(out, ref, atol=rounding * float(ref.abs().max()) + 1e-5, rtol=0)
+
+
 @DEVICE
 def test_sub_matrices_match_torch():
     import torch
