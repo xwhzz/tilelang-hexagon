@@ -20,6 +20,7 @@ SCALAR_TILE_STORE = re.compile(r"(?:\(\(half\*\)tiles\)|\btiles)\[[^\]]*\] =")
 def _map_region(kind, region="aligned", dtype="float16", guarded=False):
     transposed = kind.endswith("_t")
     row, rows, col, cols = {
+        "whole": (0, 64, 0, 96),
         "aligned": (4, 4, 0, 96),
         "columns": (4, 4, 32, 64),
         "dynamic": (4, 4, 0, 96),
@@ -152,9 +153,10 @@ def test_model_scale_regions_preserve_values_and_guards(kind, rows):
 
 def _input_and_expected(kind, region, guarded):
     shape = (96, 64) if kind.endswith("_t") else (64, 96)
-    # Exact binary fractions distinguish every row/column without depending
-    # on a particular target's arithmetic rounding or NaN policy.
-    x = ((np.arange(np.prod(shape)) % 251 - 125) / 4).astype(np.float16).reshape(shape)
+    # Positive exact binary fractions isolate layout from cancellation and
+    # target-specific Qfloat rounding. The separate whole-vector control
+    # below covers cancellation without using IEEE as the v75/v79 oracle.
+    x = ((np.arange(np.prod(shape)) % 251 + 1) / 4).astype(np.float16).reshape(shape)
     expected = x.copy()
     row, rows, col, cols = {
         "aligned": (4, 4, 0, 96),
@@ -190,21 +192,12 @@ def test_region_maps_preserve_unwritten_elements(kind, region, guarded):
         kernel.adapter.close()
 
 
-@pytest.mark.skipif(os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1", reason="requires the Hexagon SDK simulator")
-@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
-def test_region_maps_on_simulator(arch, tmp_path):
-    cases = [
-        (kind, region, guarded)
-        for kind in sorted(KINDS)
-        for region, guarded in [("aligned", False), ("columns", False), ("dynamic", False), ("cross_tile", False), ("tail", True)]
-    ]
-    sources = []
-    for index, (kind, region, guarded) in enumerate(cases):
-        source = _source(_map_region(kind, region, "float32", guarded), arch)
-        sources.append(source.replace("#include <tl_templates/hexagon/vtcm.h>", "").replace("kernel_kernel(", f"region_{index}("))
+def _simulate_maps(sources, x, arch, tmp_path):
     calls = "\n".join(
-        f"if (region_{i}(input, reinterpret_cast<half *>(output))) return 3;\nif (fwrite(output, sizeof(output), 1, out) != 1) return 4;"
-        for i in range(len(cases))
+        f"if (region_{i}(input, reinterpret_cast<half *>(output))) return 3;\n"
+        "if (memcmp(input, saved_input, sizeof(input))) return 5;\n"
+        "if (fwrite(output, sizeof(output), 1, out) != 1) return 4;"
+        for i in range(len(sources))
     )
     code = (
         """
@@ -219,12 +212,13 @@ static unsigned tl_vtcm_shared_high_water;
 """
         + "\n".join(sources)
         + """
-alignas(128) static half input[64 * 96];
+alignas(128) static half input[64 * 96], saved_input[64 * 96];
 alignas(128) static uint8_t output[64 * 96 * 2 + 128];
 int main(int argc, char **argv) {
   if (argc != 3) return 1;
   FILE *in = fopen(argv[1], "rb"), *out = fopen(argv[2], "wb");
   if (!in || !out || fread(input, sizeof(input), 1, in) != 1) return 2;
+  memcpy(saved_input, input, sizeof(input));
   memset(output, 0xa5, sizeof(output));
 """
         + calls
@@ -257,7 +251,7 @@ int main(int argc, char **argv) {
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     inputs, outputs = tmp_path / "input.bin", tmp_path / "output.bin"
-    inputs.write_bytes(_input_and_expected(*cases[0])[0].tobytes())
+    inputs.write_bytes(x.tobytes())
     simulated = subprocess.run(
         [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(inputs), str(outputs)],
         cwd=tmp_path,
@@ -266,8 +260,61 @@ int main(int argc, char **argv) {
         timeout=180,
     )
     assert simulated.returncode == 0, simulated.stdout + simulated.stderr
-    raw = np.frombuffer(outputs.read_bytes(), dtype=np.uint8).reshape(len(cases), 64 * 96 * 2 + 128)
-    for result, case in zip(raw, cases):
-        expected = _input_and_expected(*case)[1]
-        np.testing.assert_array_equal(result[:-128].view(np.uint16).reshape(expected.shape), expected.view(np.uint16), err_msg=str(case))
+    raw = np.frombuffer(outputs.read_bytes(), dtype=np.uint8).reshape(len(sources), 64 * 96 * 2 + 128)
+    for result in raw:
         np.testing.assert_array_equal(result[-128:], np.full(128, 0xA5, dtype=np.uint8))
+    return raw[:, :-128].copy().view(np.uint16)
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1", reason="requires the Hexagon SDK simulator")
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_region_maps_on_simulator(arch, tmp_path):
+    cases = [
+        (kind, region, guarded)
+        for kind in sorted(KINDS)
+        for region, guarded in [("aligned", False), ("columns", False), ("dynamic", False), ("cross_tile", False), ("tail", True)]
+    ]
+    sources = []
+    for index, (kind, region, guarded) in enumerate(cases):
+        source = _source(_map_region(kind, region, "float32", guarded), arch)
+        sources.append(source.replace("#include <tl_templates/hexagon/vtcm.h>", "").replace("kernel_kernel(", f"region_{index}("))
+    results = _simulate_maps(sources, _input_and_expected(*cases[0])[0], arch, tmp_path)
+    for result, case in zip(results, cases):
+        expected = _input_and_expected(*case)[1]
+        np.testing.assert_array_equal(result.reshape(expected.shape), expected.view(np.uint16), err_msg=str(case))
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1", reason="requires the Hexagon SDK simulator")
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_region_cancellation_matches_existing_whole_vector_path(arch, tmp_path):
+    # Region vectorization selects the same target arithmetic policy as the
+    # existing whole-buffer vector path. It need not reproduce scalar IEEE
+    # cancellation on v75/v79; do not encode one observed Qfloat bit pattern.
+    kinds = ["activation", "activation_t"]
+    sources = []
+    for kind in kinds:
+        for region in ["aligned", "whole"]:
+            source = _source(_map_region(kind, region, "float32"), arch)
+            assert re.search(r"\*\(half(?:32|64)\*\)", source)
+            assert not SCALAR_TILE_STORE.search(source)
+            sources.append(
+                source.replace("#include <tl_templates/hexagon/vtcm.h>", "").replace("kernel_kernel(", f"region_{len(sources)}(")
+            )
+    x = ((np.arange(64 * 96) % 251 - 125) / 4).astype(np.float16)
+    results = _simulate_maps(sources, x, arch, tmp_path)
+    for index, kind in enumerate(kinds):
+        shape = (96, 64) if kind.endswith("_t") else (64, 96)
+        original = x.reshape(shape)
+        region, whole = [result.reshape(shape) for result in results[2 * index : 2 * index + 2]]
+        selected = np.zeros(shape, dtype=bool)
+        if kind.endswith("_t"):
+            selected[:, 4:8] = True
+        else:
+            selected[4:8, :] = True
+        assert np.any(original[selected] == np.float16(-0.5))
+        expected = original.view(np.uint16).copy()
+        expected[selected] = whole[selected]
+        np.testing.assert_array_equal(region, expected, err_msg=kind)
+        if arch == "v73":
+            ieee = (original.astype(np.float32) * 2 + 1).astype(np.float16)
+            np.testing.assert_array_equal(whole, ieee.view(np.uint16), err_msg=kind)
