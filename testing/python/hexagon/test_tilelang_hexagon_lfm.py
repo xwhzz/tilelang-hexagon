@@ -370,6 +370,15 @@ def test_fp16_decode_matches_the_reference(model, processes, fp16_bundle):
         decoder.close()
 
 
+def _assert_prefill_norm_writes_activation_directly(source):
+    # Both paths scale FP32 values, round once to FP16 and store a whole
+    # physical register into a, with no intermediate row-major buffer.
+    assert not re.search(r"\bvoid\* rows =", source)
+    stores = [line for line in source.splitlines() if re.search(r"\*\(half(?:32|64)\*\)\(a_w \+", line)]
+    assert stores and all("nw" in line and "ss" in line for line in stores), stores
+    assert not re.search(r"a_w\[[^\]]*\] =", source)
+
+
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
 def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
@@ -378,6 +387,7 @@ def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
     # the HMX GEMM.
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm<" in source
+    _assert_prefill_norm_writes_activation_directly(source)
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
@@ -592,6 +602,7 @@ def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm_blockscaled<" in source
     assert "tl_hvx_exp2_fast(" in source and "tl_hvx_exp2(" not in source
+    _assert_prefill_norm_writes_activation_directly(source)
 
 
 @DEVICE

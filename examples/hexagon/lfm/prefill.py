@@ -122,8 +122,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
             for i in T.Parallel(2):
                 bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
             for i, k in T.Parallel(2, D):
-                bf.rows[i, k] = bf.x[r + i, k] * bf.ss[i] * bf.nw[k]
-            T.copy(bf.rows, bf.a[r : r + 2, :])
+                bf.a[r + i, k] = T.cast(bf.x[r + i, k] * bf.ss[i] * bf.nw[k], "float16")
 
     @T.macro
     def norm_rope(bf, col, weight, extra):
@@ -333,7 +332,6 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
             ones = T.alloc_shared((R, 1), "float32")
             cc = T.alloc_shared((2, R, BLOCK), "float32")
             gl = T.alloc_shared((R, BLOCK), "float16")
-            rows = T.alloc_fragment((2, D), "float32")
             sq = T.alloc_fragment((2, D), "float32")
             ss = T.alloc_fragment((2,), "float32")
             nw = T.alloc_shared((D,), "float32")
@@ -367,7 +365,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
                 ones[i, 0] = T.float32(1)
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
+                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
                 q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, gl=gl,
                 cos_rows=cos_rows, sin_rows=sin_rows, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,

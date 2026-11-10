@@ -132,9 +132,9 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         T.gemm(A, ring[k, 0:K, :], C, clear_accum=clear)
 
     @T.macro
-    def normalize(bf, s, squared: bool = False):
-        """rows = xr[s] * rsqrt(mean(xr[s]^2) + eps) * nw[k], RB rows; sq
-        already holds xr[s]^2 when `squared`."""
+    def normalize(bf, s, row, squared: bool = False):
+        """Normalize RB rows directly into a[row:row + RB] in activation
+        order; sq already holds xr[s]^2 when `squared`."""
         if not squared:
             for i, k in T.Parallel(RB, D):
                 bf.sq[i, k] = bf.xr[s, i, k] * bf.xr[s, i, k]
@@ -142,7 +142,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         for i in T.Parallel(RB):
             bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
         for i, k in T.Parallel(RB, D):
-            bf.rows[i, k] = bf.xr[s, i, k] * bf.ss[i] * bf.nw[k]
+            bf.a[row + i, k] = T.cast(bf.xr[s, i, k] * bf.ss[i] * bf.nw[k], "float16")
 
     @T.macro
     def embed(bf, chunk, n, tokens, head_rows, weight):
@@ -163,8 +163,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                 for k in T.Parallel(D):
                     bf.xr[0, i, k] = T.Cast("float32", bf.erow[k // 2, k % 2])
             T.dma_copy(bf.xr[0, :, :], bf.x[r : r + RB, :])
-            normalize(bf, 0)
-            T.copy(bf.rows, bf.a[r : r + RB, :])
+            normalize(bf, 0, r)
         T.dma_wait(0)
 
     @T.macro
@@ -177,8 +176,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             r = bf.w * RW + rb * RB
             T.dma_copy(bf.x[r : r + RB, :], bf.xr[0, :, :])
             T.dma_wait(0)
-            normalize(bf, 0)
-            T.copy(bf.rows, bf.a[r : r + RB, :])
+            normalize(bf, 0, r)
 
     @T.macro
     def add_branch(bf, post, sandwich: bool, weight, normed):
@@ -227,8 +225,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         bf.sq[i, k] = v * v
                 T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
                 if normed:
-                    normalize(bf, s, True)
-                    T.copy(bf.rows, bf.a[r : r + RB, :])
+                    normalize(bf, s, r, True)
         T.dma_wait(0)
 
     @T.macro
@@ -489,12 +486,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             sin_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
 
             # A worker's: the outputs of up to two panels, or of a head's;
-            # the rows it normalizes or embeds two at a time.
+            # the rows it normalizes or embeds RB at a time.
             cc = T.alloc_shared((2, R, TILE), "float32")
             gl = T.alloc_shared((R, TILE), "float16")
             st = T.alloc_shared((taps - 1, TILE), "float32")
             xr = T.alloc_shared((2, RB, D), "float32")
-            rows = T.alloc_fragment((RB, D), "float32")
             sq = T.alloc_fragment((RB, D), "float32")
             ss = T.alloc_fragment((RB,), "float32")
             sw = T.alloc_shared((RW,), "float32")
@@ -526,7 +522,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
 
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
+                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
                 hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
                 acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,
