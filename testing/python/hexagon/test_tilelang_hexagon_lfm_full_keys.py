@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from tilelang.hexagon.runtime import session
+from tvm import arith, tirx
 
 LFM = Path(__file__).resolve().parents[3] / "examples/hexagon/lfm"
 sys.path.insert(0, str(LFM))
@@ -142,8 +143,50 @@ def test_full_keys_normal_lowering_retains_sliding_and_four_workers(arch, keys):
     assert f"tl_hexagon_hmx_gemm<false, true, true, true>(64, {keys}, 128," in text
     assert "tl_hexagon_hmx_gemm<false, true, true, true>(64, 128, 128," in text
     assert "tl_parallel_for<tl_hmx_worker_scope, true>(4, 4," in text
-    assert "if (window == 0)" in text
+    # full_keys is an upper bound. Every selected width retains compact
+    # score/probability matrices and the existing vector reduction helpers.
+    for width in [128, 256] if keys == 256 else [128, 256, 512]:
+        assert f"tl_hexagon_hmx_gemm<false, true, true, true>(64, {width}, 128," in text
+        for op in ("MAX", "SUM"):
+            assert any(f"tl_crouton_reduce<TL_REDUCE_{op}" in line and f", 2, {width // 32}, 1," in line for line in text.splitlines())
     # The table's full layer still starts after zero rows and the sliding
     # layer after max_pos / 128 metadata units, irrespective of compute block.
     assert prefill_fp16.kinds_table(config(), 512)[1][4] == 0
     assert prefill_fp16.kinds_table(config(), 512)[3][4] == 4
+
+
+@pytest.mark.parametrize("rows", [64, 128, 256])
+@pytest.mark.parametrize("keys", [256, 512])
+@pytest.mark.parametrize("stage", ["mixed", "full", "sliding"])
+def test_full_keys_selection_uses_the_physical_chunk(rows, keys, stage):
+    layers = {"mixed": range(4), "full": range(1, 2), "sliding": range(3, 4)}[stage]
+    func = prefill_fp16.make_prefill(config(), rows, 4608, rows, layers, full_keys=keys)
+    bindings = {}
+
+    def collect(node):
+        if isinstance(node, tirx.Bind):
+            bindings[str(node.var.name)] = node
+
+    tirx.stmt_functor.post_order_visit(func.body, collect)
+    if stage == "sliding":
+        assert "selected_keys" not in bindings
+        return
+    expression = bindings["selected_keys"].value
+    for name in ("full_block", "base"):
+        if name in bindings:
+            binding = bindings[name]
+            expression = tirx.stmt_functor.substitute(expression, {binding.var: binding.value})
+    variables = []
+    tirx.stmt_functor.post_order_visit(expression, lambda node: variables.append(node) if isinstance(node, tirx.Var) else None)
+    # n/valid never enter the actual IR selector. In particular a padded
+    # n=20 call still selects for all rows, rather than for 20 queries.
+    assert {str(var.name) for var in variables} <= {"pos0", "chunk", "window"}
+    for pos0, chunk in [(0, 0), (0, 1), (1, 0), (64, 0), (65, 0), (128, 0), (129, 0), (4096, 0)]:
+        for window in [0, config().window] if stage == "mixed" else [0]:
+            values = {"pos0": pos0, "chunk": chunk, "window": window}
+            result = arith.Analyzer().simplify(
+                tirx.stmt_functor.substitute(expression, {var: tirx.IntImm(var.dtype, values[str(var.name)]) for var in variables})
+            )
+            end = pos0 + chunk * rows + rows
+            expected = 128 if window > 0 or end <= 128 else (256 if keys == 512 and end <= 256 else keys)
+            assert isinstance(result, tirx.IntImm) and int(result) == expected

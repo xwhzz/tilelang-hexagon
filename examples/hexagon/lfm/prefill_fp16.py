@@ -96,8 +96,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
 
     full_keys opts full-attention layers into 256- or 512-position blocks;
     sliding-window blocks and the cache metadata unit remain 128. A max_pos
-    not divisible by the requested block uses 128 instead. Larger blocks
-    require more VTCM; the normal four-worker arena check still applies."""
+    not divisible by the requested block uses 128 instead. When the entire
+    physical query chunk fits within 128 or 256 keys, full attention uses
+    that smaller block. Operands share a maximum-width workspace; scores
+    and probabilities keep compact per-width buffers. The normal
+    four-worker arena check still applies."""
     if not isinstance(full_keys, int) or full_keys not in (128, 256, 512):
         raise ValueError("full_keys must be 128, 256 or 512")
     # The bundle/cache metadata unit stays KEYS=128. A larger full-attention
@@ -372,11 +375,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         else:
             row = kv0 * KEYS + T.max(T.min(kb, max_pos // block_keys - 1), 0) * block_keys
             at = T.max(T.min(row, KV_ROWS - block_keys), 0)
-        T.dma_copy(bf.kv_k[kvh, at : at + block_keys, :], bf.kblk[slot, :, :])
-        T.dma_copy(bf.kv_v[kvh, at : at + block_keys, :], bf.vblk[slot, :, :])
+        T.dma_copy(bf.kv_k[kvh, at : at + block_keys, :], bf.kblk[slot, :block_keys, :])
+        T.dma_copy(bf.kv_v[kvh, at : at + block_keys, :], bf.vblk[slot, :block_keys, :])
 
     @T.macro
-    def attention(bf, kv0, base, window, block_keys: int):
+    def attention(bf, kv0, base, window, block_keys: int, scratch=None):
         """The worker's query heads, ROWS rows at a time: softmax(q K^T) V
         over the cache's positions [base + i - window + 1 (or 0), base + i]
         for row i, gated, into hid, in base 2 (the queries carry log2 e).
@@ -386,18 +389,27 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         tiles, which HMX multiplies by V and whose rows sum in fp32. The
         blocks of keys and values come by DMA, a block ahead, straight into
         HMX's operands: the cache keeps them in its tiles."""
-        qb = T.alloc_shared((ROWS, HD), "float16")
-        kblk = T.alloc_shared((2, block_keys, HD), "float16")
-        vblk = T.alloc_shared((2, block_keys, HD), "float16")
-        acc_o = T.alloc_shared((ROWS, HD), "float32")
-        m = T.alloc_shared((ROWS,), "float32")
-        ls = T.alloc_shared((ROWS,), "float32")
-        s = T.alloc_shared((ROWS, block_keys), "float16")
-        p = T.alloc_shared((ROWS, block_keys), "float16")
-        rmax = T.alloc_shared((ROWS,), "float32")
-        mh = T.alloc_shared((ROWS,), "float16")
-        rsum = T.alloc_shared((ROWS,), "float32")
-        alpha = T.alloc_shared((ROWS,), "float32")
+        if scratch is None:
+            qb = T.alloc_shared((ROWS, HD), "float16")
+            kblk = T.alloc_shared((2, block_keys, HD), "float16")
+            vblk = T.alloc_shared((2, block_keys, HD), "float16")
+            acc_o = T.alloc_shared((ROWS, HD), "float32")
+            m = T.alloc_shared((ROWS,), "float32")
+            ls = T.alloc_shared((ROWS,), "float32")
+            s = T.alloc_shared((ROWS, block_keys), "float16")
+            p = T.alloc_shared((ROWS, block_keys), "float16")
+            rmax = T.alloc_shared((ROWS,), "float32")
+            mh = T.alloc_shared((ROWS,), "float16")
+            rsum = T.alloc_shared((ROWS,), "float32")
+            alpha = T.alloc_shared((ROWS,), "float32")
+        else:
+            qb, kblk, vblk = scratch.qb, scratch.kblk, scratch.vblk
+            acc_o, m, ls = scratch.acc_o, scratch.m, scratch.ls
+            rmax, mh, rsum, alpha = scratch.rmax, scratch.mh, scratch.rsum, scratch.alpha
+            # Keep compact score/probability matrices: the existing vector
+            # maps and Crouton reductions operate on their complete buffers.
+            s = T.alloc_shared((ROWS, block_keys), "float16")
+            p = T.alloc_shared((ROWS, block_keys), "float16")
 
         abf = SimpleNamespace(
             w=bf.w,
@@ -419,8 +431,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             rsum=rsum,
             alpha=alpha,
         )
-        attn_layouts = {qb: make_hmx_activation_layout(qb), s: make_hmx_activation_layout(s)}
-        attn_layouts.update(kv_layouts(kblk, vblk))
+        if scratch is None:
+            attn_layouts = {qb: make_hmx_activation_layout(qb), s: make_hmx_activation_layout(s)}
+            attn_layouts.update(kv_layouts(kblk, vblk))
+        else:
+            attn_layouts = {s: make_hmx_activation_layout(s)}
         T.annotate_layout(attn_layouts)
         for h in T.serial(KH):
             kvh = abf.w * KH + h
@@ -445,7 +460,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                             T.dma_wait(2)
                         else:
                             T.dma_wait()
-                        T.gemm(abf.qb, abf.kblk[slot, :, :], abf.s, transpose_B=True, clear_accum=True)
+                        T.gemm(abf.qb, abf.kblk[slot, :block_keys, :], abf.s, transpose_B=True, clear_accum=True)
                         # Causal, and within the window: key kb * block_keys + j is
                         # visible to row i when row0 + i - span < key <= row0 + i,
                         # every key of the block to every row away from the
@@ -469,7 +484,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                             abf.ls[i] = abf.ls[i] * abf.alpha[i] + abf.rsum[i]
                         for i, d in T.Parallel(ROWS, HD):
                             abf.acc_o[i, d] = abf.acc_o[i, d] * abf.alpha[i]
-                        T.gemm(abf.p, abf.vblk[slot, :, :], abf.acc_o, clear_accum=False)
+                        T.gemm(abf.p, abf.vblk[slot, :block_keys, :], abf.acc_o, clear_accum=False)
                     # The loop's last step drained the queue; the wait tells the
                     # DMA queue's bound (PlanDMAQueue), which cannot prove that
                     # the loop runs at all and keeps the first fetch in flight.
@@ -578,6 +593,36 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             sq32 = T.alloc_shared((R, TILE), "float32")
             hs32 = T.alloc_shared((R,), "float32")
             gates = T.alloc_shared((KH, group, R), "float32")
+            # Mutually exclusive attention widths share their largest operands
+            # and accumulator. Each call drains DMA before it returns; the
+            # next call fills its active region before using it. Each width
+            # keeps compact S/P tiles below.
+            if full_keys != KEYS and has_full:
+                attn_qb = T.alloc_shared((ROWS, HD), "float16")
+                attn_kblk = T.alloc_shared((2, full_keys, HD), "float16")
+                attn_vblk = T.alloc_shared((2, full_keys, HD), "float16")
+                attn_acc_o = T.alloc_shared((ROWS, HD), "float32")
+                attn_m = T.alloc_shared((ROWS,), "float32")
+                attn_ls = T.alloc_shared((ROWS,), "float32")
+                attn_rmax = T.alloc_shared((ROWS,), "float32")
+                attn_mh = T.alloc_shared((ROWS,), "float16")
+                attn_rsum = T.alloc_shared((ROWS,), "float32")
+                attn_alpha = T.alloc_shared((ROWS,), "float32")
+                shared_attn_layouts = {attn_qb: make_hmx_activation_layout(attn_qb)}
+                shared_attn_layouts.update(kv_layouts(attn_kblk, attn_vblk))
+                T.annotate_layout(shared_attn_layouts)
+                attention_scratch = SimpleNamespace(
+                    qb=attn_qb,
+                    kblk=attn_kblk,
+                    vblk=attn_vblk,
+                    acc_o=attn_acc_o,
+                    m=attn_m,
+                    ls=attn_ls,
+                    rmax=attn_rmax,
+                    mh=attn_mh,
+                    rsum=attn_rsum,
+                    alpha=attn_alpha,
+                )
             # What the macros below work on.
             bf = SimpleNamespace(
                 w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
@@ -655,13 +700,23 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         ),
                     )
                     if full_keys != KEYS and has_full:
-                        if has_sliding:
-                            if window == 0:
-                                attention(bf, kv0, base, window, full_keys)
-                            else:
-                                attention(bf, kv0, base, window, KEYS)
+                        # All physical query rows, including padded tail rows,
+                        # must fit in the selected key block. Sliding stays 128.
+                        if full_keys == 512:
+                            full_block = T.if_then_else(base + R <= 256, 256, full_keys)
                         else:
-                            attention(bf, kv0, base, window, full_keys)
+                            full_block = full_keys
+                        selected_keys = T.if_then_else(base + R <= KEYS or (has_sliding and window > 0), KEYS, full_block)
+                        if selected_keys == KEYS:
+                            attention(bf, kv0, base, window, KEYS, attention_scratch)
+                        else:
+                            if full_keys == 512:
+                                if selected_keys == 256:
+                                    attention(bf, kv0, base, window, 256, attention_scratch)
+                                else:
+                                    attention(bf, kv0, base, window, full_keys, attention_scratch)
+                            else:
+                                attention(bf, kv0, base, window, full_keys, attention_scratch)
                     else:
                         attention(bf, kv0, base, window, KEYS)
                 else:
