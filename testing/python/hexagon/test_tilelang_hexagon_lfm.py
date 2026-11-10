@@ -456,6 +456,14 @@ def test_fp16_lfm2_full_keys_matches_the_reference(full_keys, fp16_bundle):
 
 
 @DEVICE
+@pytest.mark.parametrize("full_keys", [256, 512])
+def test_fp16_lfm3_full_keys_multiple_steps_match_the_reference(full_keys, fp16_bundle):
+    # One prefill call executes five STEP values, including full and sliding
+    # attention with LFM3's 128-wide heads and four workers.
+    _check_fp16_prefill_reference(fp16_bundle("lfm3"), 1, n=640, max_pos=1024, full_keys=full_keys)
+
+
+@DEVICE
 @pytest.mark.parametrize(("model", "processes"), STAGES[:3])
 def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):
     """A chat's second turn: a prefill, decode steps, then a prefill from where
