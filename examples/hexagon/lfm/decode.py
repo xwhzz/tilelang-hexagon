@@ -482,7 +482,11 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step).
+    the decode, a token a step). `prefill_full_keys` opts fp16 full-attention
+    layers into 256- or 512-position blocks; its default and sliding-window
+    blocks remain 128. A max_pos not divisible by that block uses 128.
+    Larger blocks need more VTCM; the normal arena check still rejects a
+    prefill chunk that cannot fit all four workers.
 
     The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
     weights and its cache of max_pos positions fit), each a stage of the
@@ -498,12 +502,19 @@ class Decoder:
         max_tokens: int = 4096,
         prefill_rows: int | str | None = "auto",
         processes: int | str = "auto",
+        *,
+        prefill_full_keys: int = 128,
     ):
+        if not isinstance(prefill_full_keys, int) or prefill_full_keys not in (128, 256, 512):
+            raise ValueError("prefill_full_keys must be 128, 256 or 512")
         header = bundle.read_header(bundle_path)
         c = Config.from_dict(header["config"])
         self.c, self.header, self.max_pos, self.max_tokens = c, header, max_pos, max_tokens
         # The fp16 bundle has no quantized tensors.
         self.fp16 = fp16 = not header["quant"]
+        if not fp16 and prefill_full_keys != 128:
+            raise ValueError("prefill_full_keys other than 128 requires an fp16 bundle")
+        self.prefill_full_keys = prefill_full_keys
         self.prefill_rows = (256 if fp16 else 128) if prefill_rows == "auto" else prefill_rows
         assert max_pos % POS_BLOCK == 0
         if fp16:
@@ -570,7 +581,9 @@ class Decoder:
         P = len(ranges)
         kernels = [(decode_fp16.make_decode(c, max_pos, self.max_tokens, r), []) for r in ranges]
         if R:
-            kernels += [(prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r), []) for r in ranges]
+            kernels += [
+                (prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r, full_keys=self.prefill_full_keys), []) for r in ranges
+            ]
         self.session = Session(kernels, processes=P)
 
         # The buffers, asked for by name and then allocated the largest first,
