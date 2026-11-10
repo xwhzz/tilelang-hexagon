@@ -164,6 +164,13 @@ hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP 
    └───────── adapter marshals torch tensors over FastRPC ───────┘
 ```
 
+The late `InterleaveMaps` pass supplies loop scheduling hints. Heavy HVX math
+maps unroll by two to expose independent instruction chains. On v79, complete
+contiguous FP16 maps that multiply one VTCM input by a constant or itself use
+`#pragma clang loop pipeline(disable)`. This rule requires disjoint input/output
+storage and changes no arithmetic or casts. Other targets, partial or in-place
+maps, and compound expressions retain their existing schedule.
+
 You can run it three ways: `tilelang.lower(fn, target="hexagon")` (inspect the C),
 `tilelang.compile(...)` / `@tilelang.jit(target="hexagon")` (build+deploy+run),
 or the direct `HexagonKernelAdapter`. Runnable operator examples (GEMM, flash
