@@ -45,6 +45,8 @@ from types import SimpleNamespace
 
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.target import hexagon_arch
+from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import Config, is_lfm2  # noqa: E402
@@ -77,11 +79,21 @@ def gemm(A, K: int, rw, rs, k, C, ones, clear, normal_scales: bool):
     )
 
 
-def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int, normal_scales: bool = False):
+def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int, normal_scales: bool = False, *, target=None):
     """The prefill kernel for config c, the bundle's tensor `shapes`, and
-    chunks of R rows."""
+    chunks of R rows. Without an explicit target, normalization keeps the
+    staged FP32 rows and pack. Pass the same target to the factory and compiler
+    to enable the qualified v79 large-width direct-store path."""
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, HD = c.dim, c.ff, c.head_dim
+    target = target if target is None or isinstance(target, Target) else Target(target)
+    direct_norm = (
+        D >= 2048
+        and hexagon_arch(target) == "v79"
+        and int(target.attrs.get("min_vector_bits", 0)) == 1024
+        and int(target.attrs.get("max_vector_bits", 0)) == 1024
+        and target.attrs.get("supports_unaligned_vector_access", False)
+    )
     H, KVH = c.heads, c.kv_heads
     conv_layers = [i for i in range(c.layers) if not c.is_attention(i)]
     attn_layers = list(c.attention_layers)
@@ -121,8 +133,13 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
             T.reduce_sum(bf.sq, bf.ss, dim=1)
             for i in T.Parallel(2):
                 bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
-            for i, k in T.Parallel(2, D):
-                bf.a[r + i, k] = T.cast(bf.x[r + i, k] * bf.ss[i] * bf.nw[k], "float16")
+            if direct_norm:
+                for i, k in T.Parallel(2, D):
+                    bf.a[r + i, k] = T.cast(bf.x[r + i, k] * bf.ss[i] * bf.nw[k], "float16")
+            else:
+                for i, k in T.Parallel(2, D):
+                    bf.rows[i, k] = bf.x[r + i, k] * bf.ss[i] * bf.nw[k]
+                T.copy(bf.rows, bf.a[r : r + 2, :])
 
     @T.macro
     def norm_rope(bf, col, weight, extra):
@@ -332,6 +349,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
             ones = T.alloc_shared((R, 1), "float32")
             cc = T.alloc_shared((2, R, BLOCK), "float32")
             gl = T.alloc_shared((R, BLOCK), "float16")
+            rows = T.alloc_fragment((2, D), "float32")
             sq = T.alloc_fragment((2, D), "float32")
             ss = T.alloc_fragment((2,), "float32")
             nw = T.alloc_shared((D,), "float32")
@@ -365,7 +383,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
                 ones[i, 0] = T.float32(1)
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
+                w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
                 q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, gl=gl,
                 cos_rows=cos_rows, sin_rows=sin_rows, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
                 kv_k=kv_k, kv_v=kv_v,

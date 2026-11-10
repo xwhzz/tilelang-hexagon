@@ -45,6 +45,8 @@ from types import SimpleNamespace
 
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.target import hexagon_arch
+from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decode_fp16  # noqa: E402
@@ -80,7 +82,7 @@ def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     return rows
 
 
-def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None):
+def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None):
     """The fp16 prefill kernel of config c, in chunks of R rows: chunk `chunk`
     of the n tokens from pos0 a call. The Decoder runs the chunks as a
     pipeline (Session.pipeline).
@@ -88,10 +90,20 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     A model split over DSP processes has a kernel for each run of `layers`
     (all of them by default), a stage of the pipeline, its tensors the
     layers' slices (decode_fp16.make_decode): the first embeds the chunk,
-    the others normalize the residual x the stage before left in DDR."""
+    the others normalize the residual x the stage before left in DDR.
+    Without an explicit target, normalization keeps staged FP32 rows and pack;
+    an explicit target must also be used when compiling this kernel."""
     layers = range(c.layers) if layers is None else layers
     has_embedding, has_last_layer = layers.start == 0, layers.stop == c.layers
     D, F, HD = c.dim, c.ff, c.head_dim
+    target = target if target is None or isinstance(target, Target) else Target(target)
+    direct_norm = (
+        D >= 2048
+        and hexagon_arch(target) == "v79"
+        and int(target.attrs.get("min_vector_bits", 0)) == 1024
+        and int(target.attrs.get("max_vector_bits", 0)) == 1024
+        and target.attrs.get("supports_unaligned_vector_access", False)
+    )
     H, KVH, taps = c.heads, c.kv_heads, c.conv_taps
     conv_layers = [i for i in layers if not c.is_attention(i)]
     attn_layers = [i for i in layers if c.is_attention(i)]
@@ -141,8 +153,13 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         T.reduce_sum(bf.sq, bf.ss, dim=1)
         for i in T.Parallel(RB):
             bf.ss[i] = T.rsqrt(bf.ss[i] * T.float32(1 / D) + T.float32(eps))
-        for i, k in T.Parallel(RB, D):
-            bf.a[row + i, k] = T.cast(bf.xr[s, i, k] * bf.ss[i] * bf.nw[k], "float16")
+        if direct_norm:
+            for i, k in T.Parallel(RB, D):
+                bf.a[row + i, k] = T.cast(bf.xr[s, i, k] * bf.ss[i] * bf.nw[k], "float16")
+        else:
+            for i, k in T.Parallel(RB, D):
+                bf.rows[i, k] = bf.xr[s, i, k] * bf.ss[i] * bf.nw[k]
+            T.copy(bf.rows, bf.a[row : row + RB, :])
 
     @T.macro
     def embed(bf, chunk, n, tokens, head_rows, weight):
@@ -491,6 +508,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             gl = T.alloc_shared((R, TILE), "float16")
             st = T.alloc_shared((taps - 1, TILE), "float32")
             xr = T.alloc_shared((2, RB, D), "float32")
+            rows = T.alloc_fragment((RB, D), "float32")
             sq = T.alloc_fragment((RB, D), "float32")
             ss = T.alloc_fragment((RB,), "float32")
             sw = T.alloc_shared((RW,), "float32")
@@ -522,7 +540,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
 
             # What the macros below work on.
             bf = SimpleNamespace(
-                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
+                w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
                 hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
                 acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,

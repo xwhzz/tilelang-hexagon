@@ -29,6 +29,8 @@ class _LatePermutation(tirx.PyStmtExprMutator):
         super().__init__()
         self.owned = owned
         self.analyzer = arith.Analyzer()
+        self.rewritten_stores = []
+        self.parents = []
 
     def _dense(self, buffer):
         if not self.analyzer.can_prove(buffer.elem_offset == 0):
@@ -147,7 +149,126 @@ class _LatePermutation(tirx.PyStmtExprMutator):
         order = [index for i in range(32) for index in (i, i + 32)]
         result = tirx.BufferStore(store.buffer, tirx.Shuffle([narrowed], order), indices)
         stamp_stmt_spans(result, get_stmt_span(store))
+        self.rewritten_stores.append(result)
         return result
+
+    def _contiguous_run(self, store, loop):
+        # Check the active iteration axis, not the allocation's total width.
+        # Each varying input must advance by exactly one FP32 vector.
+        loads = []
+        post_order_visit(store.value, lambda n: loads.append(n) if isinstance(n, tirx.BufferLoad) else None)
+        contiguous = False
+        for load in loads:
+            offset, scale = 0, 1
+            for index, shape in reversed(list(zip(load.indices, load.buffer.shape))):
+                offset += (index.base if isinstance(index, tirx.Ramp) else index) * scale
+                scale *= int(shape)
+            delta = self.analyzer.simplify(substitute(offset, {loop.loop_var: loop.loop_var + 1}) - offset)
+            if self.analyzer.can_prove(delta == 0):
+                continue
+            if load.dtype != "float32x32" or not self.analyzer.can_prove(delta == 32):
+                return False
+            contiguous = True
+        return contiguous
+
+    def _profitable_run(self, vector_loop, store):
+        # The initial qualified scope needs at least 64 consecutive column
+        # vectors. Small active regions keep their existing lowering, even
+        # when their backing allocation is large.
+        if not self.parents or not self.parents[-1].body.same_as(vector_loop):
+            return False
+        inner = self.parents[-1]
+
+        def long_run(loop):
+            return (
+                loop.kind in (tirx.ForKind.SERIAL, tirx.ForKind.UNROLLED)
+                and isinstance(loop.extent, tirx.IntImm)
+                and loop.extent.value >= 64
+                and self.analyzer.can_prove(loop.min == 0)
+                and (loop.step is None or self.analyzer.can_prove(loop.step == 1))
+                and not loop.annotations
+                and loop.thread_binding is None
+                and self._contiguous_run(store, loop)
+            )
+
+        if long_run(inner):
+            return True
+        if len(self.parents) < 2 or not self.parents[-2].body.same_as(inner):
+            return False
+        # A singleton pair axis disappears in normal simplification, so it
+        # already exposes the long run without reordering any iterations.
+        if (
+            inner.kind in (tirx.ForKind.SERIAL, tirx.ForKind.UNROLLED)
+            and self.analyzer.can_prove(inner.extent == 1)
+            and self.analyzer.can_prove(inner.min == 0)
+            and (inner.step is None or self.analyzer.can_prove(inner.step == 1))
+            and not inner.annotations
+            and inner.thread_binding is None
+            and long_run(self.parents[-2])
+        ):
+            return True
+        # Do not introduce permutation under a short inner loop unless the
+        # complete independent-nest proof also permits the required swap.
+        candidate = tirx.For(
+            inner.loop_var, inner.min, inner.extent, inner.kind, store, inner.thread_binding, inner.annotations, inner.step
+        )
+        return self._interchange(self.parents[-2], candidate) is not None
+
+    def _interchange(self, outer, inner):
+        # Only reorder the independent store just produced above. A longer
+        # contiguous input run belongs inside a short parity-pair loop, so the
+        # SDK can pipeline more than a handful of dependent multiplies.
+        if not isinstance(inner, tirx.For) or not isinstance(inner.body, tirx.BufferStore):
+            return None
+        store = inner.body
+        if not any(store.same_as(value) for value in self.rewritten_stores):
+            return None
+        for loop in (outer, inner):
+            if (
+                loop.kind not in (tirx.ForKind.SERIAL, tirx.ForKind.UNROLLED)
+                or not isinstance(loop.extent, tirx.IntImm)
+                or not self.analyzer.can_prove(loop.min == 0)
+                or (loop.step is not None and not self.analyzer.can_prove(loop.step == 1))
+                or loop.annotations
+                or loop.thread_binding is not None
+            ):
+                return None
+        if outer.extent.value < 64 or not 1 <= inner.extent.value <= 4:
+            return None
+        # A dense allocation may have holes between the written row groups.
+        # Flatten the store base and prove non-overlapping 64-element runs:
+        # origin + outer * outer_pitch + inner * inner_pitch + lane.
+        flat, stride = 0, 1
+        for index, shape in reversed(list(zip(store.indices, store.buffer.shape))):
+            base = index.base if isinstance(index, tirx.Ramp) else index
+            flat += base * stride
+            stride *= int(shape)
+        if stride > (1 << 31) - 1 or not self.analyzer.can_prove(flat >= 0) or not self.analyzer.can_prove(flat + 63 < stride):
+            return None
+        zero = {outer.loop_var: 0, inner.loop_var: 0}
+        origin = self.analyzer.simplify(substitute(flat, zero))
+        pitches = []
+        for loop in (outer, inner):
+            at_one = {**zero, loop.loop_var: 1}
+            pitch = self.analyzer.simplify(substitute(flat, at_one) - origin)
+            if not isinstance(pitch, tirx.IntImm):
+                return None
+            pitches.append(pitch.value)
+        outer_pitch, inner_pitch = pitches
+        if inner_pitch < 64 or outer_pitch < (inner.extent.value - 1) * inner_pitch + 64:
+            return None
+        if not self.analyzer.can_prove(flat == origin + outer.loop_var * outer_pitch + inner.loop_var * inner_pitch):
+            return None
+
+        if not self._contiguous_run(store, outer):
+            return None
+
+        def with_body(loop, body):
+            result = tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding, loop.annotations, loop.step)
+            stamp_stmt_spans(result, get_stmt_span(loop))
+            return result
+
+        return with_body(inner, with_body(outer, store))
 
     def visit_for_(self, op):
         # The bounds used below describe ordinary unit-step iteration. Do not
@@ -157,8 +278,18 @@ class _LatePermutation(tirx.PyStmtExprMutator):
         self.analyzer.bind(op.loop_var, ir.Range.from_min_extent(op.min, op.extent))
         result = self._match(op)
         if result is not None:
-            return result
-        body = self.visit_stmt(op.body)
+            if self._profitable_run(op, result):
+                return result
+            self.rewritten_stores.pop()
+            return op
+        self.parents.append(op)
+        try:
+            body = self.visit_stmt(op.body)
+        finally:
+            self.parents.pop()
+        interchanged = self._interchange(op, body)
+        if interchanged is not None:
+            return interchanged
         if body.same_as(op.body):
             return op
         result = tirx.For(op.loop_var, op.min, op.extent, op.kind, body, op.thread_binding, op.annotations, op.step)
@@ -170,7 +301,9 @@ def LateLanePermutation():
     """Before DecoupleTypeCast, move a proven parity split after FP16 narrowing.
 
     Only v79/128-byte HVX, full 64-lane stores and pure FP32 multiplication
-    trees are handled. Outer loops and rejected maps are unchanged.
+    trees with at least 64 consecutive 32-column iterations are handled.
+    A short inner parity-pair loop requires a proven independent interchange,
+    preserving both loop kinds; rejected maps keep their existing lowering.
     """
 
     def transform(func, _mod, _ctx):
