@@ -60,6 +60,18 @@ using TryPop = int (*)(tl_hexagon_dma_queue *, tl_hexagon_dma_transfer *);
 static_assert(std::is_same_v<decltype(&tl_hexagon_dma_queue_try_pop), TryPop>);
 static_assert(std::is_same_v<decltype(&tl_hexagon_dma_queue_pop), TryPop>);
 
+// Explicit two-argument function addresses retain the generic API types.
+using Generic = tl_hexagon_dma_async_context<1, 1>;
+using Submit = int (*)(Generic &, void *, const void *, uint32_t, uint32_t,
+                       uint32_t, uint32_t, int);
+using Commit = int (*)(Generic &);
+using Wait = int (*)(Generic &, uint32_t);
+static_assert(
+    std::is_same_v<decltype(&tl_hexagon_dma_async_submit<1, 1>), Submit>);
+static_assert(
+    std::is_same_v<decltype(&tl_hexagon_dma_async_commit<1, 1>), Commit>);
+static_assert(std::is_same_v<decltype(&tl_hexagon_dma_async_wait<1, 1>), Wait>);
+
 // Non-PIE host binaries put these objects below 4 GiB, so the actual DMA
 // address validation and managed constructor run without a mocked shortcut.
 alignas(128) static uint8_t src[512], dst[512];

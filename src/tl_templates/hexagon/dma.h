@@ -796,7 +796,7 @@ TL_DMA_INLINE int tl_hexagon_cache_writeback(const void *ptr,
 }
 
 // The kernel-facing calls: a failure becomes the kernel status TL_ERR_DMA.
-template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly = false>
 TL_DMA_INLINE int tl_hexagon_dma_async_submit(
     tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context,
     void *dst, const void *src, uint32_t dst_stride, uint32_t src_stride,
@@ -807,13 +807,13 @@ TL_DMA_INLINE int tl_hexagon_dma_async_submit(
              : TL_ERR_DMA;
 }
 
-template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly = false>
 TL_DMA_INLINE int tl_hexagon_dma_async_commit(
     tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context) {
   return context.commit() == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
 }
 
-template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly>
+template <uint32_t Descriptors, uint32_t Groups, bool LoadOnly = false>
 TL_DMA_INLINE int tl_hexagon_dma_async_wait(
     tl_hexagon_dma_async_context<Descriptors, Groups, LoadOnly> &context,
     uint32_t groups) {
