@@ -148,14 +148,15 @@ template <int N, int G, typename T, int M>
 TL_DEVICE vec_type<T, N> tl_hvx_broadcast_lane(const vec_type<T, M> &x, int i) {
   static_assert(M * sizeof(T) <= 128, "one register at most");
   constexpr int B = G * static_cast<int>(sizeof(T));
+  constexpr int bytes = N * static_cast<int>(sizeof(T));
   HVX_Vector v;
   __builtin_memcpy(&v, &x, sizeof(x));
   v = Q6_V_vdelta_VV(Q6_V_vror_VR(v, i * B), tl_hvx_replicate_control<B>());
   vec_type<T, N> out;
 #pragma clang loop unroll(full)
-  for (int b = 0; b < N * B; b += 128)
+  for (int b = 0; b < bytes; b += 128)
     __builtin_memcpy(reinterpret_cast<char *>(&out) + b, &v,
-                     N * B - b < 128 ? N * B - b : 128);
+                     bytes - b < 128 ? bytes - b : 128);
   return out;
 }
 
