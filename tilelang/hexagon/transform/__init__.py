@@ -1,6 +1,7 @@
 """Hexagon-specific transformation frontends."""
 
 from .. import _ffi_api
+from .late_lane_permutation import LateLanePermutation as LateLanePermutation
 
 
 def LowerKernelLaunch():

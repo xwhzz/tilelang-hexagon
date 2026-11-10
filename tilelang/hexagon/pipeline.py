@@ -96,6 +96,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.hexagon.transform.MarkDMACacheDirections()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
+    mod = tilelang.hexagon.transform.LateLanePermutation()(mod)
     mod = tilelang.transform.DecoupleTypeCast()(mod)
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
