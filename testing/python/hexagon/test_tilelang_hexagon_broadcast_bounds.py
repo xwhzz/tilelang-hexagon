@@ -54,7 +54,7 @@ def test_grouped_broadcast_stays_within_output_on_host(broadcast_host, group):
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1", reason="requires the Hexagon SDK simulator")
-@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_grouped_broadcast_on_simulator(arch, tmp_path):
     binary = tmp_path / "broadcast"
     subprocess.run(
