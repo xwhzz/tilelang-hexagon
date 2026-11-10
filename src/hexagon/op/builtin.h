@@ -26,7 +26,7 @@ constexpr const char *kHexagonNumWorkers = "hexagon.num_workers";
 // loop unroll_count). Set by InterleaveMaps.
 constexpr const char *kHexagonUnrollCount = "hexagon.unroll_count";
 
-// Disable software pipelining for the narrow v79 half map selected by
+// Disable software pipelining for the narrow v73/v79 half map selected by
 // InterleaveMaps. This does not change its arithmetic or vectorization.
 constexpr const char *kHexagonDisableSoftwarePipelining =
     "hexagon.disable_software_pipelining";
