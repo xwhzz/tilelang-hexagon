@@ -40,10 +40,14 @@ def _start(tmp_path, shell, mode):
     agent.write_text(
         f"#!{sys.executable}\n"
         "import os, sys, time\n"
+        "from pathlib import Path\n"
         "print(os.getpid(), flush=True)\n"
         "mode = sys.argv[1]\n"
         "if mode.startswith('exit'):\n"
-        "    time.sleep(0.1)\n"
+        "    deadline = time.monotonic() + 5\n"
+        "    while not Path(sys.argv[0]).with_name('release').exists():\n"
+        "        if time.monotonic() >= deadline: sys.exit(99)\n"
+        "        time.sleep(0.001)\n"
         "    sys.exit(int(mode[4:]))\n"
         "time.sleep(60)\n"
     )
@@ -95,6 +99,7 @@ def test_agent_status_survives_watchdog_cleanup(tmp_path, shell, status):
     proc, directory = _start(tmp_path, shell, f"exit{status}")
     try:
         pid, watch = _read_pid(proc)
+        (directory / "release").touch()
         # Keep stdin open: this is normal child exit, not EOF cancellation.
         assert proc.wait(timeout=5) == status
         assert _gone(pid)
