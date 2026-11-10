@@ -1,7 +1,7 @@
-"""Generated arithmetic kernels on the simulator and an opt-in v73 device.
+"""Generated v73/v75 arithmetic on the simulator and an opt-in v73 device.
 
-Only v73 enables the device-qualified local IEEE feature. The other targets'
-compilation checks ensure the policy cannot leak into their generated code.
+The local IEEE feature covers generic v73/v75 arithmetic. Compilation checks
+also ensure the feature stays out of the v79 instruction policy.
 """
 
 import importlib.util
@@ -483,15 +483,16 @@ def test_generated_arithmetic_feature_compilation(arch, tmp_path):
     compiled = subprocess.run(command, capture_output=True, text=True, timeout=180)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     text = ir.read_text()
-    assert ("+hvx-ieee-fp" in text) == (arch == "v73")
+    assert ("+hvx-ieee-fp" in text) == (arch in ("v73", "v75"))
     # Wrappers must not introduce one out-of-line C++ call per vector operation.
     assert not re.search(r"call[^\n]*@[^\n]*(?:vec_type|plERKS|mlERKS)", text)
 
 
 @SIMULATOR
+@pytest.mark.parametrize("arch", ["v73", "v75"])
 @pytest.mark.parametrize("columns", [256, 512])
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
-def test_reduction_keeps_one_qfloat_boundary(columns, dtype, tmp_path):
+def test_reduction_keeps_one_qfloat_boundary(arch, columns, dtype, tmp_path):
     @T.prim_func
     def reduce(A: T.Tensor((64, columns), dtype), C: T.Tensor((64,), "float32")):
         with T.Kernel(1):
@@ -503,7 +504,7 @@ def test_reduction_keeps_one_qfloat_boundary(columns, dtype, tmp_path):
 
     # Declaration-only VTCM entry points let the normal generated arithmetic
     # compile without a QURT runtime. No VTCM operation is simulated here.
-    generated = _source(reduce).replace("#include <tl_templates/hexagon/vtcm.h>", "")
+    generated = _source(reduce, arch).replace("#include <tl_templates/hexagon/vtcm.h>", "")
     source, ir = tmp_path / "reduction.cc", tmp_path / "reduction.ll"
     source.write_text(
         "#include <stdint.h>\nuint8_t *tl_vtcm_arena();\n"
@@ -513,7 +514,7 @@ def test_reduction_keeps_one_qfloat_boundary(columns, dtype, tmp_path):
     compiled = subprocess.run(
         [
             _tool("hexagon-clang++"),
-            "-mv73",
+            f"-m{arch}",
             "-mhvx",
             "-mhvx-length=128B",
             "-O2",
@@ -578,8 +579,9 @@ def _check_strided_half_sum(raw, initial, reference):
 
 
 @SIMULATOR
-def test_generated_half_sum_tail_and_strides(tmp_path):
-    source = _source(_strided_half_sum_kernel())
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+def test_generated_half_sum_tail_and_strides(arch, tmp_path):
+    source = _source(_strided_half_sum_kernel(), arch)
     assert "5, 259, 266, 3, (bool)1" in source
     assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, false>" in source
     # Keep the normal generated body; only provide a standalone arena in
@@ -619,7 +621,7 @@ int main(int argc, char **argv) {
     compiled = subprocess.run(
         [
             _tool("hexagon-clang++"),
-            "-mv73",
+            f"-m{arch}",
             "-mhvx",
             "-mhvx-length=128B",
             "-O2",
@@ -638,7 +640,7 @@ int main(int argc, char **argv) {
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     simulated = subprocess.run(
-        [_tool("hexagon-sim"), "-mv73", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -667,22 +669,49 @@ def test_generated_half_sum_tail_and_strides_on_device(tmp_path):
                 buffer.free()
 
 
+def _hmx_epilogue_kernel():
+    @T.prim_func
+    def epilogue(A: T.Tensor((64, 128), "float16"), B: T.Tensor((128, 64), "float16"), C: T.Tensor((64, 64), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((64, 64), "float16")
+            b = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_shared((64, 64), "float32")
+            T.clear(c)
+            for k in T.serial(2):
+                T.copy(A[:, k * 64 : (k + 1) * 64], a)
+                T.copy(B[k * 64 : (k + 1) * 64, :], b)
+                T.gemm(a, b, c)
+            for i, j in T.Parallel(64, 64):
+                C[i, j] = c[i, j] * T.float32(0.5)
+
+    return epilogue
+
+
 @SIMULATOR
-@pytest.mark.parametrize("example", ["flash_attention", "ffn"])
-def test_hmx_weight_interface_stays_inline_in_ieee_kernel(example, tmp_path):
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+@pytest.mark.parametrize("example", ["flash_attention", "ffn", "epilogue"])
+def test_hmx_weight_interface_stays_inline_in_ieee_kernel(arch, example, tmp_path):
     root = Path(__file__).resolve().parents[3]
-    spec = importlib.util.spec_from_file_location(example, root / f"examples/hexagon/example_{example}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    func = module.make_flash(64, 256, 64, 64) if example == "flash_attention" else module.make_ffn(64, 128, 256, 128)
+    if example == "epilogue":
+        func = _hmx_epilogue_kernel()
+    else:
+        spec = importlib.util.spec_from_file_location(example, root / f"examples/hexagon/example_{example}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        func = module.make_flash(64, 256, 64, 64) if example == "flash_attention" else module.make_ffn(64, 128, 256, 128)
     source, ir = tmp_path / "hmx.cc", tmp_path / "hmx.ll"
-    source.write_text(_source(func))
+    generated = _source(func, arch)
+    if example == "epilogue":
+        assert "tl_hexagon_hmx_gemm<true, true, false, false>" in generated
+    # A real writable binding prevents the unused static arena from folding to
+    # null and eliminating the kernel. Keep the generated body unchanged.
+    source.write_text(generated + '\nextern "C" int bind_test_arena(void *p, unsigned n) { return tl_vtcm_bind_region(p, n); }\n')
     sdk = Path(os.environ["HEXAGON_SDK_ROOT"])
     includes = [root / "src", sdk / "incs", sdk / "incs/stddef", sdk / "rtos/qurt"]
-    includes.extend(sdk / "rtos/qurt/computev73/include" / subdir for subdir in ("", "qurt", "posix"))
+    includes.extend(sdk / f"rtos/qurt/compute{arch}/include" / subdir for subdir in ("", "qurt", "posix"))
     command = [
         _tool("hexagon-clang++"),
-        "-mv73",
+        f"-m{arch}",
         "-mhmx",
         "-mhvx",
         "-mhvx-length=128B",
@@ -699,20 +728,27 @@ def test_hmx_weight_interface_stays_inline_in_ieee_kernel(example, tmp_path):
     ]
     compiled = subprocess.run(command, capture_output=True, text=True, timeout=180)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    text = ir.read_text()
+    entry = re.search(r"int32_t (\w+)\(", generated).group(1)
+    body = re.search(rf"^define[^\n]*@{entry}\([^\n]*\{{.*?^\}}", text, re.MULTILINE | re.DOTALL).group(0)
+    assert "ret i32 0" in body and "mxmem" in body
+    if example == "epilogue":
+        assert "llvm.hexagon.V6.vadd.sf" in body
     # Empty weight hooks, column lookup and tile lambdas must not become calls
     # inside the GEMM loops solely because the enclosing kernel enables IEEE.
-    assert not re.search(r"call[^\n]*@[^\n]*(?:tl_hmx_weight_tiles|tl_hmx_gemm)", ir.read_text())
+    assert not re.search(r"call[^\n]*@[^\n]*(?:tl_hmx_weight_tiles|tl_hmx_gemm)", text)
 
 
 @SIMULATOR
-def test_generated_v73_arithmetic_matches_ieee(tmp_path):
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+def test_generated_arithmetic_matches_ieee(arch, tmp_path):
     root = Path(__file__).resolve().parents[3]
-    source, inputs, expected = _program(tmp_path, "v73")
+    source, inputs, expected = _program(tmp_path, arch)
     executable, output = tmp_path / "generated", tmp_path / "output.bin"
     compiled = subprocess.run(
         [
             _tool("hexagon-clang++"),
-            "-mv73",
+            f"-m{arch}",
             "-mhvx",
             "-mhvx-length=128B",
             "-O2",
@@ -731,7 +767,7 @@ def test_generated_v73_arithmetic_matches_ieee(tmp_path):
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     simulated = subprocess.run(
-        [_tool("hexagon-sim"), "-mv73", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -749,14 +785,15 @@ def test_generated_v73_arithmetic_matches_ieee(tmp_path):
 
 
 @SIMULATOR
-def test_half_to_integer_truncates_across_vector_widths(tmp_path):
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+def test_half_to_integer_truncates_across_vector_widths(arch, tmp_path):
     root = Path(__file__).resolve().parents[3]
     source = Path(__file__).with_name("hvx_arithmetic_cast_sim.cc")
     executable, inputs, output = (tmp_path / name for name in ("casts", "input.bin", "output.bin"))
     compiled = subprocess.run(
         [
             _tool("hexagon-clang++"),
-            "-mv73",
+            f"-m{arch}",
             "-mhvx",
             "-mhvx-length=128B",
             "-O2",
@@ -784,7 +821,7 @@ def test_half_to_integer_truncates_across_vector_widths(tmp_path):
             expected.append(values.astype(dtype))
     inputs.write_bytes(data)
     simulated = subprocess.run(
-        [_tool("hexagon-sim"), "-mv73", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
+        [_tool("hexagon-sim"), f"-m{arch}", "--simulated_returnval", str(executable), "--", str(inputs), str(output)],
         cwd=tmp_path,
         capture_output=True,
         text=True,

@@ -35,13 +35,14 @@ using half = __fp16;
 #define TL_DEVICE static inline __attribute__((always_inline))
 #endif
 
-// Generic arithmetic on the device-qualified v73 path must not round through
-// Qfloat. Apply the feature only to generated function scopes that evaluate
-// floating operations; pure transfer/HMX scopes keep their helper policy.
+// Generic v73/v75 arithmetic must not round through Qfloat. Apply the feature
+// only to generated function scopes that evaluate floating operations;
+// pure transfer/HMX scopes keep their helper policy.
 // The tested SM8750 v79 cDSP does not execute these instructions correctly.
 // Vector wrappers must inline across this feature boundary rather than become
 // Qfloat callees.
-#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+#if defined(__HVX__) && (__HVX_ARCH__ == 73 || __HVX_ARCH__ == 75) &&          \
+    __HVX_LENGTH__ == 128
 #define TL_HEXAGON_IEEE_ARITHMETIC __attribute__((target("hvx-ieee-fp")))
 #define TL_HEXAGON_VECTOR_INLINE __attribute__((always_inline))
 #else
@@ -179,7 +180,8 @@ template <typename T, int N> struct __attribute__((may_alias)) vec_type {
       typedef int32_t wide_t __attribute__((ext_vector_type(N)));
       wide_t w = __builtin_convertvector(o.v, wide_t);
       tl_vec_vconv_sf_w<N>(&v, &w);
-#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+#if defined(__HVX__) && (__HVX_ARCH__ == 73 || __HVX_ARCH__ == 75) &&          \
+    __HVX_LENGTH__ == 128
     } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool> &&
                          std::is_same_v<U, half>) {
       // A C/TIR cast truncates; IEEE half-to-integer instructions round.

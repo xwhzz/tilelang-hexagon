@@ -270,8 +270,9 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_qf32_sum(const S *row, int steps) {
           Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1), Q6_Vqf32_vadd_Vqf32Vqf32(a2, a3))));
 }
 
-#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
-// Keep half widening and the explicit Qfloat loop in one leaf across v73's
+#if defined(__HVX__) && (__HVX_ARCH__ == 73 || __HVX_ARCH__ == 75) &&          \
+    __HVX_LENGTH__ == 128
+// Keep half widening and the explicit Qfloat loop in one leaf across v73/v75's
 // IEEE entry boundary. This avoids spilling the caller's live vectors around
 // individual widening steps without changing the FP32-source reduction path.
 template <int K, typename A, bool Aligned>
@@ -291,7 +292,8 @@ TL_DEVICE tl_hvx_reg<A> tl_reduce_row(const S *row, int cols) {
   tl_hvx_reg<A> acc;
   if (steps >= 4) {
     if constexpr (tl_reduce_qf32_row<K, A, S>) {
-#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+#if defined(__HVX__) && (__HVX_ARCH__ == 73 || __HVX_ARCH__ == 75) &&          \
+    __HVX_LENGTH__ == 128
       if constexpr (std::is_same_v<S, half>)
         acc = tl_reduce_qf32_half_sum<K, A, Aligned>(row, steps);
       else

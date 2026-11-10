@@ -87,8 +87,9 @@ template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
 // workers of a pool take turns at HMX, a tile each, and each runs its epilogue
 // and slice outside its turn.
 // Keep panel epilogues under the original inlining heuristic. Only ordinary
-// fp16 weights need this call forced across a v73 IEEE caller boundary.
-#if defined(__HVX__) && __HVX_ARCH__ == 73 && __HVX_LENGTH__ == 128
+// fp16 weights need this call forced across a v73/v75 IEEE caller boundary.
+#if defined(__HVX__) && (__HVX_ARCH__ == 73 || __HVX_ARCH__ == 75) &&          \
+    __HVX_LENGTH__ == 128
 #define TL_HMX_EPILOGUE(...)                                                   \
   do {                                                                         \
     if constexpr (std::is_same_v<B, tl_hmx_weight_tiles>) {                    \
