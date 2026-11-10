@@ -121,7 +121,7 @@ def test_full_keys_does_not_change_nonfull_stages(stage, keys):
     assert source(keys, *stage) == source(128, *stage)
 
 
-@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 @pytest.mark.parametrize("keys", [256, 512])
 def test_full_keys_normal_lowering_retains_sliding_and_four_workers(arch, keys):
     text = source(keys, arch=arch)
