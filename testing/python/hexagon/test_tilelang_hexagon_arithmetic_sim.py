@@ -1,10 +1,11 @@
-"""Generated v73/v75 arithmetic on the simulator and an opt-in v73 device.
+"""Generated v73/v75 arithmetic on the simulator and an opt-in matching device.
 
 The local IEEE feature covers generic v73/v75 arithmetic. Compilation checks
 also ensure the feature stays out of the v79 instruction policy.
 """
 
 import importlib.util
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import re
@@ -23,10 +24,19 @@ SIMULATOR = pytest.mark.skipif(
     os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1",
     reason="set TL_HEXAGON_SIMULATOR_TEST=1 to run the Hexagon SDK simulator",
 )
-DEVICE = pytest.mark.skipif(
-    os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1" or os.environ.get("HEXAGON_DSP_ARCH", "v79") != "v73",
-    reason="requires an authorized v73 device and SDK",
-)
+
+
+def _device_target():
+    from tilelang.backend.target import determine_target
+    from tilelang.hexagon.target import hexagon_arch
+
+    if os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1":
+        pytest.skip("requires an authorized v73/v75 device and SDK")
+    current = tvm.target.Target.current(allow_none=True)
+    target = determine_target(current if current is not None else "hexagon", return_object=True)
+    if hexagon_arch(target) not in ("v73", "v75"):
+        pytest.skip("IEEE arithmetic device coverage requires a v73/v75 target")
+    return target
 
 
 def _tool(name):
@@ -650,12 +660,12 @@ int main(int argc, char **argv) {
     _check_strided_half_sum(output.read_bytes(), initial, reference)
 
 
-@DEVICE
 def test_generated_half_sum_tail_and_strides_on_device(tmp_path):
+    target = _device_target()
     from tilelang.hexagon.runtime.session import Session
 
     source, initial, reference = _strided_half_sum_inputs()
-    with Session([(_strided_half_sum_kernel(), [2])]) as session:
+    with Session([(_strided_half_sum_kernel(), [2])], target=target) as session:
         buffers = [session.buffer(size + 128) for size in (source.nbytes, initial.nbytes, initial.nbytes)]
         try:
             for buffer, data in zip(buffers, (source.tobytes(), initial.tobytes(), b"\xa5" * initial.nbytes)):
@@ -846,8 +856,8 @@ def test_half_to_integer_truncates_across_vector_widths(arch, tmp_path):
     assert offset == len(raw)
 
 
-@DEVICE
-def test_generated_v73_arithmetic_on_device(tmp_path):
+def test_generated_arithmetic_on_device(tmp_path):
+    target = _device_target()
     from tilelang.hexagon.runtime.session import Session
 
     cases = list(_cases())
@@ -859,7 +869,7 @@ def test_generated_v73_arithmetic_on_device(tmp_path):
         kernels.append((func, [2]))
     # One session keeps every normally lowered serial/worker variant in the
     # same generated project. Inputs and outputs have 128-byte guard regions.
-    with Session(kernels) as session:
+    with Session(kernels, target=target) as session:
         for index, (kind, dtype, width, workers, _) in enumerate(cases):
             n = width * (4 if workers else 1)
             a, b = _inputs(dtype, n, kind)
@@ -879,15 +889,16 @@ def test_generated_v73_arithmetic_on_device(tmp_path):
                     buffer.free()
 
 
-@DEVICE
 @pytest.mark.parametrize("dtype", [f"{sign}{bits}" for bits in (8, 16, 32, 64) for sign in ("int", "uint")])
-def test_generated_v73_integer_casts_on_device(dtype, tmp_path):
+def test_generated_integer_casts_on_device(dtype, tmp_path):
+    target = _device_target()
     from tilelang.engine.param import KernelParam
+    from tilelang.hexagon.target import hexagon_arch
     from tilelang.hexagon.runtime.session import Session, lower_kernels
 
     cases = [(lanes, None) for lanes in (1, 2, 4, 8, 16, 32, 64, 128)] + [(64, 2)]
     kernels = [(_integer_cast_kernel(dtype, lanes, workers), [1]) for lanes, workers in cases]
-    lowered = lower_kernels(kernels)
+    lowered = lower_kernels(kernels, target=target)
     if dtype.startswith("uint") and dtype != "uint8":
         # Unsigned 16/32/64-bit storage is not an adapter dtype. Keep the
         # normally generated arithmetic body intact and expose its bytes
@@ -903,7 +914,7 @@ def test_generated_v73_integer_casts_on_device(dtype, tmp_path):
             params[1] = KernelParam(storage, params[1].shape)
             wrapped.append((name, source, params, out_idx))
         lowered = wrapped
-    with Session.of_lowered(lowered, dsp_arch="v73") as session:
+    with Session.of_lowered(lowered, dsp_arch=hexagon_arch(target)) as session:
         for index, (lanes, workers) in enumerate(cases):
             n = 256 * (4 if workers else 1)
             values = _integer_inputs(np.dtype(dtype), n)
@@ -920,3 +931,65 @@ def test_generated_v73_integer_casts_on_device(dtype, tmp_path):
             finally:
                 dst.free()
                 src.free()
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75"])
+@pytest.mark.parametrize("case", ["arithmetic", "integer_cast", "strided_half_sum"])
+def test_device_arithmetic_lowering_and_session_arch_agree(arch, case, monkeypatch, tmp_path):
+    from tilelang.hexagon.runtime import session
+    from tilelang.hexagon.target import hexagon_arch
+
+    monkeypatch.setenv("TL_HEXAGON_DEVICE_TEST", "1")
+    calls = []
+    targets = []
+    normal_lower = session.lower_kernels
+
+    def lower(kernels, target="hexagon"):
+        assert hexagon_arch(target) == arch
+        targets.append(arch)
+        return normal_lower(kernels, target=target)
+
+    class BeforeOpen(Exception):
+        pass
+
+    def before_open(self, lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes):
+        calls.append(dsp_arch)
+        assert dsp_arch == arch and processes == 1
+        assert lowered and all("TL_HEXAGON_IEEE_ARITHMETIC" in source for _, source, _, _ in lowered)
+        raise BeforeOpen
+
+    # Exercise the real device test and normal lowering, stopping before SDK,
+    # allocation or transport. In particular, uint16 uses the storage wrapper.
+    monkeypatch.setattr(session, "lower_kernels", lower)
+    monkeypatch.setattr(session.Session, "_open", before_open)
+    for current in (False, True):
+        # An active target must override a conflicting environment for both
+        # lowering and the session, including the strided reduction path.
+        monkeypatch.setenv("HEXAGON_DSP_ARCH", ("v75" if arch == "v73" else "v73") if current else arch)
+        scope = tvm.target.Target({"kind": "hexagon", "mcpu": f"hexagon{arch}"}) if current else nullcontext()
+        with scope, pytest.raises(BeforeOpen):
+            if case == "arithmetic":
+                test_generated_arithmetic_on_device(tmp_path)
+            elif case == "integer_cast":
+                test_generated_integer_casts_on_device("uint16", tmp_path)
+            else:
+                test_generated_half_sum_tail_and_strides_on_device(tmp_path)
+    assert calls == targets == [arch, arch]
+
+
+@pytest.mark.parametrize(
+    "arch,opt_in,current,expected",
+    [("v73", False, None, None), ("v79", True, None, None), ("v75", True, "v79", None), ("v73", True, "v75", "v75")],
+)
+def test_device_arithmetic_target_gate(arch, opt_in, current, expected, monkeypatch):
+    from tilelang.hexagon.target import hexagon_arch
+
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)
+    monkeypatch.setenv("TL_HEXAGON_DEVICE_TEST", "1" if opt_in else "0")
+    scope = tvm.target.Target({"kind": "hexagon", "mcpu": f"hexagon{current}"}) if current else nullcontext()
+    with scope:
+        if expected is None:
+            with pytest.raises(pytest.skip.Exception):
+                _device_target()
+        else:
+            assert hexagon_arch(_device_target()) == expected
