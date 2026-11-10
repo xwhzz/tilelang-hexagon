@@ -1,6 +1,6 @@
 /*!
  * \file tl/hexagon/transform/interleave_maps.cc
- * \brief Scheduling hints for heavy maps and simple v79 half maps.
+ * \brief Scheduling hints for heavy maps and simple v73/v79 half maps.
  *
  * A vectorized map whose elements compute an HVX math function (exp, sigmoid,
  * a division, ...) runs a chain of a few dozen dependent instructions per
@@ -14,8 +14,8 @@
  * Marks such loops, innermost and storing one vector an iteration, for
  * the codegen, which prints them unrolled by two (`#pragma clang loop
  * unroll_count`). Unrolling keeps the iterations in order, so any loop may.
- * A separate, conservative v79 half64 multiply/square pattern disables software
- * pipelining; other arithmetic, aliasing and partial maps retain their
+ * A separate, conservative v73/v79 half64 multiply/square pattern disables
+ * software pipelining; other arithmetic, aliasing and partial maps retain their
  * schedule.
  */
 
@@ -115,8 +115,8 @@ bool IsInt(const PrimExpr &value, int64_t expected) {
 }
 
 // A deliberately small scheduling pattern, not algebraic simplification.
-// On v79, software-pipelining these half64 maps inhibits a cheaper schedule;
-// add/affine/two-input maps need the existing pipeliner. Forward only lexical
+// The v73/v79 rule is limited to these half64 maps; add/affine/two-input maps
+// keep the existing pipeliner. Forward only lexical
 // local SSA copies for recognition, leaving the emitted math/casts untouched.
 class SimpleHalfMap {
 public:
@@ -327,7 +327,8 @@ public:
   explicit MapInterleaver(const PrimFunc &func) {
     if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
       simple_maps_ = TargetIsHexagon(target.value()) &&
-                     HexagonArchVersion(target.value()) == 79 &&
+                     (HexagonArchVersion(target.value()) == 73 ||
+                      HexagonArchVersion(target.value()) == 79) &&
                      target.value()
                              ->GetAttr<Integer>("min_vector_bits", Integer(0))
                              .value()

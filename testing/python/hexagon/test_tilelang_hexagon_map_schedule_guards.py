@@ -84,31 +84,36 @@ def _check(func, matched):
 
 
 @pytest.mark.parametrize("case", ["direct", "unit_step", "local_square"])
-def test_complete_disjoint_maps_change_only_the_schedule(case):
-    _check(_map_ir(case), True)
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_complete_disjoint_maps_change_only_the_schedule(case, arch):
+    _check(_map_ir(case, arch=arch), True)
 
 
 @pytest.mark.parametrize("case", ["same_offset", "overlap", "no_exclusive"])
-def test_distinct_arena_views_need_a_nonoverlap_proof(case):
-    _check(_map_ir(case), False)
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_distinct_arena_views_need_a_nonoverlap_proof(case, arch):
+    _check(_map_ir(case, arch=arch), False)
 
 
 @pytest.mark.parametrize("case", ["local_before_write", "local_rewrite", "local_unused", "extra_store"])
-def test_local_forwarding_requires_single_assignment_and_one_output(case):
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_local_forwarding_requires_single_assignment_and_one_output(case, arch):
     # These are pass inputs only: an undefined/reassigned local must never be
     # accepted as the simple SSA map or executed by this regression test.
-    _check(_map_ir(case), False)
+    _check(_map_ir(case, arch=arch), False)
 
 
 @pytest.mark.parametrize("case", ["load_predicate", "store_predicate", "annotated"])
-def test_predicates_and_existing_annotations_keep_their_schedule(case):
-    _check(_map_ir(case), False)
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_predicates_and_existing_annotations_keep_their_schedule(case, arch):
+    _check(_map_ir(case, arch=arch), False)
 
 
-@pytest.mark.parametrize("arch,vector_bits", [("v81", 1024), ("v79", 512), ("v79", 2048)])
+@pytest.mark.parametrize("arch,vector_bits", [("v75", 1024), ("v81", 1024), ("v73", 512), ("v73", 2048), ("v79", 512), ("v79", 2048)])
 def test_direct_vector_ir_still_requires_the_qualified_target(arch, vector_bits):
     _check(_map_ir(arch=arch, vector_bits=vector_bits), False)
 
 
-def test_nonunit_outer_step_is_not_a_complete_contiguous_map():
-    _check(_map_ir("nonunit_step"), False)
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_nonunit_outer_step_is_not_a_complete_contiguous_map(arch):
+    _check(_map_ir("nonunit_step", arch=arch), False)

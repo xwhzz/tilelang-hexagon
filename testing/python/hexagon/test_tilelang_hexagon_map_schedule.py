@@ -1,4 +1,4 @@
-"""Keep the v79 single-input multiply policy separate from other maps."""
+"""Keep the v73/v79 single-input multiply policy separate from other maps."""
 
 import os
 
@@ -12,6 +12,7 @@ from tilelang.hexagon import language as T
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires a Hexagon device and SDK")
 PRAGMA = "#pragma clang loop pipeline(disable)"
+SCHEDULED_MAPS = [("multiply", 2), ("multiply", 1.5), ("multiply", 0.5), ("multiply", -0.75), ("square", 2), ("square_half", 2)]
 
 
 def _map(mode, n=2048, dtype="float16", coefficient=2):
@@ -72,42 +73,46 @@ def _source(func, arch="v79"):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
 
-@pytest.mark.parametrize("mode", ["multiply", "square", "square_half"])
-def test_single_input_multiply_uses_one_scheduling_annotation(mode):
-    source = _source(_map(mode))
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("n", [128, 2048, 65536])
+@pytest.mark.parametrize("mode,coefficient", SCHEDULED_MAPS)
+def test_single_input_multiply_uses_one_scheduling_annotation(mode, coefficient, n, arch):
+    source = _source(_map(mode, n=n, coefficient=coefficient), arch)
     assert source.count(PRAGMA) == 1
     assert "unroll_count(2)" not in source
     following = source.split(PRAGMA)[1].lstrip()
     assert following.startswith("for (") and "half64" in following
 
 
-@pytest.mark.parametrize("coefficient", [0.5, 1.5, -0.75])
-def test_fixed_half_coefficients_share_the_policy(coefficient):
-    assert _source(_map("multiply", coefficient=coefficient)).count(PRAGMA) == 1
-
-
+@pytest.mark.parametrize("arch", ["v73", "v79"])
 @pytest.mark.parametrize("mode", ["add", "affine", "axpy", "copy", "relu", "heavy", "inplace", "strided", "partial", "two_inputs"])
-def test_other_maps_keep_their_schedule(mode):
-    source = _source(_map(mode))
+def test_other_maps_keep_their_schedule(mode, arch):
+    source = _source(_map(mode), arch)
     assert PRAGMA not in source
     if mode == "heavy":
         assert source.count("#pragma clang loop unroll_count(2)") == 1
 
 
-@pytest.mark.parametrize("mode", ["multiply", "square"])
-@pytest.mark.parametrize("arch", ["v73", "v75"])
+@pytest.mark.parametrize("mode", ["multiply", "square", "square_half"])
+@pytest.mark.parametrize("arch", ["v75", "v81"])
 def test_policy_uses_the_function_target(mode, arch):
     assert PRAGMA not in _source(_map(mode), arch)
 
 
 @pytest.mark.parametrize("mode", ["multiply", "square"])
-def test_float32_and_partial_vectors_keep_their_schedule(mode):
-    assert PRAGMA not in _source(_map(mode, dtype="float32"))
-    assert PRAGMA not in _source(_map(mode, n=2047))
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_float32_and_partial_vectors_keep_their_schedule(mode, arch):
+    assert PRAGMA not in _source(_map(mode, dtype="float32"), arch)
+    assert PRAGMA not in _source(_map(mode, n=2047), arch)
+
+
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_single_vector_has_no_loop_scheduling_hint(arch):
+    assert PRAGMA not in _source(_map("multiply", n=64), arch)
 
 
 @DEVICE
-@pytest.mark.parametrize("mode,coefficient", [("multiply", 2), ("multiply", 1.5), ("square", 2), ("square_half", 2)])
+@pytest.mark.parametrize("mode,coefficient", SCHEDULED_MAPS)
 def test_scheduled_map_values_and_buffer_guards(mode, coefficient):
     from tilelang.hexagon.runtime.session import Session
 

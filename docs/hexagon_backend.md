@@ -165,10 +165,12 @@ hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP 
 ```
 
 The late `InterleaveMaps` pass supplies loop scheduling hints. Heavy HVX math
-maps unroll by two to expose independent instruction chains. On v79, complete
+maps unroll by two to expose independent instruction chains. On v73 and v79, complete
 contiguous FP16 maps that multiply one VTCM input by a constant or itself use
 `#pragma clang loop pipeline(disable)`. This rule requires disjoint input/output
-storage and changes no arithmetic or casts. Other targets, partial or in-place
+storage and changes no arithmetic or casts. It retains v73's IEEE arithmetic
+and v79's existing typed operations; it does not change the v75 arithmetic
+policy. Other targets, partial or in-place
 maps, and compound expressions retain their existing schedule.
 
 You can run it three ways: `tilelang.lower(fn, target="hexagon")` (inspect the C),
