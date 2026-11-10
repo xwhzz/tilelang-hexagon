@@ -61,6 +61,60 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
         kernel.adapter.close()
 
 
+def make_cached_load_probe():
+    @T.prim_func
+    def probe(A: T.Tensor((320,), "int32"), Dirty: T.Tensor((320,), "int32"), Out: T.Tensor((320,), "int32")):
+        with T.Kernel(1):
+            staged = T.alloc_shared((256,), "int32", align=128)
+            for i in T.Parallel(256):
+                Dirty[i + 32] = A[i + 32] + T.int32(17)
+            T.dma_copy(Dirty[32:288], staged)
+            T.dma_wait()
+            T.copy(staged, Out[32:288])
+
+    return probe
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_load_only_dma_reads_dirty_source_and_preserves_guards():
+    """A D1/G1 load must publish preceding DSP writes even without DMA stores."""
+    import torch
+    from tilelang.hexagon.runtime.session import Session
+
+    probe = make_cached_load_probe()
+    target = determine_target("hexagon", return_object=True)
+    source = lower(probe, target)
+    policy = ", true" if target.attrs.get("mcpu") == "hexagonv79" else ""
+    assert f"tl_hexagon_dma_async_context<1, 1{policy}> tl_dma_async;" in source
+    assert submit_directions(source) == [0]
+    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
+    assert "tl_parallel_for" not in source
+
+    size = 320 * 4
+    guard = bytes([0xA5]) * 128
+    with Session([(probe, [])], target=target) as sess:
+        allocations = [sess.buffer(size + len(guard)) for _ in range(3)]
+        args = [buf.at(0, size) for buf in allocations]
+        # Aligned ordinary HVX stores keep this queue eligible for load-only.
+        # The cache lines before and after the payload must stay unchanged.
+        for seed in (1, 2):
+            src = torch.arange(320, dtype=torch.int32) * 7919 + seed
+            untouched = torch.full((320,), -9876543, dtype=torch.int32)
+            allocations[0].write(src.numpy().tobytes() + guard)
+            for buf in allocations[1:]:
+                buf.write(untouched.numpy().tobytes() + guard)
+            sess.kernels[0](*args)
+            returned = [buf.read() for buf in allocations]
+            assert returned[0] == src.numpy().tobytes() + guard
+            expected = untouched.clone()
+            expected[32:288] = src[32:288] + 17
+            for raw in returned[1:]:
+                assert raw[size:] == guard
+                actual = torch.frombuffer(bytearray(raw[:size]), dtype=torch.int32)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def lower(func, target="hexagon"):
     target = determine_target(target, return_object=True)
     with tvm.target.Target(target):
