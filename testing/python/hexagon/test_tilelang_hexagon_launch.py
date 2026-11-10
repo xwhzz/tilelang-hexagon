@@ -129,6 +129,77 @@ def test_kernel_has_no_threads_keyword():
         T.Kernel(1, threads=1)
 
 
+@pytest.mark.parametrize("requested", [0, -1, True, 1.5, 2**31, 2**32, 2**32 + 1])
+def test_worker_request_must_fit_positive_int32(requested):
+    with pytest.raises(ValueError, match="positive int no greater than 2147483647"):
+        T.Kernel(2, num_workers=requested)
+
+
+@pytest.mark.parametrize("requested", [0, -1, 2**31, 2**32, 2**32 + 1])
+def test_native_worker_annotation_rejects_out_of_range_requests(requested):
+    @T.prim_func
+    def kernel(A: T.Tensor((2,), "int32")):
+        with T.Kernel(2) as p:
+            T.sblock_attr({"hexagon.num_workers": T.int64(requested)})
+            A[p] = p
+
+    with pytest.raises(Exception, match="positive int no greater than 2147483647"):
+        _lower(kernel)
+
+
+def test_largest_worker_request_remains_an_upper_bound():
+    source = _lower(_scale(2, 1, num_workers=2**31 - 1)).kernel_source
+    assert "tl_parallel_for(2, 2147483647," in source
+
+
+@pytest.mark.parametrize(
+    "grid,message",
+    [((65536, 32768), "Hexagon worker grid.*2147483647"), ((2**31, 1), "Literal value 2147483648 exceeds maximum of int32")],
+)
+@pytest.mark.parametrize("sync", [False, True])
+def test_constant_worker_grid_cannot_overflow_the_runtime_extent(grid, message, sync):
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), "int32")):
+        with T.Kernel(*grid, num_workers=2**31 - 1) as (x, y):
+            A[0] = T.cast(x + y, "int32")
+            if sync:
+                T.sync_grid()
+
+    with pytest.raises(Exception, match=message):
+        _lower(kernel)
+
+
+def test_materialize_grid_rejects_a_wide_native_extent():
+    from tilelang.hexagon.transform import MaterializeGrid
+
+    tir = tvm.tirx
+    loop = tir.For(
+        tir.Var("p", "int64"),
+        tir.IntImm("int64", 0),
+        tir.IntImm("int64", 2**31),
+        tir.ForKind.SERIAL,
+        tir.Evaluate(0),
+        annotations={"hexagon.grid_dim": 0, "hexagon.num_workers": 8},
+    )
+    module = tvm.IRModule({"main": tir.PrimFunc([], loop)})
+    with pytest.raises(Exception, match="Hexagon worker grid extents must be in"):
+        MaterializeGrid()(module)
+
+
+@pytest.mark.parametrize("extent", [0, 2**31 - 1])
+def test_worker_grid_accepts_representable_extent_boundaries(extent):
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), "int32")):
+        with T.Kernel(extent, num_workers=8) as p:
+            A[0] = p
+
+    source = _lower(kernel).kernel_source
+    if extent:
+        assert "tl_parallel_for(2147483647, 8," in source
+    else:
+        assert "tl_parallel_for" not in source
+
+
 def test_one_kernel_per_prim_func():
     @T.prim_func
     def two_launches(A: T.Tensor((64,), "float32")):
@@ -289,6 +360,53 @@ def _check_capped_grid(func, arguments, out_idx, expected, programs, worker_limi
             assert raw[0][:-128] == initial[0]
             result = torch.frombuffer(bytearray(raw[out_idx][:-128]), dtype=expected.dtype).reshape(expected.shape)
             torch.testing.assert_close(result, expected)
+
+
+def _budgeted_worker_copy(sync):
+    programs = 2 if sync else 8
+
+    @T.prim_func
+    def copy(A: T.Tensor((programs, 32768), "float32"), B: T.Tensor((programs, 32768), "float32")):
+        with T.Kernel(programs, num_workers=8) as p:
+            s = T.alloc_shared((32768,), "float32")  # 128 KiB per arena.
+            T.copy(A[p, :], s)
+            if sync:
+                T.sync_grid()
+            T.copy(s, B[p, :])
+
+    return copy
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_budgeted_worker_copy_uses_the_requested_upper_bound(sync):
+    source = _lower(_budgeted_worker_copy(sync), {"kind": "hexagon", "mcpu": "hexagonv73", "vtcm-capacity": 512 << 10}).kernel_source
+    assert f"({2 if sync else 8}, 8, tl_vtcm_worker_arenas(131072u)," in source
+    assert ("tl_parallel_for<tl_worker_scope, true>" in source) == sync
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+@pytest.mark.parametrize("sync", [False, True])
+def test_worker_request_can_exceed_the_arena_budget_on_device(sync, device_worker_limit):
+    import torch
+    from tilelang.hexagon.runtime.session import Session
+
+    if sync and device_worker_limit < 2:
+        pytest.skip("requires capacity for two simultaneous workers")
+    programs = 2 if sync else 8
+    data = (torch.arange(programs * 32768, dtype=torch.int32) % 257 - 128).float().reshape(programs, 32768)
+    initial = data.numpy().tobytes()
+    guard = bytes([0xA5]) * 128
+    # The target budget fits four private arenas, while the request is eight.
+    # Independent programs may batch; the synchronous grid needs just two.
+    target = {"kind": "hexagon", "mcpu": f"hexagon{os.environ.get('HEXAGON_DSP_ARCH', 'v79')}", "vtcm-capacity": 512 << 10}
+    with Session([(_budgeted_worker_copy(sync), [1])], target=target) as session:
+        source = session.buffer(len(initial) + 128)
+        output = session.buffer(len(initial) + 128)
+        source.write(initial + guard)
+        output.write(bytes([0xA5]) * (len(initial) + 128))
+        session.kernels[0](source, output)
+        assert source.read() == initial + guard
+        assert output.read() == initial + guard
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")

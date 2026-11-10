@@ -188,7 +188,10 @@ Reading generated C for a tiled matmul now shows the grid loops, one
 `tl_crouton_copy` per matrix at the DDR/Crouton boundary, Crouton VTCM offsets,
 and explicit HMX atoms.
 
-`num_workers` is a requested upper bound. The runtime caches the smaller of the
+`num_workers` is a requested upper bound in `[1, 2147483647]`; `None` keeps
+serial execution. Worker-grid extents and their product must fit a signed 32-bit
+program count. Constant grids are checked during lowering; callers must keep
+dynamic extents within that range. The runtime caches the smaller of the
 reported HW-thread count, the reported 128-byte HVX-context count, and
 the SDK's `QURT_MAX_HTHREAD_LIMIT` storage capacity (currently 8). These are
 configuration limits, independent of the ISA version or the number of contexts
@@ -293,8 +296,12 @@ starts if its workers cannot all run together.
   completes it. The codegen binds the arena to the VTCM base and publishes
   `tl_vtcm_shared_high_water` for embedding/export capacity checks. Under the worker
   pool, `tl_parallel_for` gives every worker its own slice and runs no more workers
-  than slices fit in the grant; `VerifyVTCMArena` rejects at compile time a
-  `num_workers` whose slices exceed the target's `vtcm-capacity`.
+  than slices fit in the grant. For a known target `vtcm-capacity`,
+  `VerifyVTCMArena` budgets the aligned `global.vtcm` buffers plus one aligned
+  worker slice for an ordinary grid, which may run in batches. A grid using
+  `T.sync_grid()` instead needs one slice for each of its actual programs,
+  all at once. An unknown target capacity leaves the size check to the runtime;
+  a known compile-time budget does not replace the check of the actual grant.
   HMX atoms and Crouton copies use explicit shared buffers; there is no hidden
   top-down GEMM scratch allocation.
 
@@ -326,8 +333,9 @@ starts if its workers cannot all run together.
   Linux and other domains fail before building. New platform combinations need
   independent device qualification.
 
-- **The worker pool = 1 HMX + 6 HVX.** The producer/consumer model: the 6 HVX units
-  run pack/unpack/softmax/copies in parallel; the 1 HMX MAC is serialized by a
+- **The worker pool follows the reported HW/HVX capacity.** Its workers run
+  pack/unpack/softmax/copies in parallel within the cached limit described above;
+  the one HMX MAC is serialized by a
   `memw_locked` spinlock around the accumulator sequence. Each HMX-using pool thread
   enables HMX via `HAP_compute_res_hmx_lock2(SHARED)` around its tile programs.
   This is **keyed on thread id** so the execution thread, already enabled by the

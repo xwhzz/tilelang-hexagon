@@ -20,6 +20,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -54,8 +55,10 @@ private:
     if (!value)
       return GetRef<Stmt>(op);
     auto count = value->try_cast<Integer>();
-    ICHECK(count && count.value()->value > 0)
-        << attr::kHexagonNumWorkers << " must be a positive integer, got "
+    ICHECK(count && count.value()->value > 0 &&
+           count.value()->value <= std::numeric_limits<int32_t>::max())
+        << attr::kHexagonNumWorkers
+        << " must be a positive int no greater than 2147483647, got "
         << value.value();
     num_workers_ = count.value();
     SBlock block = GetRef<SBlock>(op);

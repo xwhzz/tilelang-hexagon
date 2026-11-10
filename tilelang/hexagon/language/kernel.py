@@ -26,7 +26,8 @@ def Kernel(
     ----------
     *blocks : int | PrimExpr
         Grid extent along each axis (1-3 dimensions). The launch yields one
-        program index per axis.
+        program index per axis. Worker-pool grids use signed 32-bit program
+        counts; dynamic extents and their product must also fit that range.
     prelude : str, optional
         C source injected before the generated kernel, e.g. ``#include``
         lines or helper functions.
@@ -38,7 +39,9 @@ def Kernel(
         programs with its own buffers and VTCM arena. Programs must be independent
         except at ``T.sync_grid()``: its grid must fit both ``num_workers`` and
         the available workers and arenas, or fail with ``TL_ERR_GRID`` before
-        any program starts. ``None`` runs the grid on one thread.
+        any program starts. Independent programs may run in batches when fewer
+        workers or VTCM arenas are available. The request must fit a positive
+        signed 32-bit integer. ``None`` runs the grid on one thread.
 
     Examples
     --------
@@ -58,7 +61,7 @@ def Kernel(
     # Validate here so a typo raises a clean ValueError instead of a later
     # compiler error (bool is an int subclass, so reject it explicitly).
     if num_workers is not None:
-        if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
-            raise ValueError(f"T.Kernel(num_workers=...) must be a positive int, got {num_workers!r}")
+        if isinstance(num_workers, bool) or not isinstance(num_workers, int) or not 1 <= num_workers <= 2**31 - 1:
+            raise ValueError(f"T.Kernel(num_workers=...) must be a positive int no greater than 2147483647, got {num_workers!r}")
         annotations["hexagon.num_workers"] = num_workers
     return launch_kernel(blocks, prelude=prelude, **annotations)

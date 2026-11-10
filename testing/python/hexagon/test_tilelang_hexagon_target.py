@@ -137,17 +137,101 @@ def test_vtcm_capacity_is_checked_at_compile_time():
         _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 1 << 20})
 
 
-def test_worker_arenas_must_fit_the_vtcm_together():
+def _worker_arena_kernel(programs, requested, elements=512 * 1024, sync=False):
     @T.prim_func
-    def kernel(A: T.Tensor((8, 512, 1024), "float16"), B: T.Tensor((8, 512, 1024), "float16")):
-        with T.Kernel(8, num_workers=6) as bx:
-            A_s = T.alloc_shared((512, 1024), "float16")  # 1 MiB per worker
-            T.copy(A[bx, :, :], A_s)
-            T.copy(A_s, B[bx, :, :])
+    def kernel(A: T.Tensor((programs, elements), "float16"), B: T.Tensor((programs, elements), "float16")):
+        with T.Kernel(programs, num_workers=requested) as bx:
+            A_s = T.alloc_shared((elements,), "float16")
+            T.copy(A[bx, :], A_s)
+            if sync:
+                T.sync_grid()
+            T.copy(A_s, B[bx, :])
 
-    _lower(kernel, "hexagon")  # six 1 MiB arenas fit 8 MiB
-    with pytest.raises(Exception, match=r"num_workers=6\) needs a VTCM arena of 1048576 bytes per worker.*use num_workers=4 or fewer"):
-        _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 4 << 20})
+    return kernel
+
+
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("requested", [2, 6, 8])
+@pytest.mark.parametrize("sync", [False, True])
+def test_arena_budget_uses_program_count_not_worker_request(arch, requested, sync):
+    source = _lower(
+        _worker_arena_kernel(2, requested, sync=sync),
+        {"kind": "hexagon", "mcpu": f"hexagon{arch}", "vtcm-capacity": 4 << 20},
+    ).kernel_source
+    assert f"(2, {requested}, tl_vtcm_worker_arenas(1048576u)," in source
+    assert ("tl_parallel_for<tl_worker_scope, true>" in source) == sync
+
+
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("requested", [6, 8])
+def test_independent_programs_can_share_fewer_arenas(arch, requested):
+    source = _lower(
+        _worker_arena_kernel(8, requested),
+        {"kind": "hexagon", "mcpu": f"hexagon{arch}", "vtcm-capacity": 4 << 20},
+    ).kernel_source
+    assert f"tl_parallel_for(8, {requested}, tl_vtcm_worker_arenas(1048576u)," in source
+
+
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_coresident_program_arenas_must_fit_together(arch):
+    with pytest.raises(Exception, match="T.sync_grid.*needs 6 simultaneous VTCM arenas.*only 4 fit"):
+        _lower(
+            _worker_arena_kernel(6, 8, sync=True),
+            {"kind": "hexagon", "mcpu": f"hexagon{arch}", "vtcm-capacity": 4 << 20},
+        )
+
+
+def test_even_one_worker_arena_must_fit():
+    with pytest.raises(Exception, match="A worker's VTCM arena takes 1048576 bytes.*smaller tiles"):
+        _lower(
+            _worker_arena_kernel(8, 6),
+            {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 512 << 10},
+        )
+
+
+def test_unknown_arena_budget_remains_a_runtime_check():
+    source = _lower(_worker_arena_kernel(6, 8, sync=True), {"kind": "hexagon", "mcpu": "hexagonv73"}).kernel_source
+    assert "tl_parallel_for<tl_worker_scope, true>(6, 8, tl_vtcm_worker_arenas(1048576u)," in source
+
+
+def test_dynamic_independent_grid_needs_only_one_arena():
+    n = T.dynamic("n")
+
+    @T.prim_func
+    def kernel(A: T.Tensor((n, 64), "float32"), B: T.Tensor((n, 64), "float32")):
+        with T.Kernel(n, num_workers=8) as p:
+            s = T.alloc_shared((64,), "float32")
+            T.copy(A[p, :], s)
+            T.copy(s, B[p, :])
+
+    source = _lower(kernel, {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": 2048}).kernel_source
+    assert "tl_parallel_for(n, 8, tl_vtcm_worker_arenas(256u)," in source
+
+
+@pytest.mark.parametrize("sync,capacity,accepted", [(False, 6144, True), (False, 6143, False), (True, 8192, True), (True, 8191, False)])
+def test_worker_budget_keeps_global_and_private_arena_alignment(sync, capacity, accepted):
+    @T.prim_func
+    def kernel(A: T.Tensor((2, 64), "float32"), B: T.Tensor((2, 64), "float32")):
+        with T.Kernel(2, num_workers=8) as w:
+            g0 = T.alloc_global((33,), "float32", scope="global.vtcm")
+            g1 = T.alloc_global((65,), "float32", scope="global.vtcm")
+            s = T.alloc_shared((64,), "float32")
+            T.copy(A[w, :], s)
+            g0[w] = s[0]
+            g1[w] = s[1]
+            if sync:
+                T.sync_grid()
+            T.copy(s, B[w, :])
+            B[w, 0] = g0[w] + g1[w]
+
+    target = {"kind": "hexagon", "mcpu": "hexagonv79", "vtcm-capacity": capacity}
+    if not accepted:
+        with pytest.raises(Exception, match="leave after its 4096 bytes of global.vtcm buffers"):
+            _lower(kernel, target)
+    else:
+        source = _lower(kernel, target).kernel_source
+        assert "tl_vtcm_arena() + 2048" in source
+        assert "tl_vtcm_worker_arenas(256u, 4096u)" in source
 
 
 @pytest.mark.parametrize("arch", ["v73", "v79"])

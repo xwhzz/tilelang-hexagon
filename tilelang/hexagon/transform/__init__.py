@@ -48,8 +48,9 @@ def PlanDMAQueue():
 def VerifyVTCMArena():
     """Check that the VTCM arena of every tile program fits the target.
 
-    Runs after ``MergeSharedMemoryAllocations``. ``T.Kernel(num_workers=N)``
-    needs N arenas, one per worker.
+    Runs after ``MergeSharedMemoryAllocations``. Independent programs need room
+    for one arena and may run in batches. A grid using ``T.sync_grid()`` needs
+    one arena per program, because its programs must run simultaneously.
     """
     return _ffi_api.VerifyVTCMArena()  # type: ignore
 

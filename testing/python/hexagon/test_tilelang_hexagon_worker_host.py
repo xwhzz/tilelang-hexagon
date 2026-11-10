@@ -49,6 +49,7 @@ def worker_host(tmp_path_factory):
         "hvx-64-only",
         "fallback-one",
         "empty",
+        "last-int32-program",
         "batch-four",
         "batch-request-two",
         "batch-arena-two",

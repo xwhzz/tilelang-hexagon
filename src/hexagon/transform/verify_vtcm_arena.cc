@@ -3,12 +3,12 @@
  * \brief Check that the VTCM arena of every Hexagon tile program fits.
  *
  * MergeSharedMemoryAllocations lays out the shared buffers of a tile program in
- * one allocation, its VTCM arena. A kernel's arena starts at the VTCM base. A
- * T.Kernel(num_workers=N) grid gives each of N workers its own slice, which the
- * runtime rounds up to whole HMX tiles so that every slice keeps the arena's
- * alignment. Buffers all the programs share (global.vtcm) come first, whole
- * HMX tiles each, and the arenas after them. All of it must fit the target's
- * vtcm-capacity; the runtime still checks the region it is granted.
+ * one allocation, its VTCM arena. A kernel's arena starts at the VTCM base.
+ * Worker grids round their slices up to whole HMX tiles to keep alignment.
+ * Independent programs can share a worker in successive batches, so one slice
+ * must fit. Programs meeting at T.sync_grid need a slice each, simultaneously.
+ * Buffers all programs share (global.vtcm) come first, whole HMX tiles each.
+ * The runtime still checks the region it is actually granted.
  */
 
 #include "hexagon/op/builtin.h"
@@ -47,10 +47,24 @@ private:
       StmtVisitor::VisitStmt_(op);
       return;
     }
-    int64_t outer = workers_;
-    workers_ = workers->cast<Integer>()->value;
+    bool outer_worker = worker_;
+    int64_t outer_arenas = arenas_;
+    worker_ = true;
+    arenas_ = 1;
+    bool sync = false;
+    PostOrderVisit(op->body, [&sync](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>())
+        sync |= call->op.same_as(tl::sync_grid());
+    });
+    if (sync) {
+      const auto *extent = op->extent.as<IntImmNode>();
+      ICHECK(extent && extent->value >= 0)
+          << "T.sync_grid() needs a constant nonnegative program count";
+      arenas_ = extent->value;
+    }
     StmtVisitor::VisitStmt_(op);
-    workers_ = outer;
+    worker_ = outer_worker;
+    arenas_ = outer_arenas;
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -97,7 +111,7 @@ private:
                     std::to_string(capacity_) + " leave after its " +
                     std::to_string(grid_) + " bytes of global.vtcm buffers"
               : "the target's " + std::to_string(capacity_);
-    if (workers_ == 0) {
+    if (!worker_) {
       if (bytes > capacity) {
         LOG(FATAL) << "The tile program's shared buffers take " << bytes
                    << " bytes of VTCM, more than " << room
@@ -107,22 +121,23 @@ private:
     }
     int64_t slice =
         (bytes + kSliceAlignment - 1) / kSliceAlignment * kSliceAlignment;
-    if (workers_ * slice <= capacity)
+    if (slice == 0 || arenas_ == 0 || arenas_ <= capacity / slice)
       return;
     int64_t fit = capacity / slice;
     if (fit == 0) {
       LOG(FATAL) << "A worker's VTCM arena takes " << slice
                  << " bytes, more than " << room << "; use smaller tiles";
     }
-    LOG(FATAL) << "T.Kernel(num_workers=" << workers_
-               << ") needs a VTCM arena of " << slice << " bytes per worker, "
-               << workers_ * slice << " bytes in all, more than " << room
-               << "; use num_workers=" << fit << " or fewer, or smaller tiles";
+    LOG(FATAL) << "T.sync_grid() needs " << arenas_
+               << " simultaneous VTCM arenas of " << slice
+               << " bytes each, but only " << fit << " fit in " << room
+               << "; use fewer programs or smaller tiles";
   }
 
   int64_t capacity_;
   int64_t grid_;
-  int64_t workers_ = 0;
+  bool worker_ = false;
+  int64_t arenas_ = 1;
   bool has_arena_ = false;
 };
 

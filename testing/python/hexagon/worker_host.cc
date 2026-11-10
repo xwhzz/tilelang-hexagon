@@ -238,6 +238,18 @@ int main(int argc, char **argv) {
     assert(
         (tl_parallel_for<TrackedScope, true>(0, 6, arenas(0), body) == TL_OK));
     assert(!hardware_queries && !hvx_queries && !opened && !create_attempts);
+  } else if (name == "last-int32-program") {
+    auto body = [](int32_t i, uint8_t *arena) {
+      assert(i == INT32_MAX - 2 && arena == arena_storage.data());
+      assert(resource_live);
+      ++callbacks;
+      return TL_OK;
+    };
+    tl_parallel_for_job<TrackedScope, decltype(body)> job{
+        &body, INT32_MAX, {arena_storage.data(), 0u, 1u}};
+    assert(job.run(&job, INT32_MAX - 2, 4) == TL_OK);
+    assert(callbacks == 1 && opened == 1 && closed == 1);
+    assert(!hardware_queries && !hvx_queries && !create_attempts);
   } else if (name == "batch-four" || name == "batch-request-two" ||
              name == "batch-arena-two") {
     int expected = name == "batch-four" ? 4 : 2;

@@ -33,6 +33,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -215,6 +216,8 @@ private:
     int64_t num_workers = 1;
     if (auto value = op->annotations.Get(attr::kHexagonNumWorkers))
       num_workers = value->cast<Integer>()->value;
+    if (num_workers > 1)
+      CheckGridSize(chain);
     if (ContainsGridSync(body))
       CheckCoresident(chain, num_workers);
     if (num_workers > 1 && !HasSingleIteration(chain))
@@ -238,6 +241,34 @@ private:
     return AttrStmt(Integer(0), attr::kTileProgramScope, Integer(1), body);
   }
 
+  // The worker runtime accepts an int32 program count. Check constant grids
+  // before multiplying their extents in the loop index's arithmetic type.
+  static void CheckGridSize(const std::vector<const ForNode *> &chain) {
+    constexpr int64_t limit = std::numeric_limits<int32_t>::max();
+    bool constant = true;
+    bool empty = false;
+    for (const ForNode *loop : chain) {
+      const auto *extent = loop->extent.as<IntImmNode>();
+      if (!extent) {
+        constant = false;
+        continue;
+      }
+      ICHECK(extent->value >= 0 && extent->value <= limit)
+          << "Hexagon worker grid extents must be in [0, 2147483647], got "
+          << extent->value;
+      empty |= extent->value == 0;
+    }
+    if (!constant || empty)
+      return;
+    int64_t programs = 1;
+    for (const ForNode *loop : chain) {
+      int64_t extent = loop->extent.as<IntImmNode>()->value;
+      ICHECK(extent <= limit / programs)
+          << "Hexagon worker grid exceeds 2147483647 programs";
+      programs *= extent;
+    }
+  }
+
   // T.sync_grid makes the programs of the launch wait for each other, so each
   // needs its own worker.
   static void CheckCoresident(const std::vector<const ForNode *> &chain,
@@ -254,6 +285,10 @@ private:
       ICHECK(extent) << "T.sync_grid() needs a grid of constant size, but "
                      << "grid axis `" << loop->loop_var->name_hint
                      << "` has extent " << loop->extent;
+      ICHECK(extent->value >= 0 &&
+             (programs == 0 ||
+              extent->value <= std::numeric_limits<int32_t>::max() / programs))
+          << "T.sync_grid() grid exceeds the supported int32 program count";
       programs *= extent->value;
     }
     ICHECK(programs <= num_workers)
@@ -276,8 +311,7 @@ private:
   Stmt MakeParallel(const std::vector<const ForNode *> &chain, Stmt body,
                     int64_t num_workers) {
     Map<String, Any> annotations;
-    annotations.Set(attr::kHexagonNumWorkers,
-                    Integer(static_cast<int>(num_workers)));
+    annotations.Set(attr::kHexagonNumWorkers, Integer(num_workers));
     const ForNode *head = chain.front();
     if (chain.size() == 1)
       return MakeLoop(head, ForKind::kParallel, body, annotations);

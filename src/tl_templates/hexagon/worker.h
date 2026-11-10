@@ -259,8 +259,12 @@ template <typename Scope, typename Body> struct tl_parallel_for_job {
     Scope scope;
     int status = scope.status;
     uint8_t *arena = job->arenas.base + (size_t)wid * job->arenas.bytes;
-    for (int32_t i = wid; status == TL_OK && i < job->extent; i += nw)
-      status = (*job->body)(i, arena);
+    // The last increment may go past INT32_MAX even though every program
+    // index is representable. Keep that increment unsigned, and narrow only
+    // an index that passed the positive int32 extent check.
+    for (uint32_t i = (uint32_t)wid;
+         status == TL_OK && i < (uint32_t)job->extent; i += (uint32_t)nw)
+      status = (*job->body)((int32_t)i, arena);
     // Programs waiting at a barrier for a failed one stop (tl_grid_sync).
     if (status != TL_OK)
       __atomic_store_n(&tl_grid.failed, 1, __ATOMIC_RELAXED);
