@@ -436,6 +436,65 @@ TL_DEVICE void tl_gemm_dot_leaf(HVX_Vector out[R], const TA *__restrict__ A,
   }
 }
 
+// On v79, four outputs of two rows share A loads while retaining the two
+// original G2 reduction subtrees. Keep the K-chain in source order.
+#if __HVX_ARCH__ == 79
+template <typename TA, int R, int K, int LdA, int LdB, bool RowsA, bool RowsB>
+TL_DEVICE void tl_gemm_dot_leaf4(HVX_Vector out[2][R], const TA *__restrict__ A,
+                                 const TA *__restrict__ B) {
+  constexpr int G = 4;
+  using V = tl_gemm_operand<TA>;
+  constexpr int L = V::lanes;
+  // Registers of K, the last one partial when K is not a multiple of L.
+  constexpr int KC = (K + L - 1) / L;
+  constexpr int KT = K - (KC - 1) * L;
+  constexpr int Whole = KT == L ? KC : KC - 1;
+  typename V::acc acc[R][G];
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; ++r)
+#pragma clang loop unroll(full)
+    for (int g = 0; g < G; ++g)
+      acc[r][g] = V::zero();
+#pragma clang loop pipeline(disable)
+  for (int kc = 0; kc < Whole; ++kc) {
+    HVX_Vector b[G];
+#pragma clang loop unroll(full)
+    for (int g = 0; g < G; ++g)
+      b[g] = tl_hvx_load<RowsB>(B + g * LdB + kc * L);
+#pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+      HVX_Vector a = tl_hvx_load<RowsA>(A + r * LdA + kc * L);
+#pragma clang loop unroll(full)
+      for (int g = 0; g < G; ++g)
+        V::mac(acc[r][g], a, b[g]);
+    }
+  }
+  if constexpr (KT != L) {
+    // Both operands zero past K: zero times what lies past a row's end could
+    // be a NaN.
+    HVX_Vector b[G];
+#pragma clang loop unroll(full)
+    for (int g = 0; g < G; ++g)
+      b[g] =
+          tl_gemm_load_zeroed<sizeof(TA), RowsB>(B + g * LdB + Whole * L, KT);
+#pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+      HVX_Vector a =
+          tl_gemm_load_zeroed<sizeof(TA), RowsA>(A + r * LdA + Whole * L, KT);
+#pragma clang loop unroll(full)
+      for (int g = 0; g < G; ++g)
+        V::mac(acc[r][g], a, b[g]);
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; ++r) {
+    out[0][r] = tl_gemm_merge(V::sums(acc[r][0]), V::sums(acc[r][1]));
+    out[1][r] = tl_gemm_merge(V::sums(acc[r][2]), V::sums(acc[r][3]));
+  }
+}
+
+#endif
+
 // The outputs [0, Outs), Outs <= 32, of rows r < R of C: pairs of outputs
 // enter a transpose tree of P outputs, the smallest power of two that holds
 // them, whose pending subtrees wait in `level` by height; then each output's
@@ -465,11 +524,28 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
         level[r][h] = v[r];
     };
     HVX_Vector v[R];
+#if __HVX_ARCH__ == 79
+    // A full two-row tile benefits from sharing A across four output columns.
+    // One-row and partial-output tiles retain the existing G2 schedule.
+    if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+                  RowsB && Outs == 32) {
+      HVX_Vector pairs[2][R];
 #pragma clang loop unroll(disable)
-    for (int g = 0; g < Outs / 2; ++g) {
-      tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(v, A,
-                                                            B + 2 * g * LdB);
-      push(v, g);
+      for (int g = 0; g < Outs / 4; ++g) {
+        tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
+                                                            B + 4 * g * LdB);
+        push(pairs[0], 2 * g);
+        push(pairs[1], 2 * g + 1);
+      }
+    } else
+#endif
+    {
+#pragma clang loop unroll(disable)
+      for (int g = 0; g < Outs / 2; ++g) {
+        tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(v, A,
+                                                              B + 2 * g * LdB);
+        push(v, g);
+      }
     }
     if constexpr (Outs % 2 != 0) {
       tl_gemm_dot_leaf<TA, R, 1, K, LdA, LdB, RowsA, RowsB>(

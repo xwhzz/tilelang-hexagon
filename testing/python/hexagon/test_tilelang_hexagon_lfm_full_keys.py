@@ -69,17 +69,30 @@ def test_full_keys_forwarded_to_each_fp16_stage(keys, monkeypatch):
     class BeforeDevice(Exception):
         pass
 
+    import tilelang.backend.target as target_module
+
+    resolved = target_module.determine_target({"kind": "hexagon", "mcpu": "hexagonv79"}, return_object=True)
+    resolutions = []
+
+    def resolve(value, return_object):
+        assert value == "hexagon" and return_object
+        resolutions.append(value)
+        return resolved
+
+    monkeypatch.setattr(target_module, "determine_target", resolve)
     stages = [range(2), range(2, 4)]
     calls = []
     monkeypatch.setattr(decode.bundle, "read_header", lambda _: {"config": config().to_dict(), "quant": {}})
     monkeypatch.setattr(decode_fp16, "plan_stages", lambda *args: stages)
     monkeypatch.setattr(decode_fp16, "make_decode", lambda *args: "decode")
 
-    def prefill(c, rows, max_pos, max_tokens, layers, *, full_keys):
+    def prefill(c, rows, max_pos, max_tokens, layers, *, target, full_keys):
+        assert target is resolved
         calls.append((rows, max_pos, max_tokens, layers, full_keys))
         return "prefill"
 
-    def stop(kernels, *, processes):
+    def stop(kernels, *, target, processes):
+        assert target is resolved
         assert processes == 2
         assert kernels == [("decode", []), ("decode", []), ("prefill", []), ("prefill", [])]
         raise BeforeDevice
@@ -89,6 +102,7 @@ def test_full_keys_forwarded_to_each_fp16_stage(keys, monkeypatch):
     with pytest.raises(BeforeDevice):
         decode.Decoder("unused", max_pos=512, max_tokens=64, prefill_rows=128, processes=2, prefill_full_keys=keys)
     assert calls == [(128, 512, 64, r, keys) for r in stages]
+    assert resolutions == ["hexagon"]
 
 
 @pytest.mark.parametrize("keys", [None, 256, 512])

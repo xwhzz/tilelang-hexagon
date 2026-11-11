@@ -277,7 +277,16 @@ class AdbConnection(HexagonConnection):
         # Preserve stdin on fd 3: POSIX shells otherwise give a background
         # command /dev/null before its redirections are applied.
         command = self._host_command(exe_remote_path, args)
-        cleanup = f'kill "$_tl_agent" "$_tl_watch" 2>/dev/null; rm -rf -- {shlex.quote(self.workdir)}'
+        # Android mksh can reflect a watcher's untrapped TERM to its process
+        # group. Stop only this read watchdog with KILL, then reap it; preserve
+        # the agent's saved status and its existing TERM/EOF cancellation.
+        # Save the trap's status explicitly: mksh's wait can otherwise replace
+        # a signal-handler exit status while the EXIT trap is running.
+        cleanup = (
+            '_tl_cleanup_status=$?; kill "$_tl_agent" 2>/dev/null; kill -KILL "$_tl_watch" 2>/dev/null; '
+            f'wait "$_tl_watch" 2>/dev/null; rm -rf -- {shlex.quote(self.workdir)}; '
+            'exit "$_tl_cleanup_status"'
+        )
         return self.start_shell(
             f"exec 3<&0; ( {command} ) 3<&- & _tl_agent=$!; "
             '( while IFS= read -r _tl_line; do :; done; kill "$_tl_agent" 2>/dev/null ) <&3 3<&- & _tl_watch=$!; exec 3<&-; '
