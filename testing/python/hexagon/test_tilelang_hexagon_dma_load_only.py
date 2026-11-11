@@ -177,7 +177,7 @@ def test_load_only_pipeline_wraps_and_preserves_resident_guards():
     target = determine_target("hexagon", return_object=True)
     func = make_load_only_pipeline()
     [(name, source, params, outputs)] = lower_kernels([(func, [1])], target=target)
-    arch = str(target.mcpu)
+    arch = str(target.attrs["mcpu"])
     assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch in {"hexagonv73", "hexagonv75", "hexagonv79"})
     payload = _pipeline_payload()
     expected = (payload.to(torch.int32) + 1).to(torch.uint8)
