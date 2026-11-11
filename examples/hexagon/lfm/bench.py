@@ -40,7 +40,11 @@ def main():
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--prefill-rows", default="auto", help="the prefill's chunk (Decoder's prefill_rows)")
     p.add_argument(
-        "--prefill-full-keys", type=int, choices=(128, 256, 512), default=128, help="fp16 full-attention block; sliding stays 128"
+        "--prefill-full-keys",
+        type=int,
+        choices=(128, 256, 512),
+        default=128,
+        help="fp16 full-attention block upper bound; sliding stays 128",
     )
     p.add_argument("--max-pos", type=int, default=4096, help="the KV cache's positions (Decoder's max_pos)")
     p.add_argument("--depth", type=int, default=0, help="positions of context before each test, prefilled untimed")

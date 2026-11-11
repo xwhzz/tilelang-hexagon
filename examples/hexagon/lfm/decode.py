@@ -482,9 +482,10 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step). `prefill_full_keys` opts fp16 full-attention
-    layers into 256- or 512-position blocks; its default and sliding-window
-    blocks remain 128. A max_pos not divisible by that block uses 128.
+    the decode, a token a step). `prefill_full_keys` sets the fp16 full-attention
+    block upper bound to 128, 256, or 512; early chunks use a smaller block
+    when no farther keys can be visible. Its default and sliding-window
+    blocks remain 128. A max_pos not divisible by the upper bound uses 128.
     Larger blocks need more VTCM; the normal arena check still rejects a
     prefill chunk that cannot fit all four workers.
 
