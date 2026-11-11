@@ -158,38 +158,39 @@ def test_full_keys_normal_lowering_retains_sliding_and_four_workers(arch, keys):
 @pytest.mark.parametrize("rows", [64, 128, 256])
 @pytest.mark.parametrize("keys", [256, 512])
 @pytest.mark.parametrize("stage", ["mixed", "full", "sliding"])
-def test_full_keys_selection_uses_the_physical_chunk(rows, keys, stage):
+def test_full_keys_has_one_state_loop_per_attention_kind(rows, keys, stage):
     layers = {"mixed": range(4), "full": range(1, 2), "sliding": range(3, 4)}[stage]
     func = prefill_fp16.make_prefill(config(), rows, 4608, rows, layers, full_keys=keys)
-    bindings = {}
+    bindings, loops = [], []
 
     def collect(node):
         if isinstance(node, tirx.Bind):
-            bindings[str(node.var.name)] = node
+            bindings.append(str(node.var.name))
+        elif isinstance(node, tirx.For) and str(node.loop_var.name) == "rb":
+            row0 = []
+            tirx.stmt_functor.post_order_visit(
+                node.body, lambda child: row0.append(child) if isinstance(child, tirx.Bind) and str(child.var.name) == "row0" else None
+            )
+            if row0:
+                loops.append(node)
 
     tirx.stmt_functor.post_order_visit(func.body, collect)
-    if stage == "sliding":
-        assert "selected_keys" not in bindings
-        return
-    expression = bindings["selected_keys"].value
-    for name in ("full_block", "base"):
-        if name in bindings:
-            binding = bindings[name]
-            expression = tirx.stmt_functor.substitute(expression, {binding.var: binding.value})
-    variables = []
-    tirx.stmt_functor.post_order_visit(expression, lambda node: variables.append(node) if isinstance(node, tirx.Var) else None)
-    # n/valid never enter the actual IR selector. In particular a padded
-    # n=20 call still selects for all rows, rather than for 20 queries.
-    assert {str(var.name) for var in variables} <= {"pos0", "chunk", "window"}
-    for pos0, chunk in [(0, 0), (0, 1), (1, 0), (64, 0), (65, 0), (128, 0), (129, 0), (4096, 0)]:
-        for window in [0, config().window] if stage == "mixed" else [0]:
-            values = {"pos0": pos0, "chunk": chunk, "window": window}
-            result = arith.Analyzer().simplify(
-                tirx.stmt_functor.substitute(expression, {var: tirx.IntImm(var.dtype, values[str(var.name)]) for var in variables})
-            )
-            end = pos0 + chunk * rows + rows
-            expected = 128 if window > 0 or end <= 128 else (256 if keys == 512 and end <= 256 else keys)
-            assert isinstance(result, tirx.IntImm) and int(result) == expected
+    # Narrow tails share the full path's state. Do not duplicate whole
+    # head/query loops for early physical chunks or depend on valid n.
+    assert not {"selected_keys", "full_block"} & set(bindings)
+    assert len(loops) == (2 if stage == "mixed" else 1)
+    wide = []
+    for loop in loops:
+        remaining = []
+        tirx.stmt_functor.post_order_visit(
+            loop.body,
+            lambda node, remaining=remaining: (
+                remaining.append(node) if isinstance(node, tirx.Bind) and str(node.var.name) == "remaining" else None
+            ),
+        )
+        if remaining:
+            wide.append(int(remaining[0].value.a.b))
+    assert wide == ([] if stage == "sliding" else [keys])
 
 
 def _trace_attention_row(loop, *, base, row, kv0):
@@ -293,7 +294,7 @@ def test_causal_tail_dma_and_compute_use_the_same_key_interval(rows, keys):
                 loops.append((node, int(remaining[0].value.a.b)))
 
     tirx.stmt_functor.post_order_visit(func.body, collect)
-    assert {width for _, width in loops} == ({256} if keys == 256 else {256, 512})
+    assert {width for _, width in loops} == {keys}
     for loop, width in loops:
         bulk_loops = []
 

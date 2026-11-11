@@ -769,23 +769,13 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         ),
                     )
                     if full_keys != KEYS and has_full:
-                        # All physical query rows, including padded tail rows,
-                        # must fit in the selected key block. Sliding stays 128.
-                        if full_keys == 512:
-                            full_block = T.if_then_else(base + R <= 256, 256, full_keys)
-                        else:
-                            full_block = full_keys
-                        selected_keys = T.if_then_else(base + R <= KEYS or (has_sliding and window > 0), KEYS, full_block)
-                        if selected_keys == KEYS:
+                        # The per-row-block tail already selects 128/256 when
+                        # no later keys are visible. Keep one full-attention
+                        # state loop at the requested upper bound.
+                        if has_sliding and window > 0:
                             attention(bf, kv0, base, window, KEYS, attention_scratch)
                         else:
-                            if full_keys == 512:
-                                if selected_keys == 256:
-                                    attention(bf, kv0, base, window, 256, attention_scratch)
-                                else:
-                                    attention(bf, kv0, base, window, full_keys, attention_scratch)
-                            else:
-                                attention(bf, kv0, base, window, full_keys, attention_scratch)
+                            attention(bf, kv0, base, window, full_keys, attention_scratch)
                     else:
                         attention(bf, kv0, base, window, KEYS)
                 else:
