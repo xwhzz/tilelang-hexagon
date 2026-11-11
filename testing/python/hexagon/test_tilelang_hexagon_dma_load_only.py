@@ -175,7 +175,7 @@ def test_load_only_pipeline_wraps_and_preserves_resident_guards():
     [(name, source, params, outputs)] = lower_kernels([(func, [1])], target=target)
     arch = str(target.mcpu)
     assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch == "hexagonv79")
-    payload = (torch.arange(4096, dtype=torch.int32) * 73 + 11).to(torch.uint8)
+    payload = _pipeline_payload()
     expected = (payload.to(torch.int32) + 1).to(torch.uint8)
     whole = torch.full((4096 + 256,), 0xA5, dtype=torch.uint8)
     whole[128:-128] = payload
@@ -188,6 +188,28 @@ def test_load_only_pipeline_wraps_and_preserves_resident_guards():
         actual = torch.frombuffer(bytearray(o.read()), dtype=torch.uint8)
         assert torch.equal(actual[128:-128], expected)
         assert torch.all(actual[:128] == 0xA5) and torch.all(actual[-128:] == 0xA5)
+
+
+def _pipeline_payload():
+    import torch
+
+    index = torch.arange(4096, dtype=torch.int32)
+    return (index * 73 + (index // 256) * 29 + 11).to(torch.uint8)
+
+
+def test_pipeline_oracle_distinguishes_slot_generations():
+    import torch
+
+    # A 256-byte-periodic input would let the wrong ring slot look correct.
+    tiles = _pipeline_payload().reshape(16, 256)
+    assert len({row.numpy().tobytes() for row in tiles}) == 16
+    for tile in range(3, 16):
+        assert not (tiles[tile] == tiles[tile - 3]).all()
+    expected = (tiles.to(torch.int32) + 1).to(torch.uint8)
+    assert not torch.equal(expected.roll(1, dims=0), expected)
+    stale = expected.clone()
+    stale[3:] = expected[:-3]
+    assert not torch.equal(stale, expected)
 
 
 def test_consecutive_functions_do_not_inherit_a_rejected_policy():
