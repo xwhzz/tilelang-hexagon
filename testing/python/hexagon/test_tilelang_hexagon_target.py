@@ -94,7 +94,7 @@ def test_2d_dma_uses_one_descriptor_for_small_strides(arch):
     source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
     submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     assert len(submits) == 1
-    policy = ", true" if arch == "v79" else ""
+    policy = ", true" if arch in {"v73", "v75", "v79"} else ""
     assert f"tl_hexagon_dma_async_context<1, 1{policy}>" in source
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
     assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
@@ -120,7 +120,7 @@ def test_2d_dma_stride_field_boundary(arch, stride):
         for row, call in enumerate(submits):
             assert f"(&(A[{row * stride}]))" in call
             assert "(uint32_t)32, (uint32_t)32, (uint32_t)32, (uint32_t)1, 3)" in call
-        assert "tl_hexagon_dma_async_context<2, 1>" in source
+        assert "tl_hexagon_dma_async_context<2, 1, true>" in source
     else:
         assert f"(uint32_t)32, (uint32_t){stride}, (uint32_t)32, (uint32_t)2, 3)" in submits[0]
 

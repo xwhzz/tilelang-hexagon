@@ -84,7 +84,7 @@ def test_load_only_dma_reads_dirty_source_and_preserves_guards():
     probe = make_cached_load_probe()
     target = determine_target("hexagon", return_object=True)
     source = lower(probe, target)
-    policy = ", true" if target.attrs.get("mcpu") == "hexagonv79" else ""
+    policy = ", true" if target.attrs.get("mcpu") in {"hexagonv73", "hexagonv75", "hexagonv79"} else ""
     assert f"tl_hexagon_dma_async_context<1, 1{policy}> tl_dma_async;" in source
     assert submit_directions(source) == [0]
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
@@ -179,7 +179,7 @@ def test_async_manual_ping_pong(arch):
 
     source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # At most two copies are in flight; each is one descriptor and one group.
-    policy = ", true" if arch == "v79" else ""
+    policy = ", true" if arch in {"v73", "v75", "v79"} else ""
     assert f"tl_hexagon_dma_async_context<2, 2{policy}> tl_dma_async;" in source
     assert source.count("tl_hexagon_dma_async_submit(tl_dma_async, ") == 3
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 3
@@ -460,7 +460,7 @@ def test_managed_worker_queue_is_local_and_drained():
     assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(512u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
     # Each tile program owns its queue and its buffers in the worker's arena.
-    policy = ", true" if target.attrs.get("mcpu") == "hexagonv79" else ""
+    policy = ", true" if target.attrs.get("mcpu") in {"hexagonv73", "hexagonv75", "hexagonv79"} else ""
     assert f"tl_hexagon_dma_async_context<1, 1{policy}> tl_dma_async;" in program
     assert "half* s = (half*)tl_arena;" in program
     assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")

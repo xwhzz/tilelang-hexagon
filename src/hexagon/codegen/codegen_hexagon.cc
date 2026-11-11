@@ -569,9 +569,12 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   dma_load_only_ = false;
   in_dma_program_ = false;
   auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  String mcpu = target.has_value()
+                    ? target.value()->GetAttr<String>("mcpu").value_or("")
+                    : "";
   dma_load_only_function_ =
-      dma_load_only_module_ && target.has_value() &&
-      target.value()->GetAttr<String>("mcpu").value_or("") == "hexagonv79" &&
+      dma_load_only_module_ &&
+      (mcpu == "hexagonv73" || mcpu == "hexagonv75" || mcpu == "hexagonv79") &&
       HasOnlyManagedDMACalls(f->body);
   // Names the runtime calls bind; reserve them before the parameters so no
   // parameter can take them.

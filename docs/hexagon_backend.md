@@ -282,7 +282,7 @@ starts if its workers cannot all run together.
   Crouton endpoint makes it a `tl_crouton_copy`. In a `num_workers` kernel every tile
   program owns its DMA queue.
 
-  For v79, codegen specializes a managed queue with valid constant capacities
+  For v73, v75 and v79, codegen specializes a managed queue with valid constant capacities
   (1–256 descriptors and groups)
   when every submission is a proven load (direction 0 or 3). Cached sources
   still receive their original writeback; only the unreachable store-completion

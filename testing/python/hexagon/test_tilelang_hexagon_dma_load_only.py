@@ -63,17 +63,18 @@ def _assert_policy(func, target, enabled):
     return source
 
 
-@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79", "v81"])
 @pytest.mark.parametrize("direction", [0, 3])
 def test_normal_load_policy_is_explicit_and_architecture_scoped(arch, direction):
     func, target = _normal(arch)
     func = _replace(func, "tl.hexagon_dma_submit", lambda c: I.Call(c.dtype, c.op, [*c.args[:-1], I.const(direction)]))
-    _assert_policy(func, target, arch == "v79")
+    _assert_policy(func, target, arch in {"v73", "v75", "v79"})
 
 
 @pytest.mark.parametrize("direction", [1, 2, 4, -1, "dynamic"])
-def test_store_or_dynamic_direction_keeps_generic_completion(direction):
-    func, target = _normal()
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_store_or_dynamic_direction_keeps_generic_completion(direction, arch):
+    func, target = _normal(arch)
     value = I.Var("direction", "int32") if direction == "dynamic" else I.const(direction)
     if direction == "dynamic":
         func = I.PrimFunc([*func.params, value], func.body, func.ret_type, func.buffer_map, func.attrs)
@@ -82,8 +83,9 @@ def test_store_or_dynamic_direction_keeps_generic_completion(direction):
 
 
 @pytest.mark.parametrize("kind", ["extern", "pure", "raw", "outside"])
-def test_opaque_calls_keep_the_whole_function_generic(kind):
-    func, target = _normal()
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_opaque_calls_keep_the_whole_function_generic(kind, arch):
+    func, target = _normal(arch)
     call = I.call_pure_extern("int32", "opaque") if kind == "pure" else I.call_extern("int32", "asm" if kind == "raw" else "opaque")
     if kind == "outside":
         func = func.with_body(I.SeqStmt([func.body, I.Evaluate(call)]))
@@ -92,8 +94,9 @@ def test_opaque_calls_keep_the_whole_function_generic(kind):
     _assert_policy(func, target, False)
 
 
-def test_hidden_store_and_shared_expression_use_are_not_overlooked():
-    func, target = _normal()
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_hidden_store_and_shared_expression_use_are_not_overlooked(arch):
+    func, target = _normal(arch)
 
     def hidden(body):
         submit = next(
@@ -120,8 +123,9 @@ def test_hidden_store_and_shared_expression_use_are_not_overlooked():
     _assert_policy(_scope(func, use_as_value), target, False)
 
 
-def test_nested_queues_keep_generic_policy():
-    func, target = _normal()
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_nested_queues_keep_generic_policy(arch):
+    func, target = _normal(arch)
     nested = _scope(func, lambda body: I.AttrStmt(I.const(0), "tl.tile_program_scope", 1, body))
     _assert_policy(nested, target, False)
 
@@ -132,7 +136,7 @@ def test_capacity_does_not_change_the_load_only_proof(arch, descriptors, groups)
     func, target = _normal(arch)
     func = _replace(func, "tl.hexagon_dma_queue", lambda c: I.Call(c.dtype, c.op, [I.const(descriptors), I.const(groups)]))
     source = _emit(func, target)
-    policy = ", true" if arch == "v79" else ""
+    policy = ", true" if arch in {"v73", "v75", "v79"} else ""
     assert f"tl_hexagon_dma_async_context<{descriptors}, {groups}{policy}> tl_dma_async" in source
 
 
@@ -159,7 +163,7 @@ def test_normal_multibuffer_pipeline_keeps_opaque_and_arch_guards(arch, stages):
     )
     # The parity builtin in the two-stage pipeline is still outside the
     # existing call whitelist. This capacity extension does not broaden it.
-    policy = ", true" if arch == "v79" and stages == 3 else ""
+    policy = ", true" if arch in {"v73", "v75", "v79"} and stages == 3 else ""
     assert f"tl_hexagon_dma_async_context<{stages}, {stages}{policy}>" in source
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
     assert f"tl_hexagon_dma_async_wait(tl_dma_async, {stages - 1})" in source
@@ -174,7 +178,7 @@ def test_load_only_pipeline_wraps_and_preserves_resident_guards():
     func = make_load_only_pipeline()
     [(name, source, params, outputs)] = lower_kernels([(func, [1])], target=target)
     arch = str(target.mcpu)
-    assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch == "hexagonv79")
+    assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch in {"hexagonv73", "hexagonv75", "hexagonv79"})
     payload = _pipeline_payload()
     expected = (payload.to(torch.int32) + 1).to(torch.uint8)
     whole = torch.full((4096 + 256,), 0xA5, dtype=torch.uint8)
