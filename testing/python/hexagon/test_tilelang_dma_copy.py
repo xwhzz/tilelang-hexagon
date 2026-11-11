@@ -223,9 +223,8 @@ def submit_directions(source):
 @pytest.mark.parametrize("disabled", [False, True])
 def test_submit_direction_parser_covers_both_generated_queue_policies(arch, disabled):
     probe = make_cached_load_probe()
-    if disabled:
-        probe = probe.with_attr("tilelang_pass_configs", {"tl.hexagon_disable_dma_load_only": True})
-    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    with tvm.transform.PassContext(config={"tl.hexagon_disable_dma_load_only": disabled}):
+        source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     helper = "async" if disabled else "compact"
     assert f"tl_hexagon_dma_{helper}_submit(" in source
     # DSP writes precede the load: both policies must retain direction 0.
