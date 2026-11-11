@@ -826,7 +826,15 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
         << builtin->function << " needs the tile program's DMA queue";
     headers_.insert(builtin->header);
     uses_hmx_ |= builtin->uses_hmx;
-    os << builtin->function;
+    if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_submit())) {
+      os << "tl_hexagon_dma_compact_submit";
+    } else if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_commit())) {
+      os << "tl_hexagon_dma_compact_commit";
+    } else if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_wait())) {
+      os << "tl_hexagon_dma_compact_wait";
+    } else {
+      os << builtin->function;
+    }
     size_t first = static_cast<size_t>(builtin->template_args);
     for (size_t i = 0; i < first; ++i) {
       os << (i == 0 ? "<" : ", ");
@@ -887,8 +895,9 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     const auto *groups = call->args[1].as<IntImmNode>();
     ICHECK(descriptors && groups) << "hexagon_dma_queue needs constant sizes";
     PrintIndent();
-    stream << "tl_hexagon_dma_async_context<" << descriptors->value << ", "
-           << groups->value << (dma_load_only_ ? ", true" : "")
+    stream << (dma_load_only_ ? "tl_hexagon_dma_compact_load_context<"
+                              : "tl_hexagon_dma_async_context<")
+           << descriptors->value << ", " << groups->value
            << "> tl_dma_async;\n";
     PrintIndent();
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";

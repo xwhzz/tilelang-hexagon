@@ -58,6 +58,10 @@ static int qurt_mem_cache_clean(qurt_addr_t, qurt_size_t,
 
 #include <tl_templates/hexagon/dma.h>
 
+#ifndef COMPACT
+#define COMPACT 0
+#endif
+
 using TryPop = int (*)(tl_hexagon_dma_queue *, tl_hexagon_dma_transfer *);
 static_assert(std::is_same_v<decltype(&tl_hexagon_dma_queue_try_pop), TryPop>);
 static_assert(std::is_same_v<decltype(&tl_hexagon_dma_queue_pop), TryPop>);
@@ -73,6 +77,19 @@ static_assert(
 static_assert(
     std::is_same_v<decltype(&tl_hexagon_dma_async_commit<1, 1>), Commit>);
 static_assert(std::is_same_v<decltype(&tl_hexagon_dma_async_wait<1, 1>), Wait>);
+using OldLoadOnly = tl_hexagon_dma_async_context<1, 1, true>;
+using OldSubmit = int (*)(OldLoadOnly &, void *, const void *, uint32_t,
+                          uint32_t, uint32_t, uint32_t, int);
+using OldCommit = int (*)(OldLoadOnly &);
+using OldWait = int (*)(OldLoadOnly &, uint32_t);
+static_assert(std::is_same_v<decltype(&tl_hexagon_dma_async_submit<1, 1, true>),
+                             OldSubmit>);
+static_assert(std::is_same_v<decltype(&tl_hexagon_dma_async_commit<1, 1, true>),
+                             OldCommit>);
+static_assert(
+    std::is_same_v<decltype(&tl_hexagon_dma_async_wait<1, 1, true>), OldWait>);
+static_assert(sizeof(tl_hexagon_dma_compact_load_context<3, 3>) <
+              sizeof(tl_hexagon_dma_async_context<3, 3, true>));
 
 // Non-PIE host binaries put these objects below 4 GiB, so the actual DMA
 // address validation and managed constructor run without a mocked shortcut.
@@ -85,7 +102,9 @@ static void reset_observations() {
 }
 
 template <uint32_t D, uint32_t G> struct Managed {
-#if LOAD_ONLY
+#if COMPACT
+  using Context = tl_hexagon_dma_compact_load_context<D, G>;
+#elif LOAD_ONLY
   using Context = tl_hexagon_dma_async_context<D, G, true>;
 #else
   using Context = tl_hexagon_dma_async_context<D, G>;
@@ -97,8 +116,12 @@ template <uint32_t D, uint32_t G> struct Managed {
     std::memset(storage, 0xa5, sizeof(storage));
     p = new (storage) Context;
     assert(p->status == TL_HEXAGON_DMA_OK);
-    assert(p->queue.capacity == D && p->queue.descriptors == p->descriptors &&
-           p->queue.transfers == p->transfers);
+    assert(p->queue.capacity == D && p->queue.descriptors == p->descriptors);
+#if COMPACT
+    assert(p->queue.transfers == nullptr);
+#else
+    assert(p->queue.transfers == p->transfers);
+#endif
     // Mark live padding after object construction; no indeterminate-byte
     // assumption.
     for (auto &descriptor : p->descriptors)
@@ -124,12 +147,16 @@ template <typename Context> static void finish(Context &c) {
   engine_state = 0;
 }
 
-static void assert_cleared(const tl_hexagon_dma_descriptor &d,
-                           const tl_hexagon_dma_transfer &t) {
+static void assert_descriptor_cleared(const tl_hexagon_dma_descriptor &d) {
   for (auto word : d.word)
     assert(word == 0);
   for (auto byte : d.padding)
     assert(byte == 0xa5);
+}
+
+static void assert_cleared(const tl_hexagon_dma_descriptor &d,
+                           const tl_hexagon_dma_transfer &t) {
+  assert_descriptor_cleared(d);
   assert(t.dst == nullptr && t.src == nullptr && t.dst_stride == 0 &&
          t.src_stride == 0 && t.row_bytes == 0 && t.rows == 0 &&
          t.direction == TL_HEXAGON_DMA_NO_CACHE);
@@ -171,6 +198,7 @@ static void poll_before_done() {
   poll_hook = {};
 }
 
+#if !COMPACT
 static void store_cache_error() {
   Managed<1, 1> m;
   auto &c = *m.p;
@@ -199,6 +227,7 @@ static void store_cache_error() {
          std::vector<std::string>({"poll", "invalidate", "invalidate"}));
   assert_cleared(c.descriptors[0], c.transfers[0]);
 }
+#endif
 
 static void error_drain() {
   {
@@ -339,8 +368,14 @@ template <unsigned D, unsigned G> static void capacity_ring(unsigned rounds) {
       wait(1);
   }
   wait(0);
-  for (unsigned i = 0; i < D; ++i)
+  for (unsigned i = 0; i < D; ++i) {
+#if COMPACT
+    assert_descriptor_cleared(c.descriptors[i]);
+    assert(c.queue.transfers == nullptr);
+#else
     assert_cleared(c.descriptors[i], c.transfers[i]);
+#endif
+  }
   assert(resets == 0);
 }
 
@@ -369,6 +404,50 @@ static void uncommitted_drain() {
   }
 }
 
+static void zero_and_invalid_transfers() {
+  Managed<2, 2> managed;
+  auto &c = *managed.p;
+  // Invalid geometry and addresses remain checked before queue publication.
+  for (auto args : std::vector<std::vector<uint32_t>>{
+           {64, 64, TL_HEXAGON_DMA_FIELD2D_MAX + 1, 2},
+           {64, 64, 32, TL_HEXAGON_DMA_ROWS_MAX + 1}}) {
+    assert(c.submit(dst, src, args[0], args[1], args[2], args[3], 3) ==
+           TL_HEXAGON_DMA_ERR_RANGE);
+    assert(c.queue.count == 0 && c.submitted == 0 && events.empty());
+  }
+  assert(c.submit(dst, nullptr, 64, 64, 64, 1, 3) ==
+         TL_HEXAGON_DMA_ERR_ARGUMENT);
+  assert(c.submit(dst, reinterpret_cast<void *>(UINT32_MAX - 15u), 64, 64, 64,
+                  1, 3) == TL_HEXAGON_DMA_ERR_RANGE);
+  assert(c.queue.count == 0 && c.submitted == 0 && events.empty());
+  // Zero-length 1D and zero-row 2D still publish already-done descriptors.
+  assert(c.submit(nullptr, nullptr, 0, 0, 0, 1, 3) == 0);
+  assert(c.commit() == 0);
+  assert(c.submit(nullptr, nullptr, 64, 64, 32, 0, 3) == 0);
+  assert(c.commit() == 0);
+  assert(events.empty() && c.queue.count == 2);
+  assert(c.wait(0) == 0);
+  assert(events == std::vector<std::string>({"poll", "poll"}));
+  assert(c.retired == 2 && c.queue.count == 0);
+}
+
+static void old_completed_result() {
+  // The old explicitly load-only context still exposes its transfer records
+  // through both raw pop and an explicitly specialized helper address.
+  alignas(OldLoadOnly) static uint8_t storage[sizeof(OldLoadOnly)];
+  engine_state = 0;
+  auto *c = new (storage) OldLoadOnly;
+  OldSubmit call = &tl_hexagon_dma_async_submit<1, 1, true>;
+  assert(call(*c, dst, src, 64, 64, 32, 2, 3) == TL_OK);
+  finish(*c);
+  tl_hexagon_dma_transfer result{};
+  assert(tl_hexagon_dma_queue_try_pop(&c->queue, &result) == 0);
+  assert(result.dst == dst && result.src == src && result.dst_stride == 64 &&
+         result.src_stride == 64 && result.row_bytes == 32 &&
+         result.rows == 2 && result.direction == 3);
+  c->~OldLoadOnly();
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   std::string name = argv[1];
@@ -386,8 +465,10 @@ int main(int argc, char **argv) {
     busy_then_done();
   else if (name == "poll-before-done")
     poll_before_done();
+#if !COMPACT
   else if (name == "store-cache-error")
     store_cache_error();
+#endif
   else if (name == "error-drain")
     error_drain();
   else if (name == "capacity-rings") {
@@ -396,6 +477,10 @@ int main(int argc, char **argv) {
     capacity_ring<256, 256>(769);
   } else if (name == "uncommitted-drain")
     uncommitted_drain();
+  else if (name == "zero-invalid")
+    zero_and_invalid_transfers();
+  else if (name == "old-completed")
+    old_completed_result();
   else
     assert(false);
 }

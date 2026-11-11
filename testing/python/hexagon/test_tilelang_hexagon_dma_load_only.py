@@ -12,6 +12,7 @@ from tilelang.engine.lower import _prepare_device_codegen_mod
 
 I = tvm.tirx
 PREFIX = "tl_hexagon_dma_async_context<1, 1"
+COMPACT_PREFIX = "tl_hexagon_dma_compact_load_context<1, 1"
 
 
 def _normal(arch="v79"):
@@ -57,9 +58,9 @@ def _replace(func, name, change):
 
 def _assert_policy(func, target, enabled):
     source = _emit(func, target)
-    assert (PREFIX + ", true> tl_dma_async") in source if enabled else (PREFIX + "> tl_dma_async") in source
+    assert (COMPACT_PREFIX + "> tl_dma_async") in source if enabled else (PREFIX + "> tl_dma_async") in source
     if not enabled:
-        assert ", true> tl_dma_async" not in source
+        assert "tl_hexagon_dma_compact_" not in source
     return source
 
 
@@ -136,8 +137,7 @@ def test_capacity_does_not_change_the_load_only_proof(arch, descriptors, groups)
     func, target = _normal(arch)
     func = _replace(func, "tl.hexagon_dma_queue", lambda c: I.Call(c.dtype, c.op, [I.const(descriptors), I.const(groups)]))
     source = _emit(func, target)
-    policy = ", true" if arch in {"v73", "v75", "v79"} else ""
-    assert f"tl_hexagon_dma_async_context<{descriptors}, {groups}{policy}> tl_dma_async" in source
+    assert f"tl_hexagon_dma_compact_load_context<{descriptors}, {groups}> tl_dma_async" in source
 
 
 def make_load_only_pipeline(stages=3):
@@ -163,10 +163,11 @@ def test_normal_multibuffer_pipeline_keeps_opaque_and_arch_guards(arch, stages):
     )
     # The parity builtin in the two-stage pipeline is still outside the
     # existing call whitelist. This capacity extension does not broaden it.
-    policy = ", true" if arch in {"v73", "v75", "v79"} and stages == 3 else ""
-    assert f"tl_hexagon_dma_async_context<{stages}, {stages}{policy}>" in source
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
-    assert f"tl_hexagon_dma_async_wait(tl_dma_async, {stages - 1})" in source
+    policy = "compact_load" if stages == 3 else "async"
+    helper = "compact" if stages == 3 else "async"
+    assert f"tl_hexagon_dma_{policy}_context<{stages}, {stages}>" in source
+    assert f"tl_hexagon_dma_{helper}_wait(tl_dma_async, 0)" in source
+    assert f"tl_hexagon_dma_{helper}_wait(tl_dma_async, {stages - 1})" in source
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
@@ -178,7 +179,7 @@ def test_load_only_pipeline_wraps_and_preserves_resident_guards():
     func = make_load_only_pipeline()
     [(name, source, params, outputs)] = lower_kernels([(func, [1])], target=target)
     arch = str(target.attrs["mcpu"])
-    assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch in {"hexagonv73", "hexagonv75", "hexagonv79"})
+    assert ("tl_hexagon_dma_compact_load_context<3, 3>" in source) == (arch in {"hexagonv73", "hexagonv75", "hexagonv79"})
     payload = _pipeline_payload()
     expected = (payload.to(torch.int32) + 1).to(torch.uint8)
     whole = torch.full((4096 + 256,), 0xA5, dtype=torch.uint8)
@@ -223,7 +224,7 @@ def test_consecutive_functions_do_not_inherit_a_rejected_policy():
     )
     good = func.with_attr("global_symbol", "z_good")
     source = tvm.get_global_func("target.build.tilelang_hexagon")(tvm.IRModule({"a_bad": bad, "z_good": good}), target).inspect_source()
-    assert source.count(PREFIX + ", true> tl_dma_async") == 1
+    assert source.count(COMPACT_PREFIX + "> tl_dma_async") == 1
     assert source.count(PREFIX + "> tl_dma_async") == 1
 
 
@@ -247,7 +248,7 @@ def test_imported_c_disables_specialization_for_the_entire_module(location):
             tvm.IRModule({"a_first": first, "z_import": last}), target
         ).inspect_source()
         assert source.count(PREFIX + "> tl_dma_async") == 2
-        assert ", true> tl_dma_async" not in source
+        assert "tl_hexagon_dma_compact_" not in source
         assert "#define dma_imported_marker 1" in source
 
 
@@ -263,11 +264,11 @@ def test_parameter_named_like_the_private_queue_is_renamed_safely():
     target = determine_target({"kind": "hexagon", "mcpu": "hexagonv79"}, return_object=True)
     with target:
         source = tilelang.lower(collision, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source
-    assert PREFIX + ", true> tl_dma_async" in source
+    assert COMPACT_PREFIX + "> tl_dma_async" in source
     assert "tl_dma_async_1" in source
 
 
-@pytest.fixture(scope="module", params=[False, True], ids=["generic", "load-only"])
+@pytest.fixture(scope="module", params=["generic", "load-only", "compact"])
 def dma_host(request, tmp_path_factory):
     from pathlib import Path
     import shutil
@@ -296,7 +297,8 @@ def dma_host(request, tmp_path_factory):
             "-fno-pie",
             "-no-pie",
             "-D__HEXAGON_ARCH__=79",
-            f"-DLOAD_ONLY={int(request.param)}",
+            f"-DLOAD_ONLY={int(request.param != 'generic')}",
+            f"-DCOMPACT={int(request.param == 'compact')}",
             "-I",
             str(directory),
             str(Path(__file__).with_name("dma_load_only_host.cc")),
@@ -306,11 +308,22 @@ def dma_host(request, tmp_path_factory):
         check=True,
         timeout=30,
     )
-    return binary, request.param
+    return binary, request.param != "generic"
 
 
 @pytest.mark.parametrize(
-    "case", ["cached-load", "early-success", "busy-then-done", "poll-before-done", "error-drain", "capacity-rings", "uncommitted-drain"]
+    "case",
+    [
+        "cached-load",
+        "early-success",
+        "busy-then-done",
+        "poll-before-done",
+        "error-drain",
+        "capacity-rings",
+        "uncommitted-drain",
+        "zero-invalid",
+        "old-completed",
+    ],
 )
 def test_actual_header_preserves_load_order_and_cleanup(dma_host, case):
     import subprocess
@@ -355,7 +368,7 @@ def test_adjacent_program_scopes_do_not_share_completion_policy():
         scope = I.AttrStmt(I.const(0), "tl.tile_program_scope", 1, body)
         scopes.append(I.For(I.Var(f"i{n}", "int32"), 0, 1, I.ForKind.SERIAL, scope))
     generated = _emit(func.with_body(I.SeqStmt(scopes)), target)
-    assert generated.count(PREFIX + ", true> tl_dma_async") == 2
+    assert generated.count(COMPACT_PREFIX + "> tl_dma_async") == 2
     assert generated.count(PREFIX + "> tl_dma_async") == 1
 
 
@@ -405,11 +418,11 @@ def test_normal_session_import_disables_all_kernel_policies(monkeypatch, import_
     assert len(seen) == 1
     for _, source, _, _ in seen[0]:
         assert PREFIX + "> tl_dma_async" in source
-        assert ", true> tl_dma_async" not in source
+        assert "tl_hexagon_dma_compact_" not in source
     # The composition opt-out must not mutate the caller's reusable PrimFunc.
     assert not normal.attrs.get("tl.hexagon_disable_dma_load_only", False)
     session.Session([(normal, [1])], target=target)
-    assert PREFIX + ", true> tl_dma_async" in seen[1][0][1]
+    assert COMPACT_PREFIX + "> tl_dma_async" in seen[1][0][1]
 
 
 def test_session_import_policy_has_a_distinct_lowering_cache_key(tmp_path, monkeypatch):
@@ -428,7 +441,7 @@ def test_session_import_policy_has_a_distinct_lowering_cache_key(tmp_path, monke
         normal, imported = _session_copy(), _session_copy("block")
         target = {"kind": "hexagon", "mcpu": "hexagonv79"}
         (first,) = session.lower_kernels([(normal, [1])], target)
-        assert PREFIX + ", true> tl_dma_async" in first[1]
+        assert COMPACT_PREFIX + "> tl_dma_async" in first[1]
         combined = session.lower_kernels([(normal, [1]), (imported, [1])], target)
         assert all(PREFIX + "> tl_dma_async" in item[1] for item in combined)
         assert len(calls) == 3

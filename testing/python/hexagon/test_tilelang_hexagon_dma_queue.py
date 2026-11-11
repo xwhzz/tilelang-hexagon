@@ -67,7 +67,7 @@ def test_tall_copy_splits_into_one_group(rows, arch):
     descriptors = 1 if rows == 65535 else 2
     assert _ops(artifact) == ["queue"] + ["submit"] * descriptors + ["commit", "wait"]
     assert _queue(artifact) == (descriptors, 1)
-    submits = re.findall(r"tl_hexagon_dma_async_submit\(tl_dma_async, (.*)\)\) return", artifact.kernel_source)
+    submits = re.findall(r"tl_hexagon_dma_compact_submit\(tl_dma_async, (.*)\)\) return", artifact.kernel_source)
     assert submits[0].endswith("(uint32_t)65535, 3")
     if descriptors == 2:
         assert submits[1].endswith(f"(uint32_t){rows - 65535}, 3")

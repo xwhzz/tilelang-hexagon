@@ -84,11 +84,10 @@ def test_load_only_dma_reads_dirty_source_and_preserves_guards():
     probe = make_cached_load_probe()
     target = determine_target("hexagon", return_object=True)
     source = lower(probe, target)
-    policy = ", true" if target.attrs.get("mcpu") in {"hexagonv73", "hexagonv75", "hexagonv79"} else ""
-    assert f"tl_hexagon_dma_async_context<1, 1{policy}> tl_dma_async;" in source
+    assert "tl_hexagon_dma_compact_load_context<1, 1> tl_dma_async;" in source
     assert submit_directions(source) == [0]
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
-    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") == 1
     assert "tl_parallel_for" not in source
 
     size = 320 * 4
@@ -179,14 +178,13 @@ def test_async_manual_ping_pong(arch):
 
     source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # At most two copies are in flight; each is one descriptor and one group.
-    policy = ", true" if arch in {"v73", "v75", "v79"} else ""
-    assert f"tl_hexagon_dma_async_context<2, 2{policy}> tl_dma_async;" in source
-    assert source.count("tl_hexagon_dma_async_submit(tl_dma_async, ") == 3
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 3
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in source
+    assert "tl_hexagon_dma_compact_load_context<2, 2> tl_dma_async;" in source
+    assert source.count("tl_hexagon_dma_compact_submit(tl_dma_async, ") == 3
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 3
+    assert "tl_hexagon_dma_compact_wait(tl_dma_async, 1)" in source
     # The program already drains the queue, so no second drain follows.
-    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
-    assert source.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > source.rindex("tl_hexagon_dma_async_submit(")
+    assert source.count("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") == 1
+    assert source.rindex("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") > source.rindex("tl_hexagon_dma_compact_submit(")
     assert "ptx_" not in source
 
 
@@ -459,11 +457,11 @@ def test_managed_worker_queue_is_local_and_drained():
     entry, program = source.split(" -> int32_t {", 1)
     assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(512u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
+    assert "tl_hexagon_dma_compact_load_context" not in entry
     # Each tile program owns its queue and its buffers in the worker's arena.
-    policy = ", true" if target.attrs.get("mcpu") in {"hexagonv73", "hexagonv75", "hexagonv79"} else ""
-    assert f"tl_hexagon_dma_async_context<1, 1{policy}> tl_dma_async;" in program
+    assert "tl_hexagon_dma_compact_load_context<1, 1> tl_dma_async;" in program
     assert "half* s = (half*)tl_arena;" in program
-    assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")
+    assert program.rindex("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_compact_submit(")
 
 
 def test_reject_crouton_from_row_major():
@@ -594,7 +592,7 @@ def test_rows_read_from_a_table_are_in_bounds_once_clamped(clamped):
                 T.copy(s, B[j, 0:256])
 
     if clamped:
-        assert "tl_hexagon_dma_async_submit" in lower(probe)
+        assert "tl_hexagon_dma_compact_submit" in lower(probe)
     else:
         with pytest.raises(Exception, match="in-bounds"):
             lower(probe)
@@ -703,7 +701,7 @@ def test_async_scalar_access_is_not_silently_synchronous():
             T.copy(s[0], B[0])
 
     source = lower(probe)
-    (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_compact_submit(" in line]
     assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 3)" in call
 
 
