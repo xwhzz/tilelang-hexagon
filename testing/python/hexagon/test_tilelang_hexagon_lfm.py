@@ -426,17 +426,12 @@ def _kv_errors(decoder, state, n, rel) -> list:
     return errors
 
 
-@DEVICE
-@pytest.mark.parametrize(("model", "processes"), STAGES)
-def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
-    path = fp16_bundle(model)
+def _check_fp16_prefill_reference(path, processes, *, n=200, max_pos=512, full_keys=128):
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
     torch.manual_seed(1)
-    # A chunk of 128 rows and part of another, past the tiny LFM3's window.
-    n, max_pos = 200, 512
     prompt = torch.randint(0, c.vocab, (n,))
-    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes)
+    decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes, prefill_full_keys=full_keys)
     try:
         decoder.reset()
         decoder.prefill(prompt.tolist())
@@ -457,6 +452,30 @@ def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
         assert decoder.generate(prompt.tolist(), 8) == want
     finally:
         decoder.close()
+
+
+@DEVICE
+@pytest.mark.parametrize(("model", "processes"), STAGES)
+def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
+    # A chunk of 128 rows and part of another, past the tiny LFM3's window.
+    _check_fp16_prefill_reference(fp16_bundle(model), processes)
+
+
+@DEVICE
+@pytest.mark.parametrize("full_keys", [128, 256, 512])
+def test_fp16_lfm2_full_keys_matches_the_reference(full_keys, fp16_bundle):
+    # LFM2 has 64-wide heads and two KV heads per worker. Cross a 512-key
+    # boundary and the 512+256 tail, including a padded final chunk, without
+    # a max_pos fallback or changes to the original numerical contract.
+    _check_fp16_prefill_reference(fp16_bundle("lfm2"), 1, n=777, max_pos=1024, full_keys=full_keys)
+
+
+@DEVICE
+@pytest.mark.parametrize("full_keys", [256, 512])
+def test_fp16_lfm3_full_keys_multiple_steps_match_the_reference(full_keys, fp16_bundle):
+    # One prefill call crosses the 512+256 tail and a padded final chunk,
+    # including full/sliding attention with 128-wide heads and four workers.
+    _check_fp16_prefill_reference(fp16_bundle("lfm3"), 1, n=777, max_pos=1024, full_keys=full_keys)
 
 
 @DEVICE
@@ -703,6 +722,7 @@ def test_decoder_passes_one_resolved_target_to_factory_and_session(fp16, arch, m
     decoder.c = Config(vocab=4096, dim=2048, ff=2048, heads=32, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
     decoder.header = {"tensors": {}}
     decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = 256, 64, 128
+    decoder.prefill_full_keys = 128
     if fp16:
         monkeypatch.setattr(decode_fp16, "plan_stages", lambda *args: [range(3)])
         monkeypatch.setattr(decode_fp16, "make_decode", lambda *args: "decode")

@@ -39,6 +39,13 @@ def main():
     p.add_argument("--temperature", type=float, default=0.0, help="sample the generated tokens (0: greedy)")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--prefill-rows", default="auto", help="the prefill's chunk (Decoder's prefill_rows)")
+    p.add_argument(
+        "--prefill-full-keys",
+        type=int,
+        choices=(128, 256, 512),
+        default=128,
+        help="fp16 full-attention block upper bound; sliding stays 128",
+    )
     p.add_argument("--max-pos", type=int, default=4096, help="the KV cache's positions (Decoder's max_pos)")
     p.add_argument("--depth", type=int, default=0, help="positions of context before each test, prefilled untimed")
     p.add_argument("--processes", default="auto", help="the DSP processes of the fp16 bundle (Decoder's processes)")
@@ -50,7 +57,13 @@ def main():
     rows = named[args.prefill_rows] if args.prefill_rows in named else int(args.prefill_rows)
     processes = args.processes if args.processes == "auto" else int(args.processes)
     decoder = Decoder(
-        args.bundle, args.device_bundle, max_pos=args.max_pos, max_tokens=args.max_pos, prefill_rows=rows, processes=processes
+        args.bundle,
+        args.device_bundle,
+        max_pos=args.max_pos,
+        max_tokens=args.max_pos,
+        prefill_rows=rows,
+        processes=processes,
+        prefill_full_keys=args.prefill_full_keys,
     )
     stages = " ".join(f"[{st.layers.start}, {st.layers.stop})" for st in getattr(decoder, "stages", []))
     print(f"session ready in {time.time() - t0:.0f} s" + (f"; the layers' stages: {stages}" if stages else ""))

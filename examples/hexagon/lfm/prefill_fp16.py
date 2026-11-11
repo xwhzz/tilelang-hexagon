@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decode_fp16  # noqa: E402
 from convert import TILE, qkv_group  # noqa: E402
 from decode_fp16 import NW, kv_layouts, slice_cols  # noqa: E402
-from model import SLIDING, Config  # noqa: E402
+from model import FULL, SLIDING, Config  # noqa: E402
 from stream import Phase, Stream, Weights  # noqa: E402
 
 DEPTH = 2  # blocks in flight per worker: a block multiplies longer than it streams
@@ -82,7 +82,7 @@ def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     return rows
 
 
-def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None):
+def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None, full_keys: int = KEYS):
     """The fp16 prefill kernel of config c, in chunks of R rows: chunk `chunk`
     of the n tokens from pos0 a call. The Decoder runs the chunks as a
     pipeline (Session.pipeline).
@@ -92,8 +92,25 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     layers' slices (decode_fp16.make_decode): the first embeds the chunk,
     the others normalize the residual x the stage before left in DDR.
     Without an explicit target, normalization keeps staged FP32 rows and pack;
-    an explicit target must also be used when compiling this kernel."""
+    an explicit target must also be used when compiling this kernel.
+
+    full_keys opts full-attention layers into 256- or 512-position blocks;
+    sliding-window blocks and the cache metadata unit remain 128. A max_pos
+    not divisible by the requested block uses 128 instead. When the entire
+    physical query chunk fits within 128 or 256 keys, full attention uses
+    that smaller block. Operands share a maximum-width workspace; scores
+    and probabilities keep compact per-width buffers. The final causal
+    block also uses 128 or 256 when it covers all physical query rows,
+    including padded rows; larger remainders retain the selected bound.
+    The normal four-worker arena check still applies."""
+    if not isinstance(full_keys, int) or full_keys not in (128, 256, 512):
+        raise ValueError("full_keys must be 128, 256 or 512")
+    # The bundle/cache metadata unit stays KEYS=128. A larger full-attention
+    # fetch is opt-in; otherwise-valid contexts must not overread a final block.
+    full_keys = full_keys if max_pos % full_keys == 0 else KEYS
     layers = range(c.layers) if layers is None else layers
+    has_full = any(c.layer_types[i] == FULL for i in layers)
+    has_sliding = any(c.layer_types[i] == SLIDING for i in layers)
     has_embedding, has_last_layer = layers.start == 0, layers.stop == c.layers
     D, F, HD = c.dim, c.ff, c.head_dim
     target = target if target is None or isinstance(target, Target) else Target(target)
@@ -345,19 +362,69 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                 bf.gates[kvh % KH, q, i] = T.sigmoid(bf.cc[0, i, q])
 
     @T.macro
-    def fetch(bf, kv0, window, kvh, kb, slot):
+    def fetch(bf, kv0, window, kvh, kb, slot, block_keys: int):
         """Block kb of the KV head's keys and values, in the layer's rows from
         block kv0, into a slot of HMX's operands, by DMA, the cache's tiles as
         they are: in blocks and clamped, so that the copies are provably whole
         tiles in the cache, as a block past it is never used. A ring's blocks
         do not wrap."""
-        blk = kv0 + T.if_then_else(window > 0, decode_fp16.RING_PAD // KEYS + kb % (RING // KEYS), T.max(T.min(kb, max_pos // KEYS - 1), 0))
-        at = T.max(T.min(blk, KV_ROWS // KEYS - 1), 0) * KEYS
-        T.dma_copy(bf.kv_k[kvh, at : at + KEYS, :], bf.kblk[slot, :, :])
-        T.dma_copy(bf.kv_v[kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
+        # kv0 remains a count of 128-row metadata blocks for both paths.
+        if block_keys == KEYS:
+            blk = kv0 + T.if_then_else(
+                window > 0, decode_fp16.RING_PAD // KEYS + kb % (RING // KEYS), T.max(T.min(kb, max_pos // KEYS - 1), 0)
+            )
+            at = T.max(T.min(blk, KV_ROWS // KEYS - 1), 0) * KEYS
+        else:
+            row = kv0 * KEYS + T.max(T.min(kb, max_pos // block_keys - 1), 0) * block_keys
+            at = T.max(T.min(row, KV_ROWS - block_keys), 0)
+        T.dma_copy(bf.kv_k[kvh, at : at + block_keys, :], bf.kblk[slot, :block_keys, :])
+        T.dma_copy(bf.kv_v[kvh, at : at + block_keys, :], bf.vblk[slot, :block_keys, :])
 
     @T.macro
-    def attention(bf, kv0, base, window):
+    def attention_step(abf, scores, probabilities, row0, span, key0, slot, block_keys: int):
+        """Append one contiguous key block to the same online softmax state."""
+        T.gemm(abf.qb, abf.kblk[slot, :block_keys, :], scores, transpose_B=True, clear_accum=True)
+        # Causal, and within the window: key key0 + j is
+        # visible to row i when row0 + i - span < key <= row0 + i,
+        # every key of the block to every row away from the
+        # diagonal and the window's edge.
+        if key0 + block_keys - 1 > row0 or key0 <= row0 + ROWS - 1 - span:
+            for i, j in T.Parallel(ROWS, block_keys):
+                key = key0 + j
+                causal = T.if_then_else(key <= row0 + i, scores[i, j], T.float16(NEG16))
+                scores[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
+        T.reduce_max(scores, abf.rmax, dim=1)
+        for i in T.Parallel(ROWS):
+            abf.rmax[i] = T.max(abf.m[i], abf.rmax[i])
+            abf.alpha[i] = T.exp2(abf.m[i] - abf.rmax[i])
+            abf.m[i] = abf.rmax[i]
+            # The maxima of fp16 scores are fp16.
+            abf.mh[i] = T.Cast("float16", abf.rmax[i])
+        for i, j in T.Parallel(ROWS, block_keys):
+            probabilities[i, j] = T.exp2(scores[i, j] - abf.mh[i])
+        T.reduce_sum(probabilities, abf.rsum, dim=1)
+        for i in T.Parallel(ROWS):
+            abf.ls[i] = abf.ls[i] * abf.alpha[i] + abf.rsum[i]
+        for i, d in T.Parallel(ROWS, HD):
+            abf.acc_o[i, d] = abf.acc_o[i, d] * abf.alpha[i]
+        T.gemm(probabilities, abf.vblk[slot, :block_keys, :], abf.acc_o, clear_accum=False)
+
+    @T.macro
+    def fetch_tail(bf, kv0, window, kvh, kb, slot, block_keys: int, tail_keys):
+        """Use the tail's physical width while retaining the bulk key origin."""
+        if tail_keys == KEYS:
+            fetch(bf, kv0, window, kvh, kb * (block_keys // KEYS), slot, KEYS)
+        else:
+            if block_keys == 512:
+                if tail_keys == 256:
+                    fetch(bf, kv0, window, kvh, kb * 2, slot, 256)
+                else:
+                    fetch(bf, kv0, window, kvh, kb, slot, block_keys)
+            else:
+                fetch(bf, kv0, window, kvh, kb, slot, block_keys)
+
+    @T.macro
+    def attention(bf, kv0, base, window, block_keys: int, scratch=None):
         """The worker's query heads, ROWS rows at a time: softmax(q K^T) V
         over the cache's positions [base + i - window + 1 (or 0), base + i]
         for row i, gated, into hid, in base 2 (the queries carry log2 e).
@@ -367,64 +434,121 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         tiles, which HMX multiplies by V and whose rows sum in fp32. The
         blocks of keys and values come by DMA, a block ahead, straight into
         HMX's operands: the cache keeps them in its tiles."""
+        if scratch is None:
+            qb = T.alloc_shared((ROWS, HD), "float16")
+            kblk = T.alloc_shared((2, block_keys, HD), "float16")
+            vblk = T.alloc_shared((2, block_keys, HD), "float16")
+            acc_o = T.alloc_shared((ROWS, HD), "float32")
+            m = T.alloc_shared((ROWS,), "float32")
+            ls = T.alloc_shared((ROWS,), "float32")
+            s = T.alloc_shared((ROWS, block_keys), "float16")
+            p = T.alloc_shared((ROWS, block_keys), "float16")
+            rmax = T.alloc_shared((ROWS,), "float32")
+            mh = T.alloc_shared((ROWS,), "float16")
+            rsum = T.alloc_shared((ROWS,), "float32")
+            alpha = T.alloc_shared((ROWS,), "float32")
+        else:
+            qb, kblk, vblk = scratch.qb, scratch.kblk, scratch.vblk
+            acc_o, m, ls = scratch.acc_o, scratch.m, scratch.ls
+            rmax, mh, rsum, alpha = scratch.rmax, scratch.mh, scratch.rsum, scratch.alpha
+            # These compact matrices are reused only by serial, mutually
+            # exclusive widths; each step overwrites them before reading.
+            s, p = scratch.scores[block_keys]
+
+        abf = SimpleNamespace(
+            w=bf.w,
+            qs=bf.qs,
+            kv_k=bf.kv_k,
+            kv_v=bf.kv_v,
+            hid=bf.hid,
+            gate=bf.gate,
+            qb=qb,
+            kblk=kblk,
+            vblk=vblk,
+            acc_o=acc_o,
+            m=m,
+            ls=ls,
+            s=s,
+            p=p,
+            rmax=rmax,
+            mh=mh,
+            rsum=rsum,
+            alpha=alpha,
+        )
+        if scratch is None:
+            attn_layouts = {qb: make_hmx_activation_layout(qb), s: make_hmx_activation_layout(s)}
+            attn_layouts.update(kv_layouts(kblk, vblk))
+            T.annotate_layout(attn_layouts)
         for h in T.serial(KH):
-            kvh = bf.w * KH + h
+            kvh = abf.w * KH + h
             for hq in T.serial(group):
                 for rb in T.serial(R // ROWS):
                     row0 = base + rb * ROWS
-                    T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
+                    T.dma_copy(abf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], abf.qb)
                     for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = T.float32(0)
+                        abf.acc_o[i, d] = T.float32(0)
                     for i in T.Parallel(ROWS):
-                        bf.m[i] = T.float32(NEG)
-                        bf.ls[i] = T.float32(0)
+                        abf.m[i] = T.float32(NEG)
+                        abf.ls[i] = T.float32(0)
                     # The positions a row sees: its window, or all before it.
                     span = T.if_then_else(window > 0, window, max_pos + R)
-                    first = T.max(row0 - span + 1, 0) // KEYS
-                    last = T.ceildiv(row0 + ROWS, KEYS)
-                    fetch(bf, kv0, window, kvh, first, 0)
-                    for kb in T.serial(first, last):
+                    first = T.max(row0 - span + 1, 0) // block_keys
+                    last = T.ceildiv(row0 + ROWS, block_keys)
+                    if block_keys == KEYS:
+                        fetch(abf, kv0, window, kvh, first, 0, block_keys)
+                    else:
+                        # Only the final causal block may be narrower. Include
+                        # every physical query row, independently of n/valid.
+                        remaining = (row0 + ROWS - 1) % block_keys + 1
+                        if block_keys == 512:
+                            tail_keys = T.if_then_else(remaining <= KEYS, KEYS, T.if_then_else(remaining <= 256, 256, block_keys))
+                        else:
+                            tail_keys = T.if_then_else(remaining <= KEYS, KEYS, block_keys)
+                        bulk_last = T.if_then_else(tail_keys < block_keys, last - 1, last)
+                        if first + 1 == last:
+                            fetch_tail(abf, kv0, window, kvh, first, 0, block_keys, tail_keys)
+                        else:
+                            fetch(abf, kv0, window, kvh, first, 0, block_keys)
+                    for kb in T.serial(first, last if block_keys == KEYS else bulk_last):
                         slot = (kb - first) % 2
                         if kb + 1 < last:
-                            fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
+                            if block_keys == KEYS:
+                                fetch(abf, kv0, window, kvh, kb + 1, 1 - slot, block_keys)
+                            else:
+                                if kb + 2 == last:
+                                    fetch_tail(abf, kv0, window, kvh, kb + 1, 1 - slot, block_keys, tail_keys)
+                                else:
+                                    fetch(abf, kv0, window, kvh, kb + 1, 1 - slot, block_keys)
                             T.dma_wait(2)
                         else:
                             T.dma_wait()
-                        T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
-                        # Causal, and within the window: key kb * KEYS + j is
-                        # visible to row i when row0 + i - span < key <= row0 + i,
-                        # every key of the block to every row away from the
-                        # diagonal and the window's edge.
-                        if kb * KEYS + KEYS - 1 > row0 or kb * KEYS <= row0 + ROWS - 1 - span:
-                            for i, j in T.Parallel(ROWS, KEYS):
-                                key = kb * KEYS + j
-                                causal = T.if_then_else(key <= row0 + i, bf.s[i, j], T.float16(NEG16))
-                                bf.s[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
-                        T.reduce_max(bf.s, bf.rmax, dim=1)
-                        for i in T.Parallel(ROWS):
-                            bf.rmax[i] = T.max(bf.m[i], bf.rmax[i])
-                            bf.alpha[i] = T.exp2(bf.m[i] - bf.rmax[i])
-                            bf.m[i] = bf.rmax[i]
-                            # The maxima of fp16 scores are fp16.
-                            bf.mh[i] = T.Cast("float16", bf.rmax[i])
-                        for i, j in T.Parallel(ROWS, KEYS):
-                            bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
-                        T.reduce_sum(bf.p, bf.rsum, dim=1)
-                        for i in T.Parallel(ROWS):
-                            bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
-                        for i, d in T.Parallel(ROWS, HD):
-                            bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
-                        T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
-                    # The loop's last step drained the queue; the wait tells the
+                        attention_step(abf, abf.s, abf.p, row0, span, kb * block_keys, slot, block_keys)
+                    # The outer condition is static; default128 has no tail_keys.
+                    if block_keys != KEYS:  # noqa: SIM102
+                        if tail_keys != block_keys:
+                            # The last bulk iteration prefetched this tail into
+                            # the next slot. With no bulk, it is the first fetch.
+                            T.dma_wait()
+                            slot = (last - first - 1) % 2
+                            if tail_keys == KEYS:
+                                attention_step(
+                                    abf, scratch.scores[KEYS][0], scratch.scores[KEYS][1], row0, span, (last - 1) * block_keys, slot, KEYS
+                                )
+                            else:
+                                if block_keys == 512:
+                                    attention_step(
+                                        abf, scratch.scores[256][0], scratch.scores[256][1], row0, span, (last - 1) * block_keys, slot, 256
+                                    )
+                    # The final step drained the queue; the wait tells the
                     # DMA queue's bound (PlanDMAQueue), which cannot prove that
                     # the loop runs at all and keeps the first fetch in flight.
                     T.dma_wait()
                     for i in T.Parallel(ROWS):
-                        bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
+                        abf.alpha[i] = abf.gate(h, rb * ROWS + i, hq) / abf.ls[i]
                     for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
+                        abf.acc_o[i, d] = abf.acc_o[i, d] * abf.alpha[i]
                     col = (kvh * group + hq) * HD
-                    T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
+                    T.copy(abf.acc_o, abf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
 
     @T.macro
     def branch_block(bf, b, ring, k, A, K: int, first, sums):
@@ -523,26 +647,56 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             sq32 = T.alloc_shared((R, TILE), "float32")
             hs32 = T.alloc_shared((R,), "float32")
             gates = T.alloc_shared((KH, group, R), "float32")
-            # Attention: a block of a head's queries, two slots of a block of
-            # keys and values, the softmax state and output, and the scores.
-            qb = T.alloc_shared((ROWS, HD), "float16")
-            kblk = T.alloc_shared((2, KEYS, HD), "float16")
-            vblk = T.alloc_shared((2, KEYS, HD), "float16")
-            acc_o = T.alloc_shared((ROWS, HD), "float32")
-            m = T.alloc_shared((ROWS,), "float32")
-            ls = T.alloc_shared((ROWS,), "float32")
-            s = T.alloc_shared((ROWS, KEYS), "float16")
-            p = T.alloc_shared((ROWS, KEYS), "float16")
-            rmax = T.alloc_shared((ROWS,), "float32")
-            mh = T.alloc_shared((ROWS,), "float16")
-            rsum = T.alloc_shared((ROWS,), "float32")
-            alpha = T.alloc_shared((ROWS,), "float32")
-
+            # Mutually exclusive attention widths share their largest operands
+            # and accumulator. Each call drains DMA before it returns; the
+            # next call fills its active region before using it. Each width
+            # keeps compact S/P tiles below.
+            if full_keys != KEYS and has_full:
+                attn_qb = T.alloc_shared((ROWS, HD), "float16")
+                attn_kblk = T.alloc_shared((2, full_keys, HD), "float16")
+                attn_vblk = T.alloc_shared((2, full_keys, HD), "float16")
+                attn_acc_o = T.alloc_shared((ROWS, HD), "float32")
+                attn_m = T.alloc_shared((ROWS,), "float32")
+                attn_ls = T.alloc_shared((ROWS,), "float32")
+                attn_rmax = T.alloc_shared((ROWS,), "float32")
+                attn_mh = T.alloc_shared((ROWS,), "float16")
+                attn_rsum = T.alloc_shared((ROWS,), "float32")
+                attn_alpha = T.alloc_shared((ROWS,), "float32")
+                attn_s128 = T.alloc_shared((ROWS, KEYS), "float16")
+                attn_p128 = T.alloc_shared((ROWS, KEYS), "float16")
+                attn_s256 = T.alloc_shared((ROWS, 256), "float16")
+                attn_p256 = T.alloc_shared((ROWS, 256), "float16")
+                score_buffers = {KEYS: (attn_s128, attn_p128), 256: (attn_s256, attn_p256)}
+                shared_attn_layouts = {
+                    attn_qb: make_hmx_activation_layout(attn_qb),
+                    attn_s128: make_hmx_activation_layout(attn_s128),
+                    attn_s256: make_hmx_activation_layout(attn_s256),
+                }
+                if full_keys == 512:
+                    attn_s512 = T.alloc_shared((ROWS, 512), "float16")
+                    attn_p512 = T.alloc_shared((ROWS, 512), "float16")
+                    score_buffers[512] = (attn_s512, attn_p512)
+                    shared_attn_layouts[attn_s512] = make_hmx_activation_layout(attn_s512)
+                shared_attn_layouts.update(kv_layouts(attn_kblk, attn_vblk))
+                T.annotate_layout(shared_attn_layouts)
+                attention_scratch = SimpleNamespace(
+                    qb=attn_qb,
+                    kblk=attn_kblk,
+                    vblk=attn_vblk,
+                    acc_o=attn_acc_o,
+                    m=attn_m,
+                    ls=attn_ls,
+                    rmax=attn_rmax,
+                    mh=attn_mh,
+                    rsum=attn_rsum,
+                    alpha=attn_alpha,
+                    scores=score_buffers,
+                )
             # What the macros below work on.
             bf = SimpleNamespace(
                 w=w, a=a, hid=hid, x=x, f=f, psum=psum, qs=qs, cc=cc, gl=gl, st=st, xr=xr, rows=rows, sq=sq, ss=ss, sw=sw, nw=nw, pw=pw, erow=erow, hd=hd, rot=rot,
-                hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows, qb=qb, kblk=kblk, vblk=vblk,
-                acc_o=acc_o, m=m, ls=ls, s=s, p=p, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, conv_state=conv_state, conv_w=conv_w,
+                hss=hss, sq32=sq32, hs32=hs32, gates=gates, cos_rows=cos_rows, sin_rows=sin_rows,
+                conv_state=conv_state, conv_w=conv_w,
                 q_norm=q_norm, k_norm=k_norm, kv_k=kv_k, kv_v=kv_v,
                 gate=(lambda h, i, q: gates[h, q, i]) if c.head_gate else (lambda h, i, q: T.float32(1)),
             )  # fmt: skip
@@ -553,11 +707,8 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             layouts = Stream([Phase(pj, 0, 1, lambda b: 0) for pj in projections], DEPTH, rings=rings).layouts()
             # The scores: HMX's output tiles. The queries, in DDR as in VTCM,
             # in its activation tiles.
-            layouts[s] = make_hmx_activation_layout(s)
             layouts[qs] = make_hmx_activation_layout(qs)
-            layouts[qb] = make_hmx_activation_layout(qb)
             layouts.update(kv_layouts(kv_k, kv_v))
-            layouts.update(kv_layouts(kblk, vblk))
             T.annotate_layout(layouts)
             # Only DMA moves the residual: its transfers need no cache upkeep.
             T.annotate_dma_only(x)
@@ -617,7 +768,16 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                             bf, b, ring, k, ai, kv0, window, table, base
                         ),
                     )
-                    attention(bf, kv0, base, window)
+                    if full_keys != KEYS and has_full:
+                        # The per-row-block tail already selects 128/256 when
+                        # no later keys are visible. Keep one full-attention
+                        # state loop at the requested upper bound.
+                        if has_sliding and window > 0:
+                            attention(bf, kv0, base, window, KEYS, attention_scratch)
+                        else:
+                            attention(bf, kv0, base, window, full_keys, attention_scratch)
+                    else:
+                        attention(bf, kv0, base, window, KEYS)
                 else:
                     st_conv.prologue()
                     st_conv.run(0, lambda b, ring, k, ci=ci, valid=valid: in_proj_block(bf, b, ring, k, ci, valid))
