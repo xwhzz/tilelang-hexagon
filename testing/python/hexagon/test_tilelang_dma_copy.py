@@ -215,8 +215,21 @@ def submit_directions(source):
     return [
         int(re.search(r", (\d)\)\) return tl_status;", line).group(1))
         for line in source.splitlines()
-        if "tl_hexagon_dma_async_submit(" in line
+        if re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", line)
     ]
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_submit_direction_parser_covers_both_generated_queue_policies(arch, disabled):
+    probe = make_cached_load_probe()
+    if disabled:
+        probe = probe.with_attr("tilelang_pass_configs", {"tl.hexagon_disable_dma_load_only": True})
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    helper = "async" if disabled else "compact"
+    assert f"tl_hexagon_dma_{helper}_submit(" in source
+    # DSP writes precede the load: both policies must retain direction 0.
+    assert submit_directions(source) == [0]
 
 
 def test_dma_only_buffers_skip_cache_maintenance():
