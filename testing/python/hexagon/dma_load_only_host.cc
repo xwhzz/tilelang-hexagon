@@ -3,7 +3,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
+#include <limits>
 #include <new>
 #include <string>
 #include <type_traits>
@@ -284,6 +286,89 @@ static void mixed_generic() {
   assert(events == std::vector<std::string>({"poll", "invalidate"}));
 }
 
+template <unsigned D, unsigned G> static void capacity_ring(unsigned rounds) {
+  Managed<D, G> managed;
+  auto &c = *managed.p;
+  c.submitted = c.retired = std::numeric_limits<uint32_t>::max() - 5;
+  // An unbounded FIFO of group lengths is independent of both circular rings
+  // and the wrapping submitted/retired counters in the implementation.
+  std::deque<unsigned> groups;
+  auto check = [&] {
+    unsigned pending = 0;
+    for (auto n : groups)
+      pending += n;
+    assert(c.queue.count == pending && c.group_count == groups.size());
+    assert(uint32_t(c.submitted - c.retired) == pending);
+    assert(c.queue.head < D && c.group_head < G);
+    for (auto &d : c.descriptors)
+      for (auto b : d.padding)
+        assert(b == 0xa5);
+  };
+  auto wait = [&](unsigned keep) {
+    unsigned retired = 0;
+    while (groups.size() > keep) {
+      retired += groups.front();
+      groups.pop_front();
+    }
+    poll_hook = [&] {
+      assert(c.queue.count);
+      tl_hexagon_dma_descriptor_mark_done(&c.descriptors[c.queue.head]);
+    };
+    unsigned before = polls;
+    assert(c.wait(keep) == 0);
+    assert(unsigned(polls - before) == retired);
+    poll_hook = {};
+    engine_state = c.queue.count ? 1 : 0;
+    check();
+  };
+  for (unsigned i = 0; i < rounds; ++i) {
+    unsigned count = 1 + i % 2;
+    while (c.queue.count + count > D || groups.size() == G)
+      wait(groups.size() - 1);
+    for (unsigned j = 0; j < count; ++j) {
+      int direction = (i + j) % 3 == 0 ? TL_HEXAGON_DMA_DDR_TO_VTCM
+                                       : TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN;
+      assert(c.submit(dst, src, 64, 64, 32, 2, direction) == 0);
+    }
+    assert(c.commit() == 0);
+    groups.push_back(count);
+    check();
+    if (i % 7 == 0)
+      wait(0);
+    else if (groups.size() > 1 && i % 3 == 0)
+      wait(1);
+  }
+  wait(0);
+  for (unsigned i = 0; i < D; ++i)
+    assert_cleared(c.descriptors[i], c.transfers[i]);
+  assert(resets == 0);
+}
+
+static void uncommitted_drain() {
+  for (bool error : {false, true}) {
+    {
+      Managed<4, 2> managed;
+      auto &c = *managed.p;
+      for (unsigned i = 0; i < 4; ++i) {
+        submit(c);
+        if (i < 2)
+          assert(c.commit() == 0);
+      }
+      reset_observations();
+      if (error)
+        engine_state = TL_HEXAGON_DMA_STATUS_ERROR;
+      else
+        poll_hook = [&] {
+          tl_hexagon_dma_descriptor_mark_done(&c.descriptors[c.queue.head]);
+        };
+      // Two descriptors have no committed group, but still need draining.
+    }
+    poll_hook = {};
+    assert(resets == (error ? 1 : 0));
+    assert(polls == (error ? 2 : 4));
+  }
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   std::string name = argv[1];
@@ -305,6 +390,12 @@ int main(int argc, char **argv) {
     store_cache_error();
   else if (name == "error-drain")
     error_drain();
+  else if (name == "capacity-rings") {
+    capacity_ring<3, 3>(109);
+    capacity_ring<4, 2>(137);
+    capacity_ring<256, 256>(769);
+  } else if (name == "uncommitted-drain")
+    uncommitted_drain();
   else
     assert(false);
 }

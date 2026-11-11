@@ -165,7 +165,8 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
     return dma_hmx_matmul
 
 
-def test_async_manual_ping_pong():
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_async_manual_ping_pong(arch):
     @T.prim_func
     def probe(A: T.Tensor((768,), "float16")):
         with T.Kernel(1):
@@ -176,9 +177,10 @@ def test_async_manual_ping_pong():
             T.dma_copy(A[512:768], s[0, 0:256])
             T.dma_wait()
 
-    source = lower(probe)
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # At most two copies are in flight; each is one descriptor and one group.
-    assert "tl_hexagon_dma_async_context<2, 2> tl_dma_async;" in source
+    policy = ", true" if arch == "v79" else ""
+    assert f"tl_hexagon_dma_async_context<2, 2{policy}> tl_dma_async;" in source
     assert source.count("tl_hexagon_dma_async_submit(tl_dma_async, ") == 3
     assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 3
     assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in source

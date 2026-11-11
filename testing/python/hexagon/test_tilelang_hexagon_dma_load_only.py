@@ -1,5 +1,7 @@
 """The load-only queue policy requires closed, statement-only managed use."""
 
+import os
+
 import pytest
 
 import tilelang
@@ -118,14 +120,74 @@ def test_hidden_store_and_shared_expression_use_are_not_overlooked():
     _assert_policy(_scope(func, use_as_value), target, False)
 
 
-def test_nested_and_larger_queues_keep_generic_policy():
+def test_nested_queues_keep_generic_policy():
     func, target = _normal()
     nested = _scope(func, lambda body: I.AttrStmt(I.const(0), "tl.tile_program_scope", 1, body))
     _assert_policy(nested, target, False)
-    larger = _replace(func, "tl.hexagon_dma_queue", lambda c: I.Call(c.dtype, c.op, [I.const(4), I.const(4)]))
-    source = _emit(larger, target)
-    assert "tl_hexagon_dma_async_context<4, 4> tl_dma_async" in source
-    assert ", true> tl_dma_async" not in source
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("descriptors,groups", [(2, 1), (3, 3), (4, 2), (256, 256)])
+def test_capacity_does_not_change_the_load_only_proof(arch, descriptors, groups):
+    func, target = _normal(arch)
+    func = _replace(func, "tl.hexagon_dma_queue", lambda c: I.Call(c.dtype, c.op, [I.const(descriptors), I.const(groups)]))
+    source = _emit(func, target)
+    policy = ", true" if arch == "v79" else ""
+    assert f"tl_hexagon_dma_async_context<{descriptors}, {groups}{policy}> tl_dma_async" in source
+
+
+def make_load_only_pipeline(stages=3):
+    @T.prim_func
+    def copy(A: T.Tensor((16, 256), "uint8"), O: T.Tensor((16, 256), "uint8")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "uint8")
+            for tile in T.Pipelined(16, num_stages=stages):
+                T.copy(A[tile, 0:256], s)
+                for i in T.Parallel(256):
+                    O[tile, i] = s[i] + T.uint8(1)
+
+    return copy
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("stages", [2, 3])
+def test_normal_multibuffer_pipeline_keeps_opaque_and_arch_guards(arch, stages):
+    from tilelang.hexagon.runtime.session import lower_kernels
+
+    [(name, source, params, outputs)] = lower_kernels(
+        [(make_load_only_pipeline(stages), [1])], target={"kind": "hexagon", "mcpu": f"hexagon{arch}"}
+    )
+    # The parity builtin in the two-stage pipeline is still outside the
+    # existing call whitelist. This capacity extension does not broaden it.
+    policy = ", true" if arch == "v79" and stages == 3 else ""
+    assert f"tl_hexagon_dma_async_context<{stages}, {stages}{policy}>" in source
+    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
+    assert f"tl_hexagon_dma_async_wait(tl_dma_async, {stages - 1})" in source
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_load_only_pipeline_wraps_and_preserves_resident_guards():
+    import torch
+    from tilelang.hexagon.runtime.session import Session, lower_kernels
+
+    target = determine_target("hexagon", return_object=True)
+    func = make_load_only_pipeline()
+    [(name, source, params, outputs)] = lower_kernels([(func, [1])], target=target)
+    arch = str(target.mcpu)
+    assert ("tl_hexagon_dma_async_context<3, 3, true>" in source) == (arch == "hexagonv79")
+    payload = (torch.arange(4096, dtype=torch.int32) * 73 + 11).to(torch.uint8)
+    expected = (payload.to(torch.int32) + 1).to(torch.uint8)
+    whole = torch.full((4096 + 256,), 0xA5, dtype=torch.uint8)
+    whole[128:-128] = payload
+    with Session([(func, [1])], target=target) as session:
+        a, o = session.buffer(whole.numel()), session.buffer(whole.numel())
+        a.write(whole)
+        o.write(torch.full_like(whole, 0xA5))
+        session.kernels[0](a.at(128, 4096), o.at(128, 4096))
+        assert a.read() == whole.numpy().tobytes()
+        actual = torch.frombuffer(bytearray(o.read()), dtype=torch.uint8)
+        assert torch.equal(actual[128:-128], expected)
+        assert torch.all(actual[:128] == 0xA5) and torch.all(actual[-128:] == 0xA5)
 
 
 def test_consecutive_functions_do_not_inherit_a_rejected_policy():
@@ -221,7 +283,9 @@ def dma_host(request, tmp_path_factory):
     return binary, request.param
 
 
-@pytest.mark.parametrize("case", ["cached-load", "early-success", "busy-then-done", "poll-before-done", "error-drain"])
+@pytest.mark.parametrize(
+    "case", ["cached-load", "early-success", "busy-then-done", "poll-before-done", "error-drain", "capacity-rings", "uncommitted-drain"]
+)
 def test_actual_header_preserves_load_order_and_cleanup(dma_host, case):
     import subprocess
 

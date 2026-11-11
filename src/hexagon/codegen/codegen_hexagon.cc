@@ -381,7 +381,7 @@ private:
         safe_ &= call == queue_ && call->args.size() == 2;
         for (const PrimExpr &arg : call->args) {
           const auto *n = arg.as<IntImmNode>();
-          safe_ &= n && n->value == 1; // Initially only D1/G1.
+          safe_ &= n && n->value > 0 && n->value <= 256;
         }
       } else if (call->op.same_as(tl::hexagon_dma_submit())) {
         ++submits_;
