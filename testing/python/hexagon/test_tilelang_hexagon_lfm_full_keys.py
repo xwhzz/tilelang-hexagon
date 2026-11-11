@@ -190,3 +190,146 @@ def test_full_keys_selection_uses_the_physical_chunk(rows, keys, stage):
             end = pos0 + chunk * rows + rows
             expected = 128 if window > 0 or end <= 128 else (256 if keys == 512 and end <= 256 else keys)
             assert isinstance(result, tirx.IntImm) and int(result) == expected
+
+
+def _trace_attention_row(loop, *, base, row, kv0):
+    """Interpret scalar control only; check actual DMA regions before GEMMs.
+
+    Parallel arithmetic is not evaluated here. Its numerical contract is
+    exercised by the public model tests; this checks the double-buffered
+    schedule and addresses of the generated TIR instead.
+    """
+    values = {}
+    seeds = {"base": base, "rb": row, "window": 0, "kv0": kv0, "kvh": 0, "hq": 0}
+
+    def seed(node):
+        if isinstance(node, tirx.Var) and str(node.name) in seeds:
+            values[node] = tirx.IntImm(node.dtype, seeds[str(node.name)])
+
+    tirx.stmt_functor.post_order_visit(loop.body, seed)
+    pending, loaded, events = [], {}, []
+    accumulator = []
+
+    def integer(expr):
+        value = arith.Analyzer().simplify(tirx.stmt_functor.substitute(expr, values))
+        assert isinstance(value, tirx.IntImm), value
+        return int(value)
+
+    def visit(stmt):
+        if isinstance(stmt, tirx.SeqStmt):
+            for child in stmt.seq:
+                visit(child)
+        elif isinstance(stmt, tirx.Bind):
+            values[stmt.var] = tirx.IntImm(stmt.var.dtype, integer(stmt.value))
+        elif isinstance(stmt, tirx.IfThenElse):
+            branch = stmt.then_case if integer(stmt.condition) else stmt.else_case
+            if branch is not None:
+                visit(branch)
+        elif isinstance(stmt, tirx.For):
+            if stmt.kind == tirx.ForKind.PARALLEL:
+                return
+            start, count = integer(stmt.min), integer(stmt.extent)
+            for i in range(start, start + count):
+                values[stmt.loop_var] = tirx.IntImm(stmt.loop_var.dtype, i)
+                visit(stmt.body)
+        elif isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
+            call = stmt.value
+            if call.op.name == "tl.tileop.dma_copy":
+                src, dst = call.args
+                load = src.args[0]
+                if load.buffer.name in ("kv_k", "kv_v"):
+                    kind = str(load.buffer.name)
+                    origin = integer(load.indices[1])
+                    width = integer(src.args[-2])
+                    slot = integer(dst.args[0].indices[0])
+                    assert integer(dst.args[-2]) == width
+                    pending.append((kind, slot, origin, width))
+                else:
+                    assert load.buffer.name == "qs"
+                    pending.append(None)
+                assert len(pending) <= 5  # Query plus current/next K and V.
+            elif call.op.name == "tl.hexagon_dma_wait":
+                keep = integer(call.args[0])
+                while len(pending) > keep:
+                    item = pending.pop(0)
+                    if item is not None:
+                        kind, slot, origin, width = item
+                        loaded[kind, slot] = (origin, width)
+            elif call.op.name == "tl.tileop.gemm":
+                operand = call.args[1]
+                slot = integer(operand.args[0].indices[0])
+                width = integer(operand.args[-2])
+                key0 = next(integer(v) for v in reversed(values) if str(v.name) == "key0")
+                kind = "kv_k" if integer(call.args[4]) else "kv_v"
+                assert loaded[kind, slot] == (kv0 * 128 + key0, width)
+                assert not any(item is not None and item[:2] == (kind, slot) for item in pending)
+                if kind == "kv_k":
+                    assert integer(call.args[6]) == width
+                    events.append((key0, width, slot))
+                else:
+                    assert integer(call.args[7]) == width and not integer(call.args[9])
+                    accumulator.append(call.args[2].args[0].buffer.data)
+
+    visit(loop.body)
+    assert not pending
+    assert len(accumulator) == len(events)
+    assert all(value.same_as(accumulator[0]) for value in accumulator)
+    return events
+
+
+@pytest.mark.parametrize("rows", [64, 128, 256])
+@pytest.mark.parametrize("keys", [256, 512])
+def test_causal_tail_dma_and_compute_use_the_same_key_interval(rows, keys):
+    func = prefill_fp16.make_prefill(config(), rows, 4608, rows, full_keys=keys)
+    loops = []
+
+    def collect(node):
+        if isinstance(node, tirx.For) and str(node.loop_var.name) == "rb":
+            remaining = []
+            tirx.stmt_functor.post_order_visit(
+                node.body, lambda x: remaining.append(x) if isinstance(x, tirx.Bind) and str(x.var.name) == "remaining" else None
+            )
+            if remaining:
+                loops.append((node, int(remaining[0].value.a.b)))
+
+    tirx.stmt_functor.post_order_visit(func.body, collect)
+    assert {width for _, width in loops} == ({256} if keys == 256 else {256, 512})
+    for loop, width in loops:
+        bulk_loops = []
+
+        def find_bulk(node, bulk_loops=bulk_loops):
+            if isinstance(node, tirx.For):
+                variables = []
+                tirx.stmt_functor.post_order_visit(
+                    node.extent, lambda value, variables=variables: variables.append(value) if isinstance(value, tirx.Var) else None
+                )
+                if any(str(v.name) == "bulk_last" for v in variables):
+                    bulk_loops.append(node)
+
+        tirx.stmt_functor.post_order_visit(loop.body, find_bulk)
+        assert len(bulk_loops) == 1
+        gemms = []
+        tirx.stmt_functor.post_order_visit(
+            bulk_loops[0].body,
+            lambda value, gemms=gemms: gemms.append(value) if isinstance(value, tirx.Call) and value.op.name == "tl.tileop.gemm" else None,
+        )
+        # The fixed-width bulk loop must not contain small-width arithmetic
+        # dispatch. Only its final one-ahead DMA may fetch the narrow tail.
+        assert len(gemms) == 2
+        assert int(gemms[0].args[6]) == int(gemms[1].args[7]) == width
+        variables = []
+        tirx.stmt_functor.post_order_visit(
+            loop.body, lambda value, variables=variables: variables.append(value) if isinstance(value, tirx.Var) else None
+        )
+        assert not {"n", "valid"} & {str(x.name) for x in variables}
+        # Boundaries, unaligned query origins and a long prefix. The wider
+        # block's absolute origin must not change when its final width does.
+        for base in (0, 1, 64, 65, 128, 129, 192, 256, 257, 320, 384, 448, 1010, 4096):
+            for row in range(rows // 64):
+                end = base + row * 64 + 64
+                blocks = (end + width - 1) // width
+                remainder = end - (blocks - 1) * width
+                tail = 128 if remainder <= 128 else (256 if remainder <= 256 else width)
+                expected = [(i * width, width, i % 2) for i in range(blocks - 1)]
+                expected.append(((blocks - 1) * width, tail, (blocks - 1) % 2))
+                assert _trace_attention_row(loop, base=base, row=row, kv0=8) == expected

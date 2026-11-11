@@ -465,16 +465,17 @@ def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
 @pytest.mark.parametrize("full_keys", [128, 256, 512])
 def test_fp16_lfm2_full_keys_matches_the_reference(full_keys, fp16_bundle):
     # LFM2 has 64-wide heads and two KV heads per worker. Cross a 512-key
-    # boundary without a max_pos fallback, retaining the original contract.
-    _check_fp16_prefill_reference(fp16_bundle("lfm2"), 1, n=640, max_pos=1024, full_keys=full_keys)
+    # boundary and the 512+256 tail, including a padded final chunk, without
+    # a max_pos fallback or changes to the original numerical contract.
+    _check_fp16_prefill_reference(fp16_bundle("lfm2"), 1, n=777, max_pos=1024, full_keys=full_keys)
 
 
 @DEVICE
 @pytest.mark.parametrize("full_keys", [256, 512])
 def test_fp16_lfm3_full_keys_multiple_steps_match_the_reference(full_keys, fp16_bundle):
-    # One prefill call executes five STEP values, including full and sliding
-    # attention with LFM3's 128-wide heads and four workers.
-    _check_fp16_prefill_reference(fp16_bundle("lfm3"), 1, n=640, max_pos=1024, full_keys=full_keys)
+    # One prefill call crosses the 512+256 tail and a padded final chunk,
+    # including full/sliding attention with 128-wide heads and four workers.
+    _check_fp16_prefill_reference(fp16_bundle("lfm3"), 1, n=777, max_pos=1024, full_keys=full_keys)
 
 
 @DEVICE
