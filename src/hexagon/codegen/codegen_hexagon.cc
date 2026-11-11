@@ -1057,6 +1057,51 @@ void CodeGenTileLangHexagon::VisitExpr_(const RampNode *op,
      << PrintExpr(op->stride) << ")";
 }
 
+void CodeGenTileLangHexagon::VisitExpr_(const ShuffleNode *op,
+                                        std::ostream &os) {
+  // Clang's shuffle is a pure lane selection. Keep inputs as native vectors;
+  // the generic C printer constructs one wrapper argument per output lane.
+  // Only full registers and register pairs have been qualified here. Partial
+  // native vectors can scalarize differently and keep the existing printer.
+  auto full_vector = [](DataType dtype) {
+    int64_t bits = static_cast<int64_t>(dtype.bits()) * dtype.lanes();
+    return dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32) &&
+           (bits == 1024 || bits == 2048);
+  };
+  if ((op->vectors.size() != 1 && op->vectors.size() != 2) ||
+      !full_vector(op->dtype) || !full_vector(op->vectors[0].dtype()) ||
+      (op->vectors.size() == 2 &&
+       (!full_vector(op->vectors[1].dtype()) ||
+        op->vectors[0].dtype() != op->vectors[1].dtype()))) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+  for (const PrimExpr &index : op->indices) {
+    const auto *value = index.as<IntImmNode>();
+    if (!value || value->value < 0 ||
+        value->value >= static_cast<int64_t>(op->vectors.size()) *
+                            op->vectors[0].dtype().lanes()) {
+      CodeGenC::VisitExpr_(op, os);
+      return;
+    }
+  }
+  // Keep each input at its original expression position and evaluate it once.
+  // The builtin requires two operands even for a unary shuffle. All its
+  // indices select the first input, so a zero second operand is sufficient.
+  PrintType(op->dtype, os);
+  os << "(__builtin_shufflevector((" << PrintExpr(op->vectors[0]) << ").v, (";
+  if (op->vectors.size() == 2) {
+    os << PrintExpr(op->vectors[1]);
+  } else {
+    PrintType(op->vectors[0].dtype(), os);
+    os << "{}";
+  }
+  os << ").v";
+  for (const PrimExpr &index : op->indices)
+    os << ", " << index.as<IntImmNode>()->value;
+  os << "))";
+}
+
 template <typename T>
 inline void
 CodeGenTileLangHexagon::PrintTernaryCondExpr(const T *op, const char *compare,
@@ -1080,6 +1125,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
     PrintIndent();
     stream << "#pragma clang loop unroll_count("
            << Downcast<Integer>(count.value())->value << ")\n";
+  }
+  if (op->annotations.count(tl::attr::kHexagonDisableSoftwarePipelining)) {
+    PrintIndent();
+    stream << "#pragma clang loop pipeline(disable)\n";
   }
   CodeGenC::VisitStmt_(op);
 }

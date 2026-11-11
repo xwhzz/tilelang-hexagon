@@ -56,6 +56,8 @@ public:
   // A lane-wise select prints as tl_vec_select, a ramp as tl_vec_ramp.
   void VisitExpr_(const SelectNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const RampNode *op, std::ostream &os) final;   // NOLINT(*)
+  // A constant lane permutation operates on native vectors without arithmetic.
+  void VisitExpr_(const ShuffleNode *op, std::ostream &os) final; // NOLINT(*)
   // Print Hexagon builtins as calls to their runtime template functions.
   void VisitExpr_(const CallNode *op, std::ostream &os) final; // NOLINT(*)
   // Print a worker loop as a tl_parallel_for call.

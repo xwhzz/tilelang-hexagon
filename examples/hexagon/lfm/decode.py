@@ -515,16 +515,24 @@ class Decoder:
     def _open_4bit(self, bundle_path: str, device_path: str | None) -> None:
         """The 4-bit bundle's session, on one DSP process: LFM2's decode and
         prefill kernels, and their buffers."""
+        from tilelang.backend.target import determine_target
         from tilelang.hexagon.runtime.session import Session
+
+        target = determine_target("hexagon", return_object=True)
 
         c, header, max_pos, max_tokens = self.c, self.header, self.max_pos, self.max_tokens
         shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
         kernels = [(make_decode(c, shapes, max_pos, max_tokens), [])]
         if self.prefill_rows:
             kernels.append(
-                (make_prefill(c, shapes, self.prefill_rows, max_pos, max_tokens, bundle.has_normal_scales(bundle_path, header)), [])
+                (
+                    make_prefill(
+                        c, shapes, self.prefill_rows, max_pos, max_tokens, bundle.has_normal_scales(bundle_path, header), target=target
+                    ),
+                    [],
+                )
             )
-        self.session = Session(kernels)
+        self.session = Session(kernels, target=target)
         self.weights = bundle.load(self.session, bundle_path, device_path)
         La, Lc = len(c.attention_layers), c.layers - len(c.attention_layers)
         D, F, HD = c.dim, c.ff, c.head_dim
@@ -562,7 +570,10 @@ class Decoder:
         process, with its decode and prefill kernels and its buffers."""
         import decode_fp16
         import prefill_fp16
+        from tilelang.backend.target import determine_target
         from tilelang.hexagon.runtime.session import Session
+
+        target = determine_target("hexagon", return_object=True)
 
         c, header, max_pos, R = self.c, self.header, self.max_pos, self.prefill_rows
         D, F, HD, NK = c.dim, c.ff, c.head_dim, len(c.rope)
@@ -570,8 +581,8 @@ class Decoder:
         P = len(ranges)
         kernels = [(decode_fp16.make_decode(c, max_pos, self.max_tokens, r), []) for r in ranges]
         if R:
-            kernels += [(prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r), []) for r in ranges]
-        self.session = Session(kernels, processes=P)
+            kernels += [(prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r, target=target), []) for r in ranges]
+        self.session = Session(kernels, target=target, processes=P)
 
         # The buffers, asked for by name and then allocated the largest first,
         # as bundle.load allocates the tensors: a process's 4 GB of addresses
