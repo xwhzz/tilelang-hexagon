@@ -1266,19 +1266,44 @@ public:
     // Step 2: Emit the pipeline prologue, body and epilogue.
     Optional<Integer> pipeline_num_stages =
         GetPipelineNumStages(pipeline_loop_.get());
-    Stmt prologue = EmitImpl(pipeline_loop_->min,
-                             pipeline_loop_->min + max_stage_, true, true);
-    Stmt body =
-        EmitImpl(pipeline_loop_->min + max_stage_,
-                 pipeline_loop_->min + pipeline_loop_->extent, false, false);
-    Stmt epilogue = EmitImpl(
-        pipeline_loop_->min + pipeline_loop_->extent,
-        pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
-
+    // Private diagnostic only: retain default lowering until FIFO proofs pass.
+    bool compact_probe = false;
+    if (auto value = pipeline_loop_->annotations.Get("tl_hexagon_compact_probe")) {
+      if (const auto *flag = value->as<IntImmNode>()) {
+        compact_probe = flag->value != 0;
+      }
+    }
+    compact_probe = compact_probe && target_.defined() &&
+                    TargetIsHexagon(target_.value()) && max_stage_ == 1;
+    for (const auto &[block, anno] : pipeline_info_) {
+      if (anno.async && anno.stage != 0) compact_probe = false;
+    }
     Array<Stmt> pipeline_parts;
-    for (const Stmt &part : {prologue, body, epilogue}) {
-      for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
-        pipeline_parts.push_back(stmt);
+    if (compact_probe) {
+      Stmt prologue = EmitImpl(pipeline_loop_->min,
+                               pipeline_loop_->min + 1, true, true);
+      Stmt unified = EmitImpl(
+          pipeline_loop_->min + 1,
+          pipeline_loop_->min + pipeline_loop_->extent + 1, false, true, true);
+      for (const Stmt &part : {prologue, unified}) {
+        for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
+          pipeline_parts.push_back(stmt);
+        }
+      }
+    } else {
+      Stmt prologue = EmitImpl(pipeline_loop_->min,
+                               pipeline_loop_->min + max_stage_, true, true);
+      Stmt body =
+          EmitImpl(pipeline_loop_->min + max_stage_,
+                   pipeline_loop_->min + pipeline_loop_->extent, false, false);
+      Stmt epilogue = EmitImpl(
+          pipeline_loop_->min + pipeline_loop_->extent,
+          pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
+
+      for (const Stmt &part : {prologue, body, epilogue}) {
+        for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
+          pipeline_parts.push_back(stmt);
+        }
       }
     }
 
@@ -2709,7 +2734,7 @@ private:
   std::vector<FinalStmtInfo> CompletePipelineLoopStatements(
       const std::vector<RewrittenStmtInfo> &stmts,
       const std::map<int, AsyncStateLocal> &async_states_local,
-      arith::Analyzer *ana_normalized) const {
+      arith::Analyzer *ana_normalized, bool compact_main = false) const {
     std::vector<FinalStmtInfo> new_stmts;
     new_stmts.reserve(stmts.size());
     for (const auto &stmt : stmts) {
@@ -2778,7 +2803,7 @@ private:
         for (const auto &[stage_id, wait_count] : it->second) {
           Stmt wait_stmt = make_wait_stmt(stage_id, wait_count, Evaluate(0));
           if (auto state_it = async_states_local.find(stage_id);
-              state_it != async_states_local.end() &&
+              !compact_main && state_it != async_states_local.end() &&
               state_it->second.predicate &&
               !ana_normalized->CanProve(state_it->second.predicate.value())) {
             PrimExpr predicate =
@@ -2833,7 +2858,7 @@ private:
    * \return The result loop.
    */
   Stmt EmitImpl(const PrimExpr &start, const PrimExpr &end, bool unroll_loop,
-                bool need_bound_check) {
+                bool need_bound_check, bool compact_probe = false) {
     PrimExpr new_loop_var;
     PrimExpr extent = end - start;
     Optional<Integer> pipeline_num_stages =
@@ -2891,7 +2916,8 @@ private:
     arith::Analyzer ana_normalized;
     if (!is_unit_loop) {
       ana_normalized.Bind(Downcast<Var>(new_loop_var),
-                          Range(pipeline_loop_->min, extent));
+                          compact_probe ? Range::FromMinExtent(pipeline_loop_->min, extent)
+                                        : Range(pipeline_loop_->min, extent));
     }
 
     std::vector<RewrittenStmtInfo> new_stmts;
@@ -3013,9 +3039,26 @@ private:
     PopulateWaitCounts(new_stmts, &ana_normalized, buffer_to_commit_group,
                        &async_states_local);
     std::vector<FinalStmtInfo> final_stmts = CompletePipelineLoopStatements(
-        new_stmts, async_states_local, &ana_normalized);
+        new_stmts, async_states_local, &ana_normalized, compact_probe);
 
     Array<Stmt> stmts;
+    if (compact_probe && !async_states_local.empty()) {
+      // At the final pipeline time stage-0 is inactive, while its last
+      // consumers are live. Their ordinary waits are producer-predicated.
+      // Drain all their queue groups before any consumer, including the
+      // zero/short-loop case without creating a producer or consumer.
+      PrimExpr last_consumer = ana_normalized.Simplify(
+          (pipeline_loop_->extent > 0) &&
+          (new_loop_var + (is_unit_loop ? PrimExpr(0) : start - pipeline_loop_->min) ==
+           pipeline_loop_->min + pipeline_loop_->extent));
+      if (!is_zero(last_consumer)) {
+        auto zero = make_zero(DataType::Int(32));
+        Stmt drain = AttrStmt(zero, s_tir::attr::async_wait_queue_scope, 0,
+                             AttrStmt(zero, s_tir::attr::async_wait_inflight_count,
+                                      zero, Evaluate(0)));
+        stmts.push_back(IfThenElse(last_consumer, drain, Evaluate(0)));
+      }
+    }
     for (const auto &stmt_info : final_stmts) {
       stmts.push_back(stmt_info.stmt);
     }
