@@ -431,6 +431,48 @@ static void zero_and_invalid_transfers() {
   assert(c.retired == 2 && c.queue.count == 0);
 }
 
+static void submit_rejection_retry() {
+  for (bool strided : {false, true}) {
+    Managed<2, 2> managed;
+    auto &c = *managed.p;
+    submit(c);
+    assert(c.commit() == 0);
+    const auto first = c.descriptors[0];
+    const auto before = c.queue;
+    reset_observations();
+    // Large ranges exercise the real fallible cache-preparation branch. These
+    // synthetic low addresses are never dereferenced by the mocked
+    // engine/cache.
+    constexpr uint32_t bytes = 128 * 1024 + 1;
+    uint32_t stride = bytes + (strided ? 64 : 0);
+    fail_cache_call = strided ? 2 : 1;
+    assert(c.submit(reinterpret_cast<void *>(0x20000000u),
+                    reinterpret_cast<const void *>(0x10000000u), stride, stride,
+                    bytes, strided ? 2 : 1,
+                    TL_HEXAGON_DMA_DDR_TO_VTCM) == TL_HEXAGON_DMA_ERR_CACHE);
+    assert(events == std::vector<std::string>(strided ? 2 : 1, "flush"));
+    assert(c.queue.head == before.head && c.queue.count == before.count &&
+           c.queue.tail == before.tail && c.queue.capacity == before.capacity &&
+           c.queue.descriptors == before.descriptors &&
+           c.queue.transfers == before.transfers);
+    assert(c.submitted == 1 && c.retired == 0 && c.group_count == 1);
+    assert(std::memcmp(&first, &c.descriptors[0], sizeof(first)) == 0);
+    reset_observations();
+    submit(c);
+    assert(c.commit() == 0);
+    assert(events == std::vector<std::string>({"poll", "release", "link"}));
+    reset_observations();
+    std::vector<uint8_t> full(sizeof(c));
+    std::memcpy(full.data(), &c, sizeof(c));
+    assert(c.submit(dst, src, 64, 64, 64, 1, TL_HEXAGON_DMA_DDR_TO_VTCM) ==
+           TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+    assert(events.empty() && std::memcmp(full.data(), &c, sizeof(c)) == 0);
+    finish(c);
+    assert(c.wait(0) == 0);
+    assert(c.queue.count == 0 && c.retired == 2 && c.group_count == 0);
+  }
+}
+
 static void old_completed_result() {
   // The old explicitly load-only context still exposes its transfer records
   // through both raw pop and an explicitly specialized helper address.
@@ -479,6 +521,8 @@ int main(int argc, char **argv) {
     uncommitted_drain();
   else if (name == "zero-invalid")
     zero_and_invalid_transfers();
+  else if (name == "submit-rejection-retry")
+    submit_rejection_retry();
   else if (name == "old-completed")
     old_completed_result();
   else

@@ -514,17 +514,13 @@ tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
   return &queue->descriptors[tl_hexagon_dma_queue_index(queue, queue->count)];
 }
 
-// Submits the descriptor in the next queue slot, which the caller initialized
-// and whose cache maintenance it performed, with its completion metadata.
+// Internal publication after the caller has checked and initialized this slot
+// and completed cache preparation. In the compiler-owned compact path, these
+// steps cannot change the queue head, count, capacity or descriptor base.
 template <bool KeepMetadata>
-TL_DMA_HOT int tl_hexagon_dma_queue_submit_prepared_policy(
-    tl_hexagon_dma_queue *queue, const tl_hexagon_dma_transfer &transfer) {
-  tl_hexagon_dma_descriptor *descriptor =
-      tl_hexagon_dma_queue_next_descriptor(queue);
-  if (descriptor == nullptr)
-    return queue == nullptr ? TL_HEXAGON_DMA_ERR_ARGUMENT
-                            : TL_HEXAGON_DMA_ERR_QUEUE_FULL;
-
+TL_DMA_HOT int tl_hexagon_dma_queue_submit_slot_policy(
+    tl_hexagon_dma_queue *queue, tl_hexagon_dma_descriptor *descriptor,
+    const tl_hexagon_dma_transfer &transfer) {
   if (!tl_hexagon_dma_descriptor_done(descriptor)) {
     uint32_t engine_status = tl_hexagon_dma_engine_status();
     if (engine_status == TL_HEXAGON_DMA_STATUS_IDLE) {
@@ -546,6 +542,19 @@ TL_DMA_HOT int tl_hexagon_dma_queue_submit_prepared_policy(
   }
   ++queue->count;
   return TL_HEXAGON_DMA_OK;
+}
+
+// Raw/generic callers still look up and validate the next slot here.
+template <bool KeepMetadata>
+TL_DMA_HOT int tl_hexagon_dma_queue_submit_prepared_policy(
+    tl_hexagon_dma_queue *queue, const tl_hexagon_dma_transfer &transfer) {
+  tl_hexagon_dma_descriptor *descriptor =
+      tl_hexagon_dma_queue_next_descriptor(queue);
+  if (descriptor == nullptr)
+    return queue == nullptr ? TL_HEXAGON_DMA_ERR_ARGUMENT
+                            : TL_HEXAGON_DMA_ERR_QUEUE_FULL;
+  return tl_hexagon_dma_queue_submit_slot_policy<KeepMetadata>(
+      queue, descriptor, transfer);
 }
 
 TL_DMA_HOT int
@@ -578,8 +587,11 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push_1d_policy(tl_hexagon_dma_queue *queue,
   status = tl_hexagon_dma_prepare_transfer(transfer);
   if (status != TL_HEXAGON_DMA_OK)
     return status;
-  return tl_hexagon_dma_queue_submit_prepared_policy<KeepMetadata>(queue,
-                                                                   transfer);
+  if constexpr (KeepMetadata)
+    return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
+  else
+    return tl_hexagon_dma_queue_submit_slot_policy<false>(queue, descriptor,
+                                                          transfer);
 }
 
 TL_DMA_HOT int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
@@ -614,8 +626,11 @@ tl_hexagon_dma_queue_push_2d_policy(tl_hexagon_dma_queue *queue, void *dst,
   status = tl_hexagon_dma_prepare_transfer(transfer);
   if (status != TL_HEXAGON_DMA_OK)
     return status;
-  return tl_hexagon_dma_queue_submit_prepared_policy<KeepMetadata>(queue,
-                                                                   transfer);
+  if constexpr (KeepMetadata)
+    return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
+  else
+    return tl_hexagon_dma_queue_submit_slot_policy<false>(queue, descriptor,
+                                                          transfer);
 }
 
 TL_DMA_HOT int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
