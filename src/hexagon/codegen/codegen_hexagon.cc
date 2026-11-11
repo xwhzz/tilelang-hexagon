@@ -982,6 +982,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
     stream << "#pragma clang loop unroll_count("
            << Downcast<Integer>(count.value())->value << ")\n";
   }
+  if (op->annotations.count(tl::attr::kHexagonDisableSoftwarePipelining)) {
+    PrintIndent();
+    stream << "#pragma clang loop pipeline(disable)\n";
+  }
   CodeGenC::VisitStmt_(op);
 }
 

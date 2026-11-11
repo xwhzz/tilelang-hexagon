@@ -214,9 +214,9 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         T.copy(weight, bf.nw)
         # Two slots of rows: a batch's rows come in while the one before is
         # added, stored and normalized. The batches go in pairs, so that each
-        # loop over a slot's rows addresses it at a constant offset, which the
-        # software pipeliner needs: with the slot a run-time offset, LLVM did
-        # not pipeline the add, and it ran 2.3 times slower.
+        # loop over a slot's rows addresses it at a constant offset. This form
+        # was faster in the measured residual phase; both variants were
+        # software-pipelined. The remaining dynamic-slot cost is tracked in #204.
         nb = RW // RB
         T.dma_copy(bf.x[bf.w * RW : bf.w * RW + RB, :], bf.xr[0, :, :])
         for pair in T.serial(nb // 2):

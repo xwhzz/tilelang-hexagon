@@ -135,13 +135,15 @@ def MarkUnwrittenDMASources():
 
 
 def InterleaveMaps():
-    """Unroll the loops of heavy vector maps by two.
+    """Select loop scheduling hints for vector maps.
 
     A map whose elements compute an HVX math function runs a long chain of
     dependent instructions per vector, which LLVM pipelines only up to an
     initiation interval it bounds. Each innermost loop that stores one vector
     an iteration of such a map is marked for the codegen to unroll by two, so
-    that an iteration interleaves two chains.
+    that an iteration interleaves two chains. On v73 and v79, complete half64 maps
+    that multiply one disjoint VTCM input by a constant or itself instead
+    disable software pipelining. Other maps keep their existing schedule.
     """
     return _ffi_api.InterleaveMaps()  # type: ignore
 
