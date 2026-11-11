@@ -504,7 +504,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                             tail_keys = T.if_then_else(remaining <= KEYS, KEYS, T.if_then_else(remaining <= 256, 256, block_keys))
                         else:
                             tail_keys = T.if_then_else(remaining <= KEYS, KEYS, block_keys)
-                        bulk_last = T.if_then_else(tail_keys == block_keys, last, last - 1)
+                        bulk_last = T.if_then_else(tail_keys < block_keys, last - 1, last)
                         if first + 1 == last:
                             fetch_tail(abf, kv0, window, kvh, first, 0, block_keys, tail_keys)
                         else:
