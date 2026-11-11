@@ -5,6 +5,7 @@
 
 #include "support/check.h"
 #include <optional>
+#include <tvm/arith/iter_affine_map.h>
 #include <tvm/ir/cast.h>
 #include <tvm/relax/analysis.h>
 #include <tvm/runtime/logging.h>
@@ -42,6 +43,63 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
+// A region may occupy complete physical runs without covering its buffer.
+// Remove only loop-invariant translations from its physical coordinates,
+// then require a dense bijection before using those coordinates as a loop
+// layout. Injectivity alone would allow holes and introduce extra iterations.
+static Optional<Fragment> RegionPhysicalOrderLoopLayout(
+    const Array<IterVar> &vars, const Array<PrimExpr> &physical_indices,
+    const Range &thread_bounds, arith::Analyzer *analyzer) {
+  auto local = analyzer->Clone();
+  Map<Var, Range> ranges;
+  std::unordered_set<const VarNode *> var_set;
+  PrimExpr iterations = make_const(DataType::Int(32), 1);
+  for (const IterVar &var : vars) {
+    ranges.Set(var->var, var->dom);
+    var_set.insert(var->var.get());
+    local->Bind(var->var, var->dom, true);
+    iterations = iterations * var->dom->extent;
+  }
+  if (!local->CanProve(iterations > 0))
+    return std::nullopt;
+
+  auto indices = physical_indices.Map(
+      [&](const PrimExpr &index) { return local->Simplify(index); });
+  auto mapped = arith::DetectIterMap(indices, ranges, 1,
+                                     arith::IterMapLevel::NoCheck, local.get());
+  if (!mapped->errors.empty())
+    return std::nullopt;
+
+  Array<PrimExpr> relative;
+  for (const auto &index : mapped->indices) {
+    if (UsesVar(index->base,
+                [&](const VarNode *v) { return var_set.count(v); }))
+      return std::nullopt;
+    PrimExpr coordinate = arith::NormalizeIterMapToExpr(
+        arith::IterSumExpr(index->args, make_zero(index.dtype())));
+    if (UsesVar(coordinate,
+                [&](const VarNode *v) { return !var_set.count(v); }))
+      return std::nullopt;
+    relative.push_back(coordinate);
+  }
+  auto dense = arith::DetectIterMap(
+      relative, ranges, 1, arith::IterMapLevel::Bijective, local.get());
+  if (!dense->errors.empty())
+    return std::nullopt;
+  Fragment candidate =
+      Fragment(vars, relative, make_zero(DataType::Int(32)), IterVar())
+          ->BindThreadRange(thread_bounds);
+  PrimExpr elements = make_const(DataType::Int(32), 1);
+  for (const PrimExpr &extent : candidate->OutputShape()) {
+    if (!local->CanProve(extent > 0))
+      return std::nullopt;
+    elements = elements * extent;
+  }
+  if (!local->CanProveEqual(elements, iterations))
+    return std::nullopt;
+  return candidate;
+}
+
 /*!
  * \brief The loop layout that iterates a parallel loop nest in the physical
  * order of a buffer it writes.
@@ -55,7 +113,8 @@ using namespace ffi;
 static Optional<Fragment> PhysicalOrderLoopLayout(const For &root,
                                                   const LayoutMap &layout_map,
                                                   const Range &thread_bounds,
-                                                  arith::Analyzer *analyzer) {
+                                                  arith::Analyzer *analyzer,
+                                                  bool region_order) {
   Array<IterVar> vars;
   std::unordered_set<const VarNode *> var_set;
   PrimExpr iterations = make_const(DataType::Int(32), 1);
@@ -63,6 +122,10 @@ static Optional<Fragment> PhysicalOrderLoopLayout(const For &root,
   while (const auto *loop = body.as<ForNode>()) {
     if (loop->kind != ForKind::kParallel || !is_zero(loop->min))
       break;
+    // The physical-order proof uses a contiguous Range for each loop. A
+    // stepped loop is not that domain; leave its existing layout unchanged.
+    if (loop->step.defined() && !analyzer->CanProveEqual(loop->step.value(), 1))
+      return std::nullopt;
     vars.push_back(IterVar(Range::FromMinExtent(loop->min, loop->extent),
                            loop->loop_var, IterVarType::kDataPar));
     var_set.insert(loop->loop_var.get());
@@ -80,11 +143,17 @@ static Optional<Fragment> PhysicalOrderLoopLayout(const For &root,
     PrimExpr elements = make_const(DataType::Int(32), 1);
     for (const PrimExpr &extent : layout->InputShape())
       elements = elements * extent;
-    if (!analyzer->CanProveEqual(elements, iterations))
-      return;
+    bool whole_buffer = analyzer->CanProveEqual(elements, iterations);
     for (const PrimExpr &index : store->indices) {
       if (UsesVar(index, [&](const VarNode *v) { return !var_set.count(v); }))
+        whole_buffer = false;
+    }
+    if (!whole_buffer) {
+      if (!region_order)
         return;
+      result = RegionPhysicalOrderLoopLayout(
+          vars, layout->Forward(store->indices), thread_bounds, analyzer);
+      return;
     }
     Fragment candidate = Fragment(vars, layout->Forward(store->indices),
                                   make_zero(DataType::Int(32)), IterVar())
@@ -1323,8 +1392,11 @@ private:
         op->annotations.Get(attr::kParallelLoopLayout).value());
     Range thread_bounds = CurrentThreadBounds();
     if (is_one(thread_bounds->extent)) {
-      if (auto physical = PhysicalOrderLoopLayout(GetRef<For>(op), layout_map_,
-                                                  thread_bounds, analyzer_)) {
+      // Region reordering additionally needs the target's vector lowering;
+      // retain other targets' existing whole-buffer optimization only.
+      if (auto physical = PhysicalOrderLoopLayout(
+              GetRef<For>(op), layout_map_, thread_bounds, analyzer_,
+              target_->kind->name == "hexagon")) {
         loop_layout = physical.value();
       }
     }

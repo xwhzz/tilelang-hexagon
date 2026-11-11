@@ -370,6 +370,19 @@ def test_fp16_decode_matches_the_reference(model, processes, fp16_bundle):
         decoder.close()
 
 
+def _assert_prefill_norm_path(source, direct=False):
+    if not direct:
+        assert re.search(r"\bvoid\* rows =", source)
+        assert "tl_crouton_copy" in source
+        return
+    # Both paths scale FP32 values, round once to FP16 and store a whole
+    # physical register into a, with no intermediate row-major buffer.
+    assert not re.search(r"\bvoid\* rows =", source)
+    stores = [line for line in source.splitlines() if re.search(r"\*\(half(?:32|64)\*\)\(a_w \+", line)]
+    assert stores and all("nw" in line and "ss" in line for line in stores), stores
+    assert not re.search(r"a_w\[[^\]]*\] =", source)
+
+
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
 def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
@@ -378,6 +391,7 @@ def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
     # the HMX GEMM.
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm<" in source
+    _assert_prefill_norm_path(source)
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
@@ -592,6 +606,7 @@ def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm_blockscaled<" in source
     assert "tl_hvx_exp2_fast(" in source and "tl_hvx_exp2(" not in source
+    _assert_prefill_norm_path(source)
 
 
 @DEVICE
@@ -627,3 +642,103 @@ def test_prefill_matches_the_reference(tiny_bundle):
         assert decoder.generate(prompt.tolist(), 8) == want
     finally:
         decoder.close()
+
+
+@pytest.mark.parametrize("fp16", [False, True])
+@pytest.mark.parametrize("arch,dim", [(None, 2048), (73, 2048), (75, 2048), (79, 2048), (81, 2048), (79, 1024)])
+def test_prefill_normalization_uses_explicit_target_and_qualified_width(fp16, arch, dim, monkeypatch):
+    # Factory defaults never derive optimization eligibility from the process
+    # environment. Only the explicit compilation target enables the large map.
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", "v79")
+    c = Config(vocab=4096, dim=dim, ff=2048, heads=dim // 64, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
+    target = None if arch is None else determine_target({"kind": "hexagon", "mcpu": f"hexagonv{arch}"}, return_object=True)
+    if fp16:
+        kernel = prefill_fp16.make_prefill(c, 128, 256, 64, target=target)
+    else:
+        shapes = {
+            "conv.in_proj": (2, 1, 3 * dim, dim),
+            "attn.qkv": (1, 1, dim + 1024, dim),
+            "out_proj": (3, 1, dim, dim),
+            "ffn.w13": (3, 1, 4096, dim),
+            "ffn.w2": (3, 1, dim, 2048),
+        }
+        kernel = make_prefill(c, shapes, 128, 256, 64, target=target)
+    compile_target = target if target is not None else FP16_SOURCE_TARGET
+    ((_, source, _, _),) = lower_kernels([(kernel, [])], target=compile_target)
+    _assert_prefill_norm_path(source, direct=arch == 79 and dim >= 2048)
+
+
+@pytest.mark.parametrize("fp16", [False, True])
+@pytest.mark.parametrize("arch", [73, 79])
+def test_decoder_passes_one_resolved_target_to_factory_and_session(fp16, arch, monkeypatch):
+    import decode
+    import tilelang.backend.target as target_module
+    import tilelang.hexagon.runtime.session as session_module
+
+    target = determine_target({"kind": "hexagon", "mcpu": f"hexagonv{arch}"}, return_object=True)
+    observed = []
+
+    def resolve(value, return_object):
+        assert value == "hexagon" and return_object
+        observed.append("resolve")
+        return target
+
+    def factory(*args, **kwargs):
+        assert kwargs["target"] is target
+        observed.append("factory")
+        return "prefill"
+
+    class StopBeforeTransport(Exception):
+        pass
+
+    def session(kernels, **kwargs):
+        assert kwargs["target"] is target
+        assert any(kernel == "prefill" for kernel, _ in kernels)
+        observed.append("session")
+        raise StopBeforeTransport
+
+    monkeypatch.setattr(target_module, "determine_target", resolve)
+    monkeypatch.setattr(session_module, "Session", session)
+    decoder = Decoder.__new__(Decoder)
+    decoder.c = Config(vocab=4096, dim=2048, ff=2048, heads=32, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
+    decoder.header = {"tensors": {}}
+    decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = 256, 64, 128
+    if fp16:
+        monkeypatch.setattr(decode_fp16, "plan_stages", lambda *args: [range(3)])
+        monkeypatch.setattr(decode_fp16, "make_decode", lambda *args: "decode")
+        monkeypatch.setattr(prefill_fp16, "make_prefill", factory)
+        with pytest.raises(StopBeforeTransport):
+            decoder._open_fp16("unused", None, 1)
+    else:
+        monkeypatch.setattr(decode, "make_decode", lambda *args: "decode")
+        monkeypatch.setattr(decode, "make_prefill", factory)
+        monkeypatch.setattr(bundle, "has_normal_scales", lambda *args: False)
+        with pytest.raises(StopBeforeTransport):
+            decoder._open_4bit("unused", None)
+    assert observed == ["resolve", "factory", "session"]
+
+
+@pytest.mark.parametrize("fp16", [False, True])
+@pytest.mark.parametrize("capability", ["width", "aligned_only"])
+def test_prefill_factory_keeps_staging_for_unqualified_vector_capability(fp16, capability):
+    c = Config(vocab=4096, dim=2048, ff=2048, heads=32, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
+    attrs = {"kind": "hexagon", "mcpu": "hexagonv79"}
+    if capability == "width":
+        attrs.update(min_vector_bits=512, max_vector_bits=512)
+    else:
+        attrs["supports_unaligned_vector_access"] = False
+    target = tvm.target.Target(attrs)
+    if fp16:
+        original = prefill_fp16.make_prefill(c, 128, 256, 64)
+        candidate = prefill_fp16.make_prefill(c, 128, 256, 64, target=target)
+    else:
+        shapes = {
+            "conv.in_proj": (2, 1, 6144, 2048),
+            "attn.qkv": (1, 1, 3072, 2048),
+            "out_proj": (3, 1, 2048, 2048),
+            "ffn.w13": (3, 1, 4096, 2048),
+            "ffn.w2": (3, 1, 2048, 2048),
+        }
+        original = make_prefill(c, shapes, 128, 256, 64)
+        candidate = make_prefill(c, shapes, 128, 256, 64, target=target)
+    tvm.ir.assert_structural_equal(original, candidate)
