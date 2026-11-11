@@ -326,6 +326,9 @@ def dma_host(request, tmp_path_factory):
         "submit-rejection-retry",
         "zero-nonzero-wrap",
         "raw-prepared-done",
+        "single-slot-transitions",
+        "single-slot-uncommitted-drain",
+        "single-slot-multiple-groups",
     ],
 )
 def test_actual_header_preserves_load_order_and_cleanup(dma_host, case):

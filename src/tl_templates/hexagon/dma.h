@@ -664,12 +664,14 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push(tl_hexagon_dma_queue *queue, void *dst,
                                       row_bytes, rows, direction);
 }
 
-template <bool LoadOnly, bool KeepMetadata>
+template <bool LoadOnly, bool KeepMetadata, bool SingleSlot = false>
 TL_DMA_HOT int
 tl_hexagon_dma_queue_try_pop_policy(tl_hexagon_dma_queue *queue,
                                     tl_hexagon_dma_transfer *completed) {
   static_assert(LoadOnly || KeepMetadata,
                 "Store completion requires transfer metadata");
+  static_assert(!SingleSlot || (LoadOnly && !KeepMetadata),
+                "Single-slot policy is compiler-private");
   if constexpr (!KeepMetadata) {
     if (completed != nullptr)
       return TL_HEXAGON_DMA_ERR_ARGUMENT;
@@ -680,7 +682,8 @@ tl_hexagon_dma_queue_try_pop_policy(tl_hexagon_dma_queue *queue,
     return TL_HEXAGON_DMA_ERR_QUEUE_EMPTY;
 
   tl_hexagon_dma_poll();
-  tl_hexagon_dma_descriptor *descriptor = &queue->descriptors[queue->head];
+  tl_hexagon_dma_descriptor *descriptor =
+      &queue->descriptors[SingleSlot ? 0 : queue->head];
   if (!tl_hexagon_dma_descriptor_done(descriptor)) {
     uint32_t status = tl_hexagon_dma_engine_status();
     return status == TL_HEXAGON_DMA_STATUS_ERROR ? TL_HEXAGON_DMA_ERR_ENGINE
@@ -702,10 +705,17 @@ tl_hexagon_dma_queue_try_pop_policy(tl_hexagon_dma_queue *queue,
   if constexpr (KeepMetadata)
     queue->transfers[queue->head] = {
         nullptr, nullptr, 0, 0, 0, 0, TL_HEXAGON_DMA_NO_CACHE};
-  queue->head = tl_hexagon_dma_queue_index(queue, 1);
-  --queue->count;
-  if (queue->count == 0)
+  if constexpr (SingleSlot) {
+    // The private capacity-one queue has head == 0 and count == 1 here.
+    // Only successful retirement changes that count, including zero-byte work.
+    queue->count = 0;
     queue->tail = nullptr;
+  } else {
+    queue->head = tl_hexagon_dma_queue_index(queue, 1);
+    --queue->count;
+    if (queue->count == 0)
+      queue->tail = nullptr;
+  }
   return TL_HEXAGON_DMA_OK;
 }
 
@@ -722,14 +732,15 @@ tl_hexagon_dma_queue_try_pop(tl_hexagon_dma_queue *queue,
   return tl_hexagon_dma_queue_try_pop_impl<false>(queue, completed);
 }
 
-template <bool LoadOnly, bool KeepMetadata>
+template <bool LoadOnly, bool KeepMetadata, bool SingleSlot = false>
 TL_DMA_HOT int
 tl_hexagon_dma_queue_pop_policy(tl_hexagon_dma_queue *queue,
                                 tl_hexagon_dma_transfer *completed = nullptr) {
   int status = TL_HEXAGON_DMA_ERR_BUSY;
   while (status == TL_HEXAGON_DMA_ERR_BUSY)
-    status = tl_hexagon_dma_queue_try_pop_policy<LoadOnly, KeepMetadata>(
-        queue, completed);
+    status =
+        tl_hexagon_dma_queue_try_pop_policy<LoadOnly, KeepMetadata, SingleSlot>(
+            queue, completed);
   return status;
 }
 
@@ -891,8 +902,8 @@ struct tl_hexagon_dma_compact_load_context {
     // Drain even uncommitted submissions on early return. A failed drain
     // resets only this context's outstanding DMA before its storage expires.
     while (queue.count != 0) {
-      if (tl_hexagon_dma_queue_pop_policy<true, false>(&queue) !=
-          TL_HEXAGON_DMA_OK) {
+      if (tl_hexagon_dma_queue_pop_policy<true, false, Descriptors == 1>(
+              &queue) != TL_HEXAGON_DMA_OK) {
         tl_hexagon_dma_engine_reset();
         break;
       }
@@ -927,15 +938,32 @@ struct tl_hexagon_dma_compact_load_context {
     return TL_HEXAGON_DMA_OK;
   }
   __attribute__((always_inline)) int wait(uint32_t groups) {
-    while (group_count > groups) {
-      while (group_end[group_head] - retired != 0) {
-        int result = tl_hexagon_dma_queue_pop_policy<true, false>(&queue);
-        if (result != TL_HEXAGON_DMA_OK)
-          return result;
-        ++retired;
+    if constexpr (Descriptors == 1 && Groups == 1) {
+      if (group_count > groups) {
+        // A saved group endpoint can cover at most one pending descriptor.
+        // An empty group may precede an uncommitted submit; do not pop that.
+        if (group_end[0] - retired != 0) {
+          int result =
+              tl_hexagon_dma_queue_pop_policy<true, false, true>(&queue);
+          if (result != TL_HEXAGON_DMA_OK)
+            return result;
+          ++retired;
+        }
+        group_count = 0;
       }
-      group_head = (group_head + 1) % Groups;
-      --group_count;
+    } else {
+      while (group_count > groups) {
+        while (group_end[group_head] - retired != 0) {
+          int result =
+              tl_hexagon_dma_queue_pop_policy<true, false, Descriptors == 1>(
+                  &queue);
+          if (result != TL_HEXAGON_DMA_OK)
+            return result;
+          ++retired;
+        }
+        group_head = (group_head + 1) % Groups;
+        --group_count;
+      }
     }
     asm volatile("" : : : "memory");
     return TL_HEXAGON_DMA_OK;

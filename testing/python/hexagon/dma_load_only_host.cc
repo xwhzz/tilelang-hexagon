@@ -431,6 +431,84 @@ static void zero_and_invalid_transfers() {
   assert(c.retired == 2 && c.queue.count == 0);
 }
 
+static void single_slot_transitions() {
+  Managed<1, 1> managed;
+  auto &c = *managed.p;
+  c.submitted = c.retired = std::numeric_limits<uint32_t>::max();
+  assert(c.wait(0) == 0 && events.empty());
+  assert(c.commit() == 0);
+  submit(c); // This descriptor is not part of the already saved empty group.
+  assert(c.submitted == 0 && c.retired == UINT32_MAX);
+  reset_observations();
+  assert(c.commit() == TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+  assert(c.wait(0) == 0 && events.empty());
+  assert(c.group_count == 0 && c.queue.count == 1 && c.retired == UINT32_MAX);
+  assert(c.queue.head == 0 && c.group_head == 0);
+  assert(c.commit() == 0);
+  assert(c.wait(1) == 0 && events.empty());
+  engine_state = TL_HEXAGON_DMA_STATUS_ERROR;
+  assert(c.wait(0) == TL_HEXAGON_DMA_ERR_ENGINE);
+  assert(events == std::vector<std::string>({"poll", "poll"}));
+  assert(c.group_count == 1 && c.queue.count == 1 && c.retired == UINT32_MAX);
+  reset_observations();
+  engine_state = TL_HEXAGON_DMA_STATUS_RUN;
+  poll_hook = [&] {
+    if (polls == 3)
+      finish(c);
+  };
+  assert(c.wait(0) == 0);
+  assert(events == std::vector<std::string>({"poll", "poll", "poll"}));
+  assert(c.retired == 0 && c.queue.count == 0 && c.queue.tail == nullptr);
+  assert(c.group_count == 0 && c.queue.head == 0 && c.group_head == 0);
+  reset_observations();
+  assert(c.submit(nullptr, nullptr, 0, 0, 0, 1, 3) == 0);
+  assert(c.commit() == 0 && events.empty());
+  assert(c.wait(0) == 0);
+  assert(events == std::vector<std::string>({"poll"}));
+  assert(c.submitted == 1 && c.retired == 1 && c.queue.count == 0);
+  assert_descriptor_cleared(c.descriptors[0]);
+}
+
+static void single_slot_uncommitted_drain() {
+  for (bool error : {false, true}) {
+    {
+      Managed<1, 1> managed;
+      auto &c = *managed.p;
+      assert(c.commit() == 0);
+      submit(c);
+      reset_observations();
+      assert(c.wait(0) == 0 && events.empty());
+      assert(c.queue.count == 1 && c.group_count == 0 && c.retired == 0);
+      if (error)
+        engine_state = TL_HEXAGON_DMA_STATUS_ERROR;
+      else
+        poll_hook = [&] { finish(c); };
+    }
+    poll_hook = {};
+    assert(events == (error
+                          ? std::vector<std::string>({"poll", "poll", "reset"})
+                          : std::vector<std::string>({"poll"})));
+    assert(resets == (error ? 1 : 0));
+  }
+}
+
+static void single_slot_multiple_groups() {
+  Managed<1, 3> managed;
+  auto &c = *managed.p;
+  assert(c.commit() == 0 && c.commit() == 0);
+  submit(c);
+  assert(c.commit() == 0);
+  reset_observations();
+  assert(c.wait(2) == 0 && events.empty());
+  assert(c.queue.count == 1 && c.group_count == 2 && c.retired == 0);
+  assert(c.wait(1) == 0 && events.empty());
+  assert(c.queue.count == 1 && c.group_count == 1 && c.retired == 0);
+  finish(c);
+  assert(c.wait(0) == 0 && events == std::vector<std::string>({"poll"}));
+  assert(c.queue.count == 0 && c.group_count == 0 && c.retired == 1);
+  assert(c.queue.head == 0 && c.group_head == 0);
+}
+
 static void zero_nonzero_wrap() {
   Managed<3, 3> managed;
   auto &c = *managed.p;
@@ -596,6 +674,12 @@ int main(int argc, char **argv) {
     submit_rejection_retry();
   else if (name == "zero-nonzero-wrap")
     zero_nonzero_wrap();
+  else if (name == "single-slot-transitions")
+    single_slot_transitions();
+  else if (name == "single-slot-uncommitted-drain")
+    single_slot_uncommitted_drain();
+  else if (name == "single-slot-multiple-groups")
+    single_slot_multiple_groups();
   else if (name == "old-completed")
     old_completed_result();
   else if (name == "raw-prepared-done")
