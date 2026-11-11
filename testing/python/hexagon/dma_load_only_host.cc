@@ -431,6 +431,52 @@ static void zero_and_invalid_transfers() {
   assert(c.retired == 2 && c.queue.count == 0);
 }
 
+static void zero_nonzero_wrap() {
+  Managed<3, 3> managed;
+  auto &c = *managed.p;
+  c.submitted = c.retired = std::numeric_limits<uint32_t>::max() - 3;
+  submit(c);
+  assert(c.commit() == 0);
+  for (unsigned i = 0; i < 9; ++i) {
+    const unsigned first = c.queue.head;
+    auto *tail = c.queue.tail;
+    const unsigned zero = tl_hexagon_dma_queue_index(&c.queue, c.queue.count);
+    reset_observations();
+    if (i % 3 == 0)
+      assert(c.submit(nullptr, nullptr, 0, 0, 0, 1, 3) == 0);
+    else if (i % 3 == 1)
+      assert(c.submit(nullptr, nullptr, 64, 64, 32, 0, 3) == 0);
+    else
+      assert(c.submit(nullptr, nullptr, 64, 64, 0, 2, 3) == 0);
+    assert(c.commit() == 0);
+    assert(events.empty() && c.queue.tail == tail && c.queue.count == 2);
+    assert(tl_hexagon_dma_descriptor_done(&c.descriptors[zero]));
+    const unsigned next = tl_hexagon_dma_queue_index(&c.queue, c.queue.count);
+    submit(c);
+    assert(c.commit() == 0);
+    assert(events == std::vector<std::string>({"poll", "release", "link"}));
+    assert(c.queue.tail == &c.descriptors[next] && c.queue.count == 3);
+    assert(!tl_hexagon_dma_descriptor_done(&c.descriptors[next]));
+    tl_hexagon_dma_descriptor_mark_done(&c.descriptors[first]);
+    reset_observations();
+    assert(c.wait(2) == 0);
+    assert(events == std::vector<std::string>({"poll"}));
+    assert(c.queue.head == zero && c.queue.count == 2);
+    reset_observations();
+    assert(c.wait(1) == 0);
+    assert(events == std::vector<std::string>({"poll"}));
+    assert(c.queue.head == next && c.queue.count == 1 && c.group_count == 1);
+    assert(c.queue.tail == &c.descriptors[next]);
+    assert(uint32_t(c.submitted - c.retired) == 1);
+    assert_descriptor_cleared(c.descriptors[first]);
+    assert_descriptor_cleared(c.descriptors[zero]);
+  }
+  finish(c);
+  assert(c.wait(0) == 0);
+  assert(c.queue.count == 0 && c.queue.tail == nullptr && c.group_count == 0);
+  assert(c.submitted == c.retired);
+}
+
 static void submit_rejection_retry() {
   for (bool strided : {false, true}) {
     Managed<2, 2> managed;
@@ -490,6 +536,31 @@ static void old_completed_result() {
   c->~OldLoadOnly();
 }
 
+static void raw_prepared_done() {
+  alignas(64) static tl_hexagon_dma_descriptor descriptors[2];
+  static tl_hexagon_dma_transfer transfers[2];
+  tl_hexagon_dma_queue queue{};
+  assert(tl_hexagon_dma_queue_init(&queue, descriptors, transfers, 2) == 0);
+  auto call = &tl_hexagon_dma_queue_submit_prepared;
+  tl_hexagon_dma_transfer transfer{dst, src, 64, 64, 64, 1, 3};
+  assert(tl_hexagon_dma_descriptor_init_1d(
+             &descriptors[0], dst, src, 64,
+             tl_hexagon_dma_options_for_direction(3)) == 0);
+  // A raw caller can mark a nonempty prepared descriptor done. Its API must
+  // still consult that state instead of inferring publication from geometry.
+  tl_hexagon_dma_descriptor_mark_done(&descriptors[0]);
+  reset_observations();
+  assert(call(&queue, transfer) == 0);
+  assert(events.empty() && queue.count == 1 && queue.tail == nullptr);
+  tl_hexagon_dma_transfer completed{};
+  assert(tl_hexagon_dma_queue_pop(&queue, &completed) == 0);
+  assert(events == std::vector<std::string>({"poll"}));
+  assert(completed.src == src && completed.dst == dst &&
+         completed.row_bytes == 64 && completed.rows == 1 &&
+         completed.direction == 3);
+  assert(queue.count == 0 && queue.tail == nullptr);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   std::string name = argv[1];
@@ -523,8 +594,12 @@ int main(int argc, char **argv) {
     zero_and_invalid_transfers();
   else if (name == "submit-rejection-retry")
     submit_rejection_retry();
+  else if (name == "zero-nonzero-wrap")
+    zero_nonzero_wrap();
   else if (name == "old-completed")
     old_completed_result();
+  else if (name == "raw-prepared-done")
+    raw_prepared_done();
   else
     assert(false);
 }

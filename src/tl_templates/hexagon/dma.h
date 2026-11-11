@@ -514,14 +514,12 @@ tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
   return &queue->descriptors[tl_hexagon_dma_queue_index(queue, queue->count)];
 }
 
-// Internal publication after the caller has checked and initialized this slot
-// and completed cache preparation. In the compiler-owned compact path, these
-// steps cannot change the queue head, count, capacity or descriptor base.
+// Internal publication after a checked slot and successful cache preparation.
 template <bool KeepMetadata>
-TL_DMA_HOT int tl_hexagon_dma_queue_submit_slot_policy(
+TL_DMA_HOT int tl_hexagon_dma_queue_publish_slot_policy(
     tl_hexagon_dma_queue *queue, tl_hexagon_dma_descriptor *descriptor,
-    const tl_hexagon_dma_transfer &transfer) {
-  if (!tl_hexagon_dma_descriptor_done(descriptor)) {
+    const tl_hexagon_dma_transfer &transfer, bool needs_dma) {
+  if (needs_dma) {
     uint32_t engine_status = tl_hexagon_dma_engine_status();
     if (engine_status == TL_HEXAGON_DMA_STATUS_IDLE) {
       tl_hexagon_dma_start(descriptor);
@@ -542,6 +540,16 @@ TL_DMA_HOT int tl_hexagon_dma_queue_submit_slot_policy(
   }
   ++queue->count;
   return TL_HEXAGON_DMA_OK;
+}
+
+// Raw/generic prepared descriptors may already be marked done by their caller.
+// They retain the volatile status read, including the existing old-true API.
+template <bool KeepMetadata>
+TL_DMA_HOT int tl_hexagon_dma_queue_submit_slot_policy(
+    tl_hexagon_dma_queue *queue, tl_hexagon_dma_descriptor *descriptor,
+    const tl_hexagon_dma_transfer &transfer) {
+  return tl_hexagon_dma_queue_publish_slot_policy<KeepMetadata>(
+      queue, descriptor, transfer, !tl_hexagon_dma_descriptor_done(descriptor));
 }
 
 // Raw/generic callers still look up and validate the next slot here.
@@ -590,8 +598,10 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push_1d_policy(tl_hexagon_dma_queue *queue,
   if constexpr (KeepMetadata)
     return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
   else
-    return tl_hexagon_dma_queue_submit_slot_policy<false>(queue, descriptor,
-                                                          transfer);
+    // The private slot is not published yet. Successful init set DONE exactly
+    // for zero bytes; cache preparation cannot change its descriptor or queue.
+    return tl_hexagon_dma_queue_publish_slot_policy<false>(
+        queue, descriptor, transfer, bytes != 0);
 }
 
 TL_DMA_HOT int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
@@ -629,8 +639,8 @@ tl_hexagon_dma_queue_push_2d_policy(tl_hexagon_dma_queue *queue, void *dst,
   if constexpr (KeepMetadata)
     return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
   else
-    return tl_hexagon_dma_queue_submit_slot_policy<false>(queue, descriptor,
-                                                          transfer);
+    return tl_hexagon_dma_queue_publish_slot_policy<false>(
+        queue, descriptor, transfer, row_bytes != 0 && rows != 0);
 }
 
 TL_DMA_HOT int tl_hexagon_dma_queue_push_2d(tl_hexagon_dma_queue *queue,
