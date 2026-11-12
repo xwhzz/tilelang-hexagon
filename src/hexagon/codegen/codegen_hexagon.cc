@@ -324,11 +324,11 @@ bool IsLaneTemplate(const PrimExpr &value) {
     return n->value > 0 && n->value <= 128;
   const auto *text = value.as<StringImmNode>();
   if (!text || text->value.empty() || text->value.size() > 3 ||
-      text->value[0] == '0')
+      text->value.data()[0] == '0')
     return false;
   int n = 0;
   for (size_t i = 0; i < text->value.size(); ++i) {
-    char c = text->value[i];
+    char c = text->value.data()[i];
     if (c < '0' || c > '9')
       return false;
     n = n * 10 + c - '0';
