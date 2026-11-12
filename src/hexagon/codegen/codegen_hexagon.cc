@@ -307,6 +307,121 @@ bool IsManagedDMA(const CallNode *call) {
          call->op.same_as(tl::hexagon_dma_wait());
 }
 
+bool IsIntegerScalar(const PrimExpr &value) {
+  return value.dtype().is_scalar() &&
+         (value.dtype().is_int() || value.dtype().is_uint());
+}
+
+bool IsBooleanTemplate(const PrimExpr &value) {
+  if (const auto *n = value.as<IntImmNode>())
+    return n->value == 0 || n->value == 1;
+  const auto *text = value.as<StringImmNode>();
+  return text && (text->value == "true" || text->value == "false");
+}
+
+bool IsLaneTemplate(const PrimExpr &value) {
+  if (const auto *n = value.as<IntImmNode>())
+    return n->value > 0 && n->value <= 128;
+  const auto *text = value.as<StringImmNode>();
+  if (!text || text->value.empty() || text->value.size() > 3)
+    return false;
+  int n = 0;
+  for (char c : text->value) {
+    if (c < '0' || c > '9')
+      return false;
+    n = n * 10 + c - '0';
+  }
+  return n > 0 && n <= 128;
+}
+
+// These backend helpers operate on their typed tensor operands, not the DMA
+// engine or its private completion records. Do not infer this from an Op's
+// effect annotation: even a pure external call could name the C++ context.
+// Template strings are printed as C++ text, so check their exact grammar too.
+bool IsKnownNonDMAOperation(const CallNode *call) {
+  const auto &a = call->args;
+  if (call->op.same_as(builtin::handle_add_byte_offset()))
+    return a.size() == 2 && call->dtype.is_handle() &&
+           a[0].dtype().is_handle() && !a[0].as<StringImmNode>() &&
+           IsIntegerScalar(a[1]);
+  if (call->op.same_as(builtin::shift_right()))
+    return a.size() == 2 && IsIntegerScalar(a[0]) && IsIntegerScalar(a[1]) &&
+           call->dtype == a[0].dtype();
+  if (call->op.same_as(tl::hexagon_exclusive_pointer()))
+    return a.size() == 1 && call->dtype.is_handle() &&
+           a[0].dtype().is_handle() && !a[0].as<StringImmNode>();
+  if (call->op.same_as(tl::hexagon_exp()))
+    return a.size() == 1 && call->dtype.is_float() &&
+           call->dtype == a[0].dtype();
+
+  int booleans = 0, arity = 0;
+  if (call->op.same_as(tl::hexagon_hmx_gemm())) {
+    booleans = 4;
+    arity = 16;
+  } else if (call->op.same_as(tl::hexagon_crouton_copy())) {
+    booleans = 2;
+    arity = 12;
+  }
+  if (arity) {
+    if (a.size() != static_cast<size_t>(arity) || !call->dtype.is_void())
+      return false;
+    for (int i = 0; i < booleans; ++i)
+      if (!IsBooleanTemplate(a[i]))
+        return false;
+    // The remaining arguments are typed runtime operands; a string here
+    // would be emitted as raw expression text by the common C emitter.
+    for (int i = booleans; i < arity; ++i)
+      if (a[i].as<StringImmNode>() ||
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i])))
+        return false;
+    return true;
+  }
+  if (call->op.same_as(tl::hexagon_crouton_reduce())) {
+    if (a.size() != 10 || !call->dtype.is_void())
+      return false;
+    const auto *kind = a[0].as<StringImmNode>();
+    const auto *type = a[1].as<CallNode>();
+    if (!kind ||
+        (kind->value != "TL_REDUCE_SUM" && kind->value != "TL_REDUCE_MAX" &&
+         kind->value != "TL_REDUCE_MIN") ||
+        !type || !type->op.same_as(Op::Get("tirx.type_annotation")) ||
+        !type->args.empty() || !type->dtype.is_float() ||
+        !type->dtype.is_scalar() ||
+        (type->dtype.bits() != 16 && type->dtype.bits() != 32) ||
+        !IsBooleanTemplate(a[2]) || !IsBooleanTemplate(a[3]))
+      return false;
+    for (size_t i = 4; i < a.size(); ++i)
+      if (a[i].as<StringImmNode>() ||
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i])))
+        return false;
+    return true;
+  }
+  if (call->op.same_as(tl::hexagon_load_lanes()))
+    return a.size() == 3 && IsLaneTemplate(a[0]) && a[1].dtype().is_handle() &&
+           !a[1].as<StringImmNode>() && IsIntegerScalar(a[2]) &&
+           !call->dtype.is_handle();
+  if (call->op.same_as(tl::hexagon_broadcast_lane()))
+    return a.size() == 4 && IsLaneTemplate(a[0]) && IsLaneTemplate(a[1]) &&
+           !a[2].dtype().is_handle() && IsIntegerScalar(a[3]) &&
+           !call->dtype.is_handle();
+  return false;
+}
+
+// PlanDMAQueue's dependency-only wait arguments can retain the compiler's
+// VTCM pointer expression. They are not printed or evaluated by the helper.
+// Keep arbitrary expressions out even though the module checks all calls.
+bool IsDMAWaitDependency(const PrimExpr &value) {
+  if (value.as<VarNode>())
+    return true;
+  const auto *call = value.as<CallNode>();
+  if (!call || !IsKnownNonDMAOperation(call))
+    return false;
+  if (call->op.same_as(tl::hexagon_exclusive_pointer()))
+    return IsDMAWaitDependency(call->args[0]);
+  return call->op.same_as(builtin::handle_add_byte_offset()) &&
+         call->args[0].as<VarNode>();
+}
+
 // The generated queue has no TIR handle. Opaque calls or custom expression
 // text could nevertheless name its C++ local or manipulate the DMA engine.
 // Keep the whole function generic when such a call occurs, even outside the
@@ -318,7 +433,8 @@ bool HasOnlyManagedDMACalls(const Stmt &body) {
       safe &= attr->attr_key != tirx::attr::pragma_import_c;
     if (const auto *call = node.as<CallNode>()) {
       safe &= IsManagedDMA(call) || call->op.same_as(builtin::address_of()) ||
-              call->op.same_as(Op::Get("tirx.type_annotation"));
+              call->op.same_as(Op::Get("tirx.type_annotation")) ||
+              IsKnownNonDMAOperation(call);
     }
   });
   return safe;
@@ -336,7 +452,25 @@ bool IsDMAEndpoint(const PrimExpr &expr) {
          load->indices[0].dtype().is_scalar();
 }
 
-// PlanDMAQueue declares one queue first in the tile program. Only direct
+// PlanDMAQueue declares one queue before the tile program's execution. Arena
+// merging can prepend storage declarations and typed pointer bindings.
+bool IsDMAStorageDeclaration(const Stmt &stmt) {
+  if (const auto *alloc = stmt.as<AllocBufferNode>()) {
+    if (!IsSharedScope(GetPtrStorageScope(alloc->buffer->data)))
+      return false;
+    for (const PrimExpr &extent : alloc->buffer->shape) {
+      const auto *n = extent.as<IntImmNode>();
+      if (!n || n->value <= 0)
+        return false;
+    }
+    return true;
+  }
+  if (const auto *bind = stmt.as<BindNode>())
+    return bind->var.dtype().is_handle() && IsDMAWaitDependency(bind->value);
+  return false;
+}
+
+// Only direct
 // Evaluate calls can use its implicit C++ context: never a stored, returned,
 // let-bound or nested expression. Inspect every branch, not sampled paths.
 class LoadOnlyDMAScope : public StmtExprVisitor {
@@ -345,7 +479,12 @@ public:
     const auto *seq = body.as<SeqStmtNode>();
     if (!seq || seq->seq.empty())
       return false;
-    const auto *first = seq->seq[0].as<EvaluateNode>();
+    size_t start = 0;
+    while (start < seq->seq.size() && IsDMAStorageDeclaration(seq->seq[start]))
+      ++start;
+    if (start == seq->seq.size())
+      return false;
+    const auto *first = seq->seq[start].as<EvaluateNode>();
     queue_ = first ? first->value.as<CallNode>() : nullptr;
     if (!queue_ || !queue_->op.same_as(tl::hexagon_dma_queue()))
       return false;
@@ -404,7 +543,7 @@ private:
             call->args.empty() ? nullptr : call->args[0].as<IntImmNode>();
         safe_ &= pending && pending->value >= 0;
         for (size_t i = 1; i < call->args.size(); ++i)
-          safe_ &= call->args[i].as<VarNode>() != nullptr;
+          safe_ &= IsDMAWaitDependency(call->args[i]);
       }
     }
     StmtExprVisitor::VisitExpr_(call);
