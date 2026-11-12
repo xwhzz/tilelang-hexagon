@@ -27,7 +27,7 @@ def _case(extent=5, minimum=0, grouped=False, conditional=False, recurrence=Fals
                 "software_pipeline_async_producers": [1, 1, 0],
                 "software_pipeline_async_producer_groups": [0, 0 if grouped else 1, -1],
                 "software_pipeline_async_stages": [0],
-                "tl_pipelined_num_stages": 1,
+                "tl_pipelined_num_stages": T.int32(1),
             },
         ):
             with T.sblock("produce_a"):
@@ -258,7 +258,7 @@ def test_compact_pipeline_has_one_consumer_body_without_private_annotation(arch)
         {"software_pipeline_async_producer_groups": [-1, -1, -1]},
         {"software_pipeline_async_producer_groups": [0, 1, 0]},
         {"software_pipeline_async_producer_groups": [0, 0, -1], "software_pipeline_order": [0, 2, 1]},
-        {"tl_pipelined_num_stages": 2},
+        {"tl_pipelined_num_stages": X.IntImm("int32", 2)},
     ],
 )
 def test_compact_pipeline_rejects_other_stages_or_unproven_groups(change):
@@ -400,7 +400,7 @@ def test_compact_pipeline_does_not_rewrite_either_nested_pipeline():
                 "software_pipeline_order": [0, 1],
                 "software_pipeline_async_producers": [0, 0],
                 "software_pipeline_async_producer_groups": [-1, -1],
-                "tl_pipelined_num_stages": 1,
+                "tl_pipelined_num_stages": X.IntImm("int32", 1),
             },
         )
 
