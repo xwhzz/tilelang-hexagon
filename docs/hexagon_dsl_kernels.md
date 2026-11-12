@@ -395,6 +395,17 @@ own pack. So flash attention double-buffers with `num_stages=1`, and a K loop of
 gemms with staged operands at `num_stages=2` prefetches two iterations ahead, which
 pays off for small blocks (BK = 64: 14% faster than two deep).
 
+On Hexagon, the injector can combine a one-stage pipeline's main loop and
+epilogue into one consumer body. It selects this form automatically when all
+asynchronous producers are at stage 0, consumers are at stage 1, the producer
+groups are fixed and contiguous, and the loop extent is provably nonnegative.
+Conditional payloads still commit empty groups; the final iteration drains the
+queue before its consumers. Zero and one iteration, nonzero loop minima, and
+scalar bindings retain their original semantics. Nested pipelines, manual async
+controls, opaque calls, imported C source, and unproven schedules retain the
+three-part emitter. This selection applies to v73, v75, and v79 without a private
+loop annotation, and does not change a typed copy's cache policy.
+
 ## 3. Measuring
 
 - **Measure compute, not one call's wall clock.** A standalone kernel's call is dominated
