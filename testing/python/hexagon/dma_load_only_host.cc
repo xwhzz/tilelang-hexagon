@@ -469,6 +469,79 @@ static void single_slot_transitions() {
   assert_descriptor_cleared(c.descriptors[0]);
 }
 
+static void single_slot_submit_boundaries() {
+  for (unsigned rows : {1u, 2u}) {
+    for (int direction : {0, 3}) {
+      Managed<1, 1> managed;
+      auto &c = *managed.p;
+      assert(c.submit(dst, src, 32, 32, 32, rows, direction) == 0);
+      assert(c.commit() == 0);
+      unsigned char saved[sizeof(c)];
+      std::memcpy(saved, &c, sizeof(c));
+      reset_observations();
+      // A full slot rejects before descriptor initialization, cache work or
+      // engine publication, including the two-dimensional path.
+      assert(c.submit(dst, src, 64, 64, 64, rows, direction) ==
+             TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+      assert(c.commit() == TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+      assert(events.empty() && std::memcmp(saved, &c, sizeof(c)) == 0);
+      finish(c);
+      assert(c.wait(0) == 0);
+      assert(c.submit(dst, src, 64, 64, 64, rows, direction) == 0);
+      assert(c.queue.count == 1 && c.queue.head == 0 && c.submitted == 2);
+      assert(c.commit() == 0 && c.group_count == 1);
+      finish(c);
+      assert(c.wait(0) == 0 && c.retired == 2 && c.group_count == 0);
+    }
+  }
+}
+
+static void single_slot_failed_constructor() {
+  using Context = typename Managed<1, 1>::Context;
+  for (uint32_t state :
+       {TL_HEXAGON_DMA_STATUS_RUN, TL_HEXAGON_DMA_STATUS_ERROR}) {
+    auto *storage = Managed<1, 1>::storage;
+    std::memset(storage, 0xa5, sizeof(Context));
+    engine_state = state;
+    reset_observations();
+    auto *context = new (storage) Context;
+    assert(context->status == TL_HEXAGON_DMA_ERR_BUSY);
+    assert(context->queue.capacity == 0 && context->queue.count == 0);
+    unsigned char saved[sizeof(Context)];
+    std::memcpy(saved, context, sizeof(Context));
+    reset_observations();
+    assert(context->submit(dst, src, 32, 32, 32, 1, 3) ==
+           TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+    assert(context->submit(dst, src, 32, 32, 32, 2, 3) ==
+           TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+    assert(events.empty() && std::memcmp(saved, context, sizeof(Context)) == 0);
+    context->~Context();
+    assert(events.empty() && resets == 0);
+  }
+}
+
+static void single_group_multiple_slots() {
+  Managed<3, 1> managed;
+  auto &c = *managed.p;
+  c.submitted = c.retired = UINT32_MAX - 1;
+  assert(c.commit() == 0);
+  submit(c);
+  submit(c);
+  reset_observations();
+  assert(c.wait(0) == 0 && events.empty());
+  assert(c.queue.count == 2 && c.group_count == 0 &&
+         c.retired == UINT32_MAX - 1);
+  submit(c);
+  assert(c.submitted == 1 && c.queue.count == 3);
+  assert(c.commit() == 0 && c.group_count == 1);
+  assert(c.commit() == TL_HEXAGON_DMA_ERR_QUEUE_FULL);
+  finish(c);
+  reset_observations();
+  assert(c.wait(0) == 0);
+  assert(c.retired == 1 && c.queue.count == 0 && c.group_count == 0);
+  assert(events == std::vector<std::string>({"poll", "poll", "poll"}));
+}
+
 static void single_slot_uncommitted_drain() {
   for (bool error : {false, true}) {
     {
@@ -676,6 +749,12 @@ int main(int argc, char **argv) {
     zero_nonzero_wrap();
   else if (name == "single-slot-transitions")
     single_slot_transitions();
+  else if (name == "single-slot-submit-boundaries")
+    single_slot_submit_boundaries();
+  else if (name == "single-slot-failed-constructor")
+    single_slot_failed_constructor();
+  else if (name == "single-group-multiple-slots")
+    single_group_multiple_slots();
   else if (name == "single-slot-uncommitted-drain")
     single_slot_uncommitted_drain();
   else if (name == "single-slot-multiple-groups")

@@ -506,19 +506,29 @@ TL_DMA_HOT bool tl_hexagon_dma_queue_full(const tl_hexagon_dma_queue *queue) {
   return queue != nullptr && queue->count == queue->capacity;
 }
 
+template <bool SingleSlot>
 TL_DMA_HOT tl_hexagon_dma_descriptor *
-tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
+tl_hexagon_dma_queue_next_descriptor_policy(tl_hexagon_dma_queue *queue) {
   if (queue == nullptr || queue->capacity == 0 ||
       tl_hexagon_dma_queue_full(queue))
     return nullptr;
-  return &queue->descriptors[tl_hexagon_dma_queue_index(queue, queue->count)];
+  return &queue->descriptors[SingleSlot ? 0
+                                        : tl_hexagon_dma_queue_index(
+                                              queue, queue->count)];
+}
+
+TL_DMA_HOT tl_hexagon_dma_descriptor *
+tl_hexagon_dma_queue_next_descriptor(tl_hexagon_dma_queue *queue) {
+  return tl_hexagon_dma_queue_next_descriptor_policy<false>(queue);
 }
 
 // Internal publication after a checked slot and successful cache preparation.
-template <bool KeepMetadata>
+template <bool KeepMetadata, bool SingleSlot = false>
 TL_DMA_HOT int tl_hexagon_dma_queue_publish_slot_policy(
     tl_hexagon_dma_queue *queue, tl_hexagon_dma_descriptor *descriptor,
     const tl_hexagon_dma_transfer &transfer, bool needs_dma) {
+  static_assert(!SingleSlot || !KeepMetadata,
+                "Single-slot publication is compiler-private");
   if (needs_dma) {
     uint32_t engine_status = tl_hexagon_dma_engine_status();
     if (engine_status == TL_HEXAGON_DMA_STATUS_IDLE) {
@@ -538,7 +548,11 @@ TL_DMA_HOT int tl_hexagon_dma_queue_publish_slot_policy(
     uint32_t index = tl_hexagon_dma_queue_index(queue, queue->count);
     queue->transfers[index] = transfer;
   }
-  ++queue->count;
+  if constexpr (SingleSlot)
+    // Successful slot selection proved the private capacity-one queue empty.
+    queue->count = 1;
+  else
+    ++queue->count;
   return TL_HEXAGON_DMA_OK;
 }
 
@@ -571,15 +585,17 @@ tl_hexagon_dma_queue_submit_prepared(tl_hexagon_dma_queue *queue,
   return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
 }
 
-template <bool KeepMetadata>
+template <bool KeepMetadata, bool SingleSlot = false>
 TL_DMA_HOT int tl_hexagon_dma_queue_push_1d_policy(tl_hexagon_dma_queue *queue,
                                                    void *dst, const void *src,
                                                    uint32_t bytes,
                                                    int direction) {
+  static_assert(!SingleSlot || !KeepMetadata,
+                "Single-slot submission is compiler-private");
   if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
-      tl_hexagon_dma_queue_next_descriptor(queue);
+      tl_hexagon_dma_queue_next_descriptor_policy<SingleSlot>(queue);
   if (descriptor == nullptr)
     return queue == nullptr ? TL_HEXAGON_DMA_ERR_ARGUMENT
                             : TL_HEXAGON_DMA_ERR_QUEUE_FULL;
@@ -600,7 +616,7 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push_1d_policy(tl_hexagon_dma_queue *queue,
   else
     // The private slot is not published yet. Successful init set DONE exactly
     // for zero bytes; cache preparation cannot change its descriptor or queue.
-    return tl_hexagon_dma_queue_publish_slot_policy<false>(
+    return tl_hexagon_dma_queue_publish_slot_policy<false, SingleSlot>(
         queue, descriptor, transfer, bytes != 0);
 }
 
@@ -611,16 +627,18 @@ TL_DMA_HOT int tl_hexagon_dma_queue_push_1d(tl_hexagon_dma_queue *queue,
                                                    direction);
 }
 
-template <bool KeepMetadata>
+template <bool KeepMetadata, bool SingleSlot = false>
 TL_DMA_HOT int
 tl_hexagon_dma_queue_push_2d_policy(tl_hexagon_dma_queue *queue, void *dst,
                                     const void *src, uint32_t dst_stride,
                                     uint32_t src_stride, uint32_t row_bytes,
                                     uint32_t rows, int direction) {
+  static_assert(!SingleSlot || !KeepMetadata,
+                "Single-slot submission is compiler-private");
   if (!tl_hexagon_dma_valid_direction(direction))
     return TL_HEXAGON_DMA_ERR_ARGUMENT;
   tl_hexagon_dma_descriptor *descriptor =
-      tl_hexagon_dma_queue_next_descriptor(queue);
+      tl_hexagon_dma_queue_next_descriptor_policy<SingleSlot>(queue);
   if (descriptor == nullptr)
     return queue == nullptr ? TL_HEXAGON_DMA_ERR_ARGUMENT
                             : TL_HEXAGON_DMA_ERR_QUEUE_FULL;
@@ -639,7 +657,7 @@ tl_hexagon_dma_queue_push_2d_policy(tl_hexagon_dma_queue *queue, void *dst,
   if constexpr (KeepMetadata)
     return tl_hexagon_dma_queue_submit_prepared_policy<true>(queue, transfer);
   else
-    return tl_hexagon_dma_queue_publish_slot_policy<false>(
+    return tl_hexagon_dma_queue_publish_slot_policy<false, SingleSlot>(
         queue, descriptor, transfer, row_bytes != 0 && rows != 0);
 }
 
@@ -920,12 +938,13 @@ struct tl_hexagon_dma_compact_load_context {
     if (direction != TL_HEXAGON_DMA_DDR_TO_VTCM &&
         direction != TL_HEXAGON_DMA_DDR_TO_VTCM_UNWRITTEN)
       return TL_HEXAGON_DMA_ERR_ARGUMENT;
-    int result = rows == 1 && dst_stride == row_bytes && src_stride == row_bytes
-                     ? tl_hexagon_dma_queue_push_1d_policy<false>(
-                           &queue, dst, src, row_bytes, direction)
-                     : tl_hexagon_dma_queue_push_2d_policy<false>(
-                           &queue, dst, src, dst_stride, src_stride, row_bytes,
-                           rows, direction);
+    int result =
+        rows == 1 && dst_stride == row_bytes && src_stride == row_bytes
+            ? tl_hexagon_dma_queue_push_1d_policy<false, Descriptors == 1>(
+                  &queue, dst, src, row_bytes, direction)
+            : tl_hexagon_dma_queue_push_2d_policy<false, Descriptors == 1>(
+                  &queue, dst, src, dst_stride, src_stride, row_bytes, rows,
+                  direction);
     if (result == TL_HEXAGON_DMA_OK)
       ++submitted;
     return result;
@@ -934,7 +953,10 @@ struct tl_hexagon_dma_compact_load_context {
     if (group_count == Groups)
       return TL_HEXAGON_DMA_ERR_QUEUE_FULL;
     group_end[(group_head + group_count) % Groups] = submitted;
-    ++group_count;
+    if constexpr (Groups == 1)
+      group_count = 1;
+    else
+      ++group_count;
     return TL_HEXAGON_DMA_OK;
   }
   __attribute__((always_inline)) int wait(uint32_t groups) {
