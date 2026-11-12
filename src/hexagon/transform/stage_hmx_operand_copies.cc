@@ -9,7 +9,9 @@
  * buffer, which the pipeline multi-buffers and transfers ahead, and one from
  * the staging buffer into the operand, an HVX pack, which the pipeline places
  * with the gemm that reads it. Copies that DMA would move slower than HVX
- * (DMAOutpacesHVX) stay single HVX copies into the operand.
+ * (DMAOutpacesHVX), or that are conditional within the pipeline, stay single
+ * HVX copies into the operand. PipelinePlanning does not make conditional
+ * copies async producers, so staging them would only add a synchronous copy.
  *
  * Runs before PipelinePlanning.
  */
@@ -66,16 +68,40 @@ private:
     if (!op->annotations.count("num_stages"))
       return StmtExprMutator::VisitStmt_(op);
     std::unordered_set<const BufferNode *> outer = operands_;
+    bool outer_conditional = conditional_;
+    // A condition around the whole pipeline does not condition the copies
+    // relative to that pipeline's iterations. Each nested pipeline starts its
+    // own conditional context; restore the outer context when it ends.
+    conditional_ = false;
     for (const BufferNode *buffer : HMXOperands(op->body))
       operands_.insert(buffer);
     Stmt stmt = StmtExprMutator::VisitStmt_(op);
     operands_ = std::move(outer);
+    conditional_ = outer_conditional;
+    return stmt;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    bool outer_conditional = conditional_;
+    conditional_ = true;
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    conditional_ = outer_conditional;
+    return stmt;
+  }
+
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    bool outer_conditional = conditional_;
+    // Match PipelinePlanning's conditional-execution predicate: a block
+    // predicate must be literally true to remain an async producer candidate.
+    conditional_ |= !is_one(op->predicate);
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    conditional_ = outer_conditional;
     return stmt;
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
-    if (call == nullptr || operands_.empty())
+    if (call == nullptr || operands_.empty() || conditional_)
       return StmtExprMutator::VisitStmt_(op);
     TileOperator tile_op = ParseOperator(GetRef<Call>(call));
     const auto *copy = tile_op.defined() ? tile_op.as<CopyNode>() : nullptr;
@@ -124,6 +150,7 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  bool conditional_ = false;
   std::unordered_set<const BufferNode *> operands_;
   std::unordered_map<const BufferNode *, std::vector<Buffer>> staging_;
 };
