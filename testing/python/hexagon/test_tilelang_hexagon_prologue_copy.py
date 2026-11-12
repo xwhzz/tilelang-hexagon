@@ -8,6 +8,8 @@ import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.intrinsics.panel import make_hvx_panel_layout
 
 from test_tilelang_hexagon_pipeline import _source
 
@@ -16,7 +18,7 @@ POLICY = "hexagon.prologue_copy_policy"
 CANDIDATE = "tl.hexagon.prologue_copy_candidate"
 
 
-def _kernel(policy=None, extent=3, minimum=0, mixed=False, contract=None):
+def _kernel(policy=None, extent=3, minimum=0, mixed=False, contract=None, hints=None):
     annotations = {} if policy is None else {POLICY: policy}
     second = {"hexagon_dma_src_l2_bypass": 0} if mixed else {}
 
@@ -32,8 +34,8 @@ def _kernel(policy=None, extent=3, minimum=0, mixed=False, contract=None):
             sa = T.alloc_shared((256,), "int32")
             sb = T.alloc_shared((256,), "int32")
             for i in T.Pipelined(minimum, minimum + extent, num_stages=1, annotations=annotations):
-                T.copy(A[i, 0:256], sa)
-                T.copy(B[i, 0:256], sb, annotations=second)
+                T.copy(A[i, 0:256], sa, annotations=hints)
+                T.copy(B[i, 0:256], sb, annotations=hints if hints is not None else second)
                 for j in T.Parallel(256):
                     C[i, j] = sa[j] + sb[j]
 
@@ -121,3 +123,36 @@ def test_write_through_keeps_writeback_before_synchronous_read():
     assert writebacks(actual) == writebacks(default) and writebacks(actual)
     assert actual.index("tl_hexagon_cache_writeback(") < actual.index("*(int32_t32*)(((int32_t*)sa)")
     assert _schedule(actual) == _schedule(default)
+
+
+@pytest.mark.parametrize("hints", [{"hexagon_dma_src_l2_bypass": 1}, {"custom_copy_hint": 1}])
+def test_explicit_cache_or_unknown_copy_hint_preserves_source(hints):
+    baseline, _ = _lower(_kernel(hints=hints))
+    actual, _ = _lower(_kernel("sync_if_supported", hints=hints))
+    assert actual == baseline
+
+
+def _packed_kernel(kind, policy):
+    annotations = {} if policy is None else {POLICY: policy}
+    dtype = "int8" if kind == "panel" else "float16"
+    layout = make_hvx_panel_layout if kind == "panel" else make_hmx_activation_layout
+
+    @T.prim_func
+    def kernel(A: T.Tensor((96, 64), dtype), C: T.Tensor((96, 64), dtype)):
+        with T.Kernel(1):
+            stage = T.alloc_shared((32, 64), dtype)
+            T.annotate_layout({A: layout(A), C: layout(C), stage: layout(stage)})
+            for i in T.Pipelined(3, num_stages=1, annotations=annotations):
+                T.copy(A[i * 32 : (i + 1) * 32, :], stage)
+                T.copy(stage, C[i * 32 : (i + 1) * 32, :])
+
+    return kernel
+
+
+@pytest.mark.parametrize("kind", ["panel", "crouton"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_packed_layout_keeps_original_dma_payloads_and_schedule(kind, arch):
+    baseline, _ = _lower(_packed_kernel(kind, None), arch)
+    actual, _ = _lower(_packed_kernel(kind, "sync_if_supported"), arch)
+    assert actual == baseline
+    assert re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", actual)

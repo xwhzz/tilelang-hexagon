@@ -406,6 +406,20 @@ controls, opaque calls, imported C source, and unproven schedules retain the
 three-part emitter. This selection applies to v73, v75, and v79 without a private
 loop annotation, and does not change a typed copy's cache policy.
 
+Such a one-stage pipeline can opt into synchronous first-iteration copies with
+`T.Pipelined(..., num_stages=1, annotations={"hexagon.prologue_copy_policy": "sync_if_supported"})`.
+The default and explicit `"preserve"` retain the original lowering; other values
+are rejected. Only automatic, same-dtype row-major DDR-to-VTCM copies with proven
+regions and strides qualify. Packed layouts, explicit copy hints, manual async
+operations, and ineligible pipelines keep their original lowering. Any
+`T.annotate_dma_only` declaration in the function disables this selection for
+the whole function; write-through declarations and their writebacks remain in
+effect. A selected copy completes synchronously at its original prologue
+position. Its group commit, even when empty, all waits, and the final drain
+remain. Later iterations retain their original copy lowering. This option has
+no ISA, shape, or model-specific selection rule; measure it for the workload and
+input cache state before enabling it.
+
 ## 3. Measuring
 
 - **Measure compute, not one call's wall clock.** A standalone kernel's call is dominated

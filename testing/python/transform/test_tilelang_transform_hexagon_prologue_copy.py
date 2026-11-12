@@ -5,7 +5,7 @@ import pytest
 from tilelang import tvm
 import tilelang.language as T
 
-from test_tilelang_transform_hexagon_compact_pipeline import _FIFO, _annotations, _case, _lower
+from test_tilelang_transform_hexagon_compact_pipeline import _FIFO, _annotations, _case, _lower, _rewrite_loop
 
 X = tvm.tirx
 POLICY = "hexagon.prologue_copy_policy"
@@ -167,3 +167,51 @@ def test_fifo_oracle_rejects_missing_retirement():
     corrupted = lowered.with_body(X.stmt_functor.ir_transform(lowered.body, None, corrupt))
     with pytest.raises(AssertionError, match="before retirement"):
         _run(corrupted)
+
+
+@pytest.mark.parametrize("scope", ["nested", "inherited_async", "opaque"])
+def test_sync_policy_keeps_original_scope_guards(scope):
+    func = _copies(_case())
+    if scope == "inherited_async":
+        func = func.with_body(X.AttrStmt(0, "async_commit_queue_scope", 0, func.body))
+    elif scope == "nested":
+
+        def nest(loop):
+            return X.For(
+                X.Var("outer", "int32"),
+                0,
+                2,
+                X.ForKind.SERIAL,
+                X.SBlockRealize([], True, X.SBlock([], [], [], "inner", loop)),
+                annotations={
+                    "software_pipeline_stage": [0],
+                    "software_pipeline_order": [0],
+                    "software_pipeline_async_producers": [0],
+                    "software_pipeline_async_producer_groups": [-1],
+                    "tl_pipelined_num_stages": X.IntImm("int32", 1),
+                },
+            )
+
+        func = _rewrite_loop(func, nest)
+    else:
+
+        def add_opaque(node):
+            if isinstance(node, X.SBlock) and node.name_hint == "produce_a":
+                return X.SBlock(
+                    node.iter_vars,
+                    node.reads,
+                    node.writes,
+                    node.name_hint,
+                    X.SeqStmt([X.Evaluate(X.call_pure_extern("int32", "unknown_copy_observer")), node.body]),
+                    node.init,
+                    node.alloc_buffers,
+                    node.match_buffers,
+                    node.annotations,
+                )
+            return None
+
+        func = func.with_body(X.stmt_functor.ir_transform(func.body, None, add_opaque))
+    baseline = _lower(func)
+    actual = _lower(_annotations(func, {POLICY: "sync_if_supported"}))
+    assert not _candidates(actual)
+    tvm.ir.assert_structural_equal(baseline, actual, map_free_vars=True)
