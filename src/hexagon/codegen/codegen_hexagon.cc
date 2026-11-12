@@ -372,10 +372,13 @@ bool IsKnownNonDMAOperation(const CallNode *call) {
         return false;
     // The remaining arguments are typed runtime operands; a string here
     // would be emitted as raw expression text by the common C emitter.
-    for (int i = booleans; i < arity; ++i)
+    for (int i = booleans; i < arity; ++i) {
+      const bool predicate = arity == 16 && i == 13 && a[i].dtype().is_bool() &&
+                             a[i].dtype().is_scalar();
       if (a[i].as<StringImmNode>() ||
-          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i])))
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i]) && !predicate))
         return false;
+    }
     return true;
   }
   if (call->op.same_as(tl::hexagon_crouton_reduce())) {
@@ -392,10 +395,13 @@ bool IsKnownNonDMAOperation(const CallNode *call) {
         (type->dtype.bits() != 16 && type->dtype.bits() != 32) ||
         !IsBooleanTemplate(a[2]) || !IsBooleanTemplate(a[3]))
       return false;
-    for (size_t i = 4; i < a.size(); ++i)
+    for (size_t i = 4; i < a.size(); ++i) {
+      const bool predicate =
+          i == 9 && a[i].dtype().is_bool() && a[i].dtype().is_scalar();
       if (a[i].as<StringImmNode>() ||
-          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i])))
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i]) && !predicate))
         return false;
+    }
     return true;
   }
   if (call->op.same_as(tl::hexagon_load_lanes()))
