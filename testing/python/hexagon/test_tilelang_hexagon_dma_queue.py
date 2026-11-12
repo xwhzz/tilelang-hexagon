@@ -113,8 +113,8 @@ def test_waits_list_the_buffers_they_complete():
     # The buffers keep the waits as their last accesses for memory planning.
     assert [[str(arg) for arg in call.args[1:]] for call in waits] == [["s"], ["t"]]
     source = str(artifact.kernel_source)
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 1))" in source
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0))" in source
+    assert re.search(r"tl_hexagon_dma_(?:async|compact)_wait\(tl_dma_async, 1\)\)", source)
+    assert re.search(r"tl_hexagon_dma_(?:async|compact)_wait\(tl_dma_async, 0\)\)", source)
 
 
 def test_queue_bound_covers_both_branches():

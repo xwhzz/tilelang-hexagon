@@ -1,5 +1,7 @@
 """Conditional HMX copies keep one pack instead of a synchronous staging copy."""
 
+import re
+
 import pytest
 
 import tilelang
@@ -134,6 +136,6 @@ def test_normal_lowering_keeps_direct_q_pack_and_async_k(arch):
     source = artifact.kernel_source
     assert "q_dma" not in source
     assert "tl_crouton_copy<true, false>" in source and "(&(Q[0]))" in source
-    assert "tl_hexagon_dma_async_submit(" in source and "(&(K[" in source
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 0)" in source
+    assert re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", source) and "(&(K[" in source
+    assert re.search(r"tl_hexagon_dma_(?:async|compact)_wait\(tl_dma_async, 0\)", source)
     assert "tl_hexagon_hmx_gemm<" in source

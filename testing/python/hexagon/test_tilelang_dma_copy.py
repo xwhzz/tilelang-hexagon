@@ -514,13 +514,13 @@ def test_crouton_tiles_move_as_runs(arch):
             T.dma_wait()
 
     source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
-    calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    calls = [line for line in source.splitlines() if re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", line)]
     assert len(calls) == 3
     # dst stride, src stride, run bytes, runs, direction. W[1, 64, 32] is
     # tile (1, 2) of layer 1: 32768 + 10 * 1024 elements in.
     assert "(&(W[43008]))" in calls[0] and "((half*)w)[8192]" in calls[0]
     assert "(uint32_t)8192, (uint32_t)16384, (uint32_t)8192, (uint32_t)2, 3)" in calls[0]
-    assert "tl_hexagon_dma_async_context<3, 3>" in source
+    assert re.search(r"tl_hexagon_dma_(?:async|compact_load)_context<3, 3>", source)
     assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[-2]
     assert "W[16384]" in calls[-2]
     assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[-1]
