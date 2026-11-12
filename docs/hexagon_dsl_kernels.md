@@ -403,8 +403,8 @@ Conditional payloads still commit empty groups; the final iteration drains the
 queue before its consumers. Zero and one iteration, nonzero loop minima, and
 scalar bindings retain their original semantics. Nested pipelines, manual async
 controls, opaque calls, imported C source, and unproven schedules retain the
-three-part emitter. This selection applies to v73, v75, and v79 without a private
-loop annotation, and does not change a typed copy's cache policy.
+three-part emitter. This selection applies automatically to v73, v75, and v79,
+and preserves each typed copy's cache policy.
 
 Such a one-stage pipeline can opt into synchronous first-iteration copies with
 `T.Pipelined(..., num_stages=1, annotations={"hexagon.prologue_copy_policy": "sync_if_supported"})`.

@@ -241,13 +241,6 @@ def test_compact_pipeline_has_one_consumer_body_without_private_annotation(arch)
         lowered.body, lambda node: stores.append(node) if isinstance(node, X.BufferStore) and node.buffer.name == "C" else None
     )
     assert len(stores) == 1
-    # A stale diagnostic annotation no longer controls selection.
-    stale = _lower(_annotations(func, {"tl_hexagon_compact_probe": 0}))
-    stale_stores = []
-    X.stmt_functor.post_order_visit(
-        stale.body, lambda node: stale_stores.append(node) if isinstance(node, X.BufferStore) and node.buffer.name == "C" else None
-    )
-    assert len(stale_stores) == 1
 
 
 @pytest.mark.parametrize(

@@ -66,7 +66,7 @@ def make_flash(M, SEQ, BN, D):
             for i in T.Parallel(M):
                 m[i] = T.float32(NEG)
                 l[i] = T.float32(0)
-            for kv in T.serial(SEQ // BN):
+            for kv in T.Pipelined(SEQ // BN, num_stages=1, annotations={"hexagon.prologue_copy_policy": "sync_if_supported"}):
                 T.copy(K[kv * BN, 0], K_row)
                 T.copy(V[kv * BN, 0], V_row)
                 T.copy(K_row, K_sh)
