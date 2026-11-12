@@ -31,6 +31,7 @@
 #include "hexagon/layout/crouton.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/op/dma.h"
+#include "hexagon/op/prologue_copy.h"
 
 #include <tvm/tirx/builtin.h>
 
@@ -48,6 +49,29 @@ using namespace ffi;
 namespace hexagon {
 
 namespace {
+
+bool CanUseSyncPrologueCopy(const CopyNode &op, const LowerArgs &T,
+                            arith::Analyzer *analyzer) {
+  auto candidate = op.annotations.Get(kPrologueCopyCandidate);
+  if (!candidate || is_zero(Downcast<PrimExpr>(candidate.value())) ||
+      !IsGlobalBuffer(op.src) || !IsVTCMBuffer(op.dst) ||
+      T.layout_map.count(op.src) || T.layout_map.count(op.dst)) {
+    return false;
+  }
+  // Explicit transfer/cache/SIMT hints and unknown annotations keep their
+  // existing lowering. In particular, do not turn an explicitly uncached
+  // DMA source into a CPU read. DMA-only functions never receive the marker.
+  for (const auto &entry : op.annotations) {
+    if (entry.first != kPrologueCopyCandidate &&
+        entry.first != attr::kAsyncCopyNoImplicitCommitWait) {
+      return false;
+    }
+  }
+  // Reuse the target's proof of equal scalar dtypes, in-bounds row-major
+  // regions and static non-overlapping row strides. Panel/Crouton are
+  // excluded above: their synchronous lowering has different semantics.
+  return DMARejection(op, T, analyzer).empty();
+}
 
 const CroutonLayoutNode *CroutonOf(const Buffer &buffer,
                                    const LayoutMap &layout_map) {
@@ -236,6 +260,9 @@ struct Copy {
     }
     auto pipelined = op.annotations.Get(attr::kAsyncCopyNoImplicitCommitWait);
     bool async = pipelined && !is_zero(Downcast<PrimExpr>(pipelined.value()));
+    if (async && CanUseSyncPrologueCopy(op, T, analyzer)) {
+      return LowerNormalCopy(op, T, analyzer);
+    }
     // Panel buffers move by whole panels, packed on both sides: by DMA, in
     // the pipeline's group, or waited for right away.
     if (PanelOf(op.src, T.layout_map) || PanelOf(op.dst, T.layout_map)) {
