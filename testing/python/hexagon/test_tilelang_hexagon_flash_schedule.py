@@ -21,7 +21,7 @@ SPEC.loader.exec_module(flash)
 @pytest.mark.parametrize("seq", [64, 256, 1024, 4096])
 def test_auto_uses_only_measured_target_and_shape(arch, seq):
     target = normalize_hexagon_target({"kind": "hexagon", "mcpu": "hexagon" + arch})
-    assert flash.select_schedule("auto", target, 64, seq, 64, 64) == ("pipeline" if arch == "v79" and seq >= 256 else "serial")
+    assert flash.select_schedule("auto", target, 64, seq, 64, 64) == ("pipeline" if arch in {"v73", "v79"} and seq >= 256 else "serial")
 
 
 @pytest.mark.parametrize("shape", [(32, 256, 64, 64), (64, 256, 128, 64), (64, 256, 64, 128)])
@@ -37,7 +37,9 @@ def test_explicit_schedule_overrides_auto(arch, schedule):
     assert flash.select_schedule(schedule, target, 32, 64, 64, 128) == schedule
 
 
-@pytest.mark.parametrize("explicit,environment,expected", [("v73", "v79", "serial"), ("v79", "v73", "pipeline"), ("v75", "v79", "serial")])
+@pytest.mark.parametrize(
+    "explicit,environment,expected", [("v73", "v79", "pipeline"), ("v79", "v73", "pipeline"), ("v75", "v79", "serial")]
+)
 def test_explicit_target_architecture_wins_over_environment(monkeypatch, explicit, environment, expected):
     monkeypatch.setenv("HEXAGON_DSP_ARCH", environment)
     target = normalize_hexagon_target({"kind": "hexagon", "mcpu": "hexagon" + explicit})
@@ -71,7 +73,7 @@ def test_default_factory_preserves_plain_serial_codegen(arch):
 
 @pytest.mark.parametrize(
     "arch,requested,expected",
-    [("v73", "auto", "serial"), ("v75", "pipeline", "pipeline"), ("v79", "auto", "pipeline"), ("v79", "serial", "serial")],
+    [("v73", "auto", "pipeline"), ("v75", "pipeline", "pipeline"), ("v79", "auto", "pipeline"), ("v79", "serial", "serial")],
 )
 def test_cli_normalizes_once_and_passes_the_same_target(monkeypatch, capsys, arch, requested, expected):
     monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)

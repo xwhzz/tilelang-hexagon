@@ -19,7 +19,9 @@
 #define TL_DMA_INLINE static inline
 #endif
 // The submit, commit and wait path of every transfer, inlined: as calls it
-// cost several times its instructions (#78).
+// cost several times its instructions (#78). Keep the full helper chain inline
+// across the target("hvx-ieee-fp") boundary of v73/v75 arithmetic kernels.
+// Otherwise even tiny integer helpers become calls with vector ABI spills.
 #define TL_DMA_HOT TL_DMA_INLINE __attribute__((always_inline))
 
 enum tl_hexagon_dma_direction {
@@ -132,35 +134,35 @@ struct tl_hexagon_dma_queue {
 // User-DMA instructions
 // ---------------------------------------------------------------------------
 
-TL_DMA_INLINE uint32_t tl_hexagon_dma_pause() {
+TL_DMA_HOT uint32_t tl_hexagon_dma_pause() {
   return static_cast<uint32_t>(Q6_R_dmpause());
 }
 
-TL_DMA_INLINE void tl_hexagon_dma_start(void *next) {
+TL_DMA_HOT void tl_hexagon_dma_start(void *next) {
   asm volatile("release(%0):at" : : "r"(next) : "memory");
   Q6_dmstart_A(next);
 }
 
-TL_DMA_INLINE void tl_hexagon_dma_link(void *tail, void *next) {
+TL_DMA_HOT void tl_hexagon_dma_link(void *tail, void *next) {
   asm volatile("release(%0):at" : : "r"(next) : "memory");
   Q6_dmlink_AA(tail, next);
 }
 
-TL_DMA_INLINE uint32_t tl_hexagon_dma_poll() {
+TL_DMA_HOT uint32_t tl_hexagon_dma_poll() {
   return static_cast<uint32_t>(Q6_R_dmpoll());
 }
 
-TL_DMA_INLINE uint32_t tl_hexagon_dma_engine_status() {
+TL_DMA_HOT uint32_t tl_hexagon_dma_engine_status() {
   return tl_hexagon_dma_poll() & TL_HEXAGON_DMA_STATUS_MASK;
 }
 
-TL_DMA_INLINE bool tl_hexagon_dma_engine_idle() {
+TL_DMA_HOT bool tl_hexagon_dma_engine_idle() {
   return tl_hexagon_dma_engine_status() == TL_HEXAGON_DMA_STATUS_IDLE;
 }
 
 // dmpause resets DMA0.  Call this only after acquiring exclusive ownership of
 // the engine; queue initialization intentionally does not call it.
-TL_DMA_INLINE int tl_hexagon_dma_engine_reset() {
+TL_DMA_HOT int tl_hexagon_dma_engine_reset() {
   uint32_t status = tl_hexagon_dma_pause() & TL_HEXAGON_DMA_STATUS_MASK;
   return status == TL_HEXAGON_DMA_STATUS_IDLE ? TL_HEXAGON_DMA_OK
                                               : TL_HEXAGON_DMA_ERR_ENGINE;
@@ -466,7 +468,7 @@ tl_hexagon_dma_queue_index(const tl_hexagon_dma_queue *queue, uint32_t offset) {
 }
 
 template <bool KeepMetadata>
-TL_DMA_INLINE int tl_hexagon_dma_queue_init_policy(
+TL_DMA_HOT int tl_hexagon_dma_queue_init_policy(
     tl_hexagon_dma_queue *queue, tl_hexagon_dma_descriptor *descriptors,
     tl_hexagon_dma_transfer *transfers, uint32_t capacity) {
   if (queue == nullptr || descriptors == nullptr ||
@@ -910,13 +912,13 @@ struct tl_hexagon_dma_compact_load_context {
   uint32_t retired = 0;
   int status;
 
-  tl_hexagon_dma_compact_load_context() {
+  __attribute__((always_inline)) tl_hexagon_dma_compact_load_context() {
     status = tl_hexagon_dma_engine_idle()
                  ? tl_hexagon_dma_queue_init_policy<false>(&queue, descriptors,
                                                            nullptr, Descriptors)
                  : TL_HEXAGON_DMA_ERR_BUSY;
   }
-  ~tl_hexagon_dma_compact_load_context() {
+  __attribute__((always_inline)) ~tl_hexagon_dma_compact_load_context() {
     // Drain even uncommitted submissions on early return. A failed drain
     // resets only this context's outstanding DMA before its storage expires.
     while (queue.count != 0) {
@@ -995,7 +997,7 @@ struct tl_hexagon_dma_compact_load_context {
 // Distinct private entry names avoid changing overload resolution or function
 // pointers of the existing async helpers.
 template <uint32_t Descriptors, uint32_t Groups>
-TL_DMA_INLINE int tl_hexagon_dma_compact_submit(
+TL_DMA_HOT int tl_hexagon_dma_compact_submit(
     tl_hexagon_dma_compact_load_context<Descriptors, Groups> &context,
     void *dst, const void *src, uint32_t dst_stride, uint32_t src_stride,
     uint32_t row_bytes, uint32_t rows, int direction) {
@@ -1006,13 +1008,13 @@ TL_DMA_INLINE int tl_hexagon_dma_compact_submit(
 }
 
 template <uint32_t Descriptors, uint32_t Groups>
-TL_DMA_INLINE int tl_hexagon_dma_compact_commit(
+TL_DMA_HOT int tl_hexagon_dma_compact_commit(
     tl_hexagon_dma_compact_load_context<Descriptors, Groups> &context) {
   return context.commit() == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;
 }
 
 template <uint32_t Descriptors, uint32_t Groups>
-TL_DMA_INLINE int tl_hexagon_dma_compact_wait(
+TL_DMA_HOT int tl_hexagon_dma_compact_wait(
     tl_hexagon_dma_compact_load_context<Descriptors, Groups> &context,
     uint32_t groups) {
   return context.wait(groups) == TL_HEXAGON_DMA_OK ? TL_OK : TL_ERR_DMA;

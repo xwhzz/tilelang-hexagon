@@ -105,7 +105,7 @@ def select_schedule(schedule, target, M, SEQ, BN, D):
         return schedule
     if schedule != "auto":
         raise ValueError(f"Unknown Flash schedule: {schedule}")
-    return "pipeline" if hexagon_arch(target) == "v79" and M == BN == D == 64 and SEQ >= 256 else "serial"
+    return "pipeline" if hexagon_arch(target) in {"v73", "v79"} and M == BN == D == 64 and SEQ >= 256 else "serial"
 
 
 def main():
