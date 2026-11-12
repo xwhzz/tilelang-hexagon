@@ -61,6 +61,59 @@ def test_dma_publishes_dirty_ddr_and_preserves_boundary_lines(size):
         kernel.adapter.close()
 
 
+def make_cached_load_probe():
+    @T.prim_func
+    def probe(A: T.Tensor((320,), "int32"), Dirty: T.Tensor((320,), "int32"), Out: T.Tensor((320,), "int32")):
+        with T.Kernel(1):
+            staged = T.alloc_shared((256,), "int32", align=128)
+            for i in T.Parallel(256):
+                Dirty[i + 32] = A[i + 32] + T.int32(17)
+            T.dma_copy(Dirty[32:288], staged)
+            T.dma_wait()
+            T.copy(staged, Out[32:288])
+
+    return probe
+
+
+@pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+def test_load_only_dma_reads_dirty_source_and_preserves_guards():
+    """A D1/G1 load must publish preceding DSP writes even without DMA stores."""
+    import torch
+    from tilelang.hexagon.runtime.session import Session
+
+    probe = make_cached_load_probe()
+    target = determine_target("hexagon", return_object=True)
+    source = lower(probe, target)
+    assert "tl_hexagon_dma_compact_load_context<1, 1> tl_dma_async;" in source
+    assert submit_directions(source) == [0]
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") == 1
+    assert "tl_parallel_for" not in source
+
+    size = 320 * 4
+    guard = bytes([0xA5]) * 128
+    with Session([(probe, [])], target=target) as sess:
+        allocations = [sess.buffer(size + len(guard)) for _ in range(3)]
+        args = [buf.at(0, size) for buf in allocations]
+        # Aligned ordinary HVX stores keep this queue eligible for load-only.
+        # The cache lines before and after the payload must stay unchanged.
+        for seed in (1, 2):
+            src = torch.arange(320, dtype=torch.int32) * 7919 + seed
+            untouched = torch.full((320,), -9876543, dtype=torch.int32)
+            allocations[0].write(src.numpy().tobytes() + guard)
+            for buf in allocations[1:]:
+                buf.write(untouched.numpy().tobytes() + guard)
+            sess.kernels[0](*args)
+            returned = [buf.read() for buf in allocations]
+            assert returned[0] == src.numpy().tobytes() + guard
+            expected = untouched.clone()
+            expected[32:288] = src[32:288] + 17
+            for raw in returned[1:]:
+                assert raw[size:] == guard
+                actual = torch.frombuffer(bytearray(raw[:size]), dtype=torch.int32)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def lower(func, target="hexagon"):
     target = determine_target(target, return_object=True)
     with tvm.target.Target(target):
@@ -111,7 +164,8 @@ def make_dma_hmx_matmul(M=256, N=512, K=2048, BM=128, BN=128):
     return dma_hmx_matmul
 
 
-def test_async_manual_ping_pong():
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_async_manual_ping_pong(arch):
     @T.prim_func
     def probe(A: T.Tensor((768,), "float16")):
         with T.Kernel(1):
@@ -122,15 +176,15 @@ def test_async_manual_ping_pong():
             T.dma_copy(A[512:768], s[0, 0:256])
             T.dma_wait()
 
-    source = lower(probe)
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     # At most two copies are in flight; each is one descriptor and one group.
-    assert "tl_hexagon_dma_async_context<2, 2> tl_dma_async;" in source
-    assert source.count("tl_hexagon_dma_async_submit(tl_dma_async, ") == 3
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 3
-    assert "tl_hexagon_dma_async_wait(tl_dma_async, 1)" in source
+    assert "tl_hexagon_dma_compact_load_context<2, 2> tl_dma_async;" in source
+    assert source.count("tl_hexagon_dma_compact_submit(tl_dma_async, ") == 3
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 3
+    assert "tl_hexagon_dma_compact_wait(tl_dma_async, 1)" in source
     # The program already drains the queue, so no second drain follows.
-    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
-    assert source.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > source.rindex("tl_hexagon_dma_async_submit(")
+    assert source.count("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") == 1
+    assert source.rindex("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") > source.rindex("tl_hexagon_dma_compact_submit(")
     assert "ptx_" not in source
 
 
@@ -161,8 +215,20 @@ def submit_directions(source):
     return [
         int(re.search(r", (\d)\)\) return tl_status;", line).group(1))
         for line in source.splitlines()
-        if "tl_hexagon_dma_async_submit(" in line
+        if re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", line)
     ]
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_submit_direction_parser_covers_both_generated_queue_policies(arch, disabled):
+    probe = make_cached_load_probe()
+    with tvm.transform.PassContext(config={"tl.hexagon_disable_dma_load_only": disabled}):
+        source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    helper = "async" if disabled else "compact"
+    assert f"tl_hexagon_dma_{helper}_submit(" in source
+    # DSP writes precede the load: both policies must retain direction 0.
+    assert submit_directions(source) == [0]
 
 
 def test_dma_only_buffers_skip_cache_maintenance():
@@ -398,14 +464,16 @@ def test_reject_invalid_wait_argument(pending):
 
 
 def test_managed_worker_queue_is_local_and_drained():
-    source = lower(make_queue_probe(workers=2))
+    target = determine_target("hexagon", return_object=True)
+    source = lower(make_queue_probe(workers=2), target)
     entry, program = source.split(" -> int32_t {", 1)
     assert "tl_parallel_for(2, 2, tl_vtcm_worker_arenas(512u), " in entry
     assert "tl_hexagon_dma_async_context" not in entry
+    assert "tl_hexagon_dma_compact_load_context" not in entry
     # Each tile program owns its queue and its buffers in the worker's arena.
-    assert "tl_hexagon_dma_async_context<1, 1> tl_dma_async;" in program
+    assert "tl_hexagon_dma_compact_load_context<1, 1> tl_dma_async;" in program
     assert "half* s = (half*)tl_arena;" in program
-    assert program.rindex("tl_hexagon_dma_async_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_async_submit(")
+    assert program.rindex("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") > program.rindex("tl_hexagon_dma_compact_submit(")
 
 
 def test_reject_crouton_from_row_major():
@@ -446,13 +514,13 @@ def test_crouton_tiles_move_as_runs(arch):
             T.dma_wait()
 
     source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
-    calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    calls = [line for line in source.splitlines() if re.search(r"tl_hexagon_dma_(?:async|compact)_submit\(", line)]
     assert len(calls) == 3
     # dst stride, src stride, run bytes, runs, direction. W[1, 64, 32] is
     # tile (1, 2) of layer 1: 32768 + 10 * 1024 elements in.
     assert "(&(W[43008]))" in calls[0] and "((half*)w)[8192]" in calls[0]
     assert "(uint32_t)8192, (uint32_t)16384, (uint32_t)8192, (uint32_t)2, 3)" in calls[0]
-    assert "tl_hexagon_dma_async_context<3, 3>" in source
+    assert re.search(r"tl_hexagon_dma_(?:async|compact_load)_context<3, 3>", source)
     assert "(uint32_t)8192, (uint32_t)8192, (uint32_t)8192, (uint32_t)1, 3)" in calls[-2]
     assert "W[16384]" in calls[-2]
     assert "(uint32_t)12288, (uint32_t)12288, (uint32_t)12288, (uint32_t)1, 3)" in calls[-1]
@@ -536,7 +604,7 @@ def test_rows_read_from_a_table_are_in_bounds_once_clamped(clamped):
                 T.copy(s, B[j, 0:256])
 
     if clamped:
-        assert "tl_hexagon_dma_async_submit" in lower(probe)
+        assert "tl_hexagon_dma_compact_submit" in lower(probe)
     else:
         with pytest.raises(Exception, match="in-bounds"):
             lower(probe)
@@ -645,7 +713,7 @@ def test_async_scalar_access_is_not_silently_synchronous():
             T.copy(s[0], B[0])
 
     source = lower(probe)
-    (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    (call,) = [line for line in source.splitlines() if "tl_hexagon_dma_compact_submit(" in line]
     assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 3)" in call
 
 

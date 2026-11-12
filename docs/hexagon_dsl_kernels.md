@@ -380,12 +380,24 @@ goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX p
 in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
 (BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
-8 MB of fp16 weights at 40-44 GB/s. A transfer costs about 150
-cycles to submit and as many to retire, so blocks of a few KB that serial HVX
-copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
-match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
-256. An explicit `T.dma_copy` stays a manual schedule and is rejected inside
-`T.Pipelined`.
+8 MB of fp16 weights at 40-44 GB/s. An explicit `T.dma_copy` stays a manual
+schedule and is rejected inside `T.Pipelined`.
+
+For Flash attention with M = BN = D = 64, the one-stage pipeline with synchronous
+first-block copies reduced v79 DSP kernel cycles by 1.5%, 1.6% and 18.0% at
+SEQ 256, 1024 and 4096 with read-prepared inputs, respectively. With the input
+ranges flushed and invalidated before each entry, the reductions were 19.8%,
+27.4% and 29.9%. These are medians of six paired rounds after fixed warmup, with
+both execution orders retained; they are kernel-cycle measurements, not RPC
+latency. The same SEQ256 policy increased v73 read-prepared cycles by 6.3%
+(invalidated cycles decreased by 1.0%).
+
+`example_flash_attention.py --schedule auto` therefore enables this policy only
+on v79 for M = BN = D = 64 and SEQ >= 256. Other targets and shapes use serial
+copies; v75 has offline validation but no hardware timing. `--schedule serial`
+and `--schedule pipeline` select either path explicitly. The reusable
+`make_flash(..., pipelined=False)` factory defaults to serial. This measured
+example policy does not change the compiler's target-independent opt-in rule.
 
 The shared planner (`PipelinePlanning`) runs a loop `num_stages` deep when every
 copy comes after every statement that reads a copied buffer, as in `copy A; copy B;
@@ -394,6 +406,31 @@ flash attention's K and V do, or when each staged HMX operand's transfer feeds i
 own pack. So flash attention double-buffers with `num_stages=1`, and a K loop of
 gemms with staged operands at `num_stages=2` prefetches two iterations ahead, which
 pays off for small blocks (BK = 64: 14% faster than two deep).
+
+On Hexagon, the injector can combine a one-stage pipeline's main loop and
+epilogue into one consumer body. It selects this form automatically when all
+asynchronous producers are at stage 0, consumers are at stage 1, the producer
+groups are fixed and contiguous, and the loop extent is provably nonnegative.
+Conditional payloads still commit empty groups; the final iteration drains the
+queue before its consumers. Zero and one iteration, nonzero loop minima, and
+scalar bindings retain their original semantics. Nested pipelines, manual async
+controls, opaque calls, imported C source, and unproven schedules retain the
+three-part emitter. This selection applies automatically to v73, v75, and v79,
+and preserves each typed copy's cache policy.
+
+Such a one-stage pipeline can opt into synchronous first-iteration copies with
+`T.Pipelined(..., num_stages=1, annotations={"hexagon.prologue_copy_policy": "sync_if_supported"})`.
+The default and explicit `"preserve"` retain the original lowering; other values
+are rejected. Only automatic, same-dtype row-major DDR-to-VTCM copies with proven
+regions and strides qualify. Packed layouts, explicit copy hints, manual async
+operations, and ineligible pipelines keep their original lowering. Any
+`T.annotate_dma_only` declaration in the function disables this selection for
+the whole function; write-through declarations and their writebacks remain in
+effect. A selected copy completes synchronously at its original prologue
+position. Its group commit, even when empty, all waits, and the final drain
+remain. Later iterations retain their original copy lowering. This option has
+no ISA, shape, or model-specific selection rule; measure it for the workload and
+input cache state before enabling it.
 
 ## 3. Measuring
 

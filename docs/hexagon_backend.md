@@ -282,6 +282,17 @@ starts if its workers cannot all run together.
   Crouton endpoint makes it a `tl_crouton_copy`. In a `num_workers` kernel every tile
   program owns its DMA queue.
 
+  For v73, v75 and v79, codegen specializes a managed queue with valid constant capacities
+  (1–256 descriptors and groups)
+  when every submission is a proven load (direction 0 or 3). Cached sources
+  still receive their original writeback; only the unreachable store-completion
+  path is omitted from wait and destructor drain. Stores, dynamic directions,
+  nested queues, opaque calls and imported C retain generic completion. Raw and
+  handwritten contexts also keep the generic default. A normal Session applies
+  the imported-C fallback to its complete kernel list; explicitly supplied raw
+  generated sources remain the caller's responsibility. This does not change the
+  queue capacities, polling, error handling or ownership requirements.
+
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
   pipeline axis** — you reduce the whole inner-K for an output tile in one `mxclracc`
   sequence; outer-loop / `clear_accum=False` accumulation lives in HVX/VTCM (decompose

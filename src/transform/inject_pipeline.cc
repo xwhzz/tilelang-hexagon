@@ -31,11 +31,14 @@
 #include "common/bind_utils.h"
 #include "common/mbarrier.h"
 #include "common/pipeline_utils.h"
+#include "hexagon/op/prologue_copy.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/copy.h"
+#include "op/fill.h"
 #include "op/gemm.h"
 #include "op/operator.h"
+#include "op/reduce.h"
 #include "op/utils.h"
 #include "support/utils.h"
 #include "tir/schedule/utils.h"
@@ -265,14 +268,16 @@ private:
 class SimtProducerAnnotator : public StmtExprMutator {
 public:
   static Stmt Annotate(const Stmt &stmt,
-                       Optional<Target> target = Optional<Target>()) {
-    SimtProducerAnnotator annotator(std::move(target));
+                       Optional<Target> target = Optional<Target>(),
+                       bool sync_prologue_copy = false) {
+    SimtProducerAnnotator annotator(std::move(target), sync_prologue_copy);
     return annotator.VisitStmt(stmt);
   }
 
 private:
-  explicit SimtProducerAnnotator(Optional<Target> target)
-      : target_(std::move(target)) {}
+  explicit SimtProducerAnnotator(Optional<Target> target,
+                                 bool sync_prologue_copy)
+      : target_(std::move(target)), sync_prologue_copy_(sync_prologue_copy) {}
 
   Stmt VisitStmt_(const ForNode *op) final {
     Stmt body = VisitStmt(op->body);
@@ -295,6 +300,10 @@ private:
     auto annotations = call->annotations;
     annotations.Set(attr::kAsyncCopyNoImplicitCommitWait,
                     IntImm(DataType::Int(32), 1));
+    if (sync_prologue_copy_) {
+      annotations.Set(hexagon::kPrologueCopyCandidate,
+                      IntImm(DataType::Int(32), 1));
+    }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 
@@ -308,6 +317,7 @@ private:
   }
 
   Optional<Target> target_;
+  bool sync_prologue_copy_;
 };
 
 class TileOpMbarPhaseAnnotator : public StmtExprMutator {
@@ -541,8 +551,60 @@ bool ContainsPipelineAsyncControlAttrs(const Stmt &stmt) {
   return found;
 }
 
-Stmt AnnotateSimtProducer(const Stmt &stmt, Optional<Target> target) {
-  return SimtProducerAnnotator::Annotate(stmt, std::move(target));
+// Inspect the original body: child injection can erase a nested pipeline's
+// annotations and introduce async scopes that no longer identify its source.
+bool IsCompactHexagonPipelineBody(const Stmt &stmt) {
+  static const auto effects =
+      Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+  bool safe = true;
+  PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+    if (!safe) {
+      return;
+    }
+    if (const auto *loop = obj.as<ForNode>()) {
+      safe = !loop->annotations.count(s_tir::attr::software_pipeline_stage) &&
+             !loop->annotations.count(s_tir::attr::software_pipeline_order) &&
+             !loop->annotations.count("num_stages") &&
+             !loop->annotations.count("tl_pipelined_num_stages");
+    } else if (obj.as<WhileNode>()) {
+      safe = false;
+    } else if (const auto *attr = obj.as<AttrStmtNode>()) {
+      safe = attr->attr_key != tirx::attr::pragma_import_c &&
+             attr->attr_key != s_tir::attr::async_commit_queue_scope &&
+             attr->attr_key != s_tir::attr::async_wait_queue_scope &&
+             attr->attr_key != s_tir::attr::async_wait_inflight_count;
+    } else if (const auto *block = obj.as<SBlockNode>()) {
+      safe = !block->annotations.count(tirx::attr::pragma_import_c) &&
+             !block->annotations.count(s_tir::attr::async_commit_queue_scope) &&
+             !block->annotations.count(s_tir::attr::async_wait_queue_scope) &&
+             !block->annotations.count(s_tir::attr::async_wait_inflight_count);
+    } else if (const auto *call = obj.as<CallNode>()) {
+      auto op = call->op.as<Op>();
+      if (!op.has_value() || call->op.same_as(builtin::call_pure_extern()) ||
+          op.value()->name == "tirx.call_pure_packed" ||
+          op.value()->name == "tirx.tvm_call_pure_packed") {
+        safe = false;
+      } else if (call->op.same_as(Copy::Get())) {
+        auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(call)));
+        safe = !GetIsAsyncCopy(*copy.get()) && !GetIsTmaCopy(*copy.get());
+      } else if (!call->op.same_as(Gemm::Get()) &&
+                 !call->op.same_as(ReduceOp::Get()) &&
+                 !call->op.same_as(Fill::Get())) {
+        // Typed tile operators expose their buffer effects to planning. Raw
+        // DMA/async controls, external/packed calls and control jumps do not.
+        safe = effects.count(op.value()) &&
+               effects[op.value()]->value <=
+                   static_cast<int>(CallEffectKind::kPure);
+      }
+    }
+  });
+  return safe;
+}
+
+Stmt AnnotateSimtProducer(const Stmt &stmt, Optional<Target> target,
+                          bool sync_prologue_copy) {
+  return SimtProducerAnnotator::Annotate(stmt, std::move(target),
+                                         sync_prologue_copy);
 }
 
 Stmt AnnotateTileOpMbarPhase(const Stmt &stmt, PrimExpr phase_expr) {
@@ -1227,13 +1289,15 @@ public:
                    const PipelineInfo &pipeline_info,
                    const Array<SBlock> &scalar_binding_blocks,
                    Optional<Target> target,
-                   Map<Var, arith::IntSet> thread_domains)
+                   Map<Var, arith::IntSet> thread_domains,
+                   bool compact_scope_eligible, bool sync_prologue_copy)
       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
         pipeline_allocs_(pipeline_allocs), local_allocs_(local_allocs),
         pipeline_loop_(pipeline_loop), pipeline_info_(pipeline_info),
         scalar_binding_blocks_(scalar_binding_blocks),
-        target_(std::move(target)), thread_domains_(std::move(thread_domains)) {
-  }
+        target_(std::move(target)), thread_domains_(std::move(thread_domains)),
+        compact_scope_eligible_(compact_scope_eligible),
+        sync_prologue_copy_(sync_prologue_copy) {}
 
   Stmt BuildPipeline() {
     // Step 1: Analyze accesses to the buffers in the pipeline and compute the
@@ -1266,19 +1330,33 @@ public:
     // Step 2: Emit the pipeline prologue, body and epilogue.
     Optional<Integer> pipeline_num_stages =
         GetPipelineNumStages(pipeline_loop_.get());
-    Stmt prologue = EmitImpl(pipeline_loop_->min,
-                             pipeline_loop_->min + max_stage_, true, true);
-    Stmt body =
-        EmitImpl(pipeline_loop_->min + max_stage_,
-                 pipeline_loop_->min + pipeline_loop_->extent, false, false);
-    Stmt epilogue = EmitImpl(
-        pipeline_loop_->min + pipeline_loop_->extent,
-        pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
-
     Array<Stmt> pipeline_parts;
-    for (const Stmt &part : {prologue, body, epilogue}) {
-      for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
-        pipeline_parts.push_back(stmt);
+    if (CanUseCompactHexagonPipeline()) {
+      Stmt prologue = EmitImpl(pipeline_loop_->min, pipeline_loop_->min + 1,
+                               true, true, false, true);
+      Stmt unified = EmitImpl(pipeline_loop_->min + 1,
+                              pipeline_loop_->min + pipeline_loop_->extent + 1,
+                              false, true, true);
+      for (const Stmt &part : {prologue, unified}) {
+        for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
+          pipeline_parts.push_back(stmt);
+        }
+      }
+    } else {
+      Stmt prologue = EmitImpl(pipeline_loop_->min,
+                               pipeline_loop_->min + max_stage_, true, true);
+      Stmt body =
+          EmitImpl(pipeline_loop_->min + max_stage_,
+                   pipeline_loop_->min + pipeline_loop_->extent, false, false);
+      Stmt epilogue =
+          EmitImpl(pipeline_loop_->min + pipeline_loop_->extent,
+                   pipeline_loop_->min + pipeline_loop_->extent + max_stage_,
+                   true, true);
+
+      for (const Stmt &part : {prologue, body, epilogue}) {
+        for (const Stmt &stmt : FlattenTopLevelSeq(part)) {
+          pipeline_parts.push_back(stmt);
+        }
       }
     }
 
@@ -1320,6 +1398,51 @@ public:
   const Map<Buffer, Buffer> &GetBufferRemap() const { return buffer_remap_; }
 
 private:
+  bool CanUseCompactHexagonPipeline() {
+    Optional<Integer> stages = GetPipelineNumStages(pipeline_loop_.get());
+    auto scalar_integer = [](DataType dtype) {
+      return dtype.is_scalar() && (dtype.is_int() || dtype.is_uint());
+    };
+    if (!compact_scope_eligible_ || !target_.defined() ||
+        !TargetIsHexagon(target_.value()) || !stages.defined() ||
+        stages.value()->value != 1 || max_stage_ != 1 ||
+        !scalar_integer(pipeline_loop_->min.dtype()) ||
+        !scalar_integer(pipeline_loop_->extent.dtype()) ||
+        !analyzer_.CanProve(pipeline_loop_->extent >= 0)) {
+      return false;
+    }
+    bool has_producer = false, has_consumer = false;
+    int current_group = -1;
+    std::unordered_set<int> groups;
+    for (const SBlock &block : ordered_stmts_) {
+      const PipelineAnnotation &anno = pipeline_info_.at(block);
+      if (anno.stage < 0 || anno.stage > 1) {
+        return false;
+      }
+      if (anno.async) {
+        if (anno.stage != 0 || anno.async_group_id < 0) {
+          return false;
+        }
+        if (anno.async_group_id != current_group) {
+          if (!groups.insert(anno.async_group_id).second) {
+            return false;
+          }
+          current_group = anno.async_group_id;
+        }
+        has_producer = true;
+      } else {
+        current_group = -1;
+        if (anno.async_group_id >= 0) {
+          return false;
+        }
+        has_consumer |= anno.stage == 1;
+      }
+    }
+    // Fixed contiguous groups keep a commit for every valid iteration, even
+    // when a group's payload is conditional and submits no descriptors.
+    return has_producer && has_consumer;
+  }
+
   struct ScalarBinding {
     Var var;
     PrimExpr value;
@@ -2709,7 +2832,7 @@ private:
   std::vector<FinalStmtInfo> CompletePipelineLoopStatements(
       const std::vector<RewrittenStmtInfo> &stmts,
       const std::map<int, AsyncStateLocal> &async_states_local,
-      arith::Analyzer *ana_normalized) const {
+      arith::Analyzer *ana_normalized, bool compact_main = false) const {
     std::vector<FinalStmtInfo> new_stmts;
     new_stmts.reserve(stmts.size());
     for (const auto &stmt : stmts) {
@@ -2778,7 +2901,7 @@ private:
         for (const auto &[stage_id, wait_count] : it->second) {
           Stmt wait_stmt = make_wait_stmt(stage_id, wait_count, Evaluate(0));
           if (auto state_it = async_states_local.find(stage_id);
-              state_it != async_states_local.end() &&
+              !compact_main && state_it != async_states_local.end() &&
               state_it->second.predicate &&
               !ana_normalized->CanProve(state_it->second.predicate.value())) {
             PrimExpr predicate =
@@ -2833,7 +2956,8 @@ private:
    * \return The result loop.
    */
   Stmt EmitImpl(const PrimExpr &start, const PrimExpr &end, bool unroll_loop,
-                bool need_bound_check) {
+                bool need_bound_check, bool compact_loop = false,
+                bool compact_prologue = false) {
     PrimExpr new_loop_var;
     PrimExpr extent = end - start;
     Optional<Integer> pipeline_num_stages =
@@ -2858,7 +2982,8 @@ private:
             PrimExpr unit_end =
                 analyzer_.Simplify(start + IntImm(extent.dtype(), iter + 1));
             Stmt unit_stmt =
-                EmitImpl(unit_start, unit_end, false, need_bound_check);
+                EmitImpl(unit_start, unit_end, false, need_bound_check,
+                         compact_loop, compact_prologue);
             expanded.push_back(unit_stmt);
           }
           Stmt result = expanded.size() == 1 ? expanded[0] : SeqStmt(expanded);
@@ -2890,8 +3015,10 @@ private:
 
     arith::Analyzer ana_normalized;
     if (!is_unit_loop) {
-      ana_normalized.Bind(Downcast<Var>(new_loop_var),
-                          Range(pipeline_loop_->min, extent));
+      ana_normalized.Bind(
+          Downcast<Var>(new_loop_var),
+          compact_loop ? Range::FromMinExtent(pipeline_loop_->min, extent)
+                       : Range(pipeline_loop_->min, extent));
     }
 
     std::vector<RewrittenStmtInfo> new_stmts;
@@ -2996,7 +3123,10 @@ private:
           local_state.predicate =
               ana_normalized.Simplify(local_state.predicate.value() & inbound);
         }
-        rewritten_stmt = AnnotateSimtProducer(rewritten_stmt, target_);
+        // Do not change is_async or group accounting: a selected synchronous
+        // payload still participates in its original (possibly empty) commit.
+        rewritten_stmt = AnnotateSimtProducer(
+            rewritten_stmt, target_, compact_prologue && sync_prologue_copy_);
       }
       new_stmts.push_back({stage, inbound, new_block->reads, new_block->writes,
                            normalized_access_index, is_async, rewritten_stmt});
@@ -3013,9 +3143,28 @@ private:
     PopulateWaitCounts(new_stmts, &ana_normalized, buffer_to_commit_group,
                        &async_states_local);
     std::vector<FinalStmtInfo> final_stmts = CompletePipelineLoopStatements(
-        new_stmts, async_states_local, &ana_normalized);
+        new_stmts, async_states_local, &ana_normalized, compact_loop);
 
     Array<Stmt> stmts;
+    if (compact_loop && !async_states_local.empty()) {
+      // At the final pipeline time stage-0 is inactive, while its last
+      // consumers are live. Their ordinary waits are producer-predicated.
+      // Drain all their queue groups before any consumer, including the
+      // zero/short-loop case without creating a producer or consumer.
+      PrimExpr last_consumer = ana_normalized.Simplify(
+          (pipeline_loop_->extent > 0) &&
+          (new_loop_var +
+               (is_unit_loop ? PrimExpr(0) : start - pipeline_loop_->min) ==
+           pipeline_loop_->min + pipeline_loop_->extent));
+      if (!is_zero(last_consumer)) {
+        auto zero = make_zero(DataType::Int(32));
+        Stmt drain =
+            AttrStmt(zero, s_tir::attr::async_wait_queue_scope, 0,
+                     AttrStmt(zero, s_tir::attr::async_wait_inflight_count,
+                              zero, Evaluate(0)));
+        stmts.push_back(IfThenElse(last_consumer, drain, Evaluate(0)));
+      }
+    }
     for (const auto &stmt_info : final_stmts) {
       stmts.push_back(stmt_info.stmt);
     }
@@ -3043,6 +3192,7 @@ private:
             kv.first != kPipelineAsyncProducerGroups &&
             kv.first != kPipelineTmaCopies &&
             kv.first != kPipelineReplayableScalarBinds &&
+            kv.first != hexagon::kPrologueCopyPolicy &&
             kv.first != "num_stages") {
           preserved_annotations.Set(key, kv.second);
         }
@@ -3078,18 +3228,22 @@ private:
   std::vector<ScalarBinding> scalar_bindings_;
   ScalarBindingMap scalar_binding_map_;
   std::map<int, AsyncStateGlobal> async_states_;
+  bool compact_scope_eligible_;
+  bool sync_prologue_copy_;
 };
 
-PipelineRewriteResult RewritePipeline(
-    Map<Var, Buffer> buffer_data_to_buffer,
-    const Array<Buffer> &pipeline_allocs, const Array<Buffer> &local_allocs,
-    const For &pipeline_loop, const PipelineInfo &pipeline_info,
-    const Array<SBlock> &scalar_binding_blocks, Optional<Target> target,
-    Map<Var, arith::IntSet> thread_domains) {
-  PipelineRewriter rewriter(std::move(buffer_data_to_buffer), pipeline_allocs,
-                            local_allocs, pipeline_loop, pipeline_info,
-                            scalar_binding_blocks, std::move(target),
-                            std::move(thread_domains));
+PipelineRewriteResult
+RewritePipeline(Map<Var, Buffer> buffer_data_to_buffer,
+                const Array<Buffer> &pipeline_allocs,
+                const Array<Buffer> &local_allocs, const For &pipeline_loop,
+                const PipelineInfo &pipeline_info,
+                const Array<SBlock> &scalar_binding_blocks,
+                Optional<Target> target, Map<Var, arith::IntSet> thread_domains,
+                bool compact_scope_eligible, bool sync_prologue_copy) {
+  PipelineRewriter rewriter(
+      std::move(buffer_data_to_buffer), pipeline_allocs, local_allocs,
+      pipeline_loop, pipeline_info, scalar_binding_blocks, std::move(target),
+      std::move(thread_domains), compact_scope_eligible, sync_prologue_copy);
   PipelineRewriteResult result;
   result.pipeline = rewriter.BuildPipeline();
   result.buffer_remap = rewriter.GetBufferRemap();
@@ -3228,6 +3382,30 @@ public:
     auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
     auto target = func->GetAttr<Target>(tvm::attr::kTarget);
     PipelineInjector injector(global_symbol, target);
+    injector.has_imported_source_ =
+        func->attrs.defined() &&
+        func->attrs->dict.count(tirx::attr::pragma_import_c);
+    // MarkDMACacheDirections consumes this declaration after LowerTileOp.
+    // Conservatively disable the whole function, including unrelated copies,
+    // rather than introducing a second, incomplete alias analysis here.
+    constexpr const char *dma_only = "tl.hexagon_dma_only";
+    injector.has_dma_only_ =
+        func->attrs.defined() && func->attrs->dict.count(dma_only);
+    PostOrderVisit(func->body, [&](const ObjectRef &obj) {
+      if (const auto *attr = obj.as<AttrStmtNode>()) {
+        injector.has_imported_source_ |=
+            attr->attr_key == tirx::attr::pragma_import_c;
+        injector.has_dma_only_ |= attr->attr_key == dma_only;
+      } else if (const auto *block = obj.as<SBlockNode>()) {
+        injector.has_imported_source_ |=
+            block->annotations.count(tirx::attr::pragma_import_c) != 0;
+        injector.has_dma_only_ |= block->annotations.count(dma_only) != 0;
+      } else if (const auto *loop = obj.as<ForNode>()) {
+        injector.has_dma_only_ |= loop->annotations.count(dma_only) != 0;
+      } else if (const auto *call = obj.as<CallNode>()) {
+        injector.has_dma_only_ |= call->annotations.count(dma_only) != 0;
+      }
+    });
     injector.thread_domains_ = CollectPipelineThreadDomains(func->body);
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
@@ -3428,6 +3606,7 @@ private:
           key != kPipelineAsyncProducers &&
           key != kPipelineAsyncProducerGroups && key != kPipelineTmaCopies &&
           key != kPipelineReplayableScalarBinds && key != "num_stages" &&
+          key != hexagon::kPrologueCopyPolicy &&
           key != "tl_pipelined_num_stages") {
         preserved_annotations.Set(key, kv.second);
       }
@@ -3541,10 +3720,40 @@ private:
     return result;
   }
 
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    const bool async_scope =
+        op->attr_key == s_tir::attr::async_commit_queue_scope ||
+        op->attr_key == s_tir::attr::async_wait_queue_scope ||
+        op->attr_key == s_tir::attr::async_wait_inflight_count;
+    async_scope_nesting_ += async_scope;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    async_scope_nesting_ -= async_scope;
+    return result;
+  }
+
   Stmt VisitStmt_(const ForNode *op) final {
+    bool sync_prologue_copy = false;
+    if (auto policy = op->annotations.Get(hexagon::kPrologueCopyPolicy)) {
+      auto value = policy->as<String>();
+      ICHECK(value && (*value == "preserve" || *value == "sync_if_supported"))
+          << "ValueError: hexagon.prologue_copy_policy expects 'preserve' or "
+             "'sync_if_supported'";
+      sync_prologue_copy = *value == "sync_if_supported" && !has_dma_only_;
+    }
+    const bool is_pipeline = HasPipelineAnnotation(op);
+    const bool compact_scope_eligible =
+        is_pipeline && pipeline_nesting_ == 0 && async_scope_nesting_ == 0 &&
+        !has_imported_source_ && target_.defined() &&
+        TargetIsHexagon(target_.value()) &&
+        IsCompactHexagonPipelineBody(op->body);
     // Step 1: Recursively rewrite the children first.
+    pipeline_nesting_ += is_pipeline;
     For for_node = Downcast<For>(StmtExprMutator::VisitStmt_(op));
-    if (!HasPipelineAnnotation(op)) {
+    pipeline_nesting_ -= is_pipeline;
+    if (!is_pipeline) {
+      if (for_node->annotations.count(hexagon::kPrologueCopyPolicy)) {
+        for_node.CopyOnWrite()->annotations.erase(hexagon::kPrologueCopyPolicy);
+      }
       return for_node;
     }
     // Step 2: Find the body and buffer allocations of the pipeline.
@@ -3877,7 +4086,8 @@ private:
 
     PipelineRewriteResult rewrite_result = RewritePipeline(
         buffer_data_to_buffer_, pipeline_allocs, local_allocs, for_node,
-        pipeline_info, scalar_binding_blocks, target_, thread_domains_);
+        pipeline_info, scalar_binding_blocks, target_, thread_domains_,
+        compact_scope_eligible, sync_prologue_copy);
     Stmt pipeline = rewrite_result.pipeline;
 
     subtree_modified_ = true;
@@ -3998,7 +4208,13 @@ private:
     bool outer_flag = subtree_modified_;
     size_t layout_remap_mark = pending_layout_remapped_allocs_.size();
     subtree_modified_ = false;
+    const bool async_scope =
+        op->annotations.count(s_tir::attr::async_commit_queue_scope) ||
+        op->annotations.count(s_tir::attr::async_wait_queue_scope) ||
+        op->annotations.count(s_tir::attr::async_wait_inflight_count);
+    async_scope_nesting_ += async_scope;
     SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+    async_scope_nesting_ -= async_scope;
     bool children_modified = subtree_modified_;
     // Propagate to parent: if this subtree was modified, parent should know.
     subtree_modified_ = outer_flag || children_modified;
@@ -4220,6 +4436,10 @@ private:
   // subtree.  Used to avoid unnecessary reads/writes recalculation
   // on blocks whose descendants were not modified.
   bool subtree_modified_ = false;
+  int pipeline_nesting_ = 0;
+  int async_scope_nesting_ = 0;
+  bool has_imported_source_ = false;
+  bool has_dma_only_ = false;
 };
 
 Stmt InjectPipeline(const PrimFunc &func) {

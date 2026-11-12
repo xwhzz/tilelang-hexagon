@@ -79,13 +79,13 @@ def test_v73_layout_split_respects_descriptor_capacity():
     # Physical source panels are 65,536 bytes apart, beyond the original
     # 2D format. Each selected four-column block needs one 1D descriptor.
     source = _lower(_many_panels(256), "v73")
-    assert "tl_hexagon_dma_async_context<256, 1>" in source
-    assert source.count("tl_hexagon_dma_async_submit(") == 256
-    assert source.count("tl_hexagon_dma_async_commit(") == 1
+    assert "tl_hexagon_dma_compact_load_context<256, 1>" in source
+    assert source.count("tl_hexagon_dma_compact_submit(") == 256
+    assert source.count("tl_hexagon_dma_compact_commit(") == 1
     with pytest.raises(Exception, match="more than 256 DMA transfers in flight"):
         _lower(_many_panels(257), "v73")
     # A newer target still handles all panels with one 2D descriptor.
-    assert "tl_hexagon_dma_async_context<1, 1>" in _lower(_many_panels(257), "v75")
+    assert "tl_hexagon_dma_compact_load_context<1, 1>" in _lower(_many_panels(257), "v75")
 
 
 def _weight_slice_round_trip(transposed):

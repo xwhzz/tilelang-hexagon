@@ -111,10 +111,10 @@ def make_embedding_gather():
 @pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_embedding_gather_uses_one_dma_group(arch):
     source = _lower(make_embedding_gather(), arch)
-    assert source.count("tl_hexagon_dma_async_submit(") == 1
+    assert source.count("tl_hexagon_dma_compact_submit(") == 1
     assert "(uint32_t)4, (uint32_t)128, (uint32_t)4, (uint32_t)1024, 3)" in source
-    assert "tl_hexagon_dma_async_context<1, 1>" in source
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    assert "tl_hexagon_dma_compact_load_context<1, 1>" in source
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
 
 
 @pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")

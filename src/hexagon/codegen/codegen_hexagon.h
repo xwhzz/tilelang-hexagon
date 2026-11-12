@@ -26,6 +26,8 @@ namespace codegen {
 
 class CodeGenTileLangHexagon : public CodeGenTileLangCBase {
 public:
+  // Imported C and unrecognized text can affect every function in a module.
+  void CheckLoadOnlyDMAModule(const IRModule &module);
   CodeGenTileLangHexagon();
 
   /*! \brief Emit the preamble (template include) and initialize CodeGenC. */
@@ -91,6 +93,11 @@ private:
   int64_t grid_bytes_ = 0;
   /*! \brief whether a tile program's DMA queue (tl_dma_async) is in scope */
   bool dma_in_scope_ = false;
+  // A closed D1/G1 managed load queue; raw/default queues stay generic.
+  bool dma_load_only_function_ = false;
+  bool dma_load_only_ = false;
+  bool in_dma_program_ = false;
+  bool dma_load_only_module_ = false;
   /*!
    * \brief the template headers whose code the module calls, which its
    * preamble includes, and whether it uses HMX and VTCM, which the session

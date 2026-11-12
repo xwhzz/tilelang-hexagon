@@ -92,11 +92,11 @@ def _dma_2d_kernel():
 @pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_2d_dma_uses_one_descriptor_for_small_strides(arch):
     source = str(_lower(_dma_2d_kernel(), {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
-    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_compact_submit(" in line]
     assert len(submits) == 1
-    assert "tl_hexagon_dma_async_context<1, 1>" in source
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
-    assert source.count("tl_hexagon_dma_async_wait(tl_dma_async, 0)") == 1
+    assert "tl_hexagon_dma_compact_load_context<1, 1>" in source
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_compact_wait(tl_dma_async, 0)") == 1
     assert "(uint32_t)128, (uint32_t)256, (uint32_t)128, (uint32_t)32, 3)" in submits[0]
 
 
@@ -111,15 +111,15 @@ def test_2d_dma_stride_field_boundary(arch, stride):
             T.dma_wait()
 
     source = str(_lower(kernel, {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
-    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_compact_submit(" in line]
     split = arch == "v73" and stride == 65536
     assert len(submits) == (2 if split else 1)
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
     if split:
         for row, call in enumerate(submits):
             assert f"(&(A[{row * stride}]))" in call
             assert "(uint32_t)32, (uint32_t)32, (uint32_t)32, (uint32_t)1, 3)" in call
-        assert "tl_hexagon_dma_async_context<2, 1>" in source
+        assert "tl_hexagon_dma_compact_load_context<2, 1>" in source
     else:
         assert f"(uint32_t)32, (uint32_t){stride}, (uint32_t)32, (uint32_t)2, 3)" in submits[0]
 
@@ -244,9 +244,9 @@ def test_2d_dma_wide_rows_use_1d_on_v73(arch):
             T.dma_wait()
 
     source = str(_lower(kernel, {"kind": "hexagon", "mcpu": f"hexagon{arch}"}).kernel_source)
-    submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
+    submits = [line for line in source.splitlines() if "tl_hexagon_dma_compact_submit(" in line]
     assert len(submits) == (2 if arch == "v73" else 1)
-    assert source.count("tl_hexagon_dma_async_commit(tl_dma_async)") == 1
+    assert source.count("tl_hexagon_dma_compact_commit(tl_dma_async)") == 1
     if arch == "v73":
         for call in submits:
             assert "(uint32_t)65536, (uint32_t)65536, (uint32_t)65536, (uint32_t)1, 3)" in call

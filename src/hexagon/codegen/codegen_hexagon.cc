@@ -11,6 +11,7 @@
 #include "transform/common/storage_size.h"
 
 #include <tvm/ir/op.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -23,6 +24,8 @@ namespace tvm {
 namespace codegen {
 
 using namespace ffi;
+
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.hexagon_disable_dma_load_only", Bool);
 
 namespace {
 
@@ -297,9 +300,282 @@ bool UsesGridSync(const Stmt &body) {
   return found;
 }
 
+bool IsManagedDMA(const CallNode *call) {
+  return call->op.same_as(tl::hexagon_dma_queue()) ||
+         call->op.same_as(tl::hexagon_dma_submit()) ||
+         call->op.same_as(tl::hexagon_dma_commit()) ||
+         call->op.same_as(tl::hexagon_dma_wait());
+}
+
+bool IsIntegerScalar(const PrimExpr &value) {
+  return value.dtype().is_scalar() &&
+         (value.dtype().is_int() || value.dtype().is_uint());
+}
+
+bool IsBooleanTemplate(const PrimExpr &value) {
+  if (const auto *n = value.as<IntImmNode>())
+    return n->value == 0 || n->value == 1;
+  const auto *text = value.as<StringImmNode>();
+  return text && (text->value == "true" || text->value == "false");
+}
+
+bool IsLaneTemplate(const PrimExpr &value) {
+  if (const auto *n = value.as<IntImmNode>())
+    return n->value > 0 && n->value <= 128;
+  const auto *text = value.as<StringImmNode>();
+  if (!text || text->value.empty() || text->value.size() > 3 ||
+      text->value.data()[0] == '0')
+    return false;
+  int n = 0;
+  for (size_t i = 0; i < text->value.size(); ++i) {
+    char c = text->value.data()[i];
+    if (c < '0' || c > '9')
+      return false;
+    n = n * 10 + c - '0';
+  }
+  return n > 0 && n <= 128;
+}
+
+// These backend helpers operate on their typed tensor operands, not the DMA
+// engine or its private completion records. Do not infer this from an Op's
+// effect annotation: even a pure external call could name the C++ context.
+// Template strings are printed as C++ text, so check their exact grammar too.
+bool IsKnownNonDMAOperation(const CallNode *call) {
+  const auto &a = call->args;
+  if (call->op.same_as(builtin::handle_add_byte_offset()))
+    return a.size() == 2 && call->dtype.is_handle() &&
+           a[0].dtype().is_handle() && !a[0].as<StringImmNode>() &&
+           IsIntegerScalar(a[1]);
+  if (call->op.same_as(builtin::shift_right()))
+    return a.size() == 2 && IsIntegerScalar(a[0]) && IsIntegerScalar(a[1]) &&
+           call->dtype == a[0].dtype();
+  if (call->op.same_as(tl::hexagon_exclusive_pointer()))
+    return a.size() == 1 && call->dtype.is_handle() &&
+           a[0].dtype().is_handle() && !a[0].as<StringImmNode>();
+  if (call->op.same_as(tl::hexagon_exp()))
+    return a.size() == 1 && call->dtype.is_float() &&
+           call->dtype == a[0].dtype();
+
+  int booleans = 0, arity = 0;
+  if (call->op.same_as(tl::hexagon_hmx_gemm())) {
+    booleans = 4;
+    arity = 16;
+  } else if (call->op.same_as(tl::hexagon_crouton_copy())) {
+    booleans = 2;
+    arity = 12;
+  }
+  if (arity) {
+    if (a.size() != static_cast<size_t>(arity) || !call->dtype.is_void())
+      return false;
+    for (int i = 0; i < booleans; ++i)
+      if (!IsBooleanTemplate(a[i]))
+        return false;
+    // The remaining arguments are typed runtime operands; a string here
+    // would be emitted as raw expression text by the common C emitter.
+    for (int i = booleans; i < arity; ++i) {
+      const bool predicate = arity == 16 && i == 13 && a[i].dtype().is_bool() &&
+                             a[i].dtype().is_scalar();
+      if (a[i].as<StringImmNode>() ||
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i]) && !predicate))
+        return false;
+    }
+    return true;
+  }
+  if (call->op.same_as(tl::hexagon_crouton_reduce())) {
+    if (a.size() != 10 || !call->dtype.is_void())
+      return false;
+    const auto *kind = a[0].as<StringImmNode>();
+    const auto *type = a[1].as<CallNode>();
+    if (!kind ||
+        (kind->value != "TL_REDUCE_SUM" && kind->value != "TL_REDUCE_MAX" &&
+         kind->value != "TL_REDUCE_MIN") ||
+        !type || !type->op.same_as(Op::Get("tirx.type_annotation")) ||
+        !type->args.empty() || !type->dtype.is_float() ||
+        !type->dtype.is_scalar() ||
+        (type->dtype.bits() != 16 && type->dtype.bits() != 32) ||
+        !IsBooleanTemplate(a[2]) || !IsBooleanTemplate(a[3]))
+      return false;
+    for (size_t i = 4; i < a.size(); ++i) {
+      const bool predicate =
+          i == 9 && a[i].dtype().is_bool() && a[i].dtype().is_scalar();
+      if (a[i].as<StringImmNode>() ||
+          (!a[i].dtype().is_handle() && !IsIntegerScalar(a[i]) && !predicate))
+        return false;
+    }
+    return true;
+  }
+  if (call->op.same_as(tl::hexagon_load_lanes()))
+    return a.size() == 3 && IsLaneTemplate(a[0]) && a[1].dtype().is_handle() &&
+           !a[1].as<StringImmNode>() && IsIntegerScalar(a[2]) &&
+           !call->dtype.is_handle();
+  if (call->op.same_as(tl::hexagon_broadcast_lane()))
+    return a.size() == 4 && IsLaneTemplate(a[0]) && IsLaneTemplate(a[1]) &&
+           !a[2].dtype().is_handle() && IsIntegerScalar(a[3]) &&
+           !call->dtype.is_handle();
+  return false;
+}
+
+// PlanDMAQueue's dependency-only wait arguments can retain the compiler's
+// VTCM pointer expression. They are not printed or evaluated by the helper.
+// Keep arbitrary expressions out even though the module checks all calls.
+bool IsDMAWaitDependency(const PrimExpr &value) {
+  if (value.as<VarNode>())
+    return true;
+  const auto *call = value.as<CallNode>();
+  if (!call || !IsKnownNonDMAOperation(call))
+    return false;
+  if (call->op.same_as(tl::hexagon_exclusive_pointer()))
+    return IsDMAWaitDependency(call->args[0]);
+  return call->op.same_as(builtin::handle_add_byte_offset()) &&
+         call->args[0].as<VarNode>();
+}
+
+// The generated queue has no TIR handle. Opaque calls or custom expression
+// text could nevertheless name its C++ local or manipulate the DMA engine.
+// Keep the whole function generic when such a call occurs, even outside the
+// queue's tile-program scope.
+bool HasOnlyManagedDMACalls(const Stmt &body) {
+  bool safe = true;
+  PostOrderVisit(body, [&safe](const ObjectRef &node) {
+    if (const auto *attr = node.as<AttrStmtNode>())
+      safe &= attr->attr_key != tirx::attr::pragma_import_c;
+    if (const auto *call = node.as<CallNode>()) {
+      safe &= IsManagedDMA(call) || call->op.same_as(builtin::address_of()) ||
+              call->op.same_as(Op::Get("tirx.type_annotation")) ||
+              IsKnownNonDMAOperation(call);
+    }
+  });
+  return safe;
+}
+
+bool IsDMAEndpoint(const PrimExpr &expr) {
+  // LowerIntrin turns the planner's access_ptr into address_of of a flat,
+  // scalar BufferLoad before this emitter sees it. No custom pointer call.
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(builtin::address_of()) ||
+      call->args.size() != 1)
+    return false;
+  const auto *load = call->args[0].as<BufferLoadNode>();
+  return load && load->dtype.is_scalar() && load->indices.size() == 1 &&
+         load->indices[0].dtype().is_scalar();
+}
+
+// PlanDMAQueue declares one queue before the tile program's execution. Arena
+// merging can prepend storage declarations and typed pointer bindings.
+bool IsDMAStorageDeclaration(const Stmt &stmt) {
+  if (const auto *alloc = stmt.as<AllocBufferNode>()) {
+    if (!IsSharedScope(GetPtrStorageScope(alloc->buffer->data)))
+      return false;
+    for (const PrimExpr &extent : alloc->buffer->shape) {
+      const auto *n = extent.as<IntImmNode>();
+      if (!n || n->value <= 0)
+        return false;
+    }
+    return true;
+  }
+  if (const auto *bind = stmt.as<BindNode>())
+    return bind->var.dtype().is_handle() && IsDMAWaitDependency(bind->value);
+  return false;
+}
+
+// Only direct
+// Evaluate calls can use its implicit C++ context: never a stored, returned,
+// let-bound or nested expression. Inspect every branch, not sampled paths.
+class LoadOnlyDMAScope : public StmtExprVisitor {
+public:
+  bool Check(const Stmt &body) {
+    const auto *seq = body.as<SeqStmtNode>();
+    if (!seq || seq->seq.empty())
+      return false;
+    size_t start = 0;
+    while (start < seq->seq.size() && IsDMAStorageDeclaration(seq->seq[start]))
+      ++start;
+    if (start == seq->seq.size())
+      return false;
+    const auto *first = seq->seq[start].as<EvaluateNode>();
+    queue_ = first ? first->value.as<CallNode>() : nullptr;
+    if (!queue_ || !queue_->op.same_as(tl::hexagon_dma_queue()))
+      return false;
+    VisitStmt(body);
+    return safe_ && queues_ == 1 && submits_ > 0;
+  }
+
+private:
+  bool safe_ = true;
+  int queues_ = 0, submits_ = 0;
+  const CallNode *queue_ = nullptr;
+  const CallNode *statement_ = nullptr;
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *outer = statement_;
+    statement_ = op->value.as<CallNode>();
+    StmtExprVisitor::VisitStmt_(op);
+    statement_ = outer;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    safe_ &= op->attr_key != tl::attr::kTileProgramScope;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *call) final {
+    if (IsManagedDMA(call)) {
+      // Check each occurrence, including a shared IR node used both as a
+      // statement and as an expression elsewhere.
+      safe_ &= call == statement_ && call->dtype == DataType::Int(32);
+      if (call->op.same_as(tl::hexagon_dma_queue())) {
+        ++queues_;
+        safe_ &= call == queue_ && call->args.size() == 2;
+        for (const PrimExpr &arg : call->args) {
+          const auto *n = arg.as<IntImmNode>();
+          safe_ &= n && n->value > 0 && n->value <= 256;
+        }
+      } else if (call->op.same_as(tl::hexagon_dma_submit())) {
+        ++submits_;
+        if (call->args.size() != 7) {
+          safe_ = false;
+        } else {
+          const auto *direction = call->args[6].as<IntImmNode>();
+          safe_ &= direction &&
+                   (direction->value == 0 || direction->value == 3) &&
+                   IsDMAEndpoint(call->args[0]) && IsDMAEndpoint(call->args[1]);
+          for (size_t i = 2; i < 6; ++i)
+            safe_ &= call->args[i].dtype().is_scalar() &&
+                     (call->args[i].dtype().is_int() ||
+                      call->args[i].dtype().is_uint());
+        }
+      } else if (call->op.same_as(tl::hexagon_dma_commit())) {
+        safe_ &= call->args.empty();
+      } else {
+        const auto *pending =
+            call->args.empty() ? nullptr : call->args[0].as<IntImmNode>();
+        safe_ &= pending && pending->value >= 0;
+        for (size_t i = 1; i < call->args.size(); ++i)
+          safe_ &= IsDMAWaitDependency(call->args[i]);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(call);
+  }
+};
+
 } // namespace
 
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
+
+void CodeGenTileLangHexagon::CheckLoadOnlyDMAModule(const IRModule &module) {
+  dma_load_only_module_ =
+      !tvm::transform::PassContext::Current()
+           ->GetConfig<Bool>("tl.hexagon_disable_dma_load_only", Bool(false))
+           .value();
+  for (const auto &[gvar, base] : module->functions) {
+    const auto *func = base.as<PrimFuncNode>();
+    if (!func) {
+      dma_load_only_module_ = false;
+      continue;
+    }
+    dma_load_only_module_ &= HasOnlyManagedDMACalls(func->body);
+  }
+}
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
   preamble_stream_ << "// tilelang Hexagon (cDSP) kernel\n";
@@ -437,6 +713,16 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   exclusive_params_.clear();
 
   dma_in_scope_ = false;
+  dma_load_only_ = false;
+  in_dma_program_ = false;
+  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  String mcpu = target.has_value()
+                    ? target.value()->GetAttr<String>("mcpu").value_or("")
+                    : "";
+  dma_load_only_function_ =
+      dma_load_only_module_ &&
+      (mcpu == "hexagonv73" || mcpu == "hexagonv75" || mcpu == "hexagonv79") &&
+      HasOnlyManagedDMACalls(f->body);
   // Names the runtime calls bind; reserve them before the parameters so no
   // parameter can take them.
   for (const char *name : {"tl_dma_async", "tl_status", "tl_arena"})
@@ -687,7 +973,15 @@ void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
         << builtin->function << " needs the tile program's DMA queue";
     headers_.insert(builtin->header);
     uses_hmx_ |= builtin->uses_hmx;
-    os << builtin->function;
+    if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_submit())) {
+      os << "tl_hexagon_dma_compact_submit";
+    } else if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_commit())) {
+      os << "tl_hexagon_dma_compact_commit";
+    } else if (dma_load_only_ && op->op.same_as(tl::hexagon_dma_wait())) {
+      os << "tl_hexagon_dma_compact_wait";
+    } else {
+      os << builtin->function;
+    }
     size_t first = static_cast<size_t>(builtin->template_args);
     for (size_t i = 0; i < first; ++i) {
       os << (i == 0 ? "<" : ", ");
@@ -748,8 +1042,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     const auto *groups = call->args[1].as<IntImmNode>();
     ICHECK(descriptors && groups) << "hexagon_dma_queue needs constant sizes";
     PrintIndent();
-    stream << "tl_hexagon_dma_async_context<" << descriptors->value << ", "
-           << groups->value << "> tl_dma_async;\n";
+    stream << (dma_load_only_ ? "tl_hexagon_dma_compact_load_context<"
+                              : "tl_hexagon_dma_async_context<")
+           << descriptors->value << ", " << groups->value
+           << "> tl_dma_async;\n";
     PrintIndent();
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
     dma_in_scope_ = true;
@@ -771,10 +1067,17 @@ void CodeGenTileLangHexagon::VisitStmt_(const AttrStmtNode *op) {
     // A tile program declares its DMA queue and binds its VTCM arena in this
     // scope, which is the C block of its loop body, lambda or function.
     bool outer_dma = dma_in_scope_;
+    bool outer_load_only = dma_load_only_;
+    bool outer_program = in_dma_program_;
     bool outer_arena = arena_bound_;
+    dma_load_only_ = dma_load_only_function_ && !outer_program &&
+                     LoadOnlyDMAScope().Check(op->body);
+    in_dma_program_ = true;
     arena_bound_ = false;
     CodeGenC::VisitStmt_(op);
     dma_in_scope_ = outer_dma;
+    dma_load_only_ = outer_load_only;
+    in_dma_program_ = outer_program;
     arena_bound_ = outer_arena;
     return;
   }

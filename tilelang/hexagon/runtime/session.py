@@ -1005,13 +1005,31 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
     each lowered under its own pass configs (``T.annotate_pass_configs``), as
     ``tilelang.compile`` lowers it. Lowered sources are cached on disk
     (``$TILELANG_CACHE_DIR/hexagon_lowered``), as built skels are."""
+    from tilelang import tvm
     from tilelang.backend.target import determine_target
     from tilelang.engine.lower import extrac_params
 
+    # Each PrimFunc lowers separately, but gen_dsp joins their C++ into one TU.
+    # Imported C may define macros affecting a later kernel's private queue.
+    # Carry a conservative opt-out through PassContext and its normal cache key.
+    kernels = list(kernels)
+    imports_c = False
+
+    def check_import(node):
+        nonlocal imports_c
+        if isinstance(node, tvm.tirx.AttrStmt):
+            imports_c |= node.attr_key == "pragma_import_c"
+        elif isinstance(node, tvm.tirx.SBlock):
+            imports_c |= "pragma_import_c" in node.annotations
+
+    for func, _ in kernels:
+        tvm.tirx.stmt_functor.post_order_visit(func.body, check_import)
     target = determine_target(target, return_object=True)
     lowered = []
     for func, out_idx in kernels:
         configs = dict(func.attrs["tilelang_pass_configs"]) if func.attrs and "tilelang_pass_configs" in func.attrs else {}
+        if imports_c:
+            configs["tl.hexagon_disable_dma_load_only"] = True
         name, source = _lower(func, target, configs)
         out = list(out_idx) if isinstance(out_idx, (list, tuple)) else ([] if out_idx is None else [out_idx])
         lowered.append((name, source, extrac_params(func), out))

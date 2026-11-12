@@ -35,11 +35,12 @@ import torch
 import tilelang
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_output_layout
+from tilelang.hexagon.target import hexagon_arch, normalize_hexagon_target
 
 NEG = -3.0e38
 
 
-def make_flash(M, SEQ, BN, D):
+def make_flash(M, SEQ, BN, D, *, pipelined=False):
     @T.prim_func
     def flash(
         Q: T.Tensor((M, D), "float16"), K: T.Tensor((SEQ, D), "float16"), V: T.Tensor((SEQ, D), "float16"), O: T.Tensor((M, D), "float16")
@@ -66,7 +67,11 @@ def make_flash(M, SEQ, BN, D):
             for i in T.Parallel(M):
                 m[i] = T.float32(NEG)
                 l[i] = T.float32(0)
-            for kv in T.serial(SEQ // BN):
+            for kv in T.Pipelined(
+                SEQ // BN,
+                num_stages=1 if pipelined else 0,
+                annotations={"hexagon.prologue_copy_policy": "sync_if_supported"} if pipelined else {},
+            ):
                 T.copy(K[kv * BN, 0], K_row)
                 T.copy(V[kv * BN, 0], V_row)
                 T.copy(K_row, K_sh)
@@ -94,16 +99,31 @@ def make_flash(M, SEQ, BN, D):
     return flash
 
 
+def select_schedule(schedule, target, M, SEQ, BN, D):
+    """Choose this example's measured default; explicit schedules always win."""
+    if schedule in ("serial", "pipeline"):
+        return schedule
+    if schedule != "auto":
+        raise ValueError(f"Unknown Flash schedule: {schedule}")
+    return "pipeline" if hexagon_arch(target) in {"v73", "v79"} and M == BN == D == 64 and SEQ >= 256 else "serial"
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--m", type=int, default=64, help="query length")
     p.add_argument("--seq", type=int, default=256, help="kv length")
     p.add_argument("--bn", type=int, default=64, help="kv block (multiple of 64)")
     p.add_argument("--d", type=int, default=64, help="head dim (multiple of 64)")
+    p.add_argument(
+        "--schedule", choices=["auto", "serial", "pipeline"], default="auto", help="copy schedule (auto uses measured target defaults)"
+    )
     args = p.parse_args()
     M, SEQ, BN, D = args.m, args.seq, args.bn, args.d
 
-    kernel = tilelang.compile(make_flash(M, SEQ, BN, D), out_idx=[3], target="hexagon")
+    target = normalize_hexagon_target("hexagon")
+    schedule = select_schedule(args.schedule, target, M, SEQ, BN, D)
+    print(f"Flash schedule: {schedule} (requested {args.schedule}, {hexagon_arch(target)})")
+    kernel = tilelang.compile(make_flash(M, SEQ, BN, D, pipelined=schedule == "pipeline"), out_idx=[3], target=target)
     q = (torch.randn(M, D) * 0.3).half()
     k = (torch.randn(SEQ, D) * 0.3).half()
     v = (torch.randn(SEQ, D) * 0.3).half()
