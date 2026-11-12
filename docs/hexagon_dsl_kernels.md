@@ -380,12 +380,24 @@ goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX p
 in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
 (BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
-8 MB of fp16 weights at 40-44 GB/s. A transfer costs about 150
-cycles to submit and as many to retire, so blocks of a few KB that serial HVX
-copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
-match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
-256. An explicit `T.dma_copy` stays a manual schedule and is rejected inside
-`T.Pipelined`.
+8 MB of fp16 weights at 40-44 GB/s. An explicit `T.dma_copy` stays a manual
+schedule and is rejected inside `T.Pipelined`.
+
+For Flash attention with M = BN = D = 64, the one-stage pipeline with synchronous
+first-block copies reduced v79 DSP kernel cycles by 1.5%, 1.6% and 18.0% at
+SEQ 256, 1024 and 4096 with read-prepared inputs, respectively. With the input
+ranges flushed and invalidated before each entry, the reductions were 19.8%,
+27.4% and 29.9%. These are medians of six paired rounds after fixed warmup, with
+both execution orders retained; they are kernel-cycle measurements, not RPC
+latency. The same SEQ256 policy increased v73 read-prepared cycles by 6.3%
+(invalidated cycles decreased by 1.0%).
+
+`example_flash_attention.py --schedule auto` therefore enables this policy only
+on v79 for M = BN = D = 64 and SEQ >= 256. Other targets and shapes use serial
+copies; v75 has offline validation but no hardware timing. `--schedule serial`
+and `--schedule pipeline` select either path explicitly. The reusable
+`make_flash(..., pipelined=False)` factory defaults to serial. This measured
+example policy does not change the compiler's target-independent opt-in rule.
 
 The shared planner (`PipelinePlanning`) runs a loop `num_stages` deep when every
 copy comes after every statement that reads a copied buffer, as in `copy A; copy B;
