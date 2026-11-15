@@ -495,6 +495,33 @@ TL_DEVICE void tl_gemm_dot_leaf4(HVX_Vector out[2][R], const TA *__restrict__ A,
 
 #endif
 
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
+template <int Cached, int LdB>
+TL_DEVICE void tl_gemm_dot_leaf_cached_a(HVX_Vector out[1],
+                                         const HVX_Vector (&a)[Cached],
+                                         const half *__restrict__ A,
+                                         const half *__restrict__ B) {
+  using V = tl_gemm_operand<half>;
+  V::acc acc[2] = {V::zero(), V::zero()};
+#pragma clang loop unroll(full)
+  for (int kc = 0; kc < Cached; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    V::mac(acc[0], a[kc], b0);
+    V::mac(acc[1], a[kc], b1);
+  }
+#pragma clang loop unroll(disable)
+  for (int kc = Cached; kc < 16; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    HVX_Vector av = tl_hvx_load<true>(A + kc * 64);
+    V::mac(acc[0], av, b0);
+    V::mac(acc[1], av, b1);
+  }
+  out[0] = tl_gemm_merge(V::sums(acc[0]), V::sums(acc[1]));
+}
+#endif
+
 // The outputs [0, Outs), Outs <= 32, of rows r < R of C: pairs of outputs
 // enter a transpose tree of P outputs, the smallest power of two that holds
 // them, whose pending subtrees wait in `level` by height; then each output's
@@ -524,29 +551,46 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
         level[r][h] = v[r];
     };
     HVX_Vector v[R];
-#if __HVX_ARCH__ == 79
-    // A full two-row tile benefits from sharing A across four output columns.
-    // One-row and partial-output tiles retain the existing G2 schedule.
-    if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
+    if constexpr (std::is_same_v<TA, half> && R == 1 && K == 1024 && RowsA &&
                   RowsB && Outs == 32) {
-      HVX_Vector pairs[2][R];
+      // The SDK's longer product live ranges spill a full A row on v73;
+      // eight cached vectors fit there, while v79 keeps all sixteen.
+      constexpr int Cached = __HVX_ARCH__ == 73 ? 8 : 16;
+      HVX_Vector cached_a[Cached];
+#pragma clang loop unroll(full)
+      for (int kc = 0; kc < Cached; ++kc)
+        cached_a[kc] = tl_hvx_load<true>(A + kc * 64);
 #pragma clang loop unroll(disable)
-      for (int g = 0; g < Outs / 4; ++g) {
-        tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
-                                                            B + 4 * g * LdB);
-        push(pairs[0], 2 * g);
-        push(pairs[1], 2 * g + 1);
+      for (int g = 0; g < Outs / 2; ++g) {
+        tl_gemm_dot_leaf_cached_a<Cached, LdB>(v, cached_a, A, B + 2 * g * LdB);
+        push(v, g);
       }
     } else
 #endif
-    {
+#if __HVX_ARCH__ == 79
+      // A full two-row tile benefits from sharing A across four output columns.
+      // Full one-row tiles use the cache above; partial tiles retain G2.
+      if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+                    RowsB && Outs == 32) {
+        HVX_Vector pairs[2][R];
 #pragma clang loop unroll(disable)
-      for (int g = 0; g < Outs / 2; ++g) {
-        tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(v, A,
-                                                              B + 2 * g * LdB);
-        push(v, g);
+        for (int g = 0; g < Outs / 4; ++g) {
+          tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
+                                                              B + 4 * g * LdB);
+          push(pairs[0], 2 * g);
+          push(pairs[1], 2 * g + 1);
+        }
+      } else
+#endif
+      {
+#pragma clang loop unroll(disable)
+        for (int g = 0; g < Outs / 2; ++g) {
+          tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(
+              v, A, B + 2 * g * LdB);
+          push(v, g);
+        }
       }
-    }
     if constexpr (Outs % 2 != 0) {
       tl_gemm_dot_leaf<TA, R, 1, K, LdA, LdB, RowsA, RowsB>(
           v, A, B + (Outs - 1) * LdB);
