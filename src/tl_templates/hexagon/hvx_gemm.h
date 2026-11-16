@@ -493,9 +493,25 @@ TL_DEVICE void tl_gemm_dot_leaf4(HVX_Vector out[2][R], const TA *__restrict__ A,
   }
 }
 
+// Keep the full-row leaf independent of the partial-cache remainder loop.
+template <int LdB>
+TL_DEVICE void tl_gemm_dot_leaf_cached_a(HVX_Vector out[1],
+                                         const HVX_Vector (&a)[16],
+                                         const half *__restrict__ B) {
+  using V = tl_gemm_operand<half>;
+  V::acc acc[2] = {V::zero(), V::zero()};
+#pragma clang loop unroll(full)
+  for (int kc = 0; kc < 16; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    V::mac(acc[0], a[kc], b0);
+    V::mac(acc[1], a[kc], b1);
+  }
+  out[0] = tl_gemm_merge(V::sums(acc[0]), V::sums(acc[1]));
+}
 #endif
 
-#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
+#if __HVX_ARCH__ == 73
 template <int Cached, int LdB>
 TL_DEVICE void tl_gemm_dot_leaf_cached_a(HVX_Vector out[1],
                                          const HVX_Vector (&a)[Cached],
@@ -563,7 +579,11 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
         cached_a[kc] = tl_hvx_load<true>(A + kc * 64);
 #pragma clang loop unroll(disable)
       for (int g = 0; g < Outs / 2; ++g) {
+#if __HVX_ARCH__ == 79
+        tl_gemm_dot_leaf_cached_a<LdB>(v, cached_a, B + 2 * g * LdB);
+#else
         tl_gemm_dot_leaf_cached_a<Cached, LdB>(v, cached_a, A, B + 2 * g * LdB);
+#endif
         push(v, g);
       }
     } else
@@ -574,7 +594,8 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
       if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
                     RowsB && Outs == 32) {
         HVX_Vector pairs[2][R];
-#pragma clang loop unroll(disable)
+        // Pair output groups without changing the K accumulation order.
+#pragma clang loop unroll_count(2)
         for (int g = 0; g < Outs / 4; ++g) {
           tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
                                                               B + 4 * g * LdB);
