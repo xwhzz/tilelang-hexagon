@@ -251,7 +251,12 @@ SCALAR_TILE_STORE = re.compile(r"\(\(half\*\)tiles\)\[[^\]]*\] =")
 def test_maps_over_crouton_tiles_use_whole_registers():
     source = _source(_map("activation", "float16"))
     # One register per row pair, in loops over tiles and their row pairs.
-    assert re.search(r"\*\(half64\*\)\(\(\(half\*\)tiles\) \+ \(\(i\w* \* 1024\) \+ \(j\w* \* 64\)\)\) = ", source)
+    row = re.search(r"half\* (\w+) = \(\(half\*\)tiles\) \+ \((\w+) \* 1024\);", source)
+    assert row, source
+    pointer, tile = row.groups()
+    row_loop = source.index("for (int32_t j_lane = 0; j_lane < 16;", row.end())
+    assert source.index(f"for (int32_t {tile} = 0;") < row.start() < row_loop
+    assert f"*(half64*)({pointer} + (j_lane * 64)) = " in source[row_loop:]
     # The rows' values: a tile's 32 rows in one register, two of them per row
     # pair. The columns' values: 32 elements, each repeated twice.
     assert "half64 u_lanes = tl_hvx_load_lanes<64>((&(((half*)u)[" in source

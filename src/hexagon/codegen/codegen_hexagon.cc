@@ -10,11 +10,13 @@
 #include "transform/common/attr.h"
 #include "transform/common/storage_size.h"
 
+#include <tvm/arith/pattern.h>
 #include <tvm/ir/op.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -409,6 +411,7 @@ void CodeGenTileLangHexagon::PrintType(DataType t,
 void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   // Clear previous generated state and reserve keywords.
   this->InitFuncState(f);
+  vector_row_exclusions_.clear();
   ReserveKeywordsAsUnique();
   arena_bound_ = false;
   // Lay out the global.vtcm buffers from the VTCM base, in order.
@@ -640,6 +643,8 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
            << "] __attribute__((aligned(128)));\n";
   }
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+  if (op->annotations.count(tirx::attr::kVolatile))
+    vector_row_exclusions_.insert(op->buffer->data);
 }
 
 void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
@@ -864,8 +869,14 @@ void CodeGenTileLangHexagon::VisitExpr_(const BufferLoadNode *op,
 std::string CodeGenTileLangHexagon::GetVecLoad(DataType t,
                                                const BufferNode *buffer,
                                                PrimExpr base) {
-  if (VectorAligned(t, base))
+  if (VectorAligned(t, base)) {
+    auto row = vector_rows_.find(GetRef<tirx::Buffer>(buffer));
+    if (row != vector_rows_.end())
+      return CodeGenTileLangCBase::GetVecLoad(
+          t, row->second.buffer.get(),
+          analyzer_.Simplify(base - row->second.offset));
     return CodeGenTileLangCBase::GetVecLoad(t, buffer, base);
+  }
   std::ostringstream os;
   headers_.insert("hvx_lanes.h");
   os << "tl_hvx_vec_loadu<";
@@ -883,7 +894,14 @@ void CodeGenTileLangHexagon::PrintVecStore(const BufferNode *buffer, DataType t,
                                            PrimExpr base,
                                            const std::string &value) {
   if (VectorAligned(t, base)) {
-    CodeGenTileLangCBase::PrintVecStore(buffer, t, base, value);
+    auto row = vector_rows_.find(GetRef<tirx::Buffer>(buffer));
+    if (row != vector_rows_.end()) {
+      CodeGenTileLangCBase::PrintVecStore(
+          row->second.buffer.get(), t,
+          analyzer_.Simplify(base - row->second.offset), value);
+    } else {
+      CodeGenTileLangCBase::PrintVecStore(buffer, t, base, value);
+    }
     return;
   }
   PrintIndent();
@@ -972,11 +990,133 @@ CodeGenTileLangHexagon::PrintTernaryCondExpr(const T *op, const char *compare,
      << "? (" << a_id << ") : (" << b_id << "))";
 }
 
+// Keep the invariant row separate from the column induction variable.
+// Repeatedly composing their disjoint index bits can leave scalar OR/addasl
+// address chains in an otherwise pipelined HVX map.
+void CodeGenTileLangHexagon::BindVectorRows(const tirx::For &loop) {
+  const auto *extent = loop->extent.as<IntImmNode>();
+  if (loop->kind != ForKind::kSerial || !is_zero(loop->min) || !extent ||
+      extent->value <= 0 ||
+      (loop->step.defined() && !is_one(loop->step.value())))
+    return;
+
+  bool straight_line = true;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> defined;
+  PostOrderVisit(loop->body, [&](const ObjectRef &node) {
+    if (node.as<StmtNode>() && !node.as<SeqStmtNode>() &&
+        !node.as<BindNode>() && !node.as<BufferStoreNode>())
+      straight_line = false;
+    if (const auto *bind = node.as<BindNode>())
+      defined.insert(bind->var);
+    if (const auto *let = node.as<LetNode>())
+      defined.insert(let->var);
+    // A conditional expression can skip a load even in a straight-line
+    // statement. Do not form its address earlier than the original access.
+    if (node.as<SelectNode>() || node.as<AndNode>() || node.as<OrNode>())
+      straight_line = false;
+    if (const auto *call = node.as<CallNode>();
+        call &&
+        (call->op.same_as(builtin::if_then_else()) ||
+         SideEffect(GetRef<PrimExpr>(call)) > CallEffectKind::kReadState))
+      straight_line = false;
+  });
+  if (!straight_line)
+    return;
+
+  struct Candidate {
+    tirx::Buffer buffer;
+    PrimExpr offset;
+    bool valid = true;
+  };
+  // Keep first-use order so pointer declarations are deterministic.
+  std::vector<Candidate> candidates;
+  auto access = [&](const tirx::Buffer &buffer, DataType type,
+                    const Array<PrimExpr> &indices, bool predicated) {
+    auto it = std::find_if(
+        candidates.begin(), candidates.end(),
+        [&](const Candidate &c) { return c.buffer.same_as(buffer); });
+    if (it == candidates.end()) {
+      candidates.push_back({buffer, PrimExpr(), true});
+      it = candidates.end() - 1;
+    }
+    if (!it->valid)
+      return;
+    arith::PVar<PrimExpr> base;
+    if (predicated || buffer->shape.size() != 1 || !buffer->strides.empty() ||
+        !is_zero(buffer->elem_offset) || buffer->dtype.lanes() != 1 ||
+        buffer->dtype.bits() < 8 || type.lanes() <= 1 ||
+        type.element_of() != buffer->dtype || IsVolatile(buffer->data.get()) ||
+        vector_row_exclusions_.count(buffer->data) ||
+        defined.count(buffer->data) || indices.size() != 1 ||
+        !arith::ramp(base, 1, type.lanes()).Match(indices[0]) ||
+        !base.Eval().dtype().is_int() || !VectorAligned(type, base.Eval())) {
+      it->valid = false;
+      return;
+    }
+    Array<PrimExpr> linear =
+        arith::DetectLinearEquation(base.Eval(), {loop->loop_var});
+    const auto *step =
+        linear.size() == 2 ? linear[0].as<IntImmNode>() : nullptr;
+    // Only consecutive vector chunks of a row, not strided outer-axis maps.
+    if (!step || step->value != type.lanes()) {
+      it->valid = false;
+      return;
+    }
+    PrimExpr offset = analyzer_.Simplify(linear[1]);
+    bool invariant = !offset.as<IntImmNode>() &&
+                     SideEffect(offset) <= CallEffectKind::kPure &&
+                     !UsesVar(offset, [&](const VarNode *var) {
+                       return GetRef<Var>(var).same_as(loop->loop_var) ||
+                              defined.count(GetRef<Var>(var));
+                     });
+    PostOrderVisit(offset, [&](const ObjectRef &node) {
+      if (node.as<BufferLoadNode>())
+        invariant = false;
+    });
+    if (!invariant || (it->offset.defined() &&
+                       !analyzer_.CanProveEqual(it->offset, offset))) {
+      it->valid = false;
+      return;
+    }
+    it->offset = offset;
+  };
+  PostOrderVisit(loop->body, [&](const ObjectRef &node) {
+    if (const auto *load = node.as<BufferLoadNode>())
+      access(load->buffer, load->dtype, load->indices,
+             load->predicate.defined());
+    if (const auto *store = node.as<BufferStoreNode>())
+      access(store->buffer, store->value.dtype(), store->indices,
+             store->predicate.defined());
+  });
+
+  for (const Candidate &candidate : candidates) {
+    if (!candidate.valid)
+      continue;
+    Var data(candidate.buffer->data->name_hint + "_row", DataType::Handle());
+    std::string name = AllocVarID(data.get());
+    RegisterHandleType(data.get(), candidate.buffer->dtype);
+    std::string offset = PrintExpr(candidate.offset);
+    PrintIndent();
+    PrintType(candidate.buffer->dtype, stream);
+    stream << "* " << name << " = ((";
+    PrintType(candidate.buffer->dtype, stream);
+    stream << "*)" << GetVarID(candidate.buffer->data.get()) << ") + " << offset
+           << ";\n";
+    tirx::Buffer row = candidate.buffer;
+    row.CopyOnWrite()->data = data;
+    vector_rows_.emplace(candidate.buffer, VectorRow{row, candidate.offset});
+  }
+}
+
 void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
   if (IsWorkerLoop(op)) {
     PrintWorkerLoop(op);
     return;
   }
+  auto outer_rows = std::move(vector_rows_);
+  vector_rows_.clear();
+  // Declarations must precede the pragmas, which still apply to this loop.
+  BindVectorRows(GetRef<tirx::For>(op));
   if (auto count = op->annotations.Get(tl::attr::kHexagonUnrollCount)) {
     PrintIndent();
     stream << "#pragma clang loop unroll_count("
@@ -987,6 +1127,13 @@ void CodeGenTileLangHexagon::VisitStmt_(const ForNode *op) {
     stream << "#pragma clang loop pipeline(disable)\n";
   }
   CodeGenC::VisitStmt_(op);
+  // The inherited printer keys these registrations by raw node address.
+  // Remove them before the temporary row-buffer handles leave this scope.
+  for (const auto &[buffer, row] : vector_rows_) {
+    var_idmap_.erase(row.buffer->data.get());
+    handle_data_type_.erase(row.buffer->data.get());
+  }
+  vector_rows_ = std::move(outer_rows);
 }
 
 } // namespace codegen

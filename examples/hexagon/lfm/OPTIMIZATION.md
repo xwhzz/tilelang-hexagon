@@ -374,13 +374,23 @@ On the same v79 phone, `bench.py` tg128 at depth 130816 goes from 6.46 to
 - **DMA and the L2.** Transfers bypass the DSP's L2. Through it, 4 workers'
   DMA loads read DDR at 30 GB/s, against 50 bypassing it, whatever the block
   size (16-128 KB) or the transfers in flight (1-4) (#195).
-- **Constant slots.** The residual adds' loops ran 24% faster with their
-  slot of the two-slot ring a constant (the batches in pairs, #197) than with
-  the run-time `rb % 2`: the add 16.0M against 12.2M cycles a worker. Yet
-  `hexagon-clang` pipelined both with the same initiation interval (6), so the
-  schedule does not explain it, and the cause is not established. A probe that
-  seemed to show the run-time slot stopping the pipeliner also had its buffers
-  unmarked as exclusive, which is enough on its own.
+- **Ring-slot addressing.** Historically, paired batches reduced the residual
+  add phase from 16.0M to 12.2M cycles per worker (#197). Both versions were
+  software-pipelined with initiation interval 6; an earlier probe also changed
+  the buffers' aliasing promises and did not isolate the slot offset.
+  A controlled v79 add-and-square map with the current sandwich scaling
+  (4 rows of 2048 floats, identical exclusive buffers) reproduced extra scalar
+  address work in the dynamic-slot loop: three `or` and three `addasl`
+  instructions per vector. Explicit row pointers before the column loop remove
+  those instructions. The backend now emits these pointers for eligible
+  contiguous vector loops, and the prefill can alternate slots directly.
+  Six-round A/B measurements reduced this resident map's cycles by 23.86%
+  with one worker and 12.10% with four. Complete tiny-LFM3 prefill comparisons
+  at 128/256 tokens detected no overall speed change beyond A/A variation;
+  the map result is not an end-to-end speedup. KV, convolution state and the
+  prefill residual boundary passed the reference checks, including a partial
+  second chunk at 200 tokens. v73 SDK compilation passes; board correctness
+  and performance remain unverified (#204).
 - **Write once, read many.** A DMA load from memory the DSP wrote writes the
   lines back first, every time. The KV cache, written once and read by every
   later block of queries, now writes them back once, as it is written
