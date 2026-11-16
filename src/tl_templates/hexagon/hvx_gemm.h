@@ -556,15 +556,62 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
     // Adds subtree v of two outputs, the g-th: it merges with the pending
     // subtrees of the heights that g's trailing one bits count.
     auto push = [&level](HVX_Vector *v, int g) {
-      int h = 1;
-      for (; g & 1; g >>= 1, ++h) {
+#if __HVX_ARCH__ == 79
+      // Same binary merge tree, exposing each pending subtree's fixed level.
+      if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+                    RowsB && Outs == 32) {
+        if (!(g & 1)) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            level[r][1] = v[r];
+        } else {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            v[r] = tl_gemm_merge(level[r][1], v[r]);
+          if (!(g & 2)) {
+#pragma clang loop unroll(full)
+            for (int r = 0; r < R; ++r)
+              level[r][2] = v[r];
+          } else {
+#pragma clang loop unroll(full)
+            for (int r = 0; r < R; ++r)
+              v[r] = tl_gemm_merge(level[r][2], v[r]);
+            if (!(g & 4)) {
+#pragma clang loop unroll(full)
+              for (int r = 0; r < R; ++r)
+                level[r][3] = v[r];
+            } else {
+#pragma clang loop unroll(full)
+              for (int r = 0; r < R; ++r)
+                v[r] = tl_gemm_merge(level[r][3], v[r]);
+              if (!(g & 8)) {
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  level[r][4] = v[r];
+              } else {
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  v[r] = tl_gemm_merge(level[r][4], v[r]);
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  level[r][5] = v[r];
+              }
+            }
+          }
+        }
+      } else
+#endif
+      {
+        int h = 1;
+        for (; g & 1; g >>= 1, ++h) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            v[r] = tl_gemm_merge(level[r][h], v[r]);
+        }
 #pragma clang loop unroll(full)
         for (int r = 0; r < R; ++r)
-          v[r] = tl_gemm_merge(level[r][h], v[r]);
+          level[r][h] = v[r];
       }
-#pragma clang loop unroll(full)
-      for (int r = 0; r < R; ++r)
-        level[r][h] = v[r];
     };
     HVX_Vector v[R];
 #if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
