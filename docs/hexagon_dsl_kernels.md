@@ -312,14 +312,19 @@ DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouto
 permutation. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,
 which follow each other in the tile order (a weight's K, an activation's columns): each run
 of a region's tiles is a row of one 2D descriptor, or the runs are one 1D transfer when they
-follow each other on both sides, as one panel of weights does. `T.dma_copy` submits one group
-to the managed queue owned by its tile program; `T.dma_wait(n)` completes older groups until
-at most n remain pending, and `T.dma_wait(0)` completes all groups. With
-`T.Kernel(num_workers=...)`, each tile program's descriptor arrays and queue context live on
-its worker thread's stack and drain when the tile program exits; DMA data buffers live in the
-worker's private VTCM arena. A worker must issue and complete its own queue on the same QuRT
-thread. Concurrent DDR
-stores must own disjoint cache lines, including the lines around partial rows.
+follow each other on both sides, as one panel of weights does.
+
+`T.dma_copy` submits one group to the queue owned by its tile program.
+`T.dma_wait(n)` completes older groups until at most n remain pending, and
+`T.dma_wait(0)` completes all groups.
+
+Each tile program keeps its DMA queue and descriptors on the executing thread's stack,
+including with `T.Kernel(num_workers=...)`. The queue is drained when the tile program
+exits. Per-program shared buffers use the worker's private VTCM arena; DMA can also
+access DDR endpoints and launch-wide `global.vtcm` buffers. A worker must submit and
+complete its own queue on the same QuRT thread.
+
+Concurrent DDR stores must own disjoint cache lines, including the lines around partial rows.
 Scalar/vector producers are published before DMA reads, and DMA stores finish
 cache maintenance before completion. Small source flushes use `dccleana` plus one
 `syncht` per transfer, preserving the QuRT flush semantics. A load from a kernel
@@ -368,6 +373,11 @@ wait for DMA. A program's queue spans it, so
 a `T.dma_copy` submitted before the barrier for the next phase overlaps the phase
 change; data other programs read after the barrier must be complete before it.
 
+Explicit `T.dma_copy` uses a manual schedule. A PrimFunc that contains an explicit
+submission cannot also contain a software-pipeline-annotated loop, even when they
+occur in separate loops. Explicit submissions must stay outside parallel and
+vectorized loops.
+
 `T.Pipelined` makes the copies of a loop from DDR asynchronous: the target declares
 `supports_async_copy` and names the functions that build the pipeline's commit and
 wait (`async_copy_commit`, `async_copy_wait`), so the shared pipeline injector
@@ -377,18 +387,15 @@ of a DMA transfer, when DMA moves it faster than HVX loads: one contiguous block
 or rows of at least 512 bytes (`DMAOutpacesHVX`). Other copies run at once in
 their stage. Into an HMX operand, which DMA cannot fill in Crouton order, the copy
 goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX pack
-in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
-128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
-(BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
+in the gemm's stage fills the operand (`StageHMXOperandCopies`).
+
+On v79, a 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64)
+to 3.1x (BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
 8 MB of fp16 weights at 40-44 GB/s. A transfer costs about 150
 cycles to submit and as many to retire, so blocks of a few KB that serial HVX
 copies read from L2 gain little: flash attention's 8 KB K and V blocks pipelined
 match serial copies at SEQ 1024 and run 22% faster at 4096, but 12% slower at
-256. Explicit `T.dma_copy` uses a manual schedule. A PrimFunc that contains an explicit
-`T.dma_copy` cannot also contain a software-pipeline-annotated loop; explicit submissions
-must also stay out of parallel and vectorized loops. The schedule check scans the full
-PrimFunc, so the restriction applies even when the explicit DMA and pipelined loop are
-separate.
+256.
 
 The shared planner (`PipelinePlanning`) runs a loop `num_stages` deep when every
 copy comes after every statement that reads a copied buffer, as in `copy A; copy B;
