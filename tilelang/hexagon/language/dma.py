@@ -23,9 +23,11 @@ def dma_copy(src: BufferLikeType, dst: BufferLikeType) -> tirx.PrimExpr:
     complete together. Use ``T.dma_wait(n)`` before consuming destinations or
     overwriting sources; no separate commit is needed. Every tile program owns
     its queue, which the compiler sizes for the most transfers in flight, and
-    drains it before the program ends. Raw DMA calls must not be mixed with
-    this managed queue. Compiler-generated software pipelines remain
-    unsupported; use explicit prefetch and wait scheduling.
+    drains it before the program ends. Explicit ``T.dma_copy`` uses a manual
+    schedule. Eligible ``T.copy`` operations can instead use compiler-generated
+    DMA scheduling in ``T.Pipelined``. A PrimFunc cannot combine explicit
+    ``T.dma_copy`` with a software-pipeline-annotated loop, and explicit
+    submissions must be outside parallel and vectorized loops.
     """
     src, dst = _normalize_copy_regions(src, dst)
     if isinstance(src, tirx.BufferLoad) and isinstance(dst, tirx.BufferLoad):
