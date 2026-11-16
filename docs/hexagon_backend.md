@@ -105,7 +105,8 @@ These are the decisions that keep the adaptation small and the code navigable.
   compiled kernel uses a resident session of one kernel. Android uses ADB; Linux
   BSPs (`linux_runtime.py`) use SSH when `TILELANG_HEXAGON_SSH_HOST` is set, or ADB
   otherwise. The resident Linux agent serves the adapter; `OneShotKernel` is the
-  compatibility path. Each SSH file upload, download and deployment directory
+  compatibility path. Calls on one `Session` remain serialized. Each SSH file
+  upload, download and deployment directory
   creation has a 600-second timeout. Increase `TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT`
   for large models or slow links, or pass `transfer_timeout` to `LinuxConnection`.
   The value must be finite and positive; it is captured when the connection is
@@ -265,16 +266,21 @@ starts if its workers cannot all run together.
   at most n are pending; `T.dma_wait(0)` completes all groups. `PlanDMAQueue`
   bounds the descriptors and groups kept in flight, declares the managed queue
   (`hexagon_dma_queue`) at tile-program entry, and drains it at tile-program exit.
-  The bound is conservative across branches; a loop that never waits is
-  rejected, as are more than 256 transfers in flight. Regions must have equal scalar dtypes, static
+  The planner rejects unbounded submission accumulation and schedules that exceed
+  the descriptor or group capacity (up to 256 each). Bounded loops need not wait
+  in every iteration; remaining transfers are waited for at tile-program exit.
+  Regions must have equal scalar dtypes, static
   positive extents/strides, unit innermost stride, and provable bounds. Unsupported
   async copies fail lowering. Explicit `T.dma_copy` uses a manual serial schedule;
   eligible `T.copy` operations can use compiler-generated DMA scheduling in
   `T.Pipelined`, as shown by [`example_gemm.py`](../examples/hexagon/example_gemm.py).
   A PrimFunc cannot combine explicit `T.dma_copy` with a software-pipeline-annotated
   loop; explicit DMA submission must also stay out of parallel and vectorized loops.
-  Outside the pipeline path, `T.copy` has no DMA-specific lowering; a
-  Crouton endpoint makes it a `tl_crouton_copy`. In a `num_workers` kernel every tile
+  Panel-layout `T.copy` operations also use DMA outside a pipeline, with an
+  immediate wait; [`test_panel_copy_moves_whole_panels_by_dma`](../testing/python/hexagon/test_tilelang_hexagon_gemm_int.py#L84)
+  covers this path. Outside `T.Pipelined`, ordinary row-major copies do not use
+  DMA-specific lowering; a Crouton endpoint uses `tl_crouton_copy` lowering.
+  In a `num_workers` kernel every tile
   program owns its DMA queue.
 
 - **The HMX accumulator can't be preloaded and outputs fp16 only.** So **K is not the
@@ -296,8 +302,9 @@ starts if its workers cannot all run together.
 
 - **VTCM is one arena per tile program.** `MergeSharedMemoryAllocations` lays out a
   tile program's shared buffers in one allocation and reuses the space of buffers
-  whose lifetimes do not overlap. A DMA destination stays live through the wait
-  that completes its transfer and its last use, then its space can be reused;
+  whose lifetimes do not overlap. DMA source and destination buffers stay live
+  through the wait that completes their transfer; each buffer's space can be
+  reused after its last use;
   [`test_dma_buffer_is_reused_after_its_wait`](../testing/python/hexagon/test_tilelang_hexagon_arena.py#L68-L83)
   checks this lifetime rule. The codegen binds the arena to the VTCM base and publishes
   `tl_vtcm_shared_high_water` for embedding/export capacity checks. Under the worker

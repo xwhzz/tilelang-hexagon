@@ -315,9 +315,10 @@ of a region's tiles is a row of one 2D descriptor, or the runs are one 1D transf
 follow each other on both sides, as one panel of weights does. `T.dma_copy` submits one group
 to the managed queue owned by its tile program; `T.dma_wait(n)` completes older groups until
 at most n remain pending, and `T.dma_wait(0)` completes all groups. With
-`T.Kernel(num_workers=...)`, every tile program owns its descriptors and queue in its worker's
-private VTCM arena, and the queue drains when the tile program exits. A worker must issue and
-complete its own queue on the same QuRT thread. Concurrent DDR
+`T.Kernel(num_workers=...)`, each tile program's descriptor arrays and queue context live on
+its worker thread's stack and drain when the tile program exits; DMA data buffers live in the
+worker's private VTCM arena. A worker must issue and complete its own queue on the same QuRT
+thread. Concurrent DDR
 stores must own disjoint cache lines, including the lines around partial rows.
 Scalar/vector producers are published before DMA reads, and DMA stores finish
 cache maintenance before completion. Small source flushes use `dccleana` plus one

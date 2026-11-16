@@ -6,5 +6,5 @@ FastRPC session and resident buffers. :class:`~.adapter.HexagonKernelAdapter`
 connects this to the shared JIT layer: a compiled kernel is a session of one.
 On a Linux BSP (:mod:`.linux_runtime`), the adapter uses the resident Linux agent
 and session. :class:`.linux_runtime.OneShotKernel` remains available as a
-compatibility path.
+compatibility path. Calls on one session remain serialized.
 """
