@@ -380,17 +380,9 @@ template <int K, typename A>
 TL_DEVICE void tl_crouton_rows_of(HVX_Vector pair, tl_hvx_reg<A> *even,
                                   tl_hvx_reg<A> *odd) {
   static_assert(std::is_same_v<A, float>, "fp32 rows");
-#if __HVX_ARCH__ < 79
   HVX_VectorPair w = tl_hvx_convert_hf_to_sf(pair);
   *even = tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_lo_W(w)));
   *odd = tl_reduce_operand<K, A>(tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_V_hi_W(w)));
-#else
-  HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pair, Q6_Vh_vsplat_R(0x3c00));
-  *even = tl_reduce_operand<K, A>(
-      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w))));
-  *odd = tl_reduce_operand<K, A>(
-      tl_hvx_bitcast<tl_hvx_reg<A>>(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w))));
-#endif
 }
 
 // Rows [2 q0, 2 q0 + 2N) of row tile r, every column tile combined, as one

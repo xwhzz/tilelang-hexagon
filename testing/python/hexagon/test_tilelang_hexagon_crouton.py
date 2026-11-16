@@ -456,6 +456,46 @@ def test_reductions_of_crouton_tiles_are_one_call():
 
 
 @DEVICE
+def test_crouton_sum_preserves_zero_and_v79_exact_sums():
+    import numpy as np
+    import torch
+    from tilelang.hexagon.target import hexagon_arch
+
+    target = determine_target("hexagon", return_object=True)
+    kernel = tilelang.compile(_reduce("activation", "sum", 1, "float32", (64, 128)), out_idx=[1], target=target)
+    try:
+        zero = np.zeros((64, 128), dtype=np.float16)
+        actual = kernel(torch.from_numpy(zero)).cpu().numpy()
+        np.testing.assert_array_equal(actual.view(np.uint32), np.zeros(64, dtype=np.uint32))
+        # Legacy v73/v75 Qfloat uses Von Neumann rounding, not IEEE nearest-even.
+        # The nonzero exact-rounding cases below are tested only on v79.
+        if hexagon_arch(target) != "v79":
+            return
+        rng = np.random.default_rng(220)
+        scores = rng.uniform(-8, 0, size=(64, 128))
+        p = np.exp(scores - scores.max(axis=1, keepdims=True))
+        p /= p.sum(axis=1, keepdims=True)
+        counts = np.stack([rng.multinomial(8192, row) for row in p])
+        assert counts.max() <= 2048
+        # All values and all positive partial sums are exactly representable.
+        probabilities = (counts / 8192).astype(np.float16)
+        masked = probabilities.copy()
+        for row in range(64):
+            masked[row, (row * 3) % 129 :] = 0
+            if row % 7 == 0:
+                masked[row] = 0
+        tie = zero.copy()
+        tie[:, 0] = 1
+        tie[:, 64] = np.array([1], dtype=np.uint16).view(np.float16)[0]
+        for values in (probabilities, masked, tie):
+            reference = values.astype(np.float64).sum(axis=1).astype(np.float32)
+            actual = kernel(torch.from_numpy(values)).cpu().numpy()
+            np.testing.assert_array_equal(actual.view(np.uint32), reference.view(np.uint32))
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
 @pytest.mark.parametrize("shape", [(R, C), (64, 64)])
 @pytest.mark.parametrize("dim", [0, 1])
 @pytest.mark.parametrize("op,dtype", [("max", "float16"), ("sum", "float32"), ("absmax", "float16"), ("min", "float32")])
