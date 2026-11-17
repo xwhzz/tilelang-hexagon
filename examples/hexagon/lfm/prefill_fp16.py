@@ -212,37 +212,34 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                     total = total + bf.psum[v, bf.w * RW + i]
                 bf.sw[i] = T.rsqrt(total * T.float32(1 / D) + T.float32(eps))
         T.copy(weight, bf.nw)
-        # Two slots of rows: a batch's rows come in while the one before is
-        # added, stored and normalized. The batches go in pairs, so that each
-        # loop over a slot's rows addresses it at a constant offset. This form
-        # was faster in the measured residual phase; both variants were
-        # software-pipelined. The remaining dynamic-slot cost is tracked in #204.
+        # Alternate two row slots: the next batch comes in while this one is
+        # added, stored and normalized. Codegen binds each vector map's row
+        # pointers outside its column loop, including the dynamic slot offset.
         nb = RW // RB
         T.dma_copy(bf.x[bf.w * RW : bf.w * RW + RB, :], bf.xr[0, :, :])
-        for pair in T.serial(nb // 2):
-            for s in list(range(2)):
-                rb = pair * 2 + s
-                r = bf.w * RW + rb * RB
-                # The batch's rows are in, and the slot the next takes is
-                # stored.
-                T.dma_wait(0)
-                if rb + 1 < nb:
-                    nxt = bf.w * RW + T.min(rb + 1, nb - 1) * RB
-                    T.dma_copy(bf.x[nxt : nxt + RB, :], bf.xr[1 - s, :, :])
-                if sandwich:
-                    # The new rows, and their squares for the next norm.
-                    for i, k in T.Parallel(RB, D):
-                        v = bf.xr[s, i, k] + bf.f[r + i, k] * bf.sw[rb * RB + i] * bf.pw[k]
-                        bf.xr[s, i, k] = v
-                        bf.sq[i, k] = v * v
-                else:
-                    for i, k in T.Parallel(RB, D):
-                        v = bf.xr[s, i, k] + bf.f[r + i, k]
-                        bf.xr[s, i, k] = v
-                        bf.sq[i, k] = v * v
-                T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
-                if normed:
-                    normalize(bf, s, r, True)
+        for rb in T.serial(nb):
+            s = rb % 2
+            r = bf.w * RW + rb * RB
+            # The batch's rows are in, and the slot the next takes is
+            # stored.
+            T.dma_wait(0)
+            if rb + 1 < nb:
+                nxt = bf.w * RW + T.min(rb + 1, nb - 1) * RB
+                T.dma_copy(bf.x[nxt : nxt + RB, :], bf.xr[1 - s, :, :])
+            if sandwich:
+                # The new rows, and their squares for the next norm.
+                for i, k in T.Parallel(RB, D):
+                    v = bf.xr[s, i, k] + bf.f[r + i, k] * bf.sw[rb * RB + i] * bf.pw[k]
+                    bf.xr[s, i, k] = v
+                    bf.sq[i, k] = v * v
+            else:
+                for i, k in T.Parallel(RB, D):
+                    v = bf.xr[s, i, k] + bf.f[r + i, k]
+                    bf.xr[s, i, k] = v
+                    bf.sq[i, k] = v * v
+            T.dma_copy(bf.xr[s, :, :], bf.x[r : r + RB, :])
+            if normed:
+                normalize(bf, s, r, True)
         T.dma_wait(0)
 
     @T.macro

@@ -246,32 +246,49 @@ def test_gemms_match_torch(M, N, K, c_dtype, trans_a, trans_b):
 @pytest.mark.parametrize("trans_a, trans_b", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("M, N, K", [(1, 256, 96), (7, 70, 45), (32, 96, 64)])
 def test_fp32_gemms_match_torch(M, N, K, trans_a, trans_b):
-    _check(_gemm(M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b), M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b)
+    _check(
+        _gemm(M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b, clear="first"),
+        M,
+        N,
+        K,
+        ab="float32",
+        trans_a=trans_a,
+        trans_b=trans_b,
+    )
 
 
 @DEVICE
 @pytest.mark.parametrize("trans_b", [False, True])
-@pytest.mark.parametrize("c_dtype", ["float32", "float16"])
-def test_k_loops_accumulate_across_calls(c_dtype, trans_b):
-    _check(_gemm(2, 160, 512, 128, c_dtype=c_dtype, trans_b=trans_b), 2, 160, 512, c_dtype=c_dtype, trans_b=trans_b, calls=4)
+@pytest.mark.parametrize("ab, c_dtype, block_k", [("float16", "float32", 128), ("float16", "float16", 128), ("float32", "float32", 64)])
+def test_k_loops_accumulate_across_calls(ab, c_dtype, block_k, trans_b):
+    _check(
+        _gemm(2, 160, 512, block_k, ab=ab, c_dtype=c_dtype, trans_b=trans_b),
+        2,
+        160,
+        512,
+        ab=ab,
+        c_dtype=c_dtype,
+        trans_b=trans_b,
+        calls=512 // block_k,
+    )
 
 
-def _long_dot_region(M, N, ldb, offset, c_dtype, clear):
+def _long_dot_region(M, N, ldb, offset, c_dtype, clear, lda=1024, a_offset=0):
     @T.prim_func
     def kernel(
-        A: T.Tensor((M, 1024), "float16"),
+        A: T.Tensor((M, lda), "float16"),
         B: T.Tensor((N, ldb), "float16"),
         Init: T.Tensor((M, N), c_dtype),
         C: T.Tensor((M, N), c_dtype),
     ):
         with T.Kernel(1):
-            a = T.alloc_shared((M, 1024), "float16")
+            a = T.alloc_shared((M, lda), "float16")
             b = T.alloc_shared((N, ldb), "float16")
             c = T.alloc_fragment((M, N), c_dtype)
             T.copy(A, a)
             T.copy(B, b)
             T.copy(Init, c)
-            T.gemm(a, b[:, offset : offset + 1024], c, transpose_B=True, clear_accum=clear)
+            T.gemm(a[:, a_offset : a_offset + 1024], b[:, offset : offset + 1024], c, transpose_B=True, clear_accum=clear)
             T.copy(c, C)
 
     return kernel
@@ -287,23 +304,35 @@ def _long_dot_region(M, N, ldb, offset, c_dtype, clear):
         (4, 65, 1088, 0, "float32"),  # two row tiles, padded B rows and a column tail
         (3, 33, 1025, 1, "float32"),  # unaligned B region keeps the general path
         (2, 64, 1024, 0, "float16"),
-        (1, 64, 1024, 0, "float32"),  # single-row schedule control
+        (1, 64, 1024, 0, "float32"),
+        (1, 65, 1088, 0, "float16"),  # single row, padded B, column tail and half output
         (2, 31, 1024, 0, "float32"),  # partial-output schedule control
     ],
 )
 def test_long_dot_regions_match_torch(M, N, ldb, offset, c_dtype, clear):
+    _check_long_dot_region(M, N, ldb, offset, c_dtype, clear)
+
+
+@DEVICE
+@pytest.mark.parametrize("clear", [True, False])
+def test_long_dot_unaligned_a_matches_torch(clear):
+    _check_long_dot_region(1, 33, 1024, 0, "float32", clear, lda=1025, a_offset=1)
+
+
+def _check_long_dot_region(M, N, ldb, offset, c_dtype, clear, lda=1024, a_offset=0):
     import torch
 
     generator = torch.Generator().manual_seed(83)
-    a = torch.randn(M, 1024, generator=generator).half()
+    a = torch.full((M, lda), float("nan"), dtype=torch.float16)
+    a[:, a_offset : a_offset + 1024] = torch.randn(M, 1024, generator=generator).half()
     b = torch.full((N, ldb), float("nan"), dtype=torch.float16)
     b[:, offset : offset + 1024] = (torch.randn(N, 1024, generator=generator) * 0.1).half()
     b[5, offset : offset + 1024] = 0
     init = torch.randn(M, N, generator=generator).to(getattr(torch, c_dtype))
-    ref = a.float() @ b[:, offset : offset + 1024].float().t()
+    ref = a[:, a_offset : a_offset + 1024].float() @ b[:, offset : offset + 1024].float().t()
     if not clear:
         ref += init.float()
-    out = _run(_long_dot_region(M, N, ldb, offset, c_dtype, clear), a, b, init).float()
+    out = _run(_long_dot_region(M, N, ldb, offset, c_dtype, clear, lda, a_offset), a, b, init).float()
     if clear:
         assert torch.equal(out[:, 5], torch.zeros(M))
     # On older HVX, adding zero to a nonzero fp32 accumulator can round in

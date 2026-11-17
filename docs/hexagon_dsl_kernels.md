@@ -312,14 +312,19 @@ DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouto
 permutation. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,
 which follow each other in the tile order (a weight's K, an activation's columns): each run
 of a region's tiles is a row of one 2D descriptor, or the runs are one 1D transfer when they
-follow each other on both sides, as one panel of weights does. `dma.h` exposes raw instructions, descriptor builders, synchronous
-copy helpers, and a caller-owned linked queue through explicit extern calls;
-`T.dma_copy` / `T.dma_wait` expose a managed per-callback FIFO for explicit
-manual DMA schedules. With `T.Kernel(num_workers=...)`, every tile program owns
-its descriptors and FIFO in its worker's private VTCM arena and drains the FIFO
-before it ends, including error cleanup. A worker must issue and complete its own queue on the
-same QuRT thread; managed and raw/foreign DMA may not be mixed. Concurrent DDR
-stores must own disjoint cache lines, including the lines around partial rows.
+follow each other on both sides, as one panel of weights does.
+
+`T.dma_copy` submits one group to the queue owned by its tile program.
+`T.dma_wait(n)` completes older groups until at most n remain pending, and
+`T.dma_wait(0)` completes all groups.
+
+Each tile program keeps its DMA queue and descriptors on the executing thread's stack,
+including with `T.Kernel(num_workers=...)`. The queue is drained when the tile program
+exits. Per-program shared buffers use the worker's private VTCM arena; DMA can also
+access DDR endpoints and launch-wide `global.vtcm` buffers. A worker must submit and
+complete its own queue on the same QuRT thread.
+
+Concurrent DDR stores must own disjoint cache lines, including the lines around partial rows.
 Scalar/vector producers are published before DMA reads, and DMA stores finish
 cache maintenance before completion. Small source flushes use `dccleana` plus one
 `syncht` per transfer, preserving the QuRT flush semantics. A load from a kernel
@@ -368,6 +373,11 @@ wait for DMA. A program's queue spans it, so
 a `T.dma_copy` submitted before the barrier for the next phase overlaps the phase
 change; data other programs read after the barrier must be complete before it.
 
+Explicit `T.dma_copy` uses a manual schedule. A PrimFunc that contains an explicit
+submission cannot also contain a software-pipeline-annotated loop, even when they
+occur in separate loops. Explicit submissions must stay outside parallel and
+vectorized loops.
+
 `T.Pipelined` makes the copies of a loop from DDR asynchronous: the target declares
 `supports_async_copy` and names the functions that build the pipeline's commit and
 wait (`async_copy_commit`, `async_copy_wait`), so the shared pipeline injector
@@ -377,27 +387,20 @@ of a DMA transfer, when DMA moves it faster than HVX loads: one contiguous block
 or rows of at least 512 bytes (`DMAOutpacesHVX`). Other copies run at once in
 their stage. Into an HMX operand, which DMA cannot fill in Crouton order, the copy
 goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX pack
-in the gemm's stage fills the operand (`StageHMXOperandCopies`). On v79, a
-128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64) to 3.1x
-(BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
-8 MB of fp16 weights at 40-44 GB/s. An explicit `T.dma_copy` stays a manual
-schedule and is rejected inside `T.Pipelined`.
+in the gemm's stage fills the operand (`StageHMXOperandCopies`).
 
-For Flash attention with M = BN = D = 64, the one-stage pipeline with synchronous
-first-block copies reduced v79 DSP kernel cycles by 1.5%, 1.6% and 18.0% at
-SEQ 256, 1024 and 4096 with read-prepared inputs, respectively. With the input
-ranges flushed and invalidated before each entry, the reductions were 19.8%,
-27.4% and 29.9%. These are medians of six paired rounds after fixed warmup, with
-both execution orders retained; they are kernel-cycle measurements, not RPC
-latency. The same SEQ256 policy increased v73 read-prepared cycles by 6.3%
-(invalidated cycles decreased by 1.0%).
+On v79, a 128 x 128 x 2048 K loop of fp32-accumulated gemms runs 1.6x (BK = 64)
+to 3.1x (BK = 256) faster than with serial copies (`example_gemm.py`), and a GEMV streams
+8 MB of fp16 weights at 40-44 GB/s.
 
-`example_flash_attention.py --schedule auto` therefore enables this policy only
-on v79 for M = BN = D = 64 and SEQ >= 256. Other targets and shapes use serial
-copies; v75 has offline validation but no hardware timing. `--schedule serial`
-and `--schedule pipeline` select either path explicitly. The reusable
-`make_flash(..., pipelined=False)` factory defaults to serial. This measured
-example policy does not change the compiler's target-independent opt-in rule.
+For Flash attention with M = BN = D = 64, the one-stage pipeline uses synchronous
+first-block copies and overlaps later copies with computation.
+`example_flash_attention.py --schedule auto` selects this pipeline on v73 and
+v79 at SEQ >= 256. Other targets and shapes use serial copies; v75 has offline
+validation but no hardware timing. `--schedule serial` and `--schedule pipeline`
+select either path explicitly. The reusable `make_flash(..., pipelined=False)`
+factory defaults to serial. This example policy leaves automatic pipelining
+opt-in for other kernels.
 
 The shared planner (`PipelinePlanning`) runs a loop `num_stages` deep when every
 copy comes after every statement that reads a copied buffer, as in `copy A; copy B;

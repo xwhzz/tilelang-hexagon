@@ -92,7 +92,18 @@ TL_DEVICE void tl_hvx_convert_vector(void *dst, const void *src) {
 #endif
 
 TL_DEVICE HVX_VectorPair tl_hvx_convert_hf_to_sf(HVX_Vector h) {
-#if __HVX_ARCH__ >= 79
+#if __HVX_ARCH__ == 79
+  // Keep Qfloat extended state inside the conversion: plain spills lose it.
+  // This is the SDK's hf-to-sf sequence, with only IEEE outputs visible to RA.
+  HVX_Vector even, odd;
+  const HVX_Vector one = Q6_Vh_vsplat_R(0x3c00);
+  asm("v31:30.qf32 = vmpy(%2.hf, %3.hf)\n\t"
+      "{ %0.sf = v30.qf32; %1.sf = v31.qf32 }"
+      : "=v"(even), "=v"(odd)
+      : "v"(h), "v"(one)
+      : "v30", "v31");
+  return Q6_W_vcombine_VV(odd, even);
+#elif __HVX_ARCH__ > 79
   return Q6_Wsf_vcvt_Vhf(h);
 #else
   tl_hvx_u32 bits = tl_hvx_as_u32(h);

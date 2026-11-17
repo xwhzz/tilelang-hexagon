@@ -132,6 +132,19 @@ private:
   bool VectorAligned(DataType t, const PrimExpr &base);
   // The byte that holds 4-bit element `index` of `buffer`, two to a byte.
   std::string SubByteAddress(const BufferNode *buffer, const PrimExpr &index);
+  // A plain pointer to an invariant row of a vector loop. This preserves
+  // the original buffer's alias identity; it is not another tl_exclusive.
+  struct VectorRow {
+    tirx::Buffer buffer;
+    PrimExpr offset;
+  };
+  std::unordered_map<tirx::Buffer, VectorRow, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      vector_rows_;
+  // Exclude annotated volatile buffers without changing their emission.
+  std::unordered_set<tirx::Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      vector_row_exclusions_;
+  void BindVectorRows(const tirx::For &loop);
   /*! \brief modular arithmetic of vector access offsets */
   arith::Analyzer analyzer_;
 

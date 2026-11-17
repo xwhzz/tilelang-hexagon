@@ -72,10 +72,23 @@ constexpr bool tl_reduce_is_float =
 // and spills.
 template <int K, typename V> TL_DEVICE V tl_reduce_combine(V a, V b) {
   if constexpr ((K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM) &&
-                std::is_same_v<V, tl_hvx_reg<float>>)
+                std::is_same_v<V, tl_hvx_reg<float>>) {
+#if __HVX_ARCH__ == 73
+    // Legacy Qfloat is fully represented in the vector bits across a spill.
     return tl_hvx_bitcast<V>(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(
         tl_hvx_bitcast<HVX_Vector>(a), tl_hvx_bitcast<HVX_Vector>(b))));
-  else if constexpr (K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM)
+#else
+    // v79 Qfloat state cannot survive a spill. Keep its producer and
+    // conversion in one block so register allocation only sees IEEE values.
+    HVX_Vector sum;
+    asm("%0.qf32 = vadd(%1.sf, %2.sf)\n\t"
+        "%0.sf = %0.qf32"
+        : "=v"(sum)
+        : "v"(tl_hvx_bitcast<HVX_Vector>(a)),
+          "v"(tl_hvx_bitcast<HVX_Vector>(b)));
+    return tl_hvx_bitcast<V>(sum);
+#endif
+  } else if constexpr (K == TL_REDUCE_SUM || K == TL_REDUCE_ABSSUM)
     return a + b;
   else if constexpr (K == TL_REDUCE_MAX || K == TL_REDUCE_ABSMAX)
     return __builtin_elementwise_max(a, b);

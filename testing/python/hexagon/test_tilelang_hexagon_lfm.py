@@ -502,9 +502,9 @@ def test_fp16_stages_compute_what_one_process_does(fp16_bundle):
     greedy decode steps, and through forced decode steps: the same tokens,
     and caches and logits within about an fp16 step of each other, where a
     residual or a token that crossed wrong would move them by its whole size.
-    The prefill's are not bit for bit the same: they move by an fp16 step
-    with the order in which its workers leave a barrier, which a stage's
-    kernel changes, as a barrier added to one process's kernel does (#220)."""
+    Distinct stage kernels may round differently. In #220, adding a barrier
+    exposed spilled qfloat temporaries in a Crouton reduction; changing
+    worker order inside the same binary did not reproduce that difference."""
     path = fp16_bundle("lfm3")
     c = Config.from_dict(bundle.read_header(path)["config"])
     torch.manual_seed(7)

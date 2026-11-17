@@ -19,13 +19,18 @@ def dma_copy(src: BufferLikeType, dst: BufferLikeType) -> tirx.PrimExpr:
     Strided regions use 16-bit descriptor fields before v75, 24-bit fields
     thereafter. Wider strides use one 1D descriptor per row or tiled run.
     The program may keep at most 256 descriptors in flight across its groups.
-    Each call is one group of the tile program's DMA queue: its descriptors
-    complete together. Use ``T.dma_wait(n)`` before consuming destinations or
-    overwriting sources; no separate commit is needed. Every tile program owns
-    its queue, which the compiler sizes for the most transfers in flight, and
-    drains it before the program ends. Raw DMA calls must not be mixed with
-    this managed queue. Compiler-generated software pipelines remain
-    unsupported; use explicit prefetch and wait scheduling.
+
+    Each call forms one group of the tile program's DMA queue. Wait for the
+    relevant group with ``T.dma_wait(n)`` before consuming the destination or
+    overwriting the source; no separate commit is needed. The compiler sizes
+    the queue for its maximum in-flight descriptors and groups. The queue is
+    drained when the tile program exits.
+
+    Explicit ``T.dma_copy`` uses a manual schedule. Eligible ``T.copy``
+    operations can instead use compiler-generated DMA scheduling in
+    ``T.Pipelined``. A PrimFunc cannot combine explicit ``T.dma_copy`` with a
+    software-pipeline-annotated loop, even when they occur in separate loops.
+    Explicit submissions must stay outside parallel and vectorized loops.
     """
     src, dst = _normalize_copy_regions(src, dst)
     if isinstance(src, tirx.BufferLoad) and isinstance(dst, tirx.BufferLoad):

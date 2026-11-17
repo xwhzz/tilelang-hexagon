@@ -493,6 +493,49 @@ TL_DEVICE void tl_gemm_dot_leaf4(HVX_Vector out[2][R], const TA *__restrict__ A,
   }
 }
 
+// Keep the full-row leaf independent of the partial-cache remainder loop.
+template <int LdB>
+TL_DEVICE void tl_gemm_dot_leaf_cached_a(HVX_Vector out[1],
+                                         const HVX_Vector (&a)[16],
+                                         const half *__restrict__ B) {
+  using V = tl_gemm_operand<half>;
+  V::acc acc[2] = {V::zero(), V::zero()};
+#pragma clang loop unroll(full)
+  for (int kc = 0; kc < 16; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    V::mac(acc[0], a[kc], b0);
+    V::mac(acc[1], a[kc], b1);
+  }
+  out[0] = tl_gemm_merge(V::sums(acc[0]), V::sums(acc[1]));
+}
+#endif
+
+#if __HVX_ARCH__ == 73
+template <int Cached, int LdB>
+TL_DEVICE void tl_gemm_dot_leaf_cached_a(HVX_Vector out[1],
+                                         const HVX_Vector (&a)[Cached],
+                                         const half *__restrict__ A,
+                                         const half *__restrict__ B) {
+  using V = tl_gemm_operand<half>;
+  V::acc acc[2] = {V::zero(), V::zero()};
+#pragma clang loop unroll(full)
+  for (int kc = 0; kc < Cached; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    V::mac(acc[0], a[kc], b0);
+    V::mac(acc[1], a[kc], b1);
+  }
+#pragma clang loop unroll(disable)
+  for (int kc = Cached; kc < 16; ++kc) {
+    HVX_Vector b0 = tl_hvx_load<true>(B + kc * 64);
+    HVX_Vector b1 = tl_hvx_load<true>(B + LdB + kc * 64);
+    HVX_Vector av = tl_hvx_load<true>(A + kc * 64);
+    V::mac(acc[0], av, b0);
+    V::mac(acc[1], av, b1);
+  }
+  out[0] = tl_gemm_merge(V::sums(acc[0]), V::sums(acc[1]));
+}
 #endif
 
 // The outputs [0, Outs), Outs <= 32, of rows r < R of C: pairs of outputs
@@ -513,40 +556,111 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
     // Adds subtree v of two outputs, the g-th: it merges with the pending
     // subtrees of the heights that g's trailing one bits count.
     auto push = [&level](HVX_Vector *v, int g) {
-      int h = 1;
-      for (; g & 1; g >>= 1, ++h) {
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
+      // Same binary merge tree, exposing each pending subtree's fixed level.
+      if constexpr ((__HVX_ARCH__ == 79 && std::is_same_v<TA, half> && R == 2 &&
+                     K == 1024 && RowsA && RowsB && Outs == 32) ||
+                    (__HVX_ARCH__ == 73 && std::is_same_v<TA, float> &&
+                     R == 2 && K == 64 && RowsA && RowsB && Outs == 32)) {
+        if (!(g & 1)) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            level[r][1] = v[r];
+        } else {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            v[r] = tl_gemm_merge(level[r][1], v[r]);
+          if (!(g & 2)) {
+#pragma clang loop unroll(full)
+            for (int r = 0; r < R; ++r)
+              level[r][2] = v[r];
+          } else {
+#pragma clang loop unroll(full)
+            for (int r = 0; r < R; ++r)
+              v[r] = tl_gemm_merge(level[r][2], v[r]);
+            if (!(g & 4)) {
+#pragma clang loop unroll(full)
+              for (int r = 0; r < R; ++r)
+                level[r][3] = v[r];
+            } else {
+#pragma clang loop unroll(full)
+              for (int r = 0; r < R; ++r)
+                v[r] = tl_gemm_merge(level[r][3], v[r]);
+              if (!(g & 8)) {
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  level[r][4] = v[r];
+              } else {
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  v[r] = tl_gemm_merge(level[r][4], v[r]);
+#pragma clang loop unroll(full)
+                for (int r = 0; r < R; ++r)
+                  level[r][5] = v[r];
+              }
+            }
+          }
+        }
+      } else
+#endif
+      {
+        int h = 1;
+        for (; g & 1; g >>= 1, ++h) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r)
+            v[r] = tl_gemm_merge(level[r][h], v[r]);
+        }
 #pragma clang loop unroll(full)
         for (int r = 0; r < R; ++r)
-          v[r] = tl_gemm_merge(level[r][h], v[r]);
+          level[r][h] = v[r];
       }
-#pragma clang loop unroll(full)
-      for (int r = 0; r < R; ++r)
-        level[r][h] = v[r];
     };
     HVX_Vector v[R];
-#if __HVX_ARCH__ == 79
-    // A full two-row tile benefits from sharing A across four output columns.
-    // One-row and partial-output tiles retain the existing G2 schedule.
-    if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
+    if constexpr (std::is_same_v<TA, half> && R == 1 && K == 1024 && RowsA &&
                   RowsB && Outs == 32) {
-      HVX_Vector pairs[2][R];
+      // The SDK's longer product live ranges spill a full A row on v73;
+      // eight cached vectors fit there, while v79 keeps all sixteen.
+      constexpr int Cached = __HVX_ARCH__ == 73 ? 8 : 16;
+      HVX_Vector cached_a[Cached];
+#pragma clang loop unroll(full)
+      for (int kc = 0; kc < Cached; ++kc)
+        cached_a[kc] = tl_hvx_load<true>(A + kc * 64);
 #pragma clang loop unroll(disable)
-      for (int g = 0; g < Outs / 4; ++g) {
-        tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
-                                                            B + 4 * g * LdB);
-        push(pairs[0], 2 * g);
-        push(pairs[1], 2 * g + 1);
+      for (int g = 0; g < Outs / 2; ++g) {
+#if __HVX_ARCH__ == 79
+        tl_gemm_dot_leaf_cached_a<LdB>(v, cached_a, B + 2 * g * LdB);
+#else
+        tl_gemm_dot_leaf_cached_a<Cached, LdB>(v, cached_a, A, B + 2 * g * LdB);
+#endif
+        push(v, g);
       }
     } else
 #endif
-    {
+#if __HVX_ARCH__ == 79
+      // A full two-row tile benefits from sharing A across four output columns.
+      // Full one-row tiles use the cache above; partial tiles retain G2.
+      if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
+                    RowsB && Outs == 32) {
+        HVX_Vector pairs[2][R];
+        // Pair output groups without changing the K accumulation order.
+#pragma clang loop unroll_count(2)
+        for (int g = 0; g < Outs / 4; ++g) {
+          tl_gemm_dot_leaf4<TA, R, K, LdA, LdB, RowsA, RowsB>(pairs, A,
+                                                              B + 4 * g * LdB);
+          push(pairs[0], 2 * g);
+          push(pairs[1], 2 * g + 1);
+        }
+      } else
+#endif
+      {
 #pragma clang loop unroll(disable)
-      for (int g = 0; g < Outs / 2; ++g) {
-        tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(v, A,
-                                                              B + 2 * g * LdB);
-        push(v, g);
+        for (int g = 0; g < Outs / 2; ++g) {
+          tl_gemm_dot_leaf<TA, R, 2, K, LdA, LdB, RowsA, RowsB>(
+              v, A, B + 2 * g * LdB);
+          push(v, g);
+        }
       }
-    }
     if constexpr (Outs % 2 != 0) {
       tl_gemm_dot_leaf<TA, R, 1, K, LdA, LdB, RowsA, RowsB>(
           v, A, B + (Outs - 1) * LdB);

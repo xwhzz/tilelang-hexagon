@@ -251,7 +251,12 @@ SCALAR_TILE_STORE = re.compile(r"\(\(half\*\)tiles\)\[[^\]]*\] =")
 def test_maps_over_crouton_tiles_use_whole_registers():
     source = _source(_map("activation", "float16"))
     # One register per row pair, in loops over tiles and their row pairs.
-    assert re.search(r"\*\(half64\*\)\(\(\(half\*\)tiles\) \+ \(\(i\w* \* 1024\) \+ \(j\w* \* 64\)\)\) = ", source)
+    row = re.search(r"half\* (\w+) = \(\(half\*\)tiles\) \+ \((\w+) \* 1024\);", source)
+    assert row, source
+    pointer, tile = row.groups()
+    row_loop = source.index("for (int32_t j_lane = 0; j_lane < 16;", row.end())
+    assert source.index(f"for (int32_t {tile} = 0;") < row.start() < row_loop
+    assert f"*(half64*)({pointer} + (j_lane * 64)) = " in source[row_loop:]
     # The rows' values: a tile's 32 rows in one register, two of them per row
     # pair. The columns' values: 32 elements, each repeated twice.
     assert "half64 u_lanes = tl_hvx_load_lanes<64>((&(((half*)u)[" in source
@@ -453,6 +458,46 @@ def test_reductions_of_crouton_tiles_are_one_call():
     # The rows of a transposed layout's buffer are the matrix's columns.
     source = _source(_reduce("activation_t", "max", 1, "float16"))
     assert "tl_crouton_reduce<TL_REDUCE_MAX, half, false, false>(" in source
+
+
+@DEVICE
+def test_crouton_sum_preserves_zero_and_v79_exact_sums():
+    import numpy as np
+    import torch
+    from tilelang.hexagon.target import hexagon_arch
+
+    target = determine_target("hexagon", return_object=True)
+    kernel = tilelang.compile(_reduce("activation", "sum", 1, "float32", (64, 128)), out_idx=[1], target=target)
+    try:
+        zero = np.zeros((64, 128), dtype=np.float16)
+        actual = kernel(torch.from_numpy(zero)).cpu().numpy()
+        np.testing.assert_array_equal(actual.view(np.uint32), np.zeros(64, dtype=np.uint32))
+        # Legacy v73/v75 Qfloat uses Von Neumann rounding, not IEEE nearest-even.
+        # The nonzero exact-rounding cases below are tested only on v79.
+        if hexagon_arch(target) != "v79":
+            return
+        rng = np.random.default_rng(220)
+        scores = rng.uniform(-8, 0, size=(64, 128))
+        p = np.exp(scores - scores.max(axis=1, keepdims=True))
+        p /= p.sum(axis=1, keepdims=True)
+        counts = np.stack([rng.multinomial(8192, row) for row in p])
+        assert counts.max() <= 2048
+        # All values and all positive partial sums are exactly representable.
+        probabilities = (counts / 8192).astype(np.float16)
+        masked = probabilities.copy()
+        for row in range(64):
+            masked[row, (row * 3) % 129 :] = 0
+            if row % 7 == 0:
+                masked[row] = 0
+        tie = zero.copy()
+        tie[:, 0] = 1
+        tie[:, 64] = np.array([1], dtype=np.uint16).view(np.float16)[0]
+        for values in (probabilities, masked, tie):
+            reference = values.astype(np.float64).sum(axis=1).astype(np.float32)
+            actual = kernel(torch.from_numpy(values)).cpu().numpy()
+            np.testing.assert_array_equal(actual.view(np.uint32), reference.view(np.uint32))
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE
