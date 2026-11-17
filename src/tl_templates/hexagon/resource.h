@@ -9,9 +9,6 @@
 #include <tl_templates/hexagon/common.h>
 #include <tl_templates/hexagon/vtcm.h>
 
-#define TL_RESOURCE_QUANTUM_TICKS                                              \
-  192000u // 10 ms trigger, not a response bound.
-
 struct tl_resource_worker {
   qurt_thread_t tid;
   unsigned entered;
@@ -26,7 +23,6 @@ struct tl_cooperative_run {
   uint8_t *region;
   uint8_t *shadow;
   unsigned bytes;
-  uint64_t lease_tick;
   tl_resource_worker worker[QURT_MAX_HTHREAD_LIMIT];
 
   // Session lifetime fields. They are never memset at a Run boundary.
@@ -221,7 +217,6 @@ static inline int tl_resource_owner_yield(tl_cooperative_run *run,
         __atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE) != 0);
   if (tl_vtcm_base_ptr != run->region || tl_vtcm_total != run->bytes)
     return tl_resource_fail(run, TL_ERR_RESOURCE, true);
-  run->lease_tick = HAP_perf_get_qtimer_count();
   return TL_OK;
 }
 
@@ -313,8 +308,6 @@ static inline int tl_resource_prepare(bool cooperative) {
       rc = tl_resource_fail(
           run, TL_ERR_VTCM,
           __atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE) != 0);
-    if (!rc)
-      run->lease_tick = HAP_perf_get_qtimer_count();
   }
   if (rc) {
     tl_resource_close_admission(run);

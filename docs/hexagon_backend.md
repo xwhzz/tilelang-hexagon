@@ -218,9 +218,10 @@ starts if its workers cannot all run together.
 a positive constant grid and uniform checkpoint control flow. `cooperative.h`
 coordinates DMA quiescence, VTCM snapshots and same-thread HMX unlock/relock;
 `resource.h` owns callback admission, the cached context and checked cleanup.
-The callback only publishes a request. The group handles it at a checkpoint;
-a 10 ms lease-age trigger also requests a yield there. Both paths preserve the
-arena before release and restore it before computation resumes. See the
+The callback only publishes a request. The group handles a pending request at a
+checkpoint, preserving the arena before release and restoring it before
+computation resumes. Without a pending request, the checkpoint remains a group
+barrier and does not release resources or drain DMA. See the
 [DSL guide](hexagon_dsl_kernels.md) for checkpoint placement and limitations.
 
 ---

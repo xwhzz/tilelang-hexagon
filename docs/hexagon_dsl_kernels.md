@@ -379,7 +379,7 @@ change; data other programs read after the barrier must be complete before it.
 
 Long kernels can opt into resource checkpoints with
 `T.Kernel(..., cooperative=True)`. At an existing `T.sync_grid()`, a pending SDK
-release request or an elapsed 10 ms lease triggers a collective yield: all
+release request triggers a collective yield: all
 workers finish their DMA, save the actual VTCM arena to DDR, unlock HMX on their
 own threads, release and reacquire the cached resource context, restore VTCM,
 and resume. Numerical code and DDR state are not restarted. The DDR snapshot
@@ -393,9 +393,11 @@ memory-dependent conditions, or unbounded loops. Place checkpoints after complet
 GEMM operations; live hardware accumulators and arbitrary resource operations in
 external C code are outside this contract.
 
-The 10 ms value is a trigger checked at safe points, not a preemption deadline:
-a long interval between checkpoints delays release. A checkpoint that does not
-yield keeps the ordinary barrier's DMA semantics, so explicit `T.dma_wait()`
+There is no periodic yield without a pending request. The SDK requires calling
+release within 5 ms of receiving its callback; checkpoint placement must leave
+time for DMA completion, the VTCM snapshot and HMX unlock before release. A long
+interval between checkpoints can miss that requirement. A checkpoint that does
+not yield keeps the ordinary barrier's DMA semantics, so explicit `T.dma_wait()`
 calls remain necessary before consuming asynchronous copies. A Session may mix
 ordinary and cooperative kernels; resource context modes switch at Run boundaries.
 Ownership or cleanup failures return an error rather than reporting successful

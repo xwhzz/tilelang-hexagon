@@ -125,9 +125,7 @@ static inline int tl_cooperative_checkpoint(int32_t worker, DMA &dma) {
     // cannot race a slot initializer or be overtaken by two generations.
     group->slots[(epoch + 1u) & 1u] = {epoch + 1u, TL_CP_WAIT, 0u, 0u};
     slot.requests = tl_resource_request_snapshot(run);
-    slot.yield = tl_resource_request_pending(run) ||
-                 HAP_perf_get_qtimer_count() - run->lease_tick >=
-                     TL_RESOURCE_QUANTUM_TICKS;
+    slot.yield = tl_resource_request_pending(run);
     unsigned expected = TL_CP_WAIT;
     __atomic_compare_exchange_n(&slot.state, &expected,
                                 tl_resource_error(run) ? TL_CP_ABORTED
