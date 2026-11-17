@@ -139,6 +139,11 @@ def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb,
     for pb in T.serial(T.ceildiv(pos + 1, POS_BLOCK)):
         T.copy(kv_k[ai, kvh, pb * POS_BLOCK : (pb + 1) * POS_BLOCK, :], kb)
         T.copy(kv_v[ai, kvh, pb * POS_BLOCK : (pb + 1) * POS_BLOCK, :], vb)
+        # Only the final partial block has invalid V rows. Clear the local
+        # copy before PV so previous cache contents cannot enter the GEMM.
+        if (pb + 1) * POS_BLOCK > pos + 1:
+            for j, d in T.Parallel(POS_BLOCK, 64):
+                vb[j, d] = T.if_then_else(pb * POS_BLOCK + j <= pos, vb[j, d], T.float32(0))
         T.gemm(qg, kb, sc, transpose_B=True, clear_accum=True)
         for g, j in T.Parallel(group, POS_BLOCK):
             sc[g, j] = T.if_then_else(pb * POS_BLOCK + j <= pos, sc[g, j], T.float32(-3.0e38))
