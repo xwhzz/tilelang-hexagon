@@ -556,10 +556,12 @@ TL_DEVICE void tl_gemm_dot(TC *__restrict__ C, const TA *__restrict__ A,
     // Adds subtree v of two outputs, the g-th: it merges with the pending
     // subtrees of the heights that g's trailing one bits count.
     auto push = [&level](HVX_Vector *v, int g) {
-#if __HVX_ARCH__ == 79
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 79
       // Same binary merge tree, exposing each pending subtree's fixed level.
-      if constexpr (std::is_same_v<TA, half> && R == 2 && K == 1024 && RowsA &&
-                    RowsB && Outs == 32) {
+      if constexpr ((__HVX_ARCH__ == 79 && std::is_same_v<TA, half> && R == 2 &&
+                     K == 1024 && RowsA && RowsB && Outs == 32) ||
+                    (__HVX_ARCH__ == 73 && std::is_same_v<TA, float> &&
+                     R == 2 && K == 64 && RowsA && RowsB && Outs == 32)) {
         if (!(g & 1)) {
 #pragma clang loop unroll(full)
           for (int r = 0; r < R; ++r)

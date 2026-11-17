@@ -246,14 +246,31 @@ def test_gemms_match_torch(M, N, K, c_dtype, trans_a, trans_b):
 @pytest.mark.parametrize("trans_a, trans_b", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("M, N, K", [(1, 256, 96), (7, 70, 45), (32, 96, 64)])
 def test_fp32_gemms_match_torch(M, N, K, trans_a, trans_b):
-    _check(_gemm(M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b), M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b)
+    _check(
+        _gemm(M, N, K, ab="float32", trans_a=trans_a, trans_b=trans_b, clear="first"),
+        M,
+        N,
+        K,
+        ab="float32",
+        trans_a=trans_a,
+        trans_b=trans_b,
+    )
 
 
 @DEVICE
 @pytest.mark.parametrize("trans_b", [False, True])
-@pytest.mark.parametrize("c_dtype", ["float32", "float16"])
-def test_k_loops_accumulate_across_calls(c_dtype, trans_b):
-    _check(_gemm(2, 160, 512, 128, c_dtype=c_dtype, trans_b=trans_b), 2, 160, 512, c_dtype=c_dtype, trans_b=trans_b, calls=4)
+@pytest.mark.parametrize("ab, c_dtype, block_k", [("float16", "float32", 128), ("float16", "float16", 128), ("float32", "float32", 64)])
+def test_k_loops_accumulate_across_calls(ab, c_dtype, block_k, trans_b):
+    _check(
+        _gemm(2, 160, 512, block_k, ab=ab, c_dtype=c_dtype, trans_b=trans_b),
+        2,
+        160,
+        512,
+        ab=ab,
+        c_dtype=c_dtype,
+        trans_b=trans_b,
+        calls=512 // block_k,
+    )
 
 
 def _long_dot_region(M, N, ldb, offset, c_dtype, clear, lda=1024, a_offset=0):
