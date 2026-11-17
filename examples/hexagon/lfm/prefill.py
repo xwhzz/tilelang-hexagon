@@ -9,9 +9,11 @@ workers share (``global.vtcm``):
 - the normalized input a that a layer's GEMMs multiply;
 - the operator's output, or a part of the FFN's hidden units.
 
-The layers are one loop at run time, which reads each layer's kind and its
-index among the layers of that kind from a table (``kinds``), so the code does
-not grow with the depth. Each worker multiplies the decode's share of every
+The layers share one loop at run time and a table (``kinds``) of their kinds
+and indices within each kind. Cooperative mode specializes layer selection to
+the Config so every worker follows the same checkpoint path; both table columns
+must match that Config, as Decoder constructs them. Ordinary mode reads the
+layer kind from the table. Each worker multiplies the decode's share of every
 projection's output channels, its blocks streamed by DMA through one ring
 (``Stream``): a layer's operator (the short conv or attention), then its
 output projection and its FFN. Each block is one ``T.gemm_blockscaled`` on HMX
@@ -46,6 +48,7 @@ from types import SimpleNamespace
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 from tilelang.hexagon.target import hexagon_arch
+from tvm import tirx
 from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -95,7 +98,9 @@ def make_prefill(
     staged FP32 rows and pack. Pass the same target to the factory and compiler
     to enable the qualified v79 large-width direct-store path. Cooperative
     resource checkpoints preserve VTCM while letting other DSP clients run
-    during a long prefill."""
+    during a long prefill. In cooperative mode, `kinds[layer]` must contain
+    `[int(c.is_attention(layer)), index_within_that_kind]`; layer selection is
+    specialized to c, and Decoder builds this matching table."""
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, HD = c.dim, c.ff, c.head_dim
     target = target if target is None or isinstance(target, Target) else Target(target)
@@ -127,6 +132,12 @@ def make_prefill(
 
     def clamped(index, count: int):
         return T.max(T.min(index, max(count, 1) - 1), 0)
+
+    def attention_layer(layer, kinds):
+        if not cooperative:
+            return kinds[layer, 0] == 1
+        # Same Config used by Decoder to create kinds; keep its compact loop.
+        return tirx.any(*(layer == i for i in attn_layers)) if attn_layers else False
 
     def scale_shape(w, block, group_):
         L_, S_, N_, C_ = w
@@ -283,6 +294,8 @@ def make_prefill(
                     for i, d in T.Parallel(R, HD):
                         bf.acc_o[hq, i, d] = bf.acc_o[hq, i, d] * bf.alpha[i]
                     T.gemm(bf.p, bf.vblk, bf.acc_o[hq, :, :], clear_accum=False)
+                if cooperative:
+                    T.sync_grid()
             for hq in T.serial(group):
                 for i in T.Parallel(R):
                     bf.alpha[i] = T.float32(1) / bf.ls[hq, i]
@@ -460,7 +473,7 @@ def make_prefill(
                     st_rest = Stream(rest, DEPTH, rings=rings)
                     normalize(bf, op_norm[layer, :])
                     T.sync_grid()
-                    if kinds[layer, 0] == 1:
+                    if attention_layer(layer, kinds):
                         st_attn.prologue()
                         st_attn.run(0, lambda b, rw, rs, k, ai=ai: q_block(bf, b, rw, rs, k, ai))
                         st_attn.run(1, lambda b, rw, rs, k, ai=ai, base=base: kv_block(bf, b, rw, rs, k, ai, base, False))

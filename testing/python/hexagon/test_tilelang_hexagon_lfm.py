@@ -609,16 +609,21 @@ def test_fp16_prefill_from_decode_steps_wraps_the_ring(fp16_bundle):
         decoder.close()
 
 
-def test_prefill_is_one_loop_over_the_layers(tiny_bundle):
+@pytest.mark.parametrize("arch", ("v73", "v75", "v79"))
+@pytest.mark.parametrize("cooperative", (False, True))
+def test_prefill_is_one_loop_over_the_layers(tiny_bundle, arch, cooperative):
     c, _, _, path = tiny_bundle
     header = bundle.read_header(path)
     shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
-    ((_, source, _, _),) = lower_kernels([(make_prefill(c, shapes, 128, 256, 64), [])])
+    target = determine_target({"kind": "hexagon", "mcpu": f"hexagon{arch}"}, return_object=True)
+    options = {} if cooperative else {"cooperative": False}
+    ((_, source, _, _),) = lower_kernels([(make_prefill(c, shapes, 128, 256, 64, target=target, **options), [])], target=target)
     # A loop at run time, whatever the depth; the projections are calls of
     # the HMX GEMM, and the kernel's own pass configs give it fast math.
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm_blockscaled<" in source
     assert "tl_hvx_exp2_fast(" in source and "tl_hvx_exp2(" not in source
+    assert ("#define TL_HEXAGON_USES_COOPERATIVE 1" in source) is cooperative
     _assert_prefill_norm_path(source)
 
 
