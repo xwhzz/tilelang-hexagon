@@ -6,10 +6,11 @@ measured on the device; what was tried and did not help; where the time goes
 now; and what is left. The [README](README.md) describes the kernels as they
 are.
 
-All numbers are from the v79 cDSP of a Snapdragon 8 Elite (SM8750) phone,
-batch 1, with the bundle of #106 (4-bit projections with an fp16 scale per 64
-columns, an 8-bit tied head: 685.2 MB streamed a token). The DSP runs at about
-2.06 GHz under a session's clock vote. MB and GB are 10^6 and 10^9 bytes.
+Unless noted otherwise, numbers are from the v79 cDSP of a Snapdragon 8 Elite
+(SM8750) phone, batch 1, with the bundle of #106 (4-bit projections with an
+fp16 scale per 64 columns, an 8-bit tied head: 685.2 MB streamed a token). The
+DSP runs at about 2.06 GHz under a session's clock vote. MB and GB are 10^6 and
+10^9 bytes.
 "#N" is a pull request of this repository.
 
 ## Where it stands
@@ -317,6 +318,42 @@ The first four steps are #189's.
 | the residual adds' batches in pairs, so that each loop's slot is a constant; the sandwich scales as vectors (#197) | 248.8 ms |
 | the KV cache and the queries write-through: written back as they are written, so that their DMA loads skip the writeback (`T.annotate_write_through`, #201) | 246.8 ms |
 
+### LFM3: dynamic ring-slot addressing
+
+#197 paired residual batches to give each vector loop a constant slot offset,
+reducing that phase from 16.0M to 12.2M cycles per worker. [#261](https://github.com/xwhzz/tilelang-hexagon/pull/261)
+moves invariant row and slot offsets into pointers before eligible contiguous,
+aligned vector loops. The prefill now uses one batch loop with `slot = batch % 2`,
+keeping the same buffer aliasing information and DMA wait/copy order.
+
+In the current sandwich residual map, each batch adds scaled branch outputs
+to four rows of 2048 floats and writes their squares for the next norm. On
+v79, hoisting the row pointers removes three `or` and three `addasl`
+instructions per vector from the software-pipelined loop. The resident map's
+cycle changes are:
+
+| Dynamic map, before → after | 1 worker | 4 workers |
+|---|---:|---:|
+| v79 phone | -23.86% | -12.10% |
+| v73 Linux board | +0.207% | -0.350% |
+
+Negative values mean fewer cycles. After hoisting, the dynamic and manually
+paired forms perform alike within same-function variation on v79. On v73,
+the paired form costs 16.29% more cycles than the dynamic form with four
+workers.
+
+Complete tiny-LFM3 prefill at 128/256 tokens is unchanged within measurement
+variation on v79. On v73, replacing the old paired form with the new dynamic
+form reduces median cycles by 1.61%/1.12%; all six rounds favor the change,
+while some balanced blocks overlap the same-function controls. KV, convolution
+state and prefill residual outputs pass the CPU-reference checks on both targets,
+including the partial second chunk at 200 tokens.
+
+These comparisons use normal SDK `-O2` builds, matched kernels in one module
+and six alternating rounds with same-function controls. The resident map's
+timer covers its loop and final synchronization; the complete prefill timer
+also includes DMA and worker dispatch/join. RPC is outside both intervals.
+
 ### LFM3: where the prefill's time goes
 
 pp1024, a copy of the kernel with `HAP_perf_get_pcycles` marks after each
@@ -374,23 +411,6 @@ On the same v79 phone, `bench.py` tg128 at depth 130816 goes from 6.46 to
 - **DMA and the L2.** Transfers bypass the DSP's L2. Through it, 4 workers'
   DMA loads read DDR at 30 GB/s, against 50 bypassing it, whatever the block
   size (16-128 KB) or the transfers in flight (1-4) (#195).
-- **Ring-slot addressing.** Historically, paired batches reduced the residual
-  add phase from 16.0M to 12.2M cycles per worker (#197). Both versions were
-  software-pipelined with initiation interval 6; an earlier probe also changed
-  the buffers' aliasing promises and did not isolate the slot offset.
-  A controlled v79 add-and-square map with the current sandwich scaling
-  (4 rows of 2048 floats, identical exclusive buffers) reproduced extra scalar
-  address work in the dynamic-slot loop: three `or` and three `addasl`
-  instructions per vector. Explicit row pointers before the column loop remove
-  those instructions. The backend now emits these pointers for eligible
-  contiguous vector loops, and the prefill can alternate slots directly.
-  Six-round A/B measurements reduced this resident map's cycles by 23.86%
-  with one worker and 12.10% with four. Complete tiny-LFM3 prefill comparisons
-  at 128/256 tokens detected no overall speed change beyond A/A variation;
-  the map result is not an end-to-end speedup. KV, convolution state and the
-  prefill residual boundary passed the reference checks, including a partial
-  second chunk at 200 tokens. v73 SDK compilation passes; board correctness
-  and performance remain unverified (#204).
 - **Write once, read many.** A DMA load from memory the DSP wrote writes the
   lines back first, every time. The KV cache, written once and read by every
   later block of queries, now writes them back once, as it is written
