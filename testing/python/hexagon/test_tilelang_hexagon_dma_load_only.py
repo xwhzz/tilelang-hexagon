@@ -332,6 +332,10 @@ def dma_host(request, tmp_path_factory):
         "single-group-multiple-slots",
         "single-slot-uncommitted-drain",
         "single-slot-multiple-groups",
+        "checked-finish",
+        "checked-finish-error",
+        "checked-finish-counter",
+        "checked-finish-foreign-busy",
     ],
 )
 def test_actual_header_preserves_load_order_and_cleanup(dma_host, case):

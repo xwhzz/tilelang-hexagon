@@ -592,6 +592,8 @@ void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
     os << "#define TL_HEXAGON_USES_HMX 1\n";
   if (uses_vtcm_)
     os << "#define TL_HEXAGON_USES_VTCM 1\n";
+  if (uses_cooperative_)
+    os << "#define TL_HEXAGON_USES_COOPERATIVE 1\n";
   for (const std::string &header : headers_)
     os << "#include <tl_templates/hexagon/" << header << ">\n";
   os << "\n";
@@ -716,6 +718,7 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
   exclusive_params_.clear();
 
   dma_in_scope_ = false;
+  in_cooperative_ = false;
   dma_load_only_ = false;
   in_dma_program_ = false;
   auto target = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -728,7 +731,8 @@ void CodeGenTileLangHexagon::AddFunction(const PrimFunc &f) {
       HasOnlyManagedDMACalls(f->body);
   // Names the runtime calls bind; reserve them before the parameters so no
   // parameter can take them.
-  for (const char *name : {"tl_dma_async", "tl_status", "tl_arena"})
+  for (const char *name :
+       {"tl_dma_async", "tl_cooperative_dma", "tl_status", "tl_arena"})
     name_supply_->ReserveName(name);
 
   for (size_t i = 0; i < f->params.size(); ++i) {
@@ -798,6 +802,15 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   std::string extent = PrintExpr(op->extent);
   bool hmx = UsesHMX(op->body);
   bool grid_sync = UsesGridSync(op->body);
+  bool cooperative = false;
+  if (auto value = op->annotations.Get(tl::attr::kHexagonCooperative))
+    cooperative = value->cast<Integer>()->value != 0;
+  if (cooperative) {
+    ICHECK(grid_sync) << "Cooperative launch lost its checkpoints";
+    headers_.insert("cooperative.h");
+    uses_cooperative_ = true;
+    uses_vtcm_ = true;
+  }
   headers_.insert(hmx ? "hmx.h" : "worker.h");
   // The status is a declaration, not an if condition: hexagon-clang 19
   // asserts on a #pragma (InterleaveMaps' unroll counts) inside a lambda that
@@ -806,8 +819,13 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   stream << "{\n";
   int block = BeginScope();
   PrintIndent();
-  stream << "int32_t tl_status = tl_parallel_for";
-  if (hmx || grid_sync) {
+  stream << "int32_t tl_status = ";
+  if (cooperative) {
+    stream << "tl_cooperative_parallel_for<" << (hmx ? "true" : "false") << ">";
+  } else {
+    stream << "tl_parallel_for";
+  }
+  if (!cooperative && (hmx || grid_sync)) {
     stream << '<' << (hmx ? "tl_hmx_worker_scope" : "tl_worker_scope");
     stream << (grid_sync ? ", true>" : ">");
   }
@@ -829,6 +847,7 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   stream << " -> int32_t {\n";
   int scope = BeginScope();
   in_worker_ = true;
+  in_cooperative_ = cooperative;
   worker_program_ = op->loop_var;
   auto outer = BindOuterVars(op);
   PrintStmt(op->body);
@@ -837,6 +856,7 @@ void CodeGenTileLangHexagon::PrintWorkerLoop(const ForNode *op) {
   for (const auto &[var, id] : outer)
     var_idmap_[var] = id;
   in_worker_ = false;
+  in_cooperative_ = false;
   worker_program_ = std::nullopt;
   EndScope(scope);
   PrintIndent();
@@ -931,6 +951,18 @@ void CodeGenTileLangHexagon::VisitStmt_(const AllocBufferNode *op) {
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
   if (op->annotations.count(tirx::attr::kVolatile))
     vector_row_exclusions_.insert(op->buffer->data);
+}
+
+void CodeGenTileLangHexagon::VisitStmt_(const BindNode *op) {
+  CodeGenC::VisitStmt_(op);
+  const auto *call = op->value.as<CallNode>();
+  if (in_cooperative_ && call &&
+      call->op.same_as(tl::hexagon_exclusive_pointer())) {
+    // A checkpoint accesses the whole arena through its base. Publish each
+    // otherwise-exclusive slice so LLVM retains accesses across that call.
+    PrintIndent();
+    stream << "tl_escape(" << GetVarID(op->var.get()) << ");\n";
+  }
 }
 
 void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
@@ -1034,9 +1066,13 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
     // a launch of one program has nothing to wait for.
     if (worker_program_) {
       PrintIndent();
-      stream << "if (int32_t tl_status = tl_grid_sync("
-             << GetVarID(worker_program_.value().get())
-             << ")) return tl_status;\n";
+      stream << "if (int32_t tl_status = "
+             << (in_cooperative_ ? "tl_cooperative_checkpoint("
+                                 : "tl_grid_sync(")
+             << GetVarID(worker_program_.value().get());
+      if (in_cooperative_ && dma_in_scope_)
+        stream << ", tl_dma_async";
+      stream << ")) return tl_status;\n";
     }
     return;
   }
@@ -1051,6 +1087,12 @@ void CodeGenTileLangHexagon::VisitStmt_(const EvaluateNode *op) { // NOLINT(*)
                               : "tl_hexagon_dma_async_context<")
            << descriptors->value << ", " << groups->value
            << "> tl_dma_async;\n";
+    if (in_cooperative_) {
+      PrintIndent();
+      stream << "tl_cooperative_dma_scope<decltype(tl_dma_async)> "
+                "tl_cooperative_dma(tl_dma_async, "
+             << GetVarID(worker_program_.value().get()) << ");\n";
+    }
     PrintIndent();
     stream << "if (tl_dma_async.status != TL_OK) return TL_ERR_DMA;\n";
     dma_in_scope_ = true;

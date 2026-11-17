@@ -118,14 +118,16 @@ static int tl_vtcm_take() {
   ++opened;
   return 0;
 }
-static void tl_vtcm_give() {
+static int tl_vtcm_give() {
   assert(resources_live && owner == std::this_thread::get_id());
   resources_live = false;
   ++closed;
+  return 0;
 }
-static void tl_vtcm_close() {
+static int tl_vtcm_close() {
   assert(context_live && !resources_live);
   context_live = false;
+  return 0;
 }
 static void tl_power_vote() {
   assert(votes == 0);

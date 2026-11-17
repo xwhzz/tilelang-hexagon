@@ -44,6 +44,7 @@ bool IsGridBinding(const ForNode *loop) {
 class NumWorkersExtractor : public StmtMutator {
 public:
   Optional<Integer> NumWorkers() const { return num_workers_; }
+  bool Cooperative() const { return cooperative_; }
 
 private:
   Stmt VisitStmt_(const ForNode *op) final { return GetRef<Stmt>(op); }
@@ -52,21 +53,30 @@ private:
     if (!IsDeviceMainBlock(op))
       return GetRef<Stmt>(op);
     auto value = op->annotations.Get(attr::kHexagonNumWorkers);
-    if (!value)
-      return GetRef<Stmt>(op);
-    auto count = value->try_cast<Integer>();
-    ICHECK(count && count.value()->value > 0 &&
-           count.value()->value <= std::numeric_limits<int32_t>::max())
-        << attr::kHexagonNumWorkers
-        << " must be a positive int no greater than 2147483647, got "
-        << value.value();
-    num_workers_ = count.value();
+    if (value) {
+      auto count = value->try_cast<Integer>();
+      ICHECK(count && count.value()->value > 0 &&
+             count.value()->value <= std::numeric_limits<int32_t>::max())
+          << attr::kHexagonNumWorkers
+          << " must be a positive int no greater than 2147483647, got "
+          << value.value();
+      num_workers_ = count.value();
+    }
+    if (auto cooperative = op->annotations.Get(attr::kHexagonCooperative)) {
+      auto enabled = cooperative->try_cast<Integer>();
+      ICHECK(enabled &&
+             (enabled.value()->value == 0 || enabled.value()->value == 1))
+          << attr::kHexagonCooperative << " must be a boolean";
+      cooperative_ = enabled.value()->value != 0;
+    }
     SBlock block = GetRef<SBlock>(op);
     block.CopyOnWrite()->annotations.erase(attr::kHexagonNumWorkers);
+    block.CopyOnWrite()->annotations.erase(attr::kHexagonCooperative);
     return block;
   }
 
   Optional<Integer> num_workers_;
+  bool cooperative_ = false;
 };
 
 // Annotates the T.gemm and T.gemm_blockscaled calls a pool of `workers`
@@ -115,6 +125,8 @@ private:
       if (i == 0 && extractor.NumWorkers())
         node->annotations.Set(attr::kHexagonNumWorkers,
                               extractor.NumWorkers().value());
+      if (i == 0 && extractor.Cooperative())
+        node->annotations.Set(attr::kHexagonCooperative, Integer(1));
       body = loop;
     }
     return body;
@@ -124,7 +136,10 @@ private:
   // nothing to distribute.
   Stmt VisitStmt_(const SBlockNode *op) final {
     NumWorkersExtractor extractor;
-    return extractor(StmtMutator::VisitStmt_(op));
+    Stmt body = extractor(StmtMutator::VisitStmt_(op));
+    ICHECK(!extractor.Cooperative())
+        << "Hexagon cooperative launch requires an explicit grid";
+    return body;
   }
 };
 

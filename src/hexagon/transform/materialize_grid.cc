@@ -142,6 +142,63 @@ bool ContainsGridSync(const Stmt &stmt) {
   return found;
 }
 
+// A cooperative checkpoint is collective even when another worker fails.
+// Reject control flow whose checkpoint sequence can differ by program. Buffer
+// loads are conservatively treated as varying: identical indices alone do not
+// establish that every worker observes the same value.
+class CooperativeControlVerifier : public StmtExprVisitor {
+public:
+  explicit CooperativeControlVerifier(
+      const std::vector<const ForNode *> &grid) {
+    for (const ForNode *loop : grid)
+      varying_.insert(loop->loop_var.get());
+  }
+
+private:
+  bool Uniform(const PrimExpr &expr) const {
+    bool uniform = true;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>())
+        uniform &= varying_.count(var) == 0;
+      if (node.as<BufferLoadNode>() || node.as<CallNode>())
+        uniform = false;
+    });
+    return uniform;
+  }
+
+  void VisitStmt_(const BindNode *op) final {
+    if (!Uniform(op->value))
+      varying_.insert(op->var.get());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    if (ContainsGridSync(GetRef<Stmt>(op)))
+      ICHECK(Uniform(op->condition))
+          << "Hexagon cooperative checkpoints require uniform conditions";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool uniform = Uniform(op->min) && Uniform(op->extent) &&
+                   (!op->step.defined() || Uniform(op->step.value()));
+    if (ContainsGridSync(op->body))
+      ICHECK(uniform)
+          << "Hexagon cooperative checkpoints require uniform loop bounds";
+    if (!uniform)
+      varying_.insert(op->loop_var.get());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    ICHECK(!ContainsGridSync(op->body))
+        << "Hexagon cooperative checkpoints require bounded for loops";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  std::unordered_set<const VarNode *> varying_;
+};
+
 class GridMaterializer : public StmtExprMutator {
 public:
   explicit GridMaterializer(const ProgramUseAnalysis &uses) : uses_(uses) {}
@@ -216,12 +273,27 @@ private:
     int64_t num_workers = 1;
     if (auto value = op->annotations.Get(attr::kHexagonNumWorkers))
       num_workers = value->cast<Integer>()->value;
-    if (num_workers > 1)
+    bool cooperative = false;
+    if (auto value = op->annotations.Get(attr::kHexagonCooperative))
+      cooperative = value->cast<Integer>()->value != 0;
+    if (num_workers > 1 || cooperative)
       CheckGridSize(chain);
-    if (ContainsGridSync(body))
+    bool sync = ContainsGridSync(body);
+    if (cooperative) {
+      ICHECK(sync)
+          << "Hexagon cooperative launch requires T.sync_grid() checkpoints";
+      for (const ForNode *loop : chain) {
+        const auto *extent = loop->extent.as<IntImmNode>();
+        ICHECK(extent && extent->value > 0)
+            << "Hexagon cooperative launch requires a positive constant grid";
+      }
+      CooperativeControlVerifier verify(chain);
+      verify(body);
+    }
+    if (sync)
       CheckCoresident(chain, num_workers);
-    if (num_workers > 1 && !HasSingleIteration(chain))
-      return MakeParallel(chain, body, num_workers);
+    if (cooperative || (num_workers > 1 && !HasSingleIteration(chain)))
+      return MakeParallel(chain, body, num_workers, cooperative);
 
     for (auto it = chain.rbegin(); it != chain.rend(); ++it)
       body = MakeLoop(*it, ForKind::kSerial, body, {});
@@ -309,9 +381,11 @@ private:
   // One parallel loop over the linearized index of `chain`, which rebinds
   // each grid variable from it.
   Stmt MakeParallel(const std::vector<const ForNode *> &chain, Stmt body,
-                    int64_t num_workers) {
+                    int64_t num_workers, bool cooperative) {
     Map<String, Any> annotations;
     annotations.Set(attr::kHexagonNumWorkers, Integer(num_workers));
+    if (cooperative)
+      annotations.Set(attr::kHexagonCooperative, Integer(1));
     const ForNode *head = chain.front();
     if (chain.size() == 1)
       return MakeLoop(head, ForKind::kParallel, body, annotations);

@@ -190,16 +190,29 @@ def test_fp16_bundle_holds_the_weights(tiny_lfm3_bundle):
         assert torch.equal(convert.embedding(head, token, c.dim), w["model.embed_tokens.weight"][token].half())
 
 
-def test_decode_is_one_cycle_of_phases(tiny_bundle):
+@pytest.mark.parametrize("arch", ("v73", "v75", "v79"))
+@pytest.mark.parametrize("cooperative", (False, True))
+def test_decode_is_one_cycle_of_phases(tiny_bundle, arch, cooperative):
     c, _, _, path = tiny_bundle
     header = bundle.read_header(path)
     shapes = {k: tuple(v["shape"]) for k, v in header["tensors"].items()}
-    target = determine_target("hexagon", return_object=True)
+    target = determine_target({"kind": "hexagon", "mcpu": f"hexagon{arch}"}, return_object=True)
+    # Exercise the production default as well as the explicit ordinary opt-out.
+    options = {} if cooperative else {"cooperative": False}
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
-        art = tilelang.lower(make_decode(c, shapes, 256, 64), target=target, enable_host_codegen=False, enable_device_compile=False)
+        art = tilelang.lower(
+            make_decode(c, shapes, 256, 64, **options), target=target, enable_host_codegen=False, enable_device_compile=False
+        )
     source = art.kernel_source
-    # Four barriers a layer and one after the head; the GEMVs are calls.
-    assert source.count("tl_grid_sync(") == 4 * c.layers + 1
+    if cooperative:
+        assert "#define TL_HEXAGON_USES_COOPERATIVE 1" in source
+        assert "tl_cooperative_parallel_for<false>" in source
+        assert source.count("tl_cooperative_checkpoint(") > 4 * c.layers + 1
+        assert "tl_cooperative_dma_scope<decltype(tl_dma_async)>" in source
+    else:
+        # Four barriers a layer and one after the head; the GEMVs are calls.
+        assert source.count("tl_grid_sync(") == 4 * c.layers + 1
+        assert "TL_HEXAGON_USES_COOPERATIVE" not in source
     assert "TL_GEMM" not in source and "tl_hvx_gemm_int_scaled<" in source
 
 

@@ -35,7 +35,9 @@ static domain* get_domain(int id) {
 static int test_open(const char *uri, remote_handle64 *handle) {
   *handle = strtoul(strchr(uri, '=') + 1, 0, 10); return 0;
 }
-static int test_close(remote_handle64 handle) { (void)handle; return 0; }
+static int test_close(remote_handle64 handle) {
+  (void)handle; return getenv("TL_TEST_CLOSE_ERROR") ? 0x1005 : 0;
+}
 static int test_run(remote_handle64 handle, int32_t value) {
   printf("domain=%llu value=%d\\n", (unsigned long long)handle, value); return 0;
 }
@@ -60,3 +62,27 @@ def test_one_shot_rejects_bad_domain_or_argument_count_before_rpc(driver: Path, 
     result = subprocess.run([str(driver), *args], capture_output=True, text=True, timeout=5)
     assert result.returncode == 2
     assert not result.stdout
+
+
+def test_one_shot_propagates_close_failure(driver, monkeypatch):
+    monkeypatch.setenv("TL_TEST_CLOSE_ERROR", "1")
+    result = subprocess.run([str(driver), "3", "-37"], capture_output=True, text=True, timeout=5)
+    assert result.returncode == 1
+    assert "close failed: 0x1005" in result.stderr
+
+
+def test_cooperative_dispatch_preserves_policy_and_first_error(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a native C++ compiler is required")
+    harness = Path(__file__).with_name("cooperative_dispatch_host.cc").read_text()
+    source = tmp_path / "cooperative_dispatch.cc"
+    executable = tmp_path / "cooperative_dispatch"
+    source.write_text(harness.replace("// GENERATED_RUN_KERNEL", fastrpc.RUN_KERNEL))
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(executable)], check=True, timeout=30)
+    for mode in ("ordinary", "cooperative"):
+        for failure in ("none", "prepare-error", "body-error", "finish-error", "body-error-finish-error"):
+            subprocess.run([str(executable), f"{mode}-{failure}"], check=True, timeout=5)
+    subprocess.run([str(executable), "ordinary-take-error"], check=True, timeout=5)
+    for failure in ("give-error", "body-error-give-error", "body-error-give-error-finish-error"):
+        subprocess.run([str(executable), f"ordinary-{failure}"], check=True, timeout=5)

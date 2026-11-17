@@ -14,6 +14,7 @@ def Kernel(
     *blocks: int | tirx.PrimExpr,
     prelude: str | None = None,
     num_workers: int | None = None,
+    cooperative: bool = False,
 ) -> KernelLaunchFrame:
     """Construct a kernel launch frame for Hexagon: a grid of tile programs.
 
@@ -42,6 +43,14 @@ def Kernel(
         any program starts. Independent programs may run in batches when fewer
         workers or VTCM arenas are available. The request must fit a positive
         signed 32-bit integer. ``None`` runs the grid on one thread.
+    cooperative : bool, optional
+        Let a long-running kernel yield its compute resources at
+        ``T.sync_grid()``. All programs must run simultaneously and reach the
+        same checkpoints. The runtime drains DMA, saves VTCM to DDR, releases
+        and reacquires the resources, then restores VTCM before continuing.
+        This requires an explicit grid and at least one checkpoint, including
+        for a single program. It does not preempt arbitrary instructions or
+        preserve an unfinished HMX accumulation across a checkpoint.
 
     Examples
     --------
@@ -58,6 +67,12 @@ def Kernel(
             ...
     """
     annotations = {}
+    if not isinstance(cooperative, bool):
+        raise ValueError(f"T.Kernel(cooperative=...) must be a bool, got {cooperative!r}")
+    if cooperative:
+        if not blocks:
+            raise ValueError("T.Kernel(cooperative=True) requires an explicit grid, e.g. T.Kernel(1)")
+        annotations["hexagon.cooperative"] = True
     # Validate here so a typo raises a clean ValueError instead of a later
     # compiler error (bool is an int subclass, so reject it explicitly).
     if num_workers is not None:

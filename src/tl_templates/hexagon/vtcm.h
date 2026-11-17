@@ -51,6 +51,12 @@ static unsigned int tl_vtcm_total; // its bytes (capacity guard)
 static int tl_vtcm_ctx;            // the process's HAP_compute_res context
 static void *tl_vtcm_region;       // the context's region, as HAP gives it
 static unsigned int tl_vtcm_region_bytes;
+// An unsuccessful release does not prove that the resource was relinquished.
+// Keep ownership poisoned until the process exits; never pretend cleanup ran.
+static int tl_vtcm_held;
+static int tl_vtcm_poisoned;
+static int tl_vtcm_hmx_requested;
+static int tl_vtcm_cooperative;
 
 // The VTCM arena of the current serial kernel, in bytes from
 // tl_vtcm_base_ptr. Codegen publishes this for embedding/export capacity
@@ -84,55 +90,90 @@ TL_VTCM_INLINE int tl_vtcm_bind_region(void *base, unsigned int size) {
 // Open the process's context: the whole VTCM and, for kernels that issue HMX,
 // the HMX unit (hmx.h). Returns 0, or nonzero when there is no context to be
 // had; a run takes it.
-TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
+TL_VTCM_INLINE int
+tl_vtcm_open_mode(int hmx, int (*release_callback)(unsigned int, void *),
+                  void *opaque) {
+  tl_vtcm_hmx_requested = hmx;
+  if (__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
+    return -1;
   if (tl_vtcm_ctx)
-    return 0;
+    return tl_vtcm_cooperative == (release_callback != nullptr) ? 0 : -1;
   unsigned int avail, total;
   compute_res_vtcm_page_t avail_pg, total_pg;
-  if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg))
+  if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg) ||
+      !total)
     return -1;
   compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-  HAP_compute_res_attr_set_vtcm_param(&req, total, 1);
-  if (hmx)
-    HAP_compute_res_attr_set_hmx_param(&req, 1);
-  HAP_compute_res_attr_set_cache_mode(&req, 1);
+  if (HAP_compute_res_attr_init(&req) ||
+      HAP_compute_res_attr_set_vtcm_param(&req, total, 1) ||
+      (hmx && HAP_compute_res_attr_set_hmx_param(&req, 1)) ||
+      HAP_compute_res_attr_set_cache_mode(&req, 1) ||
+      (release_callback && HAP_compute_res_attr_set_release_callback(
+                               &req, release_callback, opaque)))
+    return -1;
   tl_vtcm_ctx = HAP_compute_res_acquire(&req, 10000);
   if (!tl_vtcm_ctx)
     return -1;
   tl_vtcm_region = HAP_compute_res_attr_get_vtcm_ptr(&req);
+  // v1 requests an absolute size (unlike the optional minimum-size v2 API).
+  // Cached acquire preserves both this address and this allocation size.
   tl_vtcm_region_bytes = total;
+  tl_vtcm_cooperative = release_callback != nullptr;
   return 0;
+}
+
+TL_VTCM_INLINE int tl_vtcm_open(int hmx) {
+  return tl_vtcm_open_mode(hmx, nullptr, nullptr);
 }
 
 // A run takes the region: 0, or nonzero when it cannot be had in time.
 TL_VTCM_INLINE int tl_vtcm_take(void) {
-  if (tl_vtcm_base_ptr)
-    return 0;
+  if (__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
+    return -1;
+  if (tl_vtcm_held)
+    return tl_vtcm_base_ptr ? 0 : -1;
   if (!tl_vtcm_ctx ||
       HAP_compute_res_acquire_cached(tl_vtcm_ctx, TL_VTCM_TAKE_TIMEOUT_US))
     return -1;
+  tl_vtcm_held = 1;
   if (tl_vtcm_bind_region(tl_vtcm_region, tl_vtcm_region_bytes) != 0) {
-    HAP_compute_res_release_cached(tl_vtcm_ctx);
+    if (HAP_compute_res_release_cached(tl_vtcm_ctx))
+      __atomic_store_n(&tl_vtcm_poisoned, 1, __ATOMIC_RELEASE);
+    else
+      tl_vtcm_held = 0;
     return -1;
   }
   return 0;
 }
 
-// The end of a run: the region goes back to the context.
-TL_VTCM_INLINE void tl_vtcm_give(void) {
-  if (!tl_vtcm_base_ptr)
-    return;
-  HAP_compute_res_release_cached(tl_vtcm_ctx);
+// Return checked status even when legacy callers do not consume it.
+TL_VTCM_INLINE int tl_vtcm_give(void) {
+  if (__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
+    return -1;
+  if (!tl_vtcm_held)
+    return 0;
+  if (HAP_compute_res_release_cached(tl_vtcm_ctx)) {
+    __atomic_store_n(&tl_vtcm_poisoned, 1, __ATOMIC_RELEASE);
+    return -1;
+  }
+  tl_vtcm_held = 0;
   tl_vtcm_base_ptr = 0;
   tl_vtcm_total = 0;
+  return 0;
 }
 
-TL_VTCM_INLINE void tl_vtcm_close(void) {
-  tl_vtcm_give();
-  if (tl_vtcm_ctx)
-    HAP_compute_res_release(tl_vtcm_ctx);
+TL_VTCM_INLINE int tl_vtcm_close(void) {
+  if (tl_vtcm_give())
+    return -1;
+  if (tl_vtcm_ctx && HAP_compute_res_release(tl_vtcm_ctx)) {
+    __atomic_store_n(&tl_vtcm_poisoned, 1, __ATOMIC_RELEASE);
+    return -1;
+  }
   tl_vtcm_ctx = 0;
+  tl_vtcm_region = nullptr;
+  tl_vtcm_region_bytes = 0;
+  tl_vtcm_cooperative = 0;
+  return 0;
 }
 
 // Base of the VTCM arena: the region the current run holds, NULL outside a

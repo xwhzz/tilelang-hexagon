@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <tl_templates/hexagon/power.h> // the session's power requests
+#include <tl_templates/hexagon/resource.h>
 #include <tl_templates/hexagon/vtcm.h> // unified VTCM arena (shared with alloc_shared)
 #include <tl_templates/hexagon/worker.h> // HW-thread worker pool (multithreaded HMX/HVX)
 
@@ -32,13 +33,21 @@ static int tl_hmx_spin;
 // non-zero on failure (incl. no context) so callers can refuse rather than run
 // MACs with HMX unlocked.
 TL_HMX_INLINE int tl_hmx_enable(void) {
-  if (!tl_vtcm_ctx)
+  if (!tl_vtcm_ctx || !tl_vtcm_held ||
+      __atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
     return -1;
-  return HAP_compute_res_hmx_lock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  int rc = HAP_compute_res_hmx_lock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  if (rc)
+    tl_resource_fail(&tl_resource_state, TL_ERR_HMX, true);
+  return rc;
 }
-TL_HMX_INLINE void tl_hmx_disable(void) {
-  if (tl_vtcm_ctx)
-    HAP_compute_res_hmx_unlock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+TL_HMX_INLINE int tl_hmx_disable(void) {
+  if (!tl_vtcm_ctx || __atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
+    return -1;
+  int rc = HAP_compute_res_hmx_unlock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  if (rc)
+    tl_resource_fail(&tl_resource_state, TL_ERR_HMX, true);
+  return rc;
 }
 TL_HMX_INLINE void tl_hmx_unit_acquire(void) {
   int *lp = &tl_hmx_spin;
@@ -113,12 +122,15 @@ static void tl_hmx_session_init(void) {
   else
     tl_power_hmx(false); // a failed init must not leave HMX powered
 }
-static void tl_hmx_session_deinit(void) {
+static int tl_hmx_session_deinit(void) {
   if (!tl_hmx_inited)
-    return;
-  tl_vtcm_close();
+    return TL_OK;
+  int rc = tl_resource_close();
+  if (rc)
+    return rc;
   tl_power_hmx(false);
   tl_hmx_inited = 0;
+  return TL_OK;
 }
 
 // Let the FastRPC runtime reject execution if the context could not be had.
@@ -137,10 +149,11 @@ static int tl_hmx_take(void) {
   tl_hmx_run_tid = qurt_thread_get_id();
   return TL_OK;
 }
-static void tl_hmx_give(void) {
-  tl_hmx_disable();
+static int tl_hmx_give(void) {
+  if (tl_hmx_disable())
+    return TL_ERR_HMX;
   tl_hmx_run_tid = 0;
-  tl_vtcm_give();
+  return tl_vtcm_give() ? TL_ERR_VTCM : TL_OK;
 }
 
 // tl_parallel_for worker scope for tile programs that issue HMX: a pool thread

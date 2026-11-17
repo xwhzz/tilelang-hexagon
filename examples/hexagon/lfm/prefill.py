@@ -79,11 +79,23 @@ def gemm(A, K: int, rw, rs, k, C, ones, clear, normal_scales: bool):
     )
 
 
-def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int, normal_scales: bool = False, *, target=None):
+def make_prefill(
+    c: Config,
+    shapes: dict,
+    R: int,
+    max_pos: int,
+    max_tokens: int,
+    normal_scales: bool = False,
+    *,
+    target=None,
+    cooperative: bool = True,
+):
     """The prefill kernel for config c, the bundle's tensor `shapes`, and
     chunks of R rows. Without an explicit target, normalization keeps the
     staged FP32 rows and pack. Pass the same target to the factory and compiler
-    to enable the qualified v79 large-width direct-store path."""
+    to enable the qualified v79 large-width direct-store path. Cooperative
+    resource checkpoints preserve VTCM while letting other DSP clients run
+    during a long prefill."""
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, HD = c.dim, c.ff, c.head_dim
     target = target if target is None or isinstance(target, Target) else Target(target)
@@ -332,7 +344,7 @@ def make_prefill(c: Config, shapes: dict, R: int, max_pos: int, max_tokens: int,
         # fp16-grade math (1e-4 relative): the activations it computes are
         # fp16 for HMX anyway.
         T.annotate_pass_configs({"tl.enable_fast_math": True})
-        with T.Kernel(NW, num_workers=NW) as w:
+        with T.Kernel(NW, num_workers=NW, cooperative=cooperative) as w:
             p_in = Projection(in_w, in_s, 64, BLOCK)
             p_qkv = Projection(qkv_w, qkv_s, 64, BLOCK)
             p_out = Projection(out_w, out_s, 64, BLOCK)

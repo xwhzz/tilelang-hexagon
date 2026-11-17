@@ -115,7 +115,7 @@ int seq_test_close(remote_handle64 h) {
   assert(threads_created == threads_joined);
   for (int i = 0; i < 1024; ++i)
     assert(!memory[i].host);
-  return 0;
+  return getenv("TL_TEST_CLOSE_ERROR") ? 0x1005 : 0;
 }
 int seq_test_release(remote_handle64 h, int32_t fd) {
   (void)h;

@@ -25,7 +25,7 @@ def _session(source):
 
 def _helper(name):
     """The body of a resource helper every skel carries (fastrpc.RUN_KERNEL)."""
-    start = fastrpc.RUN_KERNEL.index(f"static inline {'int' if name == 'tl_hexagon_open' else 'void'} {name}(void) {{")
+    start = fastrpc.RUN_KERNEL.index(f"static inline int {name}(void) {{")
     return fastrpc.RUN_KERNEL[start : fastrpc.RUN_KERNEL.index("\n}\n", start)]
 
 

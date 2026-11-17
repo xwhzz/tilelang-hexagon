@@ -891,6 +891,32 @@ struct tl_hexagon_dma_async_context {
     asm volatile("" : : : "memory");
     return TL_HEXAGON_DMA_OK;
   }
+
+  // Explicit checked teardown for cooperative scopes. Unlike the destructor,
+  // this reports errors and never resets the engine. Drain submissions not yet
+  // committed too, before their descriptor storage or VTCM lease can expire.
+  __attribute__((always_inline)) int finish() {
+    if (status != TL_HEXAGON_DMA_OK)
+      return status;
+    int result = wait(0);
+    if (result != TL_HEXAGON_DMA_OK)
+      return status = result;
+    while (queue.count) {
+      result = tl_hexagon_dma_queue_pop_impl<LoadOnly>(&queue);
+      if (result != TL_HEXAGON_DMA_OK)
+        return status = result;
+      ++retired;
+    }
+    if (submitted != retired || queue.tail || !tl_hexagon_dma_engine_idle())
+      return status = TL_HEXAGON_DMA_ERR_ENGINE;
+    return TL_HEXAGON_DMA_OK;
+  }
+
+  __attribute__((always_inline)) bool quiescent() const {
+    return status == TL_HEXAGON_DMA_OK && !group_count &&
+           submitted == retired && !queue.count && !queue.tail &&
+           tl_hexagon_dma_engine_idle();
+  }
 };
 
 // Compiler-private context: the closed load-only proof excludes observers of
@@ -991,6 +1017,30 @@ struct tl_hexagon_dma_compact_load_context {
     }
     asm volatile("" : : : "memory");
     return TL_HEXAGON_DMA_OK;
+  }
+
+  __attribute__((always_inline)) int finish() {
+    if (status != TL_HEXAGON_DMA_OK)
+      return status;
+    int result = wait(0);
+    if (result != TL_HEXAGON_DMA_OK)
+      return status = result;
+    while (queue.count) {
+      result = tl_hexagon_dma_queue_pop_policy<true, false, Descriptors == 1>(
+          &queue);
+      if (result != TL_HEXAGON_DMA_OK)
+        return status = result;
+      ++retired;
+    }
+    if (submitted != retired || queue.tail || !tl_hexagon_dma_engine_idle())
+      return status = TL_HEXAGON_DMA_ERR_ENGINE;
+    return TL_HEXAGON_DMA_OK;
+  }
+
+  __attribute__((always_inline)) bool quiescent() const {
+    return status == TL_HEXAGON_DMA_OK && !group_count &&
+           submitted == retired && !queue.count && !queue.tail &&
+           tl_hexagon_dma_engine_idle();
   }
 };
 

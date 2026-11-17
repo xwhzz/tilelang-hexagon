@@ -14,6 +14,7 @@ from the static parameter shapes.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from tvm import DataType
@@ -112,7 +113,7 @@ def gen_idl(iface: str, plans: list[BufferPlan]) -> str:
 # gives them up (tl_hexagon_open and tl_hexagon_close, RUN_KERNEL).
 SKEL_INCLUDES = "#include <tl_templates/hexagon/common.h>\n#include <tl_templates/hexagon/power.h>\n"
 SKEL_OPEN = "  if (tl_hexagon_open() != 0) return AEE_EFAILED;\n"
-SKEL_CLOSE = "  tl_hexagon_close();\n"
+SKEL_CLOSE = "  int tl_rc = tl_hexagon_close();\n  if (tl_rc) return (AEEResult)(0x1000 + tl_rc);\n"
 
 
 # A kernel's status as the FastRPC result: a void kernel always succeeds.
@@ -136,7 +137,21 @@ PD_SETUP = f"""  if (&remote_session_control) {{
 # KERNEL_STATUS_BASE + status, an error FastRPC passes through.
 KERNEL_STATUS_BASE = 0x1000
 # The TL_ERR_* statuses, by code.
-KERNEL_STATUS = {1: "TL_ERR_VTCM (no VTCM region fits)", 2: "TL_ERR_HMX", 3: "TL_ERR_DMA", 4: "TL_ERR_GRID (too few workers for the grid)"}
+KERNEL_STATUS = {
+    1: "TL_ERR_VTCM (no VTCM region fits)",
+    2: "TL_ERR_HMX",
+    3: "TL_ERR_DMA",
+    4: "TL_ERR_GRID (too few workers for the grid)",
+    5: "TL_ERR_RESOURCE (compute resource ownership or lifecycle failure)",
+}
+
+
+def run_kernel_entry(source: str) -> str:
+    """Choose a kernel's resource policy before sources share a translation unit."""
+    if re.search(r"^#define TL_HEXAGON_USES_COOPERATIVE 1[ \t]*$", source, re.MULTILINE):
+        return "tl_hexagon_run_kernel<true>"
+    return "tl_hexagon_run_kernel"
+
 
 RUN_KERNEL = f"""// The DSP process's resources: its power votes (power.h) and, for kernels
 // whose sources say they use HMX or VTCM (the codegen defines
@@ -153,22 +168,31 @@ static inline int tl_hexagon_take(void) {{
   return TL_OK;
 #endif
 }}
-static inline void tl_hexagon_give(void) {{
+static inline int tl_hexagon_give(void) {{
 #if defined(TL_HEXAGON_USES_HMX)
-  tl_hmx_give();
+  return tl_hmx_give();
 #elif defined(TL_HEXAGON_USES_VTCM)
-  tl_vtcm_give();
+  return tl_vtcm_give() == 0 ? TL_OK : TL_ERR_VTCM;
+#else
+  return TL_OK;
 #endif
 }}
 
 // _close gives the resources up, or they leak for the agent's life.
-static inline void tl_hexagon_close(void) {{
-#if defined(TL_HEXAGON_USES_HMX)
-  tl_hmx_session_deinit();
-#elif defined(TL_HEXAGON_USES_VTCM)
-  tl_vtcm_close();
+static inline int tl_hexagon_close(void) {{
+  int tl_rc = TL_OK;
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+  tl_rc = tl_resource_close();
+  if (tl_rc != TL_OK) return tl_rc;
 #endif
+#if defined(TL_HEXAGON_USES_HMX)
+  tl_rc = tl_hmx_session_deinit();
+#elif defined(TL_HEXAGON_USES_VTCM)
+  tl_rc = tl_vtcm_close() == 0 ? TL_OK : TL_ERR_VTCM;
+#endif
+  if (tl_rc != TL_OK) return tl_rc;
   tl_power_unvote();
+  return TL_OK;
 }}
 
 // _open takes the context once, so that it fails loudly when another client
@@ -185,8 +209,7 @@ static inline int tl_hexagon_open(void) {{
   bool ok = true;
 #endif
   if (ok && tl_hexagon_take() == TL_OK) {{
-    tl_hexagon_give();
-    return 0;
+    if (tl_hexagon_give() == TL_OK) return 0;
   }}
   tl_hexagon_close();
   return -1;
@@ -194,16 +217,42 @@ static inline int tl_hexagon_open(void) {{
 
 // A kernel's run, between take and give; a nonzero status comes back from
 // run() as KERNEL_STATUS_BASE + status, an error FastRPC passes through.
-template <typename Fn>
+template <bool Cooperative = false, typename Fn>
 static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+  int tl_rc = tl_resource_prepare(Cooperative);
+  if (tl_rc != TL_OK) return (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
+  if constexpr (Cooperative) {{
+    if constexpr (std::is_void_v<decltype(fn())>)
+      fn();
+    else
+      tl_rc = (int)fn();
+  }} else {{
+    tl_rc = tl_hexagon_take();
+    if (tl_rc == TL_OK) {{
+      if constexpr (std::is_void_v<decltype(fn())>)
+        fn();
+      else
+        tl_rc = (int)fn();
+      // Publish the body status before cleanup can record a secondary error.
+      if (tl_rc != TL_OK) tl_resource_fail(&tl_resource_state, tl_rc);
+      int tl_cleanup = tl_hexagon_give();
+      if (tl_rc == TL_OK) tl_rc = tl_cleanup;
+    }}
+  }}
+  tl_rc = tl_resource_finish(tl_rc);
+#else
+  static_assert(!Cooperative, "Cooperative kernel needs its runtime header");
   int tl_rc = tl_hexagon_take();
   if (tl_rc == TL_OK) {{
     if constexpr (std::is_void_v<decltype(fn())>)
       fn();
     else
       tl_rc = (int)fn();
-    tl_hexagon_give();
+    int tl_cleanup = tl_hexagon_give();
+    if (tl_rc == TL_OK) tl_rc = tl_cleanup;
   }}
+#endif
   return tl_rc == TL_OK ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
 }}
 """
@@ -240,7 +289,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
         f"AEEResult {iface}_open(const char* uri, remote_handle64* h) {{\n  (void)uri; *h = 0;\n{SKEL_OPEN}  return AEE_SUCCESS;\n}}\n\n"
         f"AEEResult {iface}_close(remote_handle64 h) {{\n  (void)h;\n{SKEL_CLOSE}  return AEE_SUCCESS;\n}}\n\n"
         f"AEEResult {iface}_run({', '.join(skel_args)}) {{\n"
-        f"  return tl_hexagon_run_kernel([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
+        f"  return {run_kernel_entry(kernel_source)}([&]() {{ return {kernel_name}({', '.join(call_args)}); }});\n"
         "}\n\n"
         "#ifdef __cplusplus\n}\n#endif\n"
     )
@@ -303,7 +352,8 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
         "  if (open_session((int)domain_id) != 0) return 1;\n" + "\n".join(reads) + "\n" + f"  int e = {iface}_run({', '.join(calls)});\n"
         '  if (e != AEE_SUCCESS) { fprintf(stderr, "run failed: 0x%x\\n", e); }\n'
         "  else {\n" + "\n".join(writes) + "\n  }\n" + "\n".join(frees) + "\n"
-        f"  {iface}_close(g_handle);\n"
+        f"  int close_status = {iface}_close(g_handle);\n"
+        '  if (close_status) { fprintf(stderr, "close failed: 0x%x\\n", close_status); if (!e) e = close_status; }\n'
         "  return e ? 1 : 0;\n}\n"
     )
 

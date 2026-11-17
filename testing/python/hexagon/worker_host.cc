@@ -320,4 +320,5 @@ int main(int argc, char **argv) {
     assert(false && "unknown case");
   }
   finish();
+  return 0;
 }

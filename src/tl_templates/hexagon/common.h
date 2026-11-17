@@ -30,6 +30,7 @@ using half = __fp16;
 #define TL_ERR_DMA 3 // User-DMA submission or completion failed
 #define TL_ERR_GRID                                                            \
   4 // T.sync_grid: fewer worker threads started than the grid has programs
+#define TL_ERR_RESOURCE 5 // Compute resource ownership or lifecycle failed
 
 #ifndef TL_DEVICE
 #define TL_DEVICE static inline __attribute__((always_inline))

@@ -134,8 +134,9 @@ static __attribute__((noinline)) AEEResult tl_session_invoke(int kernel, void** 
 static AEEResult tl_session_execution_open() {{
   return tl_hexagon_open() == 0 ? AEE_SUCCESS : AEE_EFAILED;
 }}
-static void tl_session_execution_close() {{
-  tl_hexagon_close();
+static AEEResult tl_session_execution_close() {{
+  int status = tl_hexagon_close();
+  return status == TL_OK ? AEE_SUCCESS : (AEEResult)({fastrpc.KERNEL_STATUS_BASE:#x} + status);
 }}
 
 // tl_hexagon_run_kernel owns take/give, including kernel-error cleanup.
@@ -164,7 +165,7 @@ static void tl_session_worker(void*) {{
     tl_session_dispatch.status = tl_session_execute(tl_session_dispatch.kernel, tl_session_dispatch.args);
     qurt_sem_up(&tl_session_dispatch.done);
   }}
-  tl_session_execution_close();
+  tl_session_dispatch.status = tl_session_execution_close();
 }}
 
 static AEEResult tl_session_join_worker() {{
@@ -224,12 +225,12 @@ static AEEResult tl_session_dispatch_run(int kernel, void** args) {{
 
 static AEEResult tl_session_dispatch_close() {{
   if (!tl_session_dispatch.started) {{
-    tl_session_execution_close();
-    return AEE_SUCCESS;
+    return tl_session_execution_close();
   }}
   tl_session_dispatch.stopping = 1;
   qurt_sem_up(&tl_session_dispatch.go);
-  return tl_session_join_worker();
+  AEEResult joined = tl_session_join_worker();
+  return joined == AEE_SUCCESS ? tl_session_dispatch.status : joined;
 }}
 """
 
@@ -246,11 +247,11 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
-    for i, (_, _, plans) in enumerate(kernels):
+    for i, (_, source, plans) in enumerate(kernels):
         args = ", ".join(f"({pl.ctype})(intptr_t)a[{j}]" if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return tl_hexagon_run_kernel([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -787,8 +788,15 @@ int main(int argc, char** argv) {{
     }}
     rpcmem_free(g_turn);
   }}
-  for (int p = 0; p < g_processes; ++p) {iface}_close(g_handles[p]);
-  return 0;
+  int close_status = 0;
+  for (int p = 0; p < g_processes; ++p) {{
+    int status = {iface}_close(g_handles[p]);
+    if (status) {{
+      fprintf(stderr, "process %d close failed: 0x%x\\n", p, status);
+      if (!close_status) close_status = status;
+    }}
+  }}
+  return close_status ? 1 : 0;
 }}
 """
 
@@ -1137,7 +1145,8 @@ class Session:
         try:
             self._start(ready_timeout)
         except BaseException:
-            self.close()
+            with contextlib.suppress(Exception):
+                self.close()
             raise
         atexit.register(self.close)
 
@@ -1187,13 +1196,16 @@ class Session:
         self._allocations = {}
         with contextlib.suppress(Exception):
             atexit.unregister(self.close)
+        close_error = None
         try:
             shutdown_sent = False
             if getattr(self, "_sock", None) is not None:
                 if not getattr(self, "_broken", False):
-                    with contextlib.suppress(Exception):
+                    try:
                         self._sock.sendall(bytes([_OP_SHUTDOWN]))
                         shutdown_sent = True
+                    except Exception as error:
+                        close_error = RuntimeError(f"Hexagon session shutdown request failed: {error}")
                 with contextlib.suppress(Exception):
                     self._sock.close()
             if getattr(self, "_proc", None) is not None:
@@ -1202,8 +1214,12 @@ class Session:
                     with contextlib.suppress(Exception):
                         self._proc.stdin.close()
                 try:
-                    self._proc.wait(timeout=10)
-                except Exception:
+                    exit_code = self._proc.wait(timeout=10)
+                    if shutdown_sent and exit_code:
+                        close_error = RuntimeError(f"Hexagon session agent exited ({exit_code}) during normal close")
+                except Exception as error:
+                    if shutdown_sent:
+                        close_error = RuntimeError(f"Hexagon session agent did not complete normal close: {error}")
                     if self._proc.stdin is not None:
                         with contextlib.suppress(Exception):
                             self._proc.stdin.close()
@@ -1232,12 +1248,20 @@ class Session:
             if self._holds_device:
                 self._holds_device = False
                 DEVICE_LOCK.release()
+        if close_error is not None:
+            raise close_error
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except Exception as error:
+                warnings.warn(f"Hexagon session close failed after an earlier error: {error}", RuntimeWarning, stacklevel=2)
 
     def __del__(self):
         with contextlib.suppress(Exception):

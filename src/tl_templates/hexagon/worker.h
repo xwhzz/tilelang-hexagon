@@ -199,6 +199,27 @@ struct tl_worker_arenas {
   unsigned int count;
 };
 
+// Check a whole-group launch without releasing any worker. Cooperative
+// resource checkpoints cannot use the serial overflow fallback: every program
+// must keep its own worker throughout the launch. Ordinary independent grids
+// retain their existing upper-bound and batching semantics.
+static inline int tl_worker_require_coresident(int32_t extent, int max_workers,
+                                               tl_worker_arenas arenas) {
+  if (extent <= 0 || max_workers < extent || extent > TL_MAX_WORKERS)
+    return TL_ERR_GRID;
+  if (!arenas.count)
+    return TL_ERR_VTCM;
+  if ((unsigned int)extent > arenas.count || extent > tl_num_workers())
+    return TL_ERR_GRID;
+  if (extent > 1) {
+    if (!tl_pool.tried)
+      tl_pool_spawn();
+    if (tl_pool.spawned < extent - 1)
+      return TL_ERR_GRID;
+  }
+  return TL_OK;
+}
+
 // Per-worker arenas for a tile program whose arena takes `bytes`, after the
 // first `grid` bytes of VTCM, the buffers all the programs share (whole HMX
 // tiles). Each starts on a whole HMX tile, like the region itself, so that it

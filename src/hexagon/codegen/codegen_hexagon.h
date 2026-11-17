@@ -41,6 +41,7 @@ public:
   void PrintFuncPrefix(std::ostream &os) final;       // NOLINT(*)
 
   void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
+  void VisitStmt_(const BindNode *op) final;        // NOLINT(*)
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   // Declare the DMA queue, and return the status of failing runtime calls.
@@ -106,6 +107,8 @@ private:
   std::set<std::string> headers_;
   bool uses_hmx_ = false;
   bool uses_vtcm_ = false;
+  bool uses_cooperative_ = false;
+  bool in_cooperative_ = false;
   /*! \brief whether the emitter is inside a worker loop body */
   bool in_worker_ = false;
   /*! \brief the program index of the worker loop being emitted */

@@ -190,12 +190,55 @@ def test_raw_session_skel_compiles_without_kernel_template_includes(tmp_path, ar
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_every_run_takes_the_processes_resources_and_gives_them_back():
+def test_ordinary_run_uses_default_resource_policy():
     plans = fastrpc._plan([], [])
     source = session.gen_dsp("tl_session_x", [("fill_kernel", "int32_t fill_kernel(float* a) { return 0; }", plans)])
     assert "return tl_hexagon_run_kernel([&]() { return tl_session_kernel_0(" in source
-    run = source[source.index("static AEEResult tl_hexagon_run_kernel(") :]
-    assert run.index("tl_hexagon_take()") < run.index("fn()") < run.index("tl_hexagon_give()")
+
+
+def test_mixed_session_selects_resource_policy_per_kernel():
+    kernels = [
+        ("ordinary", "int ordinary() { return 0; }", []),
+        ("cooperative", "#define TL_HEXAGON_USES_COOPERATIVE 1\nint cooperative() { return 0; }", []),
+        ("ordinary_again", "int ordinary_again() { return 0; }", []),
+    ]
+    source = session.gen_dsp("mixed", kernels)
+    for i in (0, 2):
+        assert f"return tl_hexagon_run_kernel([&]() {{ return tl_session_kernel_{i}(); }});" in source
+    assert "return tl_hexagon_run_kernel<true>([&]() { return tl_session_kernel_1(); });" in source
+    assert fastrpc.run_kernel_entry("// #define TL_HEXAGON_USES_COOPERATIVE 1") == "tl_hexagon_run_kernel"
+    oneshot = fastrpc.gen_dsp("single", "cooperative", kernels[1][1], [])
+    assert "return tl_hexagon_run_kernel<true>([&]() { return cooperative(); });" in oneshot
+
+
+def test_normal_close_cannot_hide_unsent_shutdown():
+    def fail_send(data):
+        raise OSError("connection lost")
+
+    closed = []
+    instance = session.Session.__new__(session.Session)
+    instance._closed, instance._holds_device = False, False
+    instance._sock = SimpleNamespace(sendall=fail_send, close=lambda: closed.append("socket"))
+    instance._conn = SimpleNamespace(cleanup=lambda: closed.append("remote"))
+    with pytest.raises(RuntimeError, match="shutdown request failed: connection lost"):
+        instance.close()
+    assert closed == ["socket", "remote"]
+    assert instance._closed
+
+
+def test_context_manager_keeps_body_error_if_close_also_fails():
+    instance = session.Session.__new__(session.Session)
+
+    def fail_close():
+        raise RuntimeError("close failure")
+
+    instance.close = fail_close
+    with (
+        pytest.warns(RuntimeWarning, match="close failed after an earlier error"),
+        pytest.raises(ValueError, match="body failure"),
+        instance,
+    ):
+        raise ValueError("body failure")
 
 
 def test_a_pipeline_stage_runs_its_steps_in_turns():
@@ -333,6 +376,7 @@ def test_a_session_sees_its_agent_ready_after_other_output(monkeypatch, newline)
     # Both lines reach the pipe at once.
     s = _start(monkeypatch, f"printf 'loading{newline}AGENT_READY port=1{newline}'; sleep 30")
     s._proc.kill()
+    s._broken = True  # This test deliberately kills its local fake agent.
     s.close()
 
 

@@ -18,11 +18,14 @@ static int HAP_compute_res_query_VTCM(int, unsigned *total, unsigned *,
   *total = sizeof(arena);
   return failure == "query" ? -1 : 0;
 }
-static void HAP_compute_res_attr_init(compute_res_attr_t *req) {
+static int HAP_compute_res_attr_init(compute_res_attr_t *req) {
   req->cached = false;
+  return 0;
 }
-static void HAP_compute_res_attr_set_vtcm_param(compute_res_attr_t *, unsigned,
-                                                int) {}
+static int HAP_compute_res_attr_set_vtcm_param(compute_res_attr_t *, unsigned,
+                                               int) {
+  return 0;
+}
 static void *HAP_compute_res_attr_get_vtcm_ptr(compute_res_attr_t *) {
   return failure == "bind" ? nullptr : arena;
 }
@@ -38,18 +41,22 @@ static int HAP_compute_res_acquire(compute_res_attr_t *req, unsigned) {
     ++takes;
   return 17;
 }
-static void HAP_compute_res_release(int ctx) {
+static int HAP_compute_res_release(int ctx) {
   assert(ctx == 17 && context_live);
   assert(grant_live == !context_cached);
   if (grant_live)
     ++gives;
   context_live = grant_live = false;
   ++releases;
+  return 0;
 }
-static void HAP_compute_res_attr_set_hmx_param(compute_res_attr_t *, int) {}
-static void HAP_compute_res_attr_set_cache_mode(compute_res_attr_t *req,
-                                                int cached) {
+static int HAP_compute_res_attr_set_hmx_param(compute_res_attr_t *, int) {
+  return 0;
+}
+static int HAP_compute_res_attr_set_cache_mode(compute_res_attr_t *req,
+                                               int cached) {
   req->cached = cached;
+  return 0;
 }
 static int HAP_compute_res_acquire_cached(int ctx, unsigned) {
   assert(ctx == 17 && context_live && context_cached && !grant_live);
@@ -59,10 +66,16 @@ static int HAP_compute_res_acquire_cached(int ctx, unsigned) {
   ++takes;
   return 0;
 }
-static void HAP_compute_res_release_cached(int ctx) {
+static int HAP_compute_res_release_cached(int ctx) {
   assert(ctx == 17 && grant_live);
   grant_live = false;
   ++gives;
+  return 0;
+}
+static int HAP_compute_res_attr_set_release_callback(compute_res_attr_t *,
+                                                     int (*)(unsigned, void *),
+                                                     void *) {
+  return 0;
 }
 #include <tl_templates/hexagon/vtcm.h>
 

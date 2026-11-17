@@ -35,8 +35,9 @@ These are the decisions that keep the adaptation small and the code navigable.
 
 1. **Don't touch the DSL.** A Hexagon matmul is written with the *same* `T.Kernel` /
    `T.copy` / `T.gemm` a CUDA user writes. The user declares intent; the backend
-   decides hardware. (The one Hexagon-specific knob is `T.Kernel(num_workers=N)`,
-   which runs the grid's tile programs on the worker pool.)
+   decides hardware. (Hexagon launch options include `T.Kernel(num_workers=N)`,
+   which runs the grid's tile programs on the worker pool, and `cooperative=True`
+   for resource checkpoints at whole-grid synchronizations.)
 
 2. **The codegen is a thin C emitter; instruction details live in C templates.**
    `CodeGenTileLangHexagon` emits plain C and prints each Hexagon builtin as a call of its
@@ -211,6 +212,16 @@ size and available per-worker arenas can reduce the worker count further.
 Ordinary grids distribute their programs over those workers; a grid containing
 `T.sync_grid()` must fit entirely and returns `TL_ERR_GRID` before any program
 starts if its workers cannot all run together.
+
+`T.Kernel(..., cooperative=True)` opts into resource yields at existing
+`T.sync_grid()` checkpoints, including a one-program grid. The compiler verifies
+a positive constant grid and uniform checkpoint control flow. `cooperative.h`
+coordinates DMA quiescence, VTCM snapshots and same-thread HMX unlock/relock;
+`resource.h` owns callback admission, the cached context and checked cleanup.
+The callback only publishes a request. The group handles it at a checkpoint;
+a 10 ms lease-age trigger also requests a yield there. Both paths preserve the
+arena before release and restore it before computation resumes. See the
+[DSL guide](hexagon_dsl_kernels.md) for checkpoint placement and limitations.
 
 ---
 

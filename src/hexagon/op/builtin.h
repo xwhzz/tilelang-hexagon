@@ -22,6 +22,10 @@ constexpr const char *kHexagonGridDim = "hexagon.grid_dim";
 // the T.gemm calls of a pool of more than one worker (GemmHMX).
 constexpr const char *kHexagonNumWorkers = "hexagon.num_workers";
 
+// Opt-in resource checkpoints at this launch's full-group synchronizations.
+// Like the worker count, this survives from the launch block to its grid loop.
+constexpr const char *kHexagonCooperative = "hexagon.cooperative";
+
 // How many iterations of a loop the codegen unrolls into one (#pragma clang
 // loop unroll_count). Set by InterleaveMaps.
 constexpr const char *kHexagonUnrollCount = "hexagon.unroll_count";

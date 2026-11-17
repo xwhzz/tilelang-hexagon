@@ -712,6 +712,50 @@ static void raw_prepared_done() {
   assert(queue.count == 0 && queue.tail == nullptr);
 }
 
+static void checked_finish() {
+  Managed<3, 2> m;
+  auto &c = *m.p;
+  assert(c.quiescent());
+  submit(c);
+  assert(c.commit() == TL_HEXAGON_DMA_OK);
+  submit(c); // An early body return may leave this descriptor uncommitted.
+  assert(!c.quiescent());
+  finish(c);
+  assert(c.finish() == TL_HEXAGON_DMA_OK);
+  assert(c.quiescent() && c.retired == 2 && c.submitted == 2 && !resets);
+}
+
+static void checked_finish_error() {
+  Managed<1, 1> m;
+  auto &c = *m.p;
+  submit(c);
+  assert(c.commit() == TL_HEXAGON_DMA_OK);
+  engine_state = TL_HEXAGON_DMA_STATUS_ERROR;
+  assert(c.finish() == TL_HEXAGON_DMA_ERR_ENGINE);
+  assert(c.status == TL_HEXAGON_DMA_ERR_ENGINE && !resets);
+  finish(c); // Later hardware completion cannot clear the checked failure.
+  assert(!c.quiescent() && c.finish() == TL_HEXAGON_DMA_ERR_ENGINE && !resets);
+}
+
+static void checked_finish_counter() {
+  Managed<1, 1> m;
+  auto &c = *m.p;
+  c.submitted = 1;
+  assert(!c.quiescent());
+  assert(c.finish() == TL_HEXAGON_DMA_ERR_ENGINE && !resets);
+  assert(!c.quiescent());
+}
+
+static void checked_finish_foreign_busy() {
+  Managed<1, 1> m;
+  auto &c = *m.p;
+  engine_state = TL_HEXAGON_DMA_STATUS_RUN;
+  assert(!c.quiescent());
+  assert(c.finish() == TL_HEXAGON_DMA_ERR_ENGINE && !resets);
+  engine_state = TL_HEXAGON_DMA_STATUS_IDLE;
+  assert(!c.quiescent());
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   std::string name = argv[1];
@@ -763,6 +807,14 @@ int main(int argc, char **argv) {
     old_completed_result();
   else if (name == "raw-prepared-done")
     raw_prepared_done();
+  else if (name == "checked-finish")
+    checked_finish();
+  else if (name == "checked-finish-error")
+    checked_finish_error();
+  else if (name == "checked-finish-counter")
+    checked_finish_counter();
+  else if (name == "checked-finish-foreign-busy")
+    checked_finish_foreign_busy();
   else
     assert(false);
 }

@@ -150,6 +150,7 @@ def test_control_socket_eof_exits_even_while_launcher_stdin_stays_open(agent, pa
     if partial_request:
         agent._sock.sendall(bytes([session._OP_ALLOC]) + b"\x80\0")
     agent._sock.close()
+    agent._broken = True  # Deliberate transport loss, not a normal SHUTDOWN.
     assert not agent._proc.stdin.closed
     assert agent._proc.wait(timeout=5) == 0
 
@@ -168,6 +169,34 @@ def test_agent_exits_if_no_control_connection_arrives(native_agent):
         if proc.poll() is None:
             proc.kill()
         proc.communicate()
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+def test_normal_close_propagates_dsp_failure(native_agent, processes, monkeypatch):
+    monkeypatch.setenv("TL_TEST_CLOSE_ERROR", "1")
+    proc = subprocess.Popen([str(native_agent), "0", str(processes)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    instance = None
+    try:
+        assert select.select([proc.stdout], [], [], 5)[0]
+        ready = proc.stdout.readline()
+        connection = socket.create_connection(("127.0.0.1", int(ready.split(b"=")[1])), timeout=5)
+        instance = session.Session.__new__(session.Session)
+        instance._closed, instance._holds_device = False, False
+        instance._sock, instance._proc = connection, proc
+        instance._conn = SimpleNamespace(cleanup=lambda: None)
+        with pytest.raises(RuntimeError, match=r"exited \(1\) during normal close"):
+            instance.close()
+        assert instance._closed and proc.returncode == 1
+        errors = proc.stderr.read().decode()
+        for p in range(processes):
+            assert f"process {p} close failed: 0x1005" in errors
+    finally:
+        if instance is not None:
+            instance.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stderr.close()
 
 
 def _stats(agent):

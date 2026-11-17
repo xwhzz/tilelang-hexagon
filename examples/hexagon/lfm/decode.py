@@ -104,10 +104,13 @@ def glu_block(b, rw, rs, k, xq, sa, acc, D: int, ga, ff, row0):
 
 
 @T.macro
-def head_block(b, rw, rs, k, xq, sa, acc, D: int, logit):
+def head_block(b, rw, rs, k, xq, sa, acc, D: int, logit, cooperative: bool):
     gemv_block(xq, sa, rw, rs, k, acc, 0, D, D, True)
     for j in T.Parallel(HEAD_BLOCK):
         logit[0, b * HEAD_BLOCK + j] = acc[0, j]
+    if cooperative:  # noqa: SIM102 -- remove the entire checkpoint branch at factory time.
+        if (b + 1) % 16 == 0:
+            T.sync_grid()
 
 
 @T.macro
@@ -125,7 +128,7 @@ def norm_rope(v, o, weight, cos, sin, pos, t64, sq, s, eps: float):
 
 
 @T.macro
-def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb, sc, p, o, m, mb, l, lb, alpha):
+def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb, sc, p, o, m, mb, l, lb, alpha, cooperative: bool):
     """mix[0, out0 + (g * 64 + d)] = softmax(q_g K^T / 8) V over positions
     [0, pos] of KV head kvh, for the `group` query heads at qkv[0, q0 + ...]:
     blocks of POS_BLOCK positions with an online softmax."""
@@ -154,6 +157,8 @@ def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb,
         for g, d in T.Parallel(group, 64):
             o[g, d] = o[g, d] * alpha[g]
         T.gemm(p, vb, o, clear_accum=False)
+        if cooperative:
+            T.sync_grid()
     for g, d in T.Parallel(group, 64):
         mix[0, out0 + g * 64 + d] = o[g, d] / l[g]
 
@@ -185,8 +190,12 @@ def add_gumbel(logit, scale, seed, pos, first, hx, hy):
         logit[i, j] = logit[i, j] * scale + -T.log(-T.log(u))
 
 
-def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
-    """The decode kernel for config c and the bundle's tensor `shapes`."""
+def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int, *, cooperative: bool = True):
+    """The decode kernel for config c and the bundle's tensor `shapes`.
+
+    Cooperative checkpoints preserve VTCM across resource yields, including
+    inside long attention scans and between completed LM-head block batches.
+    """
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
     H, KVH = c.heads, c.kv_heads
@@ -244,7 +253,7 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
         n: T.int32,
         n_forced: T.int32,
     ):
-        with T.Kernel(NW, num_workers=NW) as w:
+        with T.Kernel(NW, num_workers=NW, cooperative=cooperative) as w:
             p_in = Projection(in_w, in_s, 64, BLOCK)
             p_qkv = Projection(qkv_w, qkv_s, 64, BLOCK)
             p_out = Projection(out_w, out_s, 64, BLOCK)
@@ -369,6 +378,7 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
                                 ls,
                                 lb,
                                 alpha,
+                                cooperative,
                             )
                         ai += 1
                     else:
@@ -404,7 +414,7 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
                 T.copy(x, xf)
                 rms_norm(xf, lambda k: final_norm[k], hf, sq, s1, D, eps)
                 quantize(hf, xq, sa, amax, D)
-                st.run(i_ph, lambda b, rw, rs, k: head_block(b, rw, rs, k, xq, sa, acc_h, D, logit))
+                st.run(i_ph, lambda b, rw, rs, k: head_block(b, rw, rs, k, xq, sa, acc_h, D, logit, cooperative))
                 for j in T.Parallel(VW):
                     logits[0, w * VW + j] = logit[0, j]
                 T.reduce_max(logit, best, dim=1)
@@ -419,6 +429,8 @@ def make_decode(c: Config, shapes: dict, max_pos: int, max_tokens: int):
                 if sampling[0] > T.float32(0):
                     add_gumbel(logit, sampling[0], T.Cast("int32", sampling[1]), pos, w * VW, hx, hy)
                     T.reduce_max(logit, best, dim=1)
+                if cooperative:
+                    T.sync_grid()
                 for i, j in T.Parallel(1, VW):
                     idx[i, j] = T.if_then_else(logit[i, j] == best[0], T.Cast("float32", j), T.float32(3.0e38))
                 T.reduce_min(idx, besti, dim=1)

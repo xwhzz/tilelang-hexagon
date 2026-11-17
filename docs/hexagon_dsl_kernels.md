@@ -377,6 +377,30 @@ wait for DMA. A program's queue spans it, so
 a `T.dma_copy` submitted before the barrier for the next phase overlaps the phase
 change; data other programs read after the barrier must be complete before it.
 
+Long kernels can opt into resource checkpoints with
+`T.Kernel(..., cooperative=True)`. At an existing `T.sync_grid()`, a pending SDK
+release request or an elapsed 10 ms lease triggers a collective yield: all
+workers finish their DMA, save the actual VTCM arena to DDR, unlock HMX on their
+own threads, release and reacquire the cached resource context, restore VTCM,
+and resume. Numerical code and DDR state are not restarted. The DDR snapshot
+takes as much space as the usable VTCM grant and is reused across calls.
+
+The grid must have a positive constant size and fit the available workers;
+`T.Kernel(1, cooperative=True)` uses the same protocol with one participant.
+Every program must reach the same checkpoints. The compiler rejects launches
+without checkpoints and checkpoint control flow with worker-dependent or
+memory-dependent conditions, or unbounded loops. Place checkpoints after complete
+GEMM operations; live hardware accumulators and arbitrary resource operations in
+external C code are outside this contract.
+
+The 10 ms value is a trigger checked at safe points, not a preemption deadline:
+a long interval between checkpoints delays release. A checkpoint that does not
+yield keeps the ordinary barrier's DMA semantics, so explicit `T.dma_wait()`
+calls remain necessary before consuming asynchronous copies. A Session may mix
+ordinary and cooperative kernels; resource context modes switch at Run boundaries.
+Ownership or cleanup failures return an error rather than reporting successful
+completion. Kernels without `cooperative=True` retain their existing scheduling.
+
 Explicit `T.dma_copy` uses a manual schedule. A PrimFunc that contains an explicit
 submission cannot also contain a software-pipeline-annotated loop, even when they
 occur in separate loops. Explicit submissions must stay outside parallel and
