@@ -461,17 +461,18 @@ def test_reductions_of_crouton_tiles_are_one_call():
 
 
 @DEVICE
-def test_crouton_sum_preserves_zero_and_v79_exact_sums():
+@pytest.mark.parametrize("dim", [0, 1])
+def test_crouton_sum_preserves_zero_and_v79_exact_sums(dim):
     import numpy as np
     import torch
     from tilelang.hexagon.target import hexagon_arch
 
     target = determine_target("hexagon", return_object=True)
-    kernel = tilelang.compile(_reduce("activation", "sum", 1, "float32", (64, 128)), out_idx=[1], target=target)
+    kernel = tilelang.compile(_reduce("activation", "sum", dim, "float32", (64, 128)), out_idx=[1], target=target)
     try:
         zero = np.zeros((64, 128), dtype=np.float16)
         actual = kernel(torch.from_numpy(zero)).cpu().numpy()
-        np.testing.assert_array_equal(actual.view(np.uint32), np.zeros(64, dtype=np.uint32))
+        np.testing.assert_array_equal(actual.view(np.uint32), np.zeros(zero.shape[1 - dim], dtype=np.uint32))
         # Legacy v73/v75 Qfloat uses Von Neumann rounding, not IEEE nearest-even.
         # The nonzero exact-rounding cases below are tested only on v79.
         if hexagon_arch(target) != "v79":
@@ -493,7 +494,7 @@ def test_crouton_sum_preserves_zero_and_v79_exact_sums():
         tie[:, 0] = 1
         tie[:, 64] = np.array([1], dtype=np.uint16).view(np.float16)[0]
         for values in (probabilities, masked, tie):
-            reference = values.astype(np.float64).sum(axis=1).astype(np.float32)
+            reference = values.astype(np.float64).sum(axis=dim).astype(np.float32)
             actual = kernel(torch.from_numpy(values)).cpu().numpy()
             np.testing.assert_array_equal(actual.view(np.uint32), reference.view(np.uint32))
     finally:

@@ -307,6 +307,10 @@ fp32 register sums in these trees are spelled out as `sf + sf` through qf32 and 
 (`tl_reduce_combine`), as the `hvx_math.h` adds are. hexagon-clang 19 miscompiled long
 chains of generic fp32 vector adds, and of qf32 values kept across permutes and spills,
 in the Crouton row sums: a row lost one tile's sum, or turned to inf.
+On v79, independent even/odd sums share an instruction packet, followed by their
+IEEE conversions in the next packet (`tl_reduce_combine_pair`). Both packets stay
+in one assembly block, keeping Qfloat state out of register spills while preserving
+each accumulator's addition order.
 
 DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
 permutation. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,

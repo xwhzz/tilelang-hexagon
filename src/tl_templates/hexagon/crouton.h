@@ -409,8 +409,12 @@ TL_DEVICE tl_hvx_reg<A> tl_crouton_row_tree(const half *crouton, int row_tiles,
         tl_crouton_rows_of<K, A>(tl_crouton_pair<ColumnTiles>(
                                      crouton, row_tiles, col_tiles, r, c, q0),
                                  &e, &o);
+#if __HVX_ARCH__ == 79
+        tl_reduce_combine_pair<K>(&even, &odd, e, o);
+#else
         even = tl_reduce_combine<K>(even, e);
         odd = tl_reduce_combine<K>(odd, o);
+#endif
       }
       return tl_reduce_merge<K, A>(even, odd);
     }
@@ -445,8 +449,12 @@ TL_DEVICE tl_hvx_reg<A> tl_crouton_columns(const half *crouton, int row_tiles,
       } else {
         tl_hvx_reg<A> e, o;
         tl_crouton_rows_of<K, A>(pair, &e, &o);
+#if __HVX_ARCH__ == 79
+        tl_reduce_combine_pair<K>(&a0, &a1, e, o);
+#else
         a0 = tl_reduce_combine<K>(a0, e);
         a1 = tl_reduce_combine<K>(a1, o);
+#endif
       }
     }
   }

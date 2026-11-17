@@ -102,6 +102,28 @@ template <int K, typename V> TL_DEVICE V tl_reduce_combine(V a, V b) {
     return a ^ b;
 }
 
+// Pair independent row sums while keeping Qfloat state inside one asm block.
+template <int K, typename V>
+TL_DEVICE void tl_reduce_combine_pair(V *a0, V *a1, V b0, V b1) {
+#if __HVX_ARCH__ == 79
+  if constexpr (K == TL_REDUCE_SUM && std::is_same_v<V, tl_hvx_reg<float>>) {
+    HVX_Vector s0, s1;
+    asm("{ %0.qf32 = vadd(%2.sf, %3.sf); %1.qf32 = vadd(%4.sf, %5.sf) }\n\t"
+        "{ %0.sf = %0.qf32; %1.sf = %1.qf32 }"
+        : "=v"(s0), "=v"(s1)
+        : "v"(tl_hvx_bitcast<HVX_Vector>(*a0)),
+          "v"(tl_hvx_bitcast<HVX_Vector>(b0)),
+          "v"(tl_hvx_bitcast<HVX_Vector>(*a1)),
+          "v"(tl_hvx_bitcast<HVX_Vector>(b1)));
+    *a0 = tl_hvx_bitcast<V>(s0);
+    *a1 = tl_hvx_bitcast<V>(s1);
+    return;
+  }
+#endif
+  *a0 = tl_reduce_combine<K>(*a0, b0);
+  *a1 = tl_reduce_combine<K>(*a1, b1);
+}
+
 // A register of the identity of the combine in T. (Registers, since __fp16 is
 // not a valid return type.)
 template <int K, typename T> TL_DEVICE tl_hvx_reg<T> tl_reduce_identity() {
