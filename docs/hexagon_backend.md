@@ -248,10 +248,12 @@ starts if its workers cannot all run together.
   compiler workaround enabled; v75 has simulator coverage, not device
   qualification.
 
-- **v73 Crouton arithmetic.** Unscaled half-to-float copies, reduction inputs,
-  and unscaled float epilogues use exact widening on older HVX. Float-to-half
-  activation packing also uses integer conversion with round-to-nearest-even,
-  preserving signed zero and infinity. Scaling and
+- **Crouton conversions and arithmetic.** On v73/v75, unscaled half-to-float
+  copies, reduction inputs, and unscaled float epilogues use exact widening.
+  Scoped native IEEE conversion helpers also pack float-to-half activations
+  with round-to-nearest-even, preserving signed zero and infinity. NaNs remain
+  NaNs; their payloads and floating-point exception flags are not part of the
+  conversion contract. Scaling and
   accumulation remain qfloat arithmetic: this includes the scaled float
   epilogue and the half row/tile add and multiply paths. These are approximate
   arithmetic operations, not an exact IEEE GEMM contract. HMX already rounds

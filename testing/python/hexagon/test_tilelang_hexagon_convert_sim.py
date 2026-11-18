@@ -353,4 +353,26 @@ def test_ordered_vector_casts_and_reduction_stores(arch, tmp_path):
                     expected[selected] = x
                     exact(read(np.dtype(dst), 128), expected)
 
+    if arch in ("v73", "v75"):
+        half_specials = np.array([0, 0x8000, 1, 0x8001, 0x03FF, 0x0400, 0x7BFF, 0x7C00, 0xFC00, 0x7C01, 0x7E01, 0xFE01], dtype="<u2")
+        for round in range(4):
+            halves = (np.arange(128) * 257 + round * 8191).astype("<u2")
+            halves[: len(half_specials)] = half_specials
+            floats = inputs[round * 128 : (round + 1) * 128]
+            for width in (32, 33, 63, 64, 65, 96, 128):
+                for bits, src, dst in ((halves[:width], "<f2", "<f4"), (floats[:width], "<f4", "<f2")):
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        expected_values = bits.view(src).astype(dst)
+                    for _ieee in (False, True):
+                        for destination in (1027, 513, 515, 508):
+                            # Include source bytes and both guards, even when
+                            # output expansion overlaps the next input chunk.
+                            expected_bytes = np.full(2048, 0xA5, dtype=np.uint8)
+                            expected_bytes[513 : 513 + bits.nbytes] = bits.view(np.uint8)
+                            actual_bytes = read(np.uint8, 2048)
+                            nbytes = expected_values.nbytes
+                            exact(actual_bytes[destination : destination + nbytes].view(dst), expected_values)
+                            np.testing.assert_array_equal(actual_bytes[:destination], expected_bytes[:destination])
+                            np.testing.assert_array_equal(actual_bytes[destination + nbytes :], expected_bytes[destination + nbytes :])
+
     assert offset == len(data), "unexpected fixture output layout"

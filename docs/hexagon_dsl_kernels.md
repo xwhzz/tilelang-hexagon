@@ -45,6 +45,8 @@ The build does not enable `-mhvx-ieee-fp` globally. v75/v79 retain qfloat arithm
 plus a conversion: the tested SM8750 (v79) cDSP returns zeros for the IEEE arithmetic
 instructions, although hexagon-sim computes them correctly. Explicit qfloat intrinsics
 in math, reduction, and GEMM helpers keep their existing algorithms and accuracy bounds.
+Half/float casts on v73/v75 use scoped native IEEE conversion helpers without
+changing the surrounding arithmetic policy.
 HVX has no divide, and clang scalarizes a vector `/`, so the codegen prints float vector
 division as `tl_hvx_div` (`hvx_math.h`): a times the Newton-Raphson reciprocal of b, in fp32.
 The fp16/fp32 math intrinsics (`T.exp`, `T.exp2`, `T.log`, `T.log2`, `T.sqrt`, `T.rsqrt`,
