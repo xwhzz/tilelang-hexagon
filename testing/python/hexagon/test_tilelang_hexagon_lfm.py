@@ -313,19 +313,30 @@ def fp16_bundle(tmp_path_factory):
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_decode_is_one_step_of_phases(model, fp16_bundle):
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("cooperative", [False, True])
+def test_fp16_decode_is_one_step_of_phases(model, arch, cooperative, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
-    target = determine_target(FP16_SOURCE_TARGET, return_object=True)
+    target = determine_target({"kind": "hexagon", "mcpu": f"hexagon{arch}"}, return_object=True)
+    options = {} if cooperative else {"cooperative": False}
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
-        art = tilelang.lower(decode_fp16.make_decode(c, 256, 64), target=target, enable_host_codegen=False, enable_device_compile=False)
+        art = tilelang.lower(
+            decode_fp16.make_decode(c, 256, 64, **options), target=target, enable_host_codegen=False, enable_device_compile=False
+        )
     source = art.kernel_source
-    # Four barriers a layer and one after the head; the GEMVs are calls of
-    # the weight-layout GEMV.
-    assert source.count("tl_grid_sync(") == 4 * c.layers + 1
+    if cooperative:
+        assert "tl_cooperative_parallel_for<false>" in source
+        assert source.count("tl_cooperative_checkpoint(") > 4 * c.layers + 1
+        assert "tl_cooperative_dma_scope<decltype(tl_dma_async)>" in source
+        assert "tl_grid_sync(" not in source
+    else:
+        assert source.count("tl_grid_sync(") == 4 * c.layers + 1
+        assert "TL_HEXAGON_USES_COOPERATIVE" not in source
     assert "tl_hvx_gemm_weight<" in source and "TL_GEMM" not in source
 
 
-def test_fp16_stages_split_the_layers(fp16_bundle):
+@pytest.mark.parametrize("cooperative", [False, True])
+def test_fp16_stages_split_the_layers(cooperative, fp16_bundle):
     """A model over several DSP processes: each stage a run of the layers, the
     largest as small as can be; the embedding in the first, the head in the
     last, and the residual handed on between."""
@@ -336,14 +347,27 @@ def test_fp16_stages_split_the_layers(fp16_bundle):
     assert decode_fp16.plan_stages(c, header, 256, 2) == [range(2), range(2, 4)]
     assert decode_fp16.plan_stages(c, header, 256, 4) == [range(i, i + 1) for i in range(4)]
     target = determine_target(FP16_SOURCE_TARGET, return_object=True)
-    for layers in (range(2), range(1, 3), range(2, 4)):
+    options = {} if cooperative else {"cooperative": False}
+    for layers in (range(2), range(1, 3), range(2, 4), range(1), range(1, 2), range(3, 4)):
         with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3):
             art = tilelang.lower(
-                decode_fp16.make_decode(c, 256, 64, layers), target=target, enable_host_codegen=False, enable_device_compile=False
+                decode_fp16.make_decode(c, 256, 64, layers, **options),
+                target=target,
+                enable_host_codegen=False,
+                enable_device_compile=False,
             )
-        # Four barriers a layer, and one after the head in the last stage.
-        assert art.kernel_source.count("tl_grid_sync(") == 4 * len(layers) + (layers.stop == c.layers)
-    ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64, range(1, 3)), [])], target=FP16_SOURCE_TARGET)
+        barrier = "tl_cooperative_checkpoint(" if cooperative else "tl_grid_sync("
+        minimum = 4 * len(layers) + (layers.stop == c.layers)
+        assert art.kernel_source.count(barrier) >= minimum
+        # Conv-only, full-only and sliding-only stages must all retain uniform
+        # checkpoints, including stages without the embedding or the LM head.
+        ((_, stage_source, _, _),) = lower_kernels(
+            [(prefill_fp16.make_prefill(c, 128, 256, 64, layers, **options), [])], target=FP16_SOURCE_TARGET
+        )
+        assert ("TL_HEXAGON_USES_COOPERATIVE" in stage_source) is cooperative
+    ((_, source, _, _),) = lower_kernels(
+        [(prefill_fp16.make_prefill(c, 128, 256, 64, range(1, 3), **options), [])], target=FP16_SOURCE_TARGET
+    )
     assert source.count("for (int32_t layer = 0; layer < 2; ++layer)") == 1
 
 
@@ -397,13 +421,22 @@ def _assert_prefill_norm_path(source, direct=False):
 
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
-def test_fp16_prefill_is_one_loop_over_the_layers(model, fp16_bundle):
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("cooperative", [False, True])
+def test_fp16_prefill_is_one_loop_over_the_layers(model, arch, cooperative, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
-    ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64), [])], target=FP16_SOURCE_TARGET)
+    target = {"kind": "hexagon", "mcpu": f"hexagon{arch}"}
+    options = {} if cooperative else {"cooperative": False}
+    ((_, source, _, _),) = lower_kernels([(prefill_fp16.make_prefill(c, 128, 256, 64, **options), [])], target=target)
     # A loop at run time, whatever the depth; the projections are calls of
     # the HMX GEMM.
     assert source.count(f"for (int32_t layer = 0; layer < {c.layers}; ++layer)") == 1
     assert "tl_hexagon_hmx_gemm<" in source
+    assert ("#define TL_HEXAGON_USES_COOPERATIVE 1" in source) is cooperative
+    if cooperative:
+        assert "tl_cooperative_parallel_for<true>" in source
+        assert re.search(r"tl_cooperative_checkpoint\(\w+, tl_dma_async\)", source)
+        assert "tl_grid_sync(" not in source
     _assert_prefill_norm_path(source)
 
 

@@ -229,7 +229,7 @@ read from the device's copy in 0.6 s.
 ### LFM3's decode
 
 `decode_fp16.py` decodes the fp16 bundle as `decode.py` decodes the 4-bit one:
-4 workers, a token in four barriers a layer, each worker's share of every
+4 workers, with synchronization between layer phases, each worker's share of every
 projection streaming by DMA a panel of 32 channels at a time and multiplied on
 HVX straight from the HMX weight layout (`T.gemm` of a weight-layout B). A
 worker owns one KV head of LFM3 with its four query heads and their gates.
@@ -242,6 +242,18 @@ its blocks into VTCM by DMA: decode multiplies them on HVX and prefill on
 HMX. Both kernels declare it write-through
 (`T.annotate_write_through`): each key and value goes back to DDR as it is
 written, so that the prefill's many DMA loads of it skip their writeback.
+
+Both FP16 kernel factories enable cooperative resource checkpoints by default,
+for LFM2 as well as LFM3. They check for pending resource requests between layer
+phases, after each attention KV block, and after every 16 completed decode
+LM-head blocks. A yield drains pending DMA and preserves the VTCM state,
+including prefetched weights/KV and the running attention or sampling reductions.
+Without a request, these points synchronize the workers without releasing
+resources. The factories accept `cooperative=False` for controlled comparisons.
+Checkpoint placement bounds the work between checks, not a wall-clock response
+time; see the [cooperative kernel contract](../../../docs/hexagon_dsl_kernels.md).
+The FP16 performance figures below were measured before cooperative checkpoints
+were enabled.
 
 On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
 call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a
@@ -384,7 +396,7 @@ in calls of at most 128 (`Decoder.CALL_STEPS`).
 On v79 (`bench.py`, one run per table entry, timed on the phone around the
 FastRPC calls). pp is a prompt of that length from position 0; tg128 is 128
 tokens after an untimed prefill of that length. The prefill figures are from
-#224; the decode figures include the DMA cache loads of #225, on the same
+PR #224; the decode figures include the DMA cache loads of #225, on the same
 phone:
 
 | positions | processes | pp (#224) | tg128 (#225) |

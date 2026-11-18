@@ -289,6 +289,7 @@ def attend(
     ls,
     lb,
     alpha,
+    cooperative: bool = False,
 ):
     """out[0, out0 + g * HD + d] = gate(g) softmax(q_g K^T / sqrt(HD)) V over
     positions [first, pos] of KV head kvh, for the `group` query heads at
@@ -332,6 +333,10 @@ def attend(
         for g, d in T.Parallel(group, HD):
             o[g, d] = o[g, d] * alpha[g]
         T.gemm(p16, vb[slot, :, :], o, clear_accum=False)
+        if cooperative:
+            # Preserve the online reduction and the prefetched KV slot only
+            # after this block's GEMM has materialized its output.
+            T.sync_grid()
     # The loop's last step drained the queue; the wait tells the DMA queue's
     # bound (PlanDMAQueue), which cannot prove that the loop runs at all.
     T.dma_wait()
@@ -407,7 +412,30 @@ def sliced_block(b, ring, k, a, acc, cols: int, slices: int, dst):
 
 
 @T.macro
-def head_block(b, ring, k, a, acc, D: int, logits, first, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy):
+def head_block(
+    b,
+    ring,
+    k,
+    a,
+    acc,
+    D: int,
+    logits,
+    first,
+    pos,
+    sampling,
+    run_m,
+    run_s,
+    best,
+    besti,
+    bm,
+    bs,
+    bi,
+    ex,
+    idx,
+    hx,
+    hy,
+    cooperative: bool = False,
+):
     """The logits of vocabulary block b from `first` into DDR, and the running
     maximum, sum of exponentials and proposal: the argmax of the logits, or
     at a temperature of the logits over it plus Gumbel noise."""
@@ -431,6 +459,9 @@ def head_block(b, ring, k, a, acc, D: int, logits, first, pos, sampling, run_m, 
     if bm[0] > best[0]:
         best[0] = bm[0]
         besti[0] = bi[0] + T.Cast("float32", v0)
+    if cooperative:  # noqa: SIM102 -- remove the entire checkpoint branch at factory time.
+        if (b + 1) % 16 == 0:
+            T.sync_grid()
 
 
 @T.macro
@@ -460,7 +491,7 @@ def add_branch(xf, branch, bf, sums, s, post, D: int, nw: int, sandwich: bool, e
             xf[i, k] = xf[i, k] + bf[i, k]
 
 
-def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None = None):
+def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None = None, *, cooperative: bool = True):
     """The fp16 decode kernel of config c (convert.py's bundle): step t of a
     generation, position pos0 + t, a call. The Decoder runs the steps as a
     pipeline (Session.pipeline).
@@ -470,7 +501,10 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
     step's token, the last runs the head and samples, and the residual goes
     from each to the next through `xs` by DMA, which crosses processes. A
     stage's tensors are its layers' slices; those of a kind it has none of,
-    and the head away from the ends, are placeholders."""
+    and the head away from the ends, are placeholders. Cooperative checkpoints
+    preserve live state between attention blocks, completed LM-head batches and
+    layer phases.
+    """
     layers = range(c.layers) if layers is None else layers
     has_embedding, has_head = layers.start == 0, layers.stop == c.layers
     D, F, V, HD = c.dim, c.ff, c.vocab, c.head_dim
@@ -540,7 +574,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
         n_forced: T.int32,
         t: T.int32,
     ):
-        with T.Kernel(NW, num_workers=NW) as w:
+        with T.Kernel(NW, num_workers=NW, cooperative=cooperative) as w:
             p_in = Weights(in_w, TILE, slice_cols(D))
             p_qkv = Weights(qkv_w, TILE, slice_cols(D))
             p_out = Weights(out_w, TILE, slice_cols(D))
@@ -685,7 +719,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
                             gate = lambda q: T.float32(1)  # noqa: E731
                         attend(
                             qkv, base, kv_k, kv_v, block, KV_ROWS // POS_BLOCK, kvh, pos, first, att, h * group * HD, gate, group, HD,
-                            qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha,
+                            qg, kb, vb, sc, pr, pr16, o, m, mb, ls, lb, alpha, cooperative,
                         )  # fmt: skip
                     T.copy(att, mix[0:1, w * DW : (w + 1) * DW])
                     ai += 1
@@ -729,7 +763,28 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
                 st.run(
                     i_ph,
                     lambda b, ring, k, pos=pos: head_block(
-                        b, ring, k, h16, acc, D, logits, w * VW, pos, sampling, run_m, run_s, best, besti, bm, bs, bi, ex, idx, hx, hy
+                        b,
+                        ring,
+                        k,
+                        h16,
+                        acc,
+                        D,
+                        logits,
+                        w * VW,
+                        pos,
+                        sampling,
+                        run_m,
+                        run_s,
+                        best,
+                        besti,
+                        bm,
+                        bs,
+                        bi,
+                        ex,
+                        idx,
+                        hx,
+                        hy,
+                        cooperative,
                     ),
                 )
                 cand[w, 0] = best[0]

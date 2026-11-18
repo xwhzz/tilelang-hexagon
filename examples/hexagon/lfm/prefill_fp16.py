@@ -46,6 +46,7 @@ from types import SimpleNamespace
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 from tilelang.hexagon.target import hexagon_arch
+from tvm import tirx
 from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,7 +83,7 @@ def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     return rows
 
 
-def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None):
+def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None, cooperative: bool = True):
     """The fp16 prefill kernel of config c, in chunks of R rows: chunk `chunk`
     of the n tokens from pos0 a call. The Decoder runs the chunks as a
     pipeline (Session.pipeline).
@@ -92,7 +93,12 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     layers' slices (decode_fp16.make_decode): the first embeds the chunk,
     the others normalize the residual x the stage before left in DDR.
     Without an explicit target, normalization keeps staged FP32 rows and pack;
-    an explicit target must also be used when compiling this kernel."""
+    an explicit target must also be used when compiling this kernel.
+
+    Cooperative checkpoints preserve the VTCM state between completed attention
+    blocks and layer phases. The table must match kinds_table(c, max_pos, layers);
+    cooperative control flow derives layer kinds/windows from that same config.
+    """
     layers = range(c.layers) if layers is None else layers
     has_embedding, has_last_layer = layers.start == 0, layers.stop == c.layers
     D, F, HD = c.dim, c.ff, c.head_dim
@@ -134,6 +140,19 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     eps = c.eps
     HID = max(D, FQ)
     SLOT = max(D, FQ)  # K of the ring's slots: in_proj, qkv, out_proj and w13's D, w2's FQ
+
+    def attention_layer(layer, table):
+        if not cooperative:
+            return table[layer, 0] == 1
+        indices = [i for i, model_layer in enumerate(layers) if c.is_attention(model_layer)]
+        return tirx.any(*(layer == i for i in indices)) if indices else False
+
+    def attention_window(layer, table):
+        if not cooperative:
+            return table[layer, 3]
+        indices = [i for i, model_layer in enumerate(layers) if c.layer_types[model_layer] == SLIDING]
+        sliding = tirx.any(*(layer == i for i in indices)) if indices else False
+        return tirx.Select(sliding, c.window, 0)
 
     def clamped(index, count: int):
         return T.max(T.min(index, max(count, 1) - 1), 0)
@@ -376,7 +395,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         bf.m[i] = T.float32(NEG)
                         bf.ls[i] = T.float32(0)
                     # The positions a row sees: its window, or all before it.
-                    span = T.if_then_else(window > 0, window, max_pos + R)
+                    span = tirx.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
                     first = T.max(row0 - span + 1, 0) // KEYS
                     last = T.ceildiv(row0 + ROWS, KEYS)
                     fetch(bf, kv0, window, kvh, first, 0)
@@ -412,6 +431,11 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         for i, d in T.Parallel(ROWS, HD):
                             bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
                         T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
+                        if cooperative:
+                            # GEMM has stored its output. On a request, the
+                            # checkpoint drains and preserves the prefetched
+                            # next KV slot along with the online softmax state.
+                            T.sync_grid()
                     # The loop's last step drained the queue; the wait tells the
                     # DMA queue's bound (PlanDMAQueue), which cannot prove that
                     # the loop runs at all and keeps the first fetch in flight.
@@ -482,7 +506,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         # fp16-grade math (1e-4 relative): the activations it computes are
         # fp16 for HMX anyway.
         T.annotate_pass_configs({"tl.enable_fast_math": True})
-        with T.Kernel(NW, num_workers=NW) as w:
+        with T.Kernel(NW, num_workers=NW, cooperative=cooperative) as w:
             p_in = Weights(in_w, TILE, D, SLOT)
             p_qkv = Weights(qkv_w, TILE, D, SLOT)
             p_out = Weights(out_w, TILE, D, SLOT)
@@ -586,7 +610,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                 ci = clamped(kinds[layer, 1], Lc)
                 ai = clamped(kinds[layer, 1], La)
                 table = clamped(kinds[layer, 2], NK)
-                window = kinds[layer, 3]
+                window = attention_window(layer, kinds)
                 kv0 = kinds[layer, 4]
                 # The layer's phases, worker w's blocks of each, in order:
                 # its operator's (the short conv's or attention's), then the
@@ -606,7 +630,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                     rest.append(Phase(p_2, layer, DW // TILE, lambda b: w * DW + b * TILE, lambda b, part=part: part))
                 st_rest = Stream(rest, DEPTH, rings=rings)
                 # a holds the layer's normalized input.
-                if kinds[layer, 0] == 1:
+                if attention_layer(layer, kinds):
                     st_attn.prologue()
                     st_attn.run(
                         0,
