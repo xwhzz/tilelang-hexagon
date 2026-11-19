@@ -459,9 +459,9 @@ def head_block(
     if bm[0] > best[0]:
         best[0] = bm[0]
         besti[0] = bi[0] + T.Cast("float32", v0)
-    if cooperative:  # noqa: SIM102 -- remove the entire checkpoint branch at factory time.
-        if (b + 1) % 16 == 0:
-            T.sync_grid()
+    # A Python `and`: cooperative=False drops the checkpoint at factory time.
+    if cooperative and (b + 1) % 16 == 0:
+        T.sync_grid()
 
 
 @T.macro

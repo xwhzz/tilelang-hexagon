@@ -41,6 +41,7 @@ The prompt's last token is left to the decode, whose first step runs it and
 the LM head (``Decoder.generate``).
 """
 
+import functools
 import os
 import sys
 from types import SimpleNamespace
@@ -48,7 +49,6 @@ from types import SimpleNamespace
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 from tilelang.hexagon.target import hexagon_arch
-from tvm import tirx
 from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -137,7 +137,7 @@ def make_prefill(
         if not cooperative:
             return kinds[layer, 0] == 1
         # Same Config used by Decoder to create kinds; keep its compact loop.
-        return tirx.any(*(layer == i for i in attn_layers)) if attn_layers else False
+        return functools.reduce(T.Or, (layer == i for i in attn_layers)) if attn_layers else False
 
     def scale_shape(w, block, group_):
         L_, S_, N_, C_ = w

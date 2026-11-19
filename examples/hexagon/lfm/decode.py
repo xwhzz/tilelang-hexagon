@@ -108,9 +108,9 @@ def head_block(b, rw, rs, k, xq, sa, acc, D: int, logit, cooperative: bool):
     gemv_block(xq, sa, rw, rs, k, acc, 0, D, D, True)
     for j in T.Parallel(HEAD_BLOCK):
         logit[0, b * HEAD_BLOCK + j] = acc[0, j]
-    if cooperative:  # noqa: SIM102 -- remove the entire checkpoint branch at factory time.
-        if (b + 1) % 16 == 0:
-            T.sync_grid()
+    # A Python `and`: cooperative=False drops the checkpoint at factory time.
+    if cooperative and (b + 1) % 16 == 0:
+        T.sync_grid()
 
 
 @T.macro

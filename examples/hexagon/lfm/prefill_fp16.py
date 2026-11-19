@@ -39,6 +39,7 @@ The prompt's last token is left to the decode, whose first step runs it and
 the LM head (``Decoder.generate``).
 """
 
+import functools
 import os
 import sys
 from types import SimpleNamespace
@@ -46,7 +47,6 @@ from types import SimpleNamespace
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
 from tilelang.hexagon.target import hexagon_arch
-from tvm import tirx
 from tvm.target import Target
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -145,14 +145,14 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         if not cooperative:
             return table[layer, 0] == 1
         indices = [i for i, model_layer in enumerate(layers) if c.is_attention(model_layer)]
-        return tirx.any(*(layer == i for i in indices)) if indices else False
+        return functools.reduce(T.Or, (layer == i for i in indices)) if indices else False
 
     def attention_window(layer, table):
         if not cooperative:
             return table[layer, 3]
         indices = [i for i, model_layer in enumerate(layers) if c.layer_types[model_layer] == SLIDING]
-        sliding = tirx.any(*(layer == i for i in indices)) if indices else False
-        return tirx.Select(sliding, c.window, 0)
+        sliding = functools.reduce(T.Or, (layer == i for i in indices)) if indices else False
+        return T.Select(sliding, c.window, 0)
 
     def clamped(index, count: int):
         return T.max(T.min(index, max(count, 1) - 1), 0)
@@ -395,7 +395,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                         bf.m[i] = T.float32(NEG)
                         bf.ls[i] = T.float32(0)
                     # The positions a row sees: its window, or all before it.
-                    span = tirx.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
+                    span = T.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
                     first = T.max(row0 - span + 1, 0) // KEYS
                     last = T.ceildiv(row0 + ROWS, KEYS)
                     fetch(bf, kv0, window, kvh, first, 0)
