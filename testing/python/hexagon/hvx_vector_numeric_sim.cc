@@ -47,6 +47,60 @@ static void write_stores(FILE *out, const half *halves) {
   }
 }
 
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+template <typename To, typename From, int N>
+__attribute__((noinline)) static void cast_default(void *dst, const void *src) {
+  tl_hvx_convert_vector<To, From, N>(dst, src);
+}
+
+template <typename To, typename From, int N>
+TL_HEXAGON_IEEE_ARITHMETIC __attribute__((noinline)) static void
+cast_ieee(void *dst, const void *src) {
+  tl_hvx_convert_vector<To, From, N>(dst, src);
+}
+
+template <typename To, typename From, int N>
+static void write_cast_guards(FILE *out, const void *input) {
+  for (auto cast : {cast_default<To, From, N>, cast_ieee<To, From, N>}) {
+    // Unaligned separate, identical, right-overlapping and left-overlapping
+    // ranges. Save the entire allocation to check bytes outside the output.
+    for (int destination : {1027, 513, 515, 508}) {
+      alignas(128) uint8_t bytes[2048];
+      memset(bytes, 0xa5, sizeof(bytes));
+      memcpy(bytes + 513, input, N * sizeof(From));
+      cast(bytes + destination, bytes + 513);
+      fwrite(bytes, sizeof(bytes), 1, out);
+    }
+  }
+}
+
+template <int N>
+static void write_cast_guards(FILE *out, const uint16_t *halves,
+                              const uint32_t *floats) {
+  write_cast_guards<float, half, N>(out, halves);
+  write_cast_guards<half, float, N>(out, floats);
+}
+
+static void write_cast_guards(FILE *out, const uint32_t *bits) {
+  const uint16_t special[] = {0,      0x8000, 1,      0x8001, 0x03ff, 0x0400,
+                              0x7bff, 0x7c00, 0xfc00, 0x7c01, 0x7e01, 0xfe01};
+  for (int round = 0; round < 4; ++round) {
+    uint16_t halves[128];
+    for (int i = 0; i < 128; ++i)
+      halves[i] = i * 257 + round * 8191;
+    memcpy(halves, special, sizeof(special));
+    const uint32_t *floats = bits + round * 128;
+    write_cast_guards<32>(out, halves, floats);
+    write_cast_guards<33>(out, halves, floats);
+    write_cast_guards<63>(out, halves, floats);
+    write_cast_guards<64>(out, halves, floats);
+    write_cast_guards<65>(out, halves, floats);
+    write_cast_guards<96>(out, halves, floats);
+    write_cast_guards<128>(out, halves, floats);
+  }
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc != 3)
     return 1;
@@ -82,6 +136,9 @@ int main(int argc, char **argv) {
   }
   write_stores<half, float>(out, halves);
   write_stores<float, half>(out, halves);
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  write_cast_guards(out, bits);
+#endif
 
   fclose(in);
   return fclose(out);

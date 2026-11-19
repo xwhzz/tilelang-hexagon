@@ -7,13 +7,30 @@
 #define TL_DEVICE static inline __attribute__((always_inline))
 #endif
 
-// v73/v75 have qfloat conversions, but they do not implement IEEE casts:
-// multiplying a half by 1.0 changes finite values and treats Inf/NaN as finite.
-// Integer vector operations preserve finite values, signed zeros and infinities
-// and narrow with round-to-nearest, ties-to-even. NaN payload/quieting is not a
+// v73/v75 Qfloat conversions do not implement IEEE casts: multiplying a half
+// by 1.0 changes finite values and treats Inf/NaN as finite. Scoped native
+// IEEE operations widen exactly and narrow with round-to-nearest, ties-to-even,
+// preserving signed zeros and infinities. NaN payload/quieting is not a
 // cross-architecture contract. v79 retains native vcvt behavior (including
-// narrowing exact -0.0f to +0.0h). Both paths keep the even/odd lane
+// narrowing exact -0.0f to +0.0h). These helpers keep the even/odd lane
 // convention.
+
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+// Keep native IEEE conversions on feature-specific leaves. Default-feature
+// callers retain their arithmetic policy; IEEE callers can inline the leaves.
+// Widening is exact; narrowing uses round-to-nearest, ties-to-even. Signed
+// zeros and infinities are preserved. NaN payload and exception flags are not
+// a cast contract; the multiply can quiet signaling NaNs.
+static inline __attribute__((target("hvx-ieee-fp"))) HVX_VectorPair
+tl_hvx_widen_half_ieee(HVX_Vector h) {
+  return Q6_Wsf_vmpy_VhfVhf(h, Q6_Vh_vsplat_R(0x3c00));
+}
+
+static inline __attribute__((target("hvx-ieee-fp"))) HVX_Vector
+tl_hvx_narrow_float_ieee(HVX_Vector even, HVX_Vector odd) {
+  return Q6_Vhf_vcvt_VsfVsf(even, odd);
+}
+#endif
 
 #if __HVX_ARCH__ < 79
 typedef uint32_t tl_hvx_u32 __attribute__((ext_vector_type(32)));
@@ -66,6 +83,32 @@ constexpr bool tl_hvx_ieee_half_cast =
 template <typename To, typename From, int N>
 TL_DEVICE void tl_hvx_convert_vector(void *dst, const void *src) {
   static_assert(tl_hvx_ieee_half_cast<To, From>, "half/float vector cast");
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  // Capture the complete input before any output store, including overlapping
+  // source/destination ranges. Copies use N's logical size, not padded vectors.
+  alignas(128) uint8_t captured[N * sizeof(From)];
+  __builtin_memcpy(captured, src, sizeof(captured));
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N; i += 64) {
+    const int lanes = N - i < 64 ? N - i : 64;
+    if constexpr (sizeof(From) == 2) {
+      HVX_Vector input{};
+      __builtin_memcpy(&input, captured + i * 2, lanes * 2);
+      HVX_VectorPair split = tl_hvx_widen_half_ieee(input);
+      HVX_VectorPair ordered =
+          Q6_W_vshuff_VVR(Q6_V_hi_W(split), Q6_V_lo_W(split), -4);
+      __builtin_memcpy(static_cast<char *>(dst) + i * 4, &ordered, lanes * 4);
+    } else {
+      HVX_VectorPair input{};
+      __builtin_memcpy(&input, captured + i * 4, lanes * 4);
+      HVX_VectorPair split =
+          Q6_W_vdeal_VVR(Q6_V_hi_W(input), Q6_V_lo_W(input), -4);
+      HVX_Vector ordered =
+          tl_hvx_narrow_float_ieee(Q6_V_lo_W(split), Q6_V_hi_W(split));
+      __builtin_memcpy(static_cast<char *>(dst) + i * 2, &ordered, lanes * 2);
+    }
+  }
+#else
   using input_word = std::conditional_t<sizeof(From) == 2, uint16_t, uint32_t>;
   using output_word = std::conditional_t<sizeof(To) == 2, uint16_t, uint32_t>;
   typedef input_word input_vec __attribute__((ext_vector_type(N)));
@@ -88,11 +131,14 @@ TL_DEVICE void tl_hvx_convert_vector(void *dst, const void *src) {
   }
   output_vec output = __builtin_convertvector(bits, output_vec);
   __builtin_memcpy(dst, &output, sizeof(output));
+#endif
 }
 #endif
 
 TL_DEVICE HVX_VectorPair tl_hvx_convert_hf_to_sf(HVX_Vector h) {
-#if __HVX_ARCH__ == 79
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  return tl_hvx_widen_half_ieee(h);
+#elif __HVX_ARCH__ == 79
   // Keep Qfloat extended state inside the conversion: plain spills lose it.
   // This is the SDK's hf-to-sf sequence, with only IEEE outputs visible to RA.
   HVX_Vector even, odd;
@@ -114,7 +160,9 @@ TL_DEVICE HVX_VectorPair tl_hvx_convert_hf_to_sf(HVX_Vector h) {
 }
 
 TL_DEVICE HVX_Vector tl_hvx_convert_sf_to_hf(HVX_Vector even, HVX_Vector odd) {
-#if __HVX_ARCH__ >= 79
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  return tl_hvx_narrow_float_ieee(even, odd);
+#elif __HVX_ARCH__ >= 79
   return Q6_Vhf_vcvt_VsfVsf(even, odd);
 #else
   return tl_hvx_as_vector(tl_hvx_narrow_float_bits(tl_hvx_as_u32(even)) |

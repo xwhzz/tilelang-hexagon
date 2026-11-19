@@ -631,7 +631,13 @@ static int serve(int cli, unsigned char op, int* running) {{
     }}
     // The first turn is step 0's first stage's.
     *(volatile uint32_t*)g_turn = 0;
-    for (int p = 0; p < g_processes; ++p) {iface}_sync(g_handles[p], g_turn_fd, 0, 128, 0);
+    for (int p = 0; p < g_processes; ++p) {{
+      if ({iface}_sync(g_handles[p], g_turn_fd, 0, 128, 0) != AEE_SUCCESS) {{
+        // A stage must not wait on a turn whose initialization failed.
+        for (int i = 0; i < head[0]; ++i) free(st[i].args);
+        return reply(cli, 255, 0, 0);
+      }}
+    }}
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     struct launch_gate gate = {{PTHREAD_MUTEX_INITIALIZER, 0}};
@@ -657,13 +663,17 @@ static int serve(int cli, unsigned char op, int* running) {{
     pthread_mutex_destroy(&gate.mutex);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_last_run_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000 + (t1.tv_nsec - t0.tv_nsec);
-    // The status of the first stage that failed, not of those that gave up.
+    // Prefer the first actual error over peers that stopped waiting for it.
+    // A lone give-up still means the pipeline did not complete successfully.
     unsigned char status = (!ok || started < head[0]) ? 255 : 0;
+    int gave_up = 0;
     for (int i = 0; i < started && status == 0; ++i) {{
       AEEResult e = st[i].result;
-      if (e == AEE_SUCCESS || e == {_TURN_GAVE_UP:#x}) continue;
+      if (e == {_TURN_GAVE_UP:#x}) {{ gave_up = 1; continue; }}
+      if (e == AEE_SUCCESS) continue;
       status = (e > {fastrpc.KERNEL_STATUS_BASE:#x} && e < {fastrpc.KERNEL_STATUS_BASE + 255:#x}) ? (unsigned char)(e - {fastrpc.KERNEL_STATUS_BASE:#x}) : 255;
     }}
+    if (status == 0 && gave_up) status = 255;
     for (int i = 0; i < head[0]; ++i) free(st[i].args);
     return reply(cli, status, 0, 0);
   }}
