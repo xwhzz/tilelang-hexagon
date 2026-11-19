@@ -53,17 +53,19 @@ std::string TypeName(DataType dtype) {
 
 } // namespace
 
-std::string HMXRejection(const GemmNode &op) {
+std::string HMXRejection(const GemmNode &op, bool pad) {
   const DataType fp16 = DataType::Float(16);
   if (op.a_->dtype != fp16 || op.b_->dtype != fp16)
     return "HMX multiplies fp16 operands, not " + TypeName(op.a_->dtype) +
            " x " + TypeName(op.b_->dtype);
   if (op.c_->dtype != fp16 && op.c_->dtype != DataType::Float(32))
     return "HMX writes an fp16 or fp32 C, not " + TypeName(op.c_->dtype);
-  if (op.m_ % kTile || op.n_ % kTile || op.k_ % kTile)
-    return "HMX needs M, N and K multiples of 32, not " +
-           std::to_string(op.m_) + " x " + std::to_string(op.n_) + " x " +
-           std::to_string(op.k_);
+  if (op.m_ <= 0 || op.n_ <= 0 || op.k_ <= 0)
+    return "HMX needs a GEMM of positive M, N and K";
+  bool whole = op.m_ % kTile == 0 && op.n_ % kTile == 0 && op.k_ % kTile == 0;
+  if (!whole && op.m_ % kTile && op.m_ < kHMXMinRows)
+    return "HMX multiplies padded tiles from M = " +
+           std::to_string(kHMXMinRows) + " rows, not " + std::to_string(op.m_);
   arith::Analyzer analyzer;
   const std::pair<const char *, const BufferRegion *> operands[] = {
       {"A", &op.aRegion_}, {"B", &op.bRegion_}, {"C", &op.cRegion_}};
@@ -85,8 +87,10 @@ std::string HMXRejection(const GemmNode &op) {
     for (size_t i = rank - 2; i < rank; ++i) {
       if (!OnTiles(ranges[i]->min, &analyzer))
         return operand + "'s region does not start on a 32 x 32 tile";
-      if (buffer.same_as(op.c_) && buffer->dtype != fp16)
-        continue; // An fp32 C stays row-major.
+      // C of whole tiles takes the Crouton layout if fp16, else it stays
+      // row-major. A and B are padded to whole tiles.
+      if (buffer.same_as(op.c_) || pad)
+        continue;
       if (!OnTiles(buffer->shape[i], &analyzer))
         return operand + " is not whole 32 x 32 tiles";
     }

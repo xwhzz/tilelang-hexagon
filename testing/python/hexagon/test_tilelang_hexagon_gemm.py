@@ -238,6 +238,55 @@ def test_gemms_hmx_cannot_run_go_to_hvx_saying_why(caplog):
         assert f"runs on HVX, not on HMX: {reason}" in caplog.text
 
 
+def test_gemms_off_tiles_multiply_padded_tiles_on_hmx():
+    # A, B and C are padded to whole tiles, so HMX stores whole tiles of C;
+    # K stays 200, and the call zeroes A's and B's padding along it.
+    source = _source(_k_loop(16, 48, 200, 200, clear="first"))
+    assert "tl_crouton_copy<true, false>((&(((half*)a)[0])), 1, 7, 0, 0, 16, 200," in source
+    assert "tl_crouton_copy<true, true>((&(((half*)b)[0])), 7, 2, 0, 0, 200, 48," in source
+    assert "tl_hexagon_hmx_gemm<true, true, false, false>(32, 64, 200, (&(((float*)c)[0])), 64," in source
+    # An fp16 C padded to whole tiles takes the Crouton layout, whose padding
+    # its copy out leaves.
+    source = _source(_k_loop(17, 40, 64, 64, "float16", "shared", clear="first"))
+    assert "tl_hexagon_hmx_gemm<false, true, false, true>(32, 64, 64, (&(((half*)c)[0])), 2," in source
+    assert "tl_crouton_copy<false, false>((&(((half*)c)[0])), 1, 2, 0, 0, 17, 40," in source
+
+
+def _c_part(c_dtype):
+    """C[32:49, 0:40] = A @ B, the rest of C as given: a GEMM off tiles into
+    part of a C of whole tiles, whose other rows and columns it keeps."""
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((17, 64), "float16"), B: T.Tensor((64, 40), "float16"), C0: T.Tensor((64, 64), c_dtype), C: T.Tensor((64, 64), c_dtype)
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((17, 64), "float16")
+            b = T.alloc_shared((64, 40), "float16")
+            c = T.alloc_shared((64, 64), c_dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            T.copy(C0, c)
+            T.gemm(a, b, c[32:49, 0:40], clear_accum=True)
+            T.copy(c, C)
+
+    return kernel
+
+
+@pytest.mark.parametrize("c_dtype", ["float32", "float16"])
+def test_a_gemm_into_part_of_c_stores_only_its_rows_and_columns(c_dtype):
+    # C is not padded: the last tiles store 17 rows and 40 columns.
+    source = _source(_c_part(c_dtype))
+    assert "tl_hexagon_hmx_gemm<" in source and "(17, 40, 64, " in source
+
+
+def test_gemms_of_one_row_stay_on_hvx(caplog):
+    with caplog.at_level(logging.DEBUG, logger="tilelang.hexagon.op.gemm"):
+        source = _source(_k_loop(1, 64, 64, 64, clear="first"))
+    assert "tl_hexagon_hmx_" not in source and "tl_hvx_gemm<" in source
+    assert "runs on HVX, not on HMX: HMX multiplies padded tiles from M = 2 rows, not 1" in caplog.text
+
+
 def test_operands_in_other_layouts_are_rejected():
     @T.prim_func
     def kernel(A: T.Tensor((64, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((64, 64), "float32")):
@@ -354,6 +403,48 @@ def test_c_layouts_match_torch(kind):
     torch.testing.assert_close(out, ref, atol=_tolerance(ref, 2), rtol=0)
 
 
+@DEVICE
+@pytest.mark.parametrize(
+    "M, N, K, BK, c_dtype, scope, trans_a, trans_b",
+    [
+        (16, 512, 512, 512, "float32", "fragment", False, False),  # #84's case
+        (16, 48, 200, 200, "float32", "fragment", False, False),  # K off tiles
+        (17, 32, 64, 64, "float32", "fragment", False, False),  # a prefill's tail
+        (33, 47, 100, 50, "float32", "shared", False, False),  # K tails in a loop
+        (40, 40, 72, 72, "float16", "shared", False, False),
+        (9, 64, 96, 96, "float16", "fragment", False, True),
+        (16, 48, 200, 200, "float32", "fragment", True, True),
+        (2, 40, 70, 70, "float16", "shared", True, False),
+    ],
+)
+def test_off_tile_shapes_match_torch(M, N, K, BK, c_dtype, scope, trans_a, trans_b):
+    import torch
+
+    a = (torch.randn(M, K) * 0.25).half()
+    b = (torch.randn(K, N) * 0.25).half()
+    out = _run(
+        _k_loop(M, N, K, BK, c_dtype, scope, "first", trans_a, trans_b),
+        a.t().contiguous() if trans_a else a,
+        b.t().contiguous() if trans_b else b,
+    )
+    ref = a.float() @ b.float()
+    torch.testing.assert_close(out.float(), ref, atol=_tolerance(ref, K // BK), rtol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("c_dtype", ["float32", "float16"])
+def test_a_gemm_into_part_of_c_matches_torch(c_dtype):
+    import torch
+
+    a = (torch.randn(17, 64) * 0.25).half()
+    b = (torch.randn(64, 40) * 0.25).half()
+    c0 = torch.randn(64, 64).to(getattr(torch, c_dtype))
+    out = _run(_c_part(c_dtype), a, b, c0)
+    ref = c0.clone().float()
+    ref[32:49, 0:40] = a.float() @ b.float()
+    torch.testing.assert_close(out.float(), ref, atol=_tolerance(ref, 1), rtol=0)
+
+
 def _worker_k_loops(NB, M, N, K, BK, num_workers):
     """NB independent K loops of accumulating calls into fp32 C, one per tile
     program, spread over a worker pool."""
@@ -381,11 +472,11 @@ def test_workers_take_hmx_one_output_tile_at_a_time():
 
 
 @DEVICE
-@pytest.mark.parametrize("num_workers", [2, 6])
-def test_worker_k_loops_match_torch(num_workers):
+@pytest.mark.parametrize("num_workers, M, N", [(2, 64, 96), (6, 64, 96), (6, 17, 40)])
+def test_worker_k_loops_match_torch(num_workers, M, N):
     import torch
 
-    NB, M, N, K, BK = 6, 64, 96, 256, 64
+    NB, K, BK = 6, 256, 64
     a = (torch.randn(NB, M, K) * 0.1).half()
     b = (torch.randn(NB, K, N) * 0.1).half()
     kernel = tilelang.compile(_worker_k_loops(NB, M, N, K, BK, num_workers), out_idx=[2], target="hexagon")

@@ -89,6 +89,17 @@ def LowerWindowLoads():
     return _ffi_api.LowerWindowLoads()  # type: ignore
 
 
+def PadHMXOperands():
+    """Pad the A and B of the gemms on HMX to whole 32 x 32 tiles.
+
+    A gemm whose M, N or K is not a multiple of 32 runs on HMX in the tiles
+    that cover it. Its A and B buffers, allocated in the kernel, get their
+    matrix dimensions rounded up to multiples of 32; every access keeps its
+    region. Runs before ``LayoutInference``.
+    """
+    return _ffi_api.PadHMXOperands()  # type: ignore
+
+
 def StageHMXOperandCopies():
     """Stage a software pipeline's copies into HMX operands through DMA.
 

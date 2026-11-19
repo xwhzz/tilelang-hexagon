@@ -17,12 +17,25 @@ namespace hexagon {
 /*!
  * \brief Why HMX cannot run `op`, or an empty string when it can: A and B
  * fp16 and C fp16 or fp32, all in VTCM (shared buffers or fragments, which are
- * VTCM on Hexagon); M, N and K multiples of 32; and each operand a matrix of
- * whole 32 x 32 tiles: its region starts on a tile, its leading dimensions are
- * single indices, and A's and B's matrices, which take Crouton layouts, are
- * whole tiles too.
+ * VTCM on Hexagon); each operand a matrix whose region starts on a 32 x 32
+ * tile and whose leading dimensions are single indices; and A's and B's
+ * buffers, which take Crouton layouts, whole tiles. M, N and K need not be
+ * multiples of 32: HMX multiplies zero-padded tiles (PadHMXOperands pads the
+ * buffers), when M is at least kHMXMinRows or a multiple of 32.
+ *
+ * With `pad`, A's and B's buffers need not be whole tiles yet: whether HMX
+ * runs `op` once PadHMXOperands pads them.
  */
-std::string HMXRejection(const GemmNode &op);
+std::string HMXRejection(const GemmNode &op, bool pad = false);
+
+/*!
+ * \brief The fewest rows of a GEMM off whole tiles that HMX runs. A GEMV
+ * (M = 1) stays on HVX: padding its A and C to 32 rows would take 32 times
+ * their VTCM. HMX would still be faster (on v79 at N = K = 512, 1-1.5 against
+ * 7.9 us a call with B in VTCM, 7.3 against 11.8 us when B is copied in each
+ * call, #84): a GEMV that can spare the VTCM can multiply 2 rows instead.
+ */
+constexpr int kHMXMinRows = 2;
 
 /*!
  * \brief Why HVX cannot run `op` (tl_hvx_gemm, hvx_gemm.h), or an empty string

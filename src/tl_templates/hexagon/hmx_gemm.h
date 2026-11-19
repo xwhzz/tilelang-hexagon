@@ -81,6 +81,13 @@ template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
 // tiles as they are; else each tile goes through a staging tile in stage, which
 // an HVX epilogue writes or adds into C. config holds the conversion config.
 //
+// M, N and K need not be multiples of 32: HMX multiplies the tiles that cover
+// them. A's and B's padding along K is zeroed first, so that whatever it held
+// adds nothing (the padding of a B weight source stays zero: its prepare()
+// fills whole tiles), and the last tiles of a row or a column store only C's
+// rows and columns (tl_crouton_tile_store_part). Direct needs M and N whole
+// tiles.
+//
 // The tiles go by columns, (mt, nt) for nt, for mt, with no division by the
 // run-time counts: Hexagon divides in software. One program runs the previous
 // tile's epilogue, and B's slice, while HMX multiplies each tile. Shared: the
@@ -110,7 +117,19 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
                                half *stage, uint32_t *config) {
   static_assert(!Direct || (!Rows && !Scaled),
                 "HMX stores only into Crouton tiles, as they are");
-  const int MT = M / TL_HMX_T, NT = N / TL_HMX_T, KT = K / TL_HMX_T;
+  const int MT = (M + TL_HMX_T - 1) / TL_HMX_T;
+  const int NT = (N + TL_HMX_T - 1) / TL_HMX_T;
+  const int KT = (K + TL_HMX_T - 1) / TL_HMX_T;
+  // C's rows and columns of the last row and column of tiles.
+  const int m_last = M - (MT - 1) * TL_HMX_T, n_last = N - (NT - 1) * TL_HMX_T;
+  if (const int k_last = K - (KT - 1) * TL_HMX_T; k_last < TL_HMX_T) {
+    half *a_tail = const_cast<half *>(a) + (KT - 1) * TL_HMX_TILE_ELMS;
+    tl_crouton_zero_columns(a_tail, a_row_tile, MT, k_last);
+    if constexpr (std::is_same_v<B, tl_hmx_weight_tiles>)
+      tl_crouton_zero_rows(const_cast<half *>(b.tiles) +
+                               (KT - 1) * TL_HMX_TILE_ELMS,
+                           b.stride, NT, k_last);
+  }
 
   auto multiply = [&](int mt, int nt) TL_HEXAGON_VECTOR_INLINE {
     const half *row = a + mt * a_row_tile;
@@ -133,6 +152,18 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
       D *dst = Rows ? c + mt * TL_HMX_T * ldc + nt * TL_HMX_T
                     : c + (mt * ldc + nt) * TL_HMX_TILE_ELMS;
       const float *scale = Scaled ? sfa + mt * TL_HMX_T * ld_sfa : nullptr;
+      if (!Scaled && ((mt == MT - 1 && m_last < TL_HMX_T) ||
+                      (nt == NT - 1 && n_last < TL_HMX_T))) {
+        int rows = mt == MT - 1 ? m_last : TL_HMX_T;
+        int cols = nt == NT - 1 ? n_last : TL_HMX_T;
+        if (clear)
+          tl_crouton_tile_store_part<false, Rows, Aligned>(dst, ldc, tile, rows,
+                                                           cols);
+        else
+          tl_crouton_tile_store_part<true, Rows, Aligned>(dst, ldc, tile, rows,
+                                                          cols);
+        return;
+      }
       if (clear)
         tl_crouton_tile_store<false, Rows, Aligned, Scaled>(dst, ldc, tile,
                                                             scale, ld_sfa);

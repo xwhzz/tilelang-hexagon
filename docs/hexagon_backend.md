@@ -516,7 +516,8 @@ barrier and does not release resources or drain DMA. See the
 **Device-validated on v79** (the Hexagon test suite with device tests enabled, about 730
 tests, and the examples):
 
-- `T.gemm` on HMX: fp16 into fp16 or fp32, any tile-aligned shape, transposes, and K loops
+- `T.gemm` on HMX: fp16 into fp16 or fp32, any shape from M = 2 (zero-padded tiles off
+  multiples of 32), transposes, and K loops
   accumulated across calls; on HVX: floating point, fp16 GEMVs of HMX weight-layout
   weights, integer GEMMs of panel-layout weights, and `T.gemm_blockscaled`; and
   `T.gemm_blockscaled` of fp16 activations on HMX, its 4-bit weights dequantized on HVX.

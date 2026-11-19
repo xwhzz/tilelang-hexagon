@@ -636,6 +636,99 @@ TL_DEVICE void tl_crouton_tile_store(D *__restrict__ dst, int ldc,
   }
 }
 
+// tl_crouton_tile_store for a tile at the edge of C: only its first `rows`
+// rows and `cols` columns (1..32 each) are C's. Rows: the block is row-major,
+// fp16 or fp32; otherwise a Crouton tile, fp16, whose other elements keep
+// what they hold. Aligned as for tl_crouton_tile_store: whole rows (cols of
+// 32) then store whole registers or half registers.
+template <bool Accumulate, bool Rows, bool Aligned, typename D>
+TL_DEVICE void tl_crouton_tile_store_part(D *__restrict__ dst, int ldc,
+                                          const half *__restrict__ tile,
+                                          int rows, int cols) {
+  const HVX_Vector *t = reinterpret_cast<const HVX_Vector *>(tile);
+  if constexpr (!Rows) {
+    static_assert(std::is_same_v<D, half>, "Crouton tiles are fp16");
+    HVX_Vector *d = reinterpret_cast<HVX_Vector *>(dst);
+    // Lane 2c + (r & 1) of row pair q holds (2q + (r & 1), c).
+    HVX_VectorPred in_cols = Q6_Q_vsetq2_R(cols * 4);
+    HVX_VectorPred even = Q6_Q_vand_VR(Q6_V_vsplat_R(0x0000FFFF), -1);
+    for (int q = 0; 2 * q < rows; ++q) {
+      HVX_VectorPred keep =
+          2 * q + 1 < rows ? in_cols : Q6_Q_and_QQ(in_cols, even);
+      HVX_Vector v = Accumulate
+                         ? Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(d[q], t[q]))
+                         : t[q];
+      d[q] = Q6_V_vmux_QVV(keep, v, d[q]);
+    }
+  } else {
+    for (int q = 0; 2 * q < rows; ++q) {
+      // Row 2q in the low register, row 2q + 1 in the high one: fp32 from
+      // the even and odd lanes, fp16 each in both halves
+      // (tl_crouton_tile_store).
+      HVX_VectorPair d = std::is_same_v<D, float>
+                             ? tl_hvx_convert_hf_to_sf(t[q])
+                             : Q6_W_vdeal_VVR(t[q], t[q], -2);
+      HVX_Vector row[2] = {Q6_V_lo_W(d), Q6_V_hi_W(d)};
+      for (int i = 0; i < 2 && 2 * q + i < rows; ++i) {
+        D *r = dst + (2 * q + i) * ldc;
+        if constexpr (std::is_same_v<D, float>) {
+          HVX_Vector w = row[i];
+          if (cols == 32) {
+            if constexpr (Accumulate)
+              w = Q6_Vsf_equals_Vqf32(
+                  Q6_Vqf32_vadd_VsfVsf(w, tl_hvx_load<Aligned>(r)));
+            tl_hvx_store<Aligned>(r, w);
+            continue;
+          }
+          if constexpr (Accumulate)
+            w = Q6_Vsf_equals_Vqf32(
+                Q6_Vqf32_vadd_VsfVsf(w, tl_hvx_load_bytes(r, cols * 4)));
+          tl_hvx_store_bytes(r, w, cols * 4);
+        } else {
+          static_assert(std::is_same_v<D, half>, "fp16 or fp32 matrices");
+          HVX_Vector v = row[i];
+          if (cols == 32) {
+            tl_crouton_half_row<Accumulate, Aligned>(r, v);
+            continue;
+          }
+          if constexpr (Accumulate)
+            v = Q6_Vhf_equals_Vqf16(
+                Q6_Vqf16_vadd_VhfVhf(tl_hvx_load_bytes(r, cols * 2), v));
+          tl_hvx_store_bytes(r, v, cols * 2);
+        }
+      }
+    }
+  }
+}
+
+// Zeroes the columns from `cols` on (1..31) of the Crouton tiles at `tile`,
+// `count` of them `stride` halves apart: the padding along K of an HMX
+// activation's last K tile.
+TL_DEVICE void tl_crouton_zero_columns(half *tile, int stride, int count,
+                                       int cols) {
+  HVX_VectorPred keep = Q6_Q_vsetq2_R(cols * 4);
+  for (int i = 0; i < count; ++i) {
+    HVX_Vector *v = reinterpret_cast<HVX_Vector *>(tile + i * stride);
+    for (int q = 0; q < 16; ++q)
+      v[q] = Q6_V_vmux_QVV(keep, v[q], Q6_V_vzero());
+  }
+}
+
+// Zeroes the rows from `rows` on (1..31) of the Crouton tiles at `tile`,
+// `count` of them `stride` halves apart: the padding along K of an HMX
+// weight's last K tile.
+TL_DEVICE void tl_crouton_zero_rows(half *tile, int stride, int count,
+                                    int rows) {
+  for (int i = 0; i < count; ++i) {
+    HVX_Vector *v = reinterpret_cast<HVX_Vector *>(tile + i * stride);
+    // An odd count keeps the even rows (low halves) of its last row pair.
+    if (rows & 1)
+      v[rows / 2] = Q6_V_vand_VV(v[rows / 2], Q6_V_vsplat_R(0x0000FFFF));
+    for (int q = (rows + 1) / 2; q < 16; ++q)
+      v[q] = Q6_V_vzero();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HMX weight tiles from 4-bit panels (T.gemm_blockscaled on HMX): 32 rows of
 // a 4-bit B [N, K] in the panel layout (tilelang.hexagon.intrinsics.panel)

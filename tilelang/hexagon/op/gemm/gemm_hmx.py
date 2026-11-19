@@ -18,6 +18,14 @@ In a worker pool, whose workers share HMX (``LowerKernelLaunch`` marks such
 calls), each output tile is a critical section of its own instead, and its
 epilogue runs outside it, while another worker multiplies.
 
+M, N and K need not be multiples of 32. A and B then fill the tiles that
+cover them, their buffers padded (``PadHMXOperands``); the call zeroes the
+padding along K before it multiplies, so that whatever the padding held adds
+nothing, and writes only C's own rows and columns of its last tiles, or
+whole tiles when C is padded too (``hexagon.padded_c``, which
+``PadHMXOperands`` sets when the call writes all of C). A C of fp16 that is not
+whole tiles stays row-major.
+
 A call may multiply only the first rows of A at run time
 (``annotations={"hexagon.rows": rows}``, a multiple of 32 up to M): HMX then
 neither reads A's other rows nor writes C's, which keep what they held. A
@@ -55,6 +63,8 @@ GEMM_INST_HMX_BLOCK_SCALED = "hexagon.hmx.blockscaled"
 _NUM_WORKERS = "hexagon.num_workers"
 # The rows a call multiplies at run time, when fewer than M.
 _ROWS = "hexagon.rows"
+# C is padded to whole tiles, which the call may write (PadHMXOperands).
+_PADDED_C = "hexagon.padded_c"
 # The conversion config HMX reads: 32 scale words, then 32 bias words.
 CONFIG_WORDS = 64
 
@@ -76,16 +86,21 @@ def _first(region):
 
 
 def _tiles(extent) -> int:
-    """The tiles of a static extent."""
-    return int(extent) // TILE
+    """The tiles that cover a static extent."""
+    return -(-int(extent) // TILE)
+
+
+def _whole(*extents) -> bool:
+    """Whether static extents are whole tiles."""
+    return all(int(e) % TILE == 0 for e in extents)
 
 
 class GemmHMX(GemmBase):
     """``T.gemm`` of fp16 operands on HMX: one ``tl_hexagon_hmx_gemm`` call."""
 
-    def _check_shape(self, name: str) -> None:
+    def _check_shape(self, name: str, whole: bool = True) -> None:
         for dim, extent in (("M", self.M), ("N", self.N), ("K", self.K)):
-            if extent <= 0 or extent % TILE:
+            if extent <= 0 or (whole and extent % TILE):
                 raise ValueError(f"{name}: {dim} = {extent} is not a positive multiple of {TILE}")
 
     def infer_layout(self, target, thread_nums: int):
@@ -94,8 +109,8 @@ class GemmHMX(GemmBase):
             self.B: make_hmx_weight_layout(self.B, self.trans_B),
         }
         # An fp32 C stays row-major, where each register of the epilogue is
-        # one row of a tile.
-        if str(self.C.dtype) == "float16":
+        # one row of a tile, and so does an fp16 one that is not whole tiles.
+        if str(self.C.dtype) == "float16" and _whole(*self.C.shape[-2:]):
             layouts[self.C] = make_hmx_output_layout(self.C)
         return layouts
 
@@ -146,10 +161,12 @@ class GemmHMX(GemmBase):
         tiles of a row tile are contiguous, along the buffer's K extent."""
         A_buf = self.ARegion.buffer
         row_tile = _tiles(A_buf.shape[-2] if self.trans_A else A_buf.shape[-1]) * TILE_ELEMS
-        extent = (self.M // TILE - 1) * row_tile + self.K * TILE
-        return T.access_ptr(_first(self.ARegion), "r", extent), row_tile
+        extent = (_tiles(self.M) - 1) * row_tile + _tiles(self.K) * TILE_ELEMS
+        # The call zeroes A's padding along K.
+        mode = "r" if _whole(self.K) else "rw"
+        return T.access_ptr(_first(self.ARegion), mode, extent), row_tile
 
-    def _c(self, kind: str):
+    def _c(self, kind: str, M: int, N: int):
         """C's first element, its leading dimension (elements, or tiles of
         Crouton rows), whether its rows are aligned, and how the call
         accesses it."""
@@ -162,33 +179,41 @@ class GemmHMX(GemmBase):
             # boundaries: the region starts on a tile, and VTCM buffers on
             # registers.
             aligned = isinstance(ldc, tirx.IntImm) and ldc.value % TILE == 0
-            extent = (self.M - 1) * ldc + self.N
+            extent = (M - 1) * ldc + N
         else:
             ldc = _tiles(C_buf.shape[-1])
             aligned = True
-            extent = ((self.M // TILE - 1) * ldc + self.N // TILE) * TILE_ELEMS
+            extent = ((_tiles(M) - 1) * ldc + _tiles(N)) * TILE_ELEMS
         return T.access_ptr(_first(self.CRegion), mode, extent), ldc, aligned
 
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
         name = f"T.gemm({self.A.name}, {self.B.name}, {self.C.name}) on HMX"
-        self._check_shape(name)
+        self._check_shape(name, whole=False)
         if str(self.a_dtype) != "float16" or str(self.b_dtype) != "float16":
             raise ValueError(f"{name} multiplies fp16 operands, not {self.a_dtype} by {self.b_dtype}")
         self._check_operand_layouts(layout_map)
         kind = self._c_kind(layout_map)
         clear = self.clear_accum
         static_clear = bool(clear.value) if isinstance(clear, tirx.IntImm) else None
-        # An overwritten Crouton C takes HMX's tiles as they are.
-        direct = kind == "crouton" and static_clear is True
+        # C's rows and columns that the call writes: whole tiles when C is
+        # padded to them.
+        padded_c = bool(self.gemm_node.annotations.get(_PADDED_C, False))
+        M_c, N_c = (_tiles(self.M) * TILE, _tiles(self.N) * TILE) if padded_c else (self.M, self.N)
+        # An overwritten Crouton C takes HMX's tiles as they are, when they
+        # are all its own.
+        direct = kind == "crouton" and static_clear is True and _whole(M_c, N_c)
         a, a_row_tile = self._a()
         B_buf = self.BRegion.buffer
         b_column_tile = _tiles(B_buf.shape[-1] if self.trans_B else B_buf.shape[-2]) * TILE_ELEMS
-        b = T.access_ptr(_first(self.BRegion), "r", (self.N // TILE - 1) * b_column_tile + self.K * TILE)
+        b_mode = "r" if _whole(self.K) else "rw"
+        b = T.access_ptr(_first(self.BRegion), b_mode, (_tiles(self.N) - 1) * b_column_tile + _tiles(self.K) * TILE_ELEMS)
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm")
         shared = _flag(self._shared())
-        M, N, K = self.M, self.N, self.K
+        M, N, K = M_c, N_c, self.K
         # The rows HMX multiplies; the accesses above cover all M.
-        rows = self._rows()
+        rows = M if self.gemm_node.annotations.get(_ROWS, None) is None else self._rows()
+        if self.gemm_node.annotations.get(_ROWS, None) is not None and not _whole(M):
+            raise ValueError(f"{name}: run-time rows need M a multiple of {TILE}, not {M}")
 
         def call(c, ldc, rows_major: bool, aligned: bool, clear, stage, config):
             flags = [_flag(rows_major), _flag(aligned), shared, _flag(direct)]
@@ -197,7 +222,7 @@ class GemmHMX(GemmBase):
             return tirx.call_intrin("void", gemm, *flags, *args)
 
         if kind != "elements":
-            c, ldc, aligned = self._c(kind)
+            c, ldc, aligned = self._c(kind, M, N)
 
             @T.prim_func
             def _gemm_hmx() -> None:
@@ -317,7 +342,7 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
         sfa_first = sfa_origin[:-1] + (sfa_origin[-1] + first_a,)
         sfa = T.access_ptr(sfa_region.buffer[sfa_first], "r", (M - 1) * ld_sfa + 1)
 
-        c, ldc, aligned = self._c(kind)
+        c, ldc, aligned = self._c(kind, M, N)
         clear = self.clear_accum
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm_blockscaled")
         normal = self.gemm_node.annotations.get("hexagon.normal_scales", False)

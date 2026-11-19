@@ -84,6 +84,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.hexagon.transform.InsertWriteThroughWritebacks()(mod)
+    mod = tilelang.hexagon.transform.PadHMXOperands()(mod)
     mod = tilelang.hexagon.transform.StageHMXOperandCopies()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)

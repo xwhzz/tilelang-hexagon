@@ -148,10 +148,19 @@ multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 2
 ## 2. GEMMs, and the pipelined K loop
 
 `T.gemm(A, B, C)` runs on HMX when A and B are fp16 and C is fp16 or fp32, all three in VTCM
-(shared buffers or fragments), M, N and K are multiples of 32, and each operand is a matrix
-of whole 32x32 tiles that starts on a tile: a whole buffer, a sub-matrix of a larger one, or
-one matrix of a stack. Transposes and `clear_accum`, also as an expression such as `k == 0`,
-combine freely.
+(shared buffers or fragments), and each operand is a matrix that starts on a 32x32 tile: a
+whole buffer, a sub-matrix of a larger one, or one matrix of a stack. Transposes and
+`clear_accum`, also as an expression such as `k == 0`, combine freely.
+
+M, N and K need not be multiples of 32: HMX multiplies the tiles that cover them, from
+M = 2 rows. `PadHMXOperands` pads A's and B's buffers to whole tiles, and C's when the
+call writes all of it; the copies into them and every other access keep their regions. The
+call zeroes A's and B's padding along K before it multiplies, and writes only C's rows and
+columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
+tiles stays row-major. On v79, an M x 512 x 512 GEMM from VTCM takes about 1.3 µs on HMX
+for any M from 2 to 32, against 16 µs (M = 2) to 135 µs (M = 16) on HVX. A GEMV (M = 1)
+stays on HVX, as do the GEMMs whose A or B has a layout of its own (`T.annotate_layout`),
+such as the LFM decode's, whose weights stream by DMA in the HMX weight layout.
 
 Any other GEMM of row-major matrices runs on HVX (`GemmHVX`, `tl.hexagon.GemmHVXRejection`):
 fp16 operands into an fp16 or fp32 C, fp32 operands into an fp32 C, any M, N and K, at most

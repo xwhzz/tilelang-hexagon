@@ -20,9 +20,17 @@ def _source(func):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
 
+def _row_major(*buffers):
+    """Row-major layouts of their own for 2D buffers: a gemm of such operands
+    keeps the unit they chose (HVX), where HMX would otherwise multiply fp16
+    operands off whole tiles in padded tiles (PadHMXOperands)."""
+    T.annotate_layout({b: T.Layout(tuple(b.shape), lambda i, j: [i, j]) for b in buffers})
+
+
 def _gemm(M, N, K, BK=None, ab="float16", c_dtype="float32", trans_a=False, trans_b=False, clear="fill"):
     """C = A @ B over K in blocks of BK (all of K by default): T.clear and
-    accumulating calls ("fill"), or clear_accum on the first block ("first")."""
+    accumulating calls ("fill"), or clear_accum on the first block ("first").
+    A and B are row-major, on HVX (_row_major)."""
 
     BK = BK or K
 
@@ -36,6 +44,7 @@ def _gemm(M, N, K, BK=None, ab="float16", c_dtype="float32", trans_a=False, tran
             a = T.alloc_shared((BK, M) if trans_a else (M, BK), ab)
             b = T.alloc_shared((N, BK) if trans_b else (BK, N), ab)
             c = T.alloc_fragment((M, N), c_dtype)
+            _row_major(a, b)
             if clear == "fill":
                 T.clear(c)
             for k in T.serial(K // BK):
@@ -155,8 +164,7 @@ def test_gemms_neither_unit_runs_say_why(caplog):
         source = _source(_gemm(16, 64, 64, trans_a=True, trans_b=True))
     assert "tl_hvx_gemm" not in source
     assert (
-        "runs as a scalar loop, not on HMX: HMX needs M, N and K multiples of 32, not 16 x 64 x 64; "
-        "not on HVX: HVX reads A or B along K, so not both transposed"
+        "runs as a scalar loop, not on HMX: A (a) is not whole 32 x 32 tiles; not on HVX: HVX reads A or B along K, so not both transposed"
     ) in caplog.text
 
 
@@ -285,6 +293,7 @@ def _long_dot_region(M, N, ldb, offset, c_dtype, clear, lda=1024, a_offset=0):
             a = T.alloc_shared((M, lda), "float16")
             b = T.alloc_shared((N, ldb), "float16")
             c = T.alloc_fragment((M, N), c_dtype)
+            _row_major(a, b)
             T.copy(A, a)
             T.copy(B, b)
             T.copy(Init, c)
