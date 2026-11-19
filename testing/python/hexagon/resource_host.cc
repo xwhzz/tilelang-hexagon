@@ -138,8 +138,13 @@ static bool hmx_power;
 static void tl_power_hmx(bool enabled) { hmx_power = enabled; }
 #include <tl_templates/hexagon/hmx_lifecycle.h>
 
+// What tl_hexagon_open does for a Session with a cooperative kernel.
+static int open_session(int hmx) {
+  return tl_vtcm_open_mode(hmx, tl_resource_release_callback,
+                           &tl_resource_state);
+}
 static tl_cooperative_run *begin(unsigned nw = 1, bool hmx = true) {
-  assert(tl_vtcm_open(hmx) == 0);
+  assert(open_session(hmx) == 0);
   assert(tl_resource_prepare(true) == 0);
   auto *r = tl_resource_current();
   assert(r && held);
@@ -238,7 +243,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (mode == "four-runs") {
-    assert(tl_vtcm_open(1) == 0);
+    assert(open_session(1) == 0);
     uint8_t *shadow = nullptr;
     unsigned previous_epoch = 0;
     for (unsigned call = 0; call < 4; ++call) {
@@ -258,12 +263,15 @@ int main(int argc, char **argv) {
       assert(tl_resource_worker_terminal(r, 0) == 0);
       assert(tl_resource_finish(0) == 0);
     }
-    assert(opens == 2 && closes == 1 && takes == 4 && gives == 4);
+    assert(opens == 1 && closes == 0 && takes == 4 && gives == 4);
     assert(tl_resource_close() == 0);
     return 0;
   }
   if (mode == "ordinary-switch") {
-    assert(tl_vtcm_open(1) == 0);
+    // Ordinary and cooperative runs share the Session's one callback context;
+    // a request during an ordinary run is not recorded, the run just returns.
+    assert(open_session(1) == 0);
+    assert(tl_vtcm_open(1) == 0); // the HMX session init reuses it
     for (bool coop : {false, false, true, true, false}) {
       assert(tl_resource_prepare(coop) == 0);
       if (coop) {
@@ -272,13 +280,29 @@ int main(int argc, char **argv) {
         assert(tl_resource_worker_enter(r, 0) == 0);
         assert(tl_resource_worker_terminal(r, 0) == 0);
       } else {
-        assert(!callback);
+        assert(callback && !tl_resource_current());
         assert(tl_vtcm_take() == 0);
+        callback(ctx, opaque);
+        assert(tl_resource_state.request_seq == 0);
         assert(tl_vtcm_give() == 0);
       }
       assert(tl_resource_finish(0) == 0);
     }
-    assert(opens == 3 && closes == 2);
+    assert(opens == 1 && closes == 0);
+    assert(tl_resource_close() == 0);
+    return 0;
+  }
+  if (mode == "plain-context-cooperative") {
+    // A context opened without the callback cannot run a cooperative kernel;
+    // the run is refused without reopening or poisoning the context.
+    assert(tl_vtcm_open(1) == 0);
+    assert(tl_resource_prepare(true) == TL_ERR_VTCM);
+    assert(!held && !tl_resource_state.busy);
+    assert(!__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE));
+    assert(opens == 1 && closes == 0);
+    assert(tl_resource_prepare(false) == 0);
+    assert(tl_vtcm_take() == 0 && tl_vtcm_give() == 0);
+    assert(tl_resource_finish(0) == 0);
     assert(tl_resource_close() == 0);
     return 0;
   }

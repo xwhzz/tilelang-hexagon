@@ -62,6 +62,7 @@ def resource_host(tmp_path_factory):
         "no-hmx",
         "parallel-workers",
         "ordinary-switch",
+        "plain-context-cooperative",
         "query",
         "attribute",
         "open",

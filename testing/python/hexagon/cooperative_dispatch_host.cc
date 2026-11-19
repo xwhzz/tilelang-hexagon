@@ -46,6 +46,15 @@ static int tl_resource_close() {
   return close_error;
 }
 static int tl_vtcm_open(int) { return 0; }
+static int open_error;
+static int tl_resource_release_callback(unsigned, void *) { return 0; }
+static int tl_vtcm_open_mode(int, int (*callback)(unsigned, void *),
+                             void *opaque) {
+  assert(callback == tl_resource_release_callback &&
+         opaque == &tl_resource_state);
+  calls.push_back("open-callback");
+  return open_error;
+}
 static int tl_vtcm_take() {
   assert(prepared && !cooperative && !held);
   calls.push_back("take");
@@ -123,4 +132,12 @@ int main(int argc, char **argv) {
   assert(tl_hexagon_close() == TL_OK);
   assert((calls ==
           std::vector<std::string>{"close-resource", "close-vtcm", "unvote"}));
+
+  // A Session with a cooperative kernel opens its context with the release
+  // callback; when that fails, open gives everything back.
+  calls.clear();
+  open_error = -1;
+  assert(tl_hexagon_open() == -1);
+  assert((calls == std::vector<std::string>{"open-callback", "close-resource",
+                                            "close-vtcm", "unvote"}));
 }

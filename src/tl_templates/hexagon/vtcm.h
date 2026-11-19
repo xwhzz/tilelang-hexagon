@@ -93,11 +93,14 @@ TL_VTCM_INLINE int tl_vtcm_bind_region(void *base, unsigned int size) {
 TL_VTCM_INLINE int
 tl_vtcm_open_mode(int hmx, int (*release_callback)(unsigned int, void *),
                   void *opaque) {
-  tl_vtcm_hmx_requested = hmx;
   if (__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
     return -1;
+  // One context per process: an ordinary request reuses either kind, and a
+  // cooperative one needs the context to carry the release callback. A
+  // context is never reopened mid-session.
   if (tl_vtcm_ctx)
-    return tl_vtcm_cooperative == (release_callback != nullptr) ? 0 : -1;
+    return !release_callback || tl_vtcm_cooperative ? 0 : -1;
+  tl_vtcm_hmx_requested = hmx;
   unsigned int avail, total;
   compute_res_vtcm_page_t avail_pg, total_pg;
   if (HAP_compute_res_query_VTCM(0, &total, &total_pg, &avail, &avail_pg) ||
@@ -111,7 +114,7 @@ tl_vtcm_open_mode(int hmx, int (*release_callback)(unsigned int, void *),
       (release_callback && HAP_compute_res_attr_set_release_callback(
                                &req, release_callback, opaque)))
     return -1;
-  tl_vtcm_ctx = HAP_compute_res_acquire(&req, 10000);
+  tl_vtcm_ctx = HAP_compute_res_acquire(&req, TL_VTCM_TAKE_TIMEOUT_US);
   if (!tl_vtcm_ctx)
     return -1;
   tl_vtcm_region = HAP_compute_res_attr_get_vtcm_ptr(&req);

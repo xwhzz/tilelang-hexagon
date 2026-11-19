@@ -264,17 +264,10 @@ static inline int tl_resource_prepare(bool cooperative) {
     worker.entered = worker.held = worker.terminal = 0;
   }
   int rc = TL_OK;
-  if (tl_vtcm_ctx && tl_vtcm_cooperative != cooperative) {
-    if (tl_vtcm_close())
-      rc = tl_resource_fail(run, TL_ERR_VTCM, true);
-    else {
-      free(run->shadow_allocation);
-      run->shadow_allocation = nullptr;
-      run->shadow = nullptr;
-    }
-  }
-  if (!rc &&
-      tl_vtcm_open_mode(tl_vtcm_hmx_requested,
+  // The Session opens its context with the release callback when it has a
+  // cooperative kernel (tl_hexagon_open), so ordinary and cooperative runs
+  // share it; this only opens a missing context.
+  if (tl_vtcm_open_mode(tl_vtcm_hmx_requested,
                         cooperative ? tl_resource_release_callback : nullptr,
                         cooperative ? run : nullptr))
     rc = tl_resource_fail(

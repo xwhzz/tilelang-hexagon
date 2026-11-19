@@ -200,6 +200,19 @@ static inline int tl_hexagon_close(void) {{
 // zeros; a failed open gives up what it took. 0, or nonzero.
 static inline int tl_hexagon_open(void) {{
   tl_power_vote();
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+  // One context for the Session's life, with the release callback: a
+  // cooperative run yields on request at its checkpoints, an ordinary run
+  // ignores the request and gives the context back when it returns.
+#if defined(TL_HEXAGON_USES_HMX)
+  if (tl_vtcm_open_mode(1, tl_resource_release_callback, &tl_resource_state)) {{
+#else
+  if (tl_vtcm_open_mode(0, tl_resource_release_callback, &tl_resource_state)) {{
+#endif
+    tl_hexagon_close();
+    return -1;
+  }}
+#endif
 #if defined(TL_HEXAGON_USES_HMX)
   tl_hmx_session_init();
   bool ok = tl_hmx_session_ok();

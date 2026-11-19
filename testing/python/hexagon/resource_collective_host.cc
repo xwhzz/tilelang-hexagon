@@ -11,7 +11,8 @@ int main(int argc, char **argv) {
   std::string mode = argv[1];
   granted =
       8193; // Exercise the final scalar tail, as well as every HVX stripe.
-  assert(tl_vtcm_open(1) == 0);
+  assert(tl_vtcm_open_mode(1, tl_resource_release_callback,
+                           &tl_resource_state) == 0);
   for (unsigned call = 0; call < (mode == "repeated" ? 4u : 1u); ++call) {
     assert(tl_resource_prepare(true) == 0);
     auto *run = tl_resource_current();
