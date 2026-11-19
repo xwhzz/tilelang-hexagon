@@ -128,7 +128,7 @@ def norm_rope(v, o, weight, cos, sin, pos, t64, sq, s, eps: float):
 
 
 @T.macro
-def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb, sc, p, o, m, mb, l, lb, alpha, cooperative: bool):
+def attend(qkv, q0, kv_k, kv_v, ai, kvh, pos, mix, out0, group: int, qg, kb, vb, sc, p, o, m, mb, l, lb, alpha, cooperative: bool = False):
     """mix[0, out0 + (g * 64 + d)] = softmax(q_g K^T / 8) V over positions
     [0, pos] of KV head kvh, for the `group` query heads at qkv[0, q0 + ...]:
     blocks of POS_BLOCK positions with an online softmax."""

@@ -87,6 +87,8 @@ def resource_host(tmp_path_factory):
         "four-runs",
         "admission-closed",
         "ordinary-hmx",
+        "ordinary-hmx-take-lock-fail",
+        "ordinary-hmx-pool-lock-fail",
         "ordinary-hmx-unlock-fail",
         "ordinary-hmx-body-pool-fail",
         "ordinary-hmx-body-give-fail",

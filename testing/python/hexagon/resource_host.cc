@@ -161,6 +161,39 @@ int main(int argc, char **argv) {
     granted = 12289;
     offset = 1;
   }
+  if (mode == "ordinary-hmx-take-lock-fail" ||
+      mode == "ordinary-hmx-pool-lock-fail") {
+    // A failed lock takes nothing: VTCM goes back and the context stays usable.
+    tl_hmx_session_init();
+    assert(tl_resource_prepare(false) == 0);
+    if (mode == "ordinary-hmx-take-lock-fail") {
+      failure = "lock";
+      assert(tl_hmx_take() == TL_ERR_HMX);
+      assert(!held && gives == 1 && locks == 0);
+    } else {
+      assert(tl_hmx_take() == 0);
+      tid = 2;
+      failure = "lock";
+      {
+        tl_hmx_worker_scope worker;
+        assert(worker.status == TL_ERR_HMX);
+      }
+      failure.clear();
+      tid = 1;
+      assert(tl_hmx_give() == 0);
+      assert(!held && locks == 1 && unlocks == 1);
+    }
+    assert(!__atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE));
+    assert(tl_resource_finish(TL_ERR_HMX) == TL_ERR_HMX);
+    failure.clear();
+    assert(tl_resource_prepare(false) == 0);
+    assert(tl_hmx_take() == 0);
+    assert(tl_hmx_give() == 0);
+    assert(tl_resource_finish(0) == 0);
+    assert(tl_hmx_session_deinit() == 0);
+    assert(!hmx_power && !live);
+    return 0;
+  }
   if (mode == "ordinary-hmx" || mode == "ordinary-hmx-unlock-fail" ||
       mode == "ordinary-hmx-body-pool-fail" ||
       mode == "ordinary-hmx-body-give-fail") {

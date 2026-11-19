@@ -37,8 +37,10 @@ TL_HMX_INLINE int tl_hmx_enable(void) {
       __atomic_load_n(&tl_vtcm_poisoned, __ATOMIC_ACQUIRE))
     return -1;
   int rc = HAP_compute_res_hmx_lock2(tl_vtcm_ctx, HAP_COMPUTE_RES_HMX_SHARED);
+  // A failed lock took nothing, so the run can still give VTCM back. Only a
+  // failed unlock leaves ownership unknown and poisons the context.
   if (rc)
-    tl_resource_fail(&tl_resource_state, TL_ERR_HMX, true);
+    tl_resource_fail(&tl_resource_state, TL_ERR_HMX);
   return rc;
 }
 TL_HMX_INLINE int tl_hmx_disable(void) {
