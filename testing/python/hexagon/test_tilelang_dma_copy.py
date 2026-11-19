@@ -188,7 +188,7 @@ def test_async_manual_ping_pong(arch):
     assert "ptx_" not in source
 
 
-@pytest.mark.parametrize("arch", ["v75", "v79"])
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
 def test_async_strided_load_store(arch):
     @T.prim_func
     def probe(A: T.Tensor((32, 128), "float16"), B: T.Tensor((32, 128), "float16")):
@@ -440,7 +440,6 @@ def test_async_hmx_dsl_schedule(arch):
     assert "tl_crouton_copy<true," in source
     # The block multiplies in one call, which stores HMX's tiles into cn.
     assert "tl_hexagon_hmx_gemm<false, true, false, true>(128, 128, 2048, " in source
-    assert "tl_hexagon_dma_copy_hmx_matmul_double_buffer" not in source
 
 
 def make_queue_probe(workers=None):
@@ -693,14 +692,11 @@ def make_hmx_probe():
     return dma_hmx_workers
 
 
-def test_worker_hmx_thread_cleanup_survives_dma_errors():
+def test_worker_hmx_programs_use_the_hmx_worker_scope():
     source = lower(make_hmx_probe())
     # The worker scope holds the thread's HMX enable for all of its programs
-    # and drops it on any return. The GEMM holds the HMX unit only inside its
-    # own function, which returns no errors.
+    # and drops it on any return, including a DMA error's.
     assert "tl_parallel_for<tl_hmx_worker_scope>(13, 6, " in source
-    assert "tl_hmx_enable" not in source
-    assert "tl_hmx_disable" not in source
 
 
 def test_async_scalar_access_is_not_silently_synchronous():

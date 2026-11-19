@@ -434,9 +434,9 @@ def _typed_copy(func, annotations, op="tl.tileop.copy"):
     return func.with_body(X.stmt_functor.ir_transform(func.body, None, change))
 
 
-@pytest.mark.parametrize("cache_bypass", [0, 1])
-def test_compact_pipeline_preserves_typed_copy_cache_annotation(cache_bypass):
-    lowered = _lower(_typed_copy(_case(), {"hexagon_dma_src_l2_bypass": cache_bypass}))
+@pytest.mark.parametrize("hint", [0, 1])
+def test_compact_pipeline_preserves_typed_copy_annotations(hint):
+    lowered = _lower(_typed_copy(_case(), {"custom_copy_hint": hint}))
     stores, copies = [], []
 
     def collect(node):
@@ -447,7 +447,7 @@ def test_compact_pipeline_preserves_typed_copy_cache_annotation(cache_bypass):
 
     X.stmt_functor.post_order_visit(lowered.body, collect)
     assert len(stores) == 1 and copies
-    assert all(int(copy.annotations["hexagon_dma_src_l2_bypass"]) == cache_bypass for copy in copies)
+    assert all(int(copy.annotations["custom_copy_hint"]) == hint for copy in copies)
 
 
 @pytest.mark.parametrize("flag", ["is_async_copy", "force_cp_async", "is_tma_copy"])

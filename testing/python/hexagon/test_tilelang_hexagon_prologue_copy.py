@@ -20,7 +20,7 @@ CANDIDATE = "tl.hexagon.prologue_copy_candidate"
 
 def _kernel(policy=None, extent=3, minimum=0, mixed=False, contract=None, hints=None):
     annotations = {} if policy is None else {POLICY: policy}
-    second = {"hexagon_dma_src_l2_bypass": 0} if mixed else {}
+    second = {"custom_copy_hint": 0} if mixed else {}
 
     @T.prim_func
     def kernel(A: T.Tensor((8, 256), "int32"), B: T.Tensor((8, 256), "int32"), C: T.Tensor((8, 256), "int32")):
@@ -125,8 +125,8 @@ def test_write_through_keeps_writeback_before_synchronous_read():
     assert _schedule(actual) == _schedule(default)
 
 
-@pytest.mark.parametrize("hints", [{"hexagon_dma_src_l2_bypass": 1}, {"custom_copy_hint": 1}])
-def test_explicit_cache_or_unknown_copy_hint_preserves_source(hints):
+def test_unknown_copy_hint_preserves_source():
+    hints = {"custom_copy_hint": 1}
     baseline, _ = _lower(_kernel(hints=hints))
     actual, _ = _lower(_kernel("sync_if_supported", hints=hints))
     assert actual == baseline

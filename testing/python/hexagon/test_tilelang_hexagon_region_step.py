@@ -49,8 +49,8 @@ def _iteration_shape(func):
     return [int(loop.extent) for loop in reversed(loops)]
 
 
-@pytest.mark.parametrize("axis", [0, 1])
-@pytest.mark.parametrize("step", [None, 1])
+# Without a step, the axis makes no difference: one case.
+@pytest.mark.parametrize(("axis", "step"), [(0, None), (0, 1), (1, 1)])
 def test_unit_step_region_uses_physical_order(axis, step):
     # The 2x4 logical region is transposed physically, so contiguous traversal
     # is 4x2. This ensures the negative cases do not pass through a dead path.

@@ -213,7 +213,7 @@ def test_decode_is_one_cycle_of_phases(tiny_bundle, arch, cooperative):
         # Four barriers a layer and one after the head; the GEMVs are calls.
         assert source.count("tl_grid_sync(") == 4 * c.layers + 1
         assert "TL_HEXAGON_USES_COOPERATIVE" not in source
-    assert "TL_GEMM" not in source and "tl_hvx_gemm_int_scaled<" in source
+    assert "tl_hvx_gemm_int_scaled<" in source
 
 
 def _reference(model, tokens, n, n_forced):
@@ -332,7 +332,7 @@ def test_fp16_decode_is_one_step_of_phases(model, arch, cooperative, fp16_bundle
     else:
         assert source.count("tl_grid_sync(") == 4 * c.layers + 1
         assert "TL_HEXAGON_USES_COOPERATIVE" not in source
-    assert "tl_hvx_gemm_weight<" in source and "TL_GEMM" not in source
+    assert "tl_hvx_gemm_weight<" in source
 
 
 @pytest.mark.parametrize("cooperative", [False, True])

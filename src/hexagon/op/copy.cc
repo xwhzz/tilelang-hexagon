@@ -58,9 +58,8 @@ bool CanUseSyncPrologueCopy(const CopyNode &op, const LowerArgs &T,
       T.layout_map.count(op.src) || T.layout_map.count(op.dst)) {
     return false;
   }
-  // Explicit transfer/cache/SIMT hints and unknown annotations keep their
-  // existing lowering. In particular, do not turn an explicitly uncached
-  // DMA source into a CPU read. DMA-only functions never receive the marker.
+  // Explicit transfer/SIMT hints and unknown annotations keep their existing
+  // lowering. DMA-only functions never receive the marker.
   for (const auto &entry : op.annotations) {
     if (entry.first != kPrologueCopyCandidate &&
         entry.first != attr::kAsyncCopyNoImplicitCommitWait) {

@@ -44,9 +44,12 @@ def make_strided_layout_copy(layout, wide_stride=True):
     return probe
 
 
-@pytest.mark.parametrize("layout", ["rows", "panel", "activation", "weight"])
+# A wide "rows" buffer is the default shape: one case of it.
+@pytest.mark.parametrize(
+    ("layout", "wide_stride"),
+    [("rows", False), ("panel", False), ("panel", True), ("activation", False), ("activation", True), ("weight", False), ("weight", True)],
+)
 @pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
-@pytest.mark.parametrize("wide_stride", [False, True])
 def test_strided_layout_copies_use_target_descriptors(layout, arch, wide_stride):
     source = _lower(make_strided_layout_copy(layout, wide_stride), arch)
     submits = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]

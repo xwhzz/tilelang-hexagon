@@ -63,7 +63,7 @@ def test_tall_copy_splits_into_one_group(rows, arch):
             T.dma_wait()
 
     artifact = _lower(column, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
-    # A 2D descriptor has at most 65535 rows on both architectures.
+    # A 2D descriptor has at most 65535 rows on every architecture.
     descriptors = 1 if rows == 65535 else 2
     assert _ops(artifact) == ["queue"] + ["submit"] * descriptors + ["commit", "wait"]
     assert _queue(artifact) == (descriptors, 1)

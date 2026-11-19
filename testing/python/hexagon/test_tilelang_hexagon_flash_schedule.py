@@ -30,11 +30,12 @@ def test_auto_keeps_unmeasured_shapes_serial(shape):
     assert flash.select_schedule("auto", target, *shape) == "serial"
 
 
-@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
-@pytest.mark.parametrize("schedule", ["serial", "pipeline"])
+@pytest.mark.parametrize(("arch", "schedule"), [("v79", "serial"), ("v75", "pipeline")])
 def test_explicit_schedule_overrides_auto(arch, schedule):
+    # A shape whose auto schedule is the other one on that architecture.
     target = normalize_hexagon_target({"kind": "hexagon", "mcpu": "hexagon" + arch})
-    assert flash.select_schedule(schedule, target, 32, 64, 64, 128) == schedule
+    assert flash.select_schedule("auto", target, 64, 256, 64, 64) != schedule
+    assert flash.select_schedule(schedule, target, 64, 256, 64, 64) == schedule
 
 
 @pytest.mark.parametrize(

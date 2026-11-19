@@ -15,7 +15,7 @@ CANDIDATE = "tl.hexagon.prologue_copy_candidate"
 def _copies(func, mixed=False, explicit=None):
     def change(node):
         if isinstance(node, X.BufferStore) and node.buffer.name in ("sa", "sb"):
-            annotations = {"hexagon_dma_src_l2_bypass": 0} if mixed and node.buffer.name == "sb" else {}
+            annotations = {"custom_copy_hint": 0} if mixed and node.buffer.name == "sb" else {}
             annotations.update(explicit or {})
             src = X.BufferRegion(node.value.buffer, [tvm.ir.Range.from_min_extent(index, 1) for index in node.value.indices])
             dst = X.BufferRegion(node.buffer, [tvm.ir.Range.from_min_extent(index, 1) for index in node.indices])
@@ -48,7 +48,7 @@ class _CopyFIFO(_FIFO):
             assert not self.pending(key), f"reuse before retirement: {key}"
             # These tests use ordinary, in-bounds same-dtype scalar regions.
             # The actual target lowerer is covered separately by source tests.
-            selected = CANDIDATE in call.annotations and "hexagon_dma_src_l2_bypass" not in call.annotations
+            selected = CANDIDATE in call.annotations and "custom_copy_hint" not in call.annotations
             if selected:
                 self.mem[key] = value
                 self.sync += 1

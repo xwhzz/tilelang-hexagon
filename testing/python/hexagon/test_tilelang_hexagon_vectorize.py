@@ -190,8 +190,8 @@ def test_row_scalars_come_from_one_register_per_strip():
     assert "float32 r_lanes = tl_hvx_load_lanes<32>((&(((float*)r)[(i_strip * 32)])), 32);" in source
     assert "for (int32_t i_lane = 0; i_lane < 32; ++i_lane) {" in source
     assert "tl_hvx_broadcast_lane<32, 1>(r_lanes, i_lane)" in source
-    # The row loop reads no scalar of r.
-    assert "((float*)r)[" not in source.split("i_strip")[1].split("tl_hvx_load_lanes")[0]
+    # Past the strip's register, the row loop reads no scalar of r.
+    assert "((float*)r)[" not in source.split("r_lanes = tl_hvx_load_lanes")[1].split(";", 1)[1]
 
 
 def test_fp16_row_scalars_fill_a_strip_of_64_rows():

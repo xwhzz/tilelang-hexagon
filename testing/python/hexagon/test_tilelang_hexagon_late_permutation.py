@@ -297,8 +297,6 @@ def test_interchange_preserves_holey_store_domain_and_loop_kinds(kinds):
     assert isinstance(store.value, tirx.Shuffle)
     assert store.indices[0].same_as(outer.loop_var)
     assert tvm.arith.Analyzer().can_prove(store.indices[1] == inner.loop_var + 2)
-    addresses = [i * 1024 + (j + 2) * 64 + k for i in range(64) for j in range(2) for k in range(64)]
-    assert len(addresses) == len(set(addresses)) == 8192
 
 
 @pytest.mark.parametrize(

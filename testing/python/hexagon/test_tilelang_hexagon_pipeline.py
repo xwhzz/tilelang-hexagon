@@ -20,7 +20,7 @@ def _source(func, target="hexagon"):
 
 
 def _gemm(M, N, K, BK, stages):
-    """One BM x BN block of C = A @ B, its K loop pipelined (or serial: 0)."""
+    """One BM x BN block of C = A @ B, its K loop pipelined."""
 
     @T.prim_func
     def kernel(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"), C: T.Tensor((M, N), "float32")):
@@ -28,16 +28,10 @@ def _gemm(M, N, K, BK, stages):
             a = T.alloc_shared((M, BK), "float16")
             b = T.alloc_shared((BK, N), "float16")
             acc = T.alloc_fragment((M, N), "float32")
-            if stages:
-                for k in T.Pipelined(K // BK, num_stages=stages):
-                    T.copy(A[0, k * BK], a)
-                    T.copy(B[k * BK, 0], b)
-                    T.gemm(a, b, acc, clear_accum=(k == 0))
-            else:
-                for k in T.serial(K // BK):
-                    T.copy(A[0, k * BK], a)
-                    T.copy(B[k * BK, 0], b)
-                    T.gemm(a, b, acc, clear_accum=(k == 0))
+            for k in T.Pipelined(K // BK, num_stages=stages):
+                T.copy(A[0, k * BK], a)
+                T.copy(B[k * BK, 0], b)
+                T.gemm(a, b, acc, clear_accum=(k == 0))
             T.copy(acc, C)
 
     return kernel

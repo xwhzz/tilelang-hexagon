@@ -1,6 +1,6 @@
 """Actual cooperative/worker headers; SDK, DMA and resource API are host fakes.
 
-The resource API itself is covered independently by cooperative_resource_host.
+The resource API itself is covered independently by test_tilelang_hexagon_resource_host.
 These tests model barriers, admission, byte preservation and checked error
 propagation. They neither access a device nor prove SDK scheduling/latency.
 """
