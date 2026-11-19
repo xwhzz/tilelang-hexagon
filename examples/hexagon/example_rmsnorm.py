@@ -14,7 +14,7 @@ standard lowering (fp16 loads, fp32 arithmetic, fp16 stores); `T.rsqrt` becomes 
 the shared tile in place: HVX transpose trees reduce blocks of rows into whole
 registers of results.
 
-Requires a Hexagon device + SDK over adb (see README.md).
+Requires a Hexagon device (adb or SSH) and the SDK (see README.md).
 
     python example_rmsnorm.py --m 64 --n 256
 """

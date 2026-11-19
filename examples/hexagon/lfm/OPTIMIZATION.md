@@ -11,7 +11,7 @@ Unless noted otherwise, numbers are from the v79 cDSP of a Snapdragon 8 Elite
 fp16 scale per 64 columns, an 8-bit tied head: 685.2 MB streamed a token). The
 DSP runs at about 2.06 GHz under a session's clock vote. MB and GB are 10^6 and
 10^9 bytes.
-"#N" is a pull request of this repository.
+"#N" is a pull request or an issue of this repository.
 
 ## Where it stands
 
@@ -281,7 +281,7 @@ Within W4A16, each of these would give about 0.5-1%:
 LFM3-1.7B runs unquantized: its projections in fp16, in a bundle of 3463.4 MB,
 of which a decoded token reads 3461.9 MB. The numbers are from the same phone
 and the same measurements as above, with `bench.py` taking the median of 3
-runs unless noted otherwise. #179 tracks this work.
+runs unless noted otherwise. #179 tracked this work.
 
 ### LFM3: where it stands
 
@@ -427,7 +427,7 @@ On the same v79 phone, `bench.py` tg128 at depth 130816 goes from 6.46 to
   - the VTCM changes hands between them in about 72 µs (the resource manager
     zeroes it).
 
-  The layers split into a stage per process (#219): at 32K, two processes
+  The layers split into a stage per process (#219, #224): at 32K, two processes
   against one cost the prefill nothing measurable and a token 0.8 ms (0.9%).
 
 ### LFM3: what is next

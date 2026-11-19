@@ -23,7 +23,8 @@ branch's whole output to it, read from the workers' slices in DDR. LFM3 norms
 a branch's output over all of it before the add (sandwich norm), so a worker
 writes its slice's sum of squares beside the slice. A layer takes four
 barriers: after the operator's output, its projection, the FFN's hidden
-units and their projection.
+units and their projection. Cooperative kernels (the default) also meet after
+each block of attention keys and every 16 blocks of the LM head.
 
 The KV cache is fp16, as the weights, in HMX's tiles (``kv_layouts``), which
 the prefill's attention reads by DMA into its operands; the decode's attention

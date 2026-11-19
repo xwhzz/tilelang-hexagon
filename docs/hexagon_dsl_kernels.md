@@ -30,7 +30,7 @@ offsets it proves multiples of their alignment as aligned `vmem`, and the others
 cycles, as fast as an aligned one, where it was a scalar loop of 3.7M to 4.0M. Backing this,
 `src/tl_templates/hexagon/common.h`'s `vec_type` is a native clang `ext_vector` (so
 `a * b`, `a & mask` become real HVX ops, not scalar struct loops), and `PrintType` emits
-vector spellings up to 128 lanes. On v73, generated function scopes that evaluate
+vector spellings up to 128 lanes. On v73 and v75, generated function scopes that evaluate
 floating operations enable IEEE fp16/fp32 arithmetic with a local attribute.
 The entry and each worker body are checked separately: pure data transfer, DMA,
 and HMX scopes keep their existing instruction policy. Casts, comparisons, scalar
@@ -41,7 +41,7 @@ without an intermediate qfloat rounding. Half-to-integer casts decode the expone
 significand, and sign with integer operations to truncate; the compiler's direct
 IEEE half conversion rounds instead. As with an ordinary C cast, the finite
 truncated value must fit the destination integer type.
-The build does not enable `-mhvx-ieee-fp` globally. v75/v79 retain qfloat arithmetic
+The build does not enable `-mhvx-ieee-fp` globally. v79 retains qfloat arithmetic
 plus a conversion: the tested SM8750 (v79) cDSP returns zeros for the IEEE arithmetic
 instructions, although hexagon-sim computes them correctly. Explicit qfloat intrinsics
 in math, reduction, and GEMM helpers keep their existing algorithms and accuracy bounds.
@@ -470,7 +470,7 @@ input cache state before enabling it.
 ## 3. Measuring
 
 - **Measure compute, not one call's wall clock.** A standalone kernel's call is dominated
-  by moving its arguments over FastRPC and `adb`. Time inside the kernel
+  by moving its arguments over FastRPC and `adb` or SSH. Time inside the kernel
   (`HAP_perf_get_pcycles`), repeat the work, or keep the arguments resident in a session
   (`tilelang.hexagon.runtime.session`) before reading a number as compute.
 - **HMX accumulates K in high precision.** Each K tile accumulates without a clear, and

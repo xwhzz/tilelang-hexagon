@@ -22,6 +22,8 @@ get_started/targets
 :caption: HARDWARE BACKENDS
 
 hexagon_backend
+hexagon_dsl_kernels
+hexagon_env_setup
 :::
 
 :::{toctree}

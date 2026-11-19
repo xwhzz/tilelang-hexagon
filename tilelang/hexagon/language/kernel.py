@@ -46,8 +46,9 @@ def Kernel(
     cooperative : bool, optional
         Let a long-running kernel yield its compute resources at
         ``T.sync_grid()``. All programs must run simultaneously and reach the
-        same checkpoints. The runtime drains DMA, saves VTCM to DDR, releases
-        and reacquires the resources, then restores VTCM before continuing.
+        same checkpoints. When a release request is pending at a checkpoint,
+        the runtime drains DMA, saves VTCM to DDR, releases and reacquires the
+        resources, then restores VTCM before continuing.
         This requires an explicit grid and at least one checkpoint, including
         for a single program. It does not preempt arbitrary instructions or
         preserve an unfinished HMX accumulation across a checkpoint.

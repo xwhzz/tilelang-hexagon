@@ -6,7 +6,7 @@ in their physical order, a register at a time, and writes the gate into `h1`,
 which the last gemm reads as its activation. Nothing converts layouts between
 the gemms.
 
-Requires a Hexagon device + SDK over adb (see README.md).
+Requires a Hexagon device (adb or SSH) and the SDK (see README.md).
 
     python example_ffn.py
 """

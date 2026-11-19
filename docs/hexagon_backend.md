@@ -4,8 +4,9 @@ This document explains how the `hexagon` backend was added to tilelang, and — 
 importantly — *the principles* behind it, so you can read the code (and extend it)
 without re-deriving the design.
 
-Target hardware: Qualcomm Hexagon v79 (Snapdragon 8 Gen 4, e.g. OnePlus 13), reached
-from an x86 host over `adb` + FastRPC. The backend is device-validated end to end.
+Target hardware: Qualcomm Hexagon v79 (Snapdragon 8 Gen 4, e.g. OnePlus 13) under
+Android, reached from an x86 host over `adb` + FastRPC, and v73 (SA8650) under a Linux
+BSP, reached over SSH + FastRPC. The backend is device-validated end to end on both.
 
 ---
 
@@ -21,10 +22,10 @@ TensorCore `T.gemm` — assumes CUDA-shaped hardware. Hexagon is a different mac
 | Thread model | implicit `blockIdx`/`threadIdx` | explicit C loops; multithread via a worker pool |
 | On-chip memory | per-block shared memory | **VTCM** ~8 MB per core (HAP-acquired arena) |
 | Matrix engine | warp-cooperative TensorCores | **standalone HMX coprocessor** — one unit, lock-protected, mandatory *Crouton* tile layout, fp32 accumulator that **can't be preloaded** and outputs **fp16 only** |
-| Launch | in-process async | **out-of-process FastRPC** to a separate OS/chip, reached over `adb` from x86 |
+| Launch | in-process async | **out-of-process FastRPC** to a separate OS/chip, reached over `adb` or SSH from x86 |
 
 The genuinely new engineering is the **out-of-process device** (3-tier: x86 Python ⇄
-adb ⇄ Android ARM stub ⇄ Hexagon DSP) and the **standalone HMX** with its Crouton
+adb or SSH ⇄ ARM agent on Android or Linux ⇄ Hexagon DSP) and the **standalone HMX** with its Crouton
 layout and un-preloadable accumulator. Everything else is "C codegen + a runtime."
 
 ---
@@ -74,8 +75,9 @@ These are the decisions that keep the adaptation small and the code navigable.
 ```
 
 - **Layer 2** — `tilelang/hexagon/pipeline.py` owns the full Hexagon pass order (the
-  CPU-style sequence plus VTCM arena planning) and registers the Hexagon `T.gemm`
-  impls (`GemmHMX` for fp16 ×32 shapes, `GemmScalar` fallback). Op lowering for `T.copy`/`T.gemm`/`T.fill` lives in `src/hexagon/op/*.cc`,
+  CPU-style sequence plus VTCM arena planning). `tilelang/hexagon/op/gemm/` registers
+  the Hexagon `T.gemm` impls: HMX, HVX, their block-scaled variants, and a scalar
+  fallback. Op lowering for `T.copy`/`T.gemm`/`T.fill` lives in `src/hexagon/op/*.cc`,
   each gated on `TargetIsHexagon` and reusing the CPU op where possible. The launch
   grid becomes loops in TIR, as on CPU: `src/hexagon/transform/` marks the grid
   loops (`LowerKernelLaunch`) and, after the loop transformations, sinks each tile
@@ -132,8 +134,9 @@ The backend registers itself through upstream's backend plugin interface
   gemm dispatch (`register_gemm_impl(...)`)
 - `tilelang/hexagon/intrinsics/` — Crouton layouts, and the panel layouts of integer
   GEMM operands
-- `tilelang/hexagon/language/` — the Hexagon dialect: `T.Kernel(num_workers=...)` and
-  `T.dma_copy`/`T.dma_wait`. Kernels import it as
+- `tilelang/hexagon/language/` — the Hexagon dialect: `T.Kernel(num_workers=...,
+  cooperative=...)`, `T.dma_copy`/`T.dma_wait`, `T.annotate_dma_only`,
+  `T.annotate_write_through` and the Hexagon `T.reduce_*`. Kernels import it as
   `from tilelang.hexagon import language as T`
 - `tilelang/cache/__init__.py` + `jit/kernel.py` — `_dispatch_map["hexagon"]` →
   `HexagonKernelCache` (in-memory only — a Hexagon "artifact" is a live device
@@ -154,14 +157,14 @@ see them all.
 ```
 @T.prim_func ─► TIR
    │  BackendContext.lower() → HexagonPassPipelineBody  (LowerOpaqueBlock, LowerTileOp→HMX/HVX, ...)
-   │  SplitHostDevice  (device PrimFunc; ORDER params by host decl order — see §7)
+   │  SplitHostDevice + KeepKernelParams  (device PrimFunc takes the host's params in order — see §7)
    ▼
 CodeGenTileLangHexagon  ─►  C + HVX/HMX intrinsics   (the generated kernel)
    +  src/tl_templates/hexagon/*.h                   (the hardware recipe)
    ▼
 fastrpc.write_project   ─►  FastRPC skel (.idl/.c/.cc) + host + CMake
    ▼
-hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb push──►  cDSP user PD
+hexagon-clang++ (-mhmx -mhvx)  ─►  skel .so   ──adb/ssh push──►  cDSP user PD
    ▲                                                              │
    └───────── adapter marshals torch tensors over FastRPC ───────┘
 ```
@@ -178,7 +181,7 @@ maps, and compound expressions retain their existing schedule.
 You can run it three ways: `tilelang.lower(fn, target="hexagon")` (inspect the C),
 `tilelang.compile(...)` / `@tilelang.jit(target="hexagon")` (build+deploy+run),
 or the direct `HexagonKernelAdapter`. Runnable operator examples (GEMM, flash
-attention, FFN, RMSNorm, a w4a16 GEMV) and the LFM2-1.2B model end to end live in
+attention, FFN, RMSNorm, a w4a16 GEMV) and the LFM2-1.2B and LFM3-1.7B models end to end live in
 [`examples/hexagon/`](../examples/hexagon/).
 
 ---
@@ -193,11 +196,11 @@ attention, FFN, RMSNorm, a w4a16 GEMV) and the LFM2-1.2B model end to end live i
 | `T.alloc_global(..., scope="global.vtcm")` | one buffer all the programs share, bound before the worker loop at a byte offset from the VTCM base; the arenas follow | `vtcm.h`, `worker.h` |
 | `T.copy(matrix, crouton_shared)` | one `tl_crouton_copy`: pack a region of a strided fp16/fp32 matrix (DDR or VTCM) into Crouton tiles | `copy.cc`, `crouton.h` |
 | `T.copy(crouton_shared, matrix)` | one `tl_crouton_copy`: unpack a Crouton region into a strided matrix | `copy.cc`, `crouton.h` |
-| `T.gemm(A,B,C)` | explicit HMX atom loops; each result stores directly into its 2 KB-aligned native C tile | `gemm_hmx.py`, `hmx.h` |
+| `T.gemm(A,B,C)` on HMX | one `tl_hexagon_hmx_gemm` call over the Crouton operands | `gemm_hmx.py`, `hmx_gemm.h` |
 
 Reading generated C for a tiled matmul now shows the grid loops, one
 `tl_crouton_copy` per matrix at the DDR/Crouton boundary, Crouton VTCM offsets,
-and explicit HMX atoms.
+and one `tl_hexagon_hmx_gemm` call per `T.gemm`.
 
 `num_workers` is a requested upper bound in `[1, 2147483647]`; `None` keeps
 serial execution. Worker-grid extents and their product must fit a signed 32-bit
@@ -327,7 +330,8 @@ barrier and does not release resources or drain DMA. See the
 - **Param-order ABI bug (subtle, was silent).** `SplitHostDevice::SortDeviceParams`
   orders device-kernel params *alphabetically*; correct for GPU (the host wrapper
   reorders args) but the Hexagon FastRPC skel calls the kernel **directly by position**
-  in declaration order. Fix: `OrderByHostParams` for `kDLHexagon`. *Lesson: validate
+  in declaration order. Fix: the Hexagon pass `KeepKernelParams`, right after
+  `SplitHostDevice`, gives the kernel every host parameter in the host's order. *Lesson: validate
   with non-alphabetical param names + non-square shapes, or symmetry hides the bug.*
 
 - **VTCM is one arena per tile program.** `MergeSharedMemoryAllocations` lays out a
@@ -368,8 +372,11 @@ barrier and does not release resources or drain DMA. See the
   uncontended release and acquire costs about 5 µs on the upstream-tested v79.
   Resident DDR, workers, and DSP power votes stay alive across calls; grants are
   released only after the kernel has joined its workers and drained DMA. This
-  does not preempt a long kernel or promise a release-callback deadline.
-  The BSP's legacy resource-attribute initializer option remains independent.
+  does not preempt a long kernel or promise a release-callback deadline. A Session with
+  a `cooperative=True` kernel opens the context with a release callback instead, and
+  its cooperative kernels give it back at their next checkpoint when asked (§6).
+  The initial take waits up to 1 s. The BSP's legacy resource-attribute initializer
+  option (`TILELANG_HEXAGON_LEGACY_COMPUTE_RES`) remains independent.
   Multi-process sessions currently require Android's default cDSP domain;
   Linux and other domains fail before building. New platform combinations need
   independent device qualification.
@@ -384,9 +391,6 @@ barrier and does not release resources or drain DMA. See the
   **persistent** (spawned once, blocks on semaphores) so per-call spawn doesn't
   dominate tiny ops. *Never `qurt_hvx_lock`* — just never spawn more workers than HVX
   contexts, and QuRT assigns them implicitly (the htp-ops-lib pattern).
-
-- **fp16 `T.exp` is unresolved** (`FloatSuffix` returns "" for fp16) — compute softmax
-  in fp32 (cast → exp → back).
 
 - **The grid is a loop, so allocations escape it.** `StorageRewrite` hoists buffers
   out of the grid loops to function scope. `MaterializeGrid` sinks every buffer that
@@ -421,7 +425,8 @@ barrier and does not release resources or drain DMA. See the
   to it directly.
 - **Surface a device-side failure** (VTCM/HMX unavailable, an unmet precondition):
   the generated kernel entry returns an `int32` status — `TL_OK` / `TL_ERR_VTCM` /
-  `TL_ERR_HMX` / `TL_ERR_DMA` (`tl_templates/hexagon/common.h`). In a `num_workers` kernel each tile
+  `TL_ERR_HMX` / `TL_ERR_DMA` / `TL_ERR_GRID` / `TL_ERR_RESOURCE`
+  (`tl_templates/hexagon/common.h`). In a `num_workers` kernel each tile
   program returns its code, and `tl_parallel_for` returns the lowest failing worker's. The
   FastRPC skel maps a nonzero kernel status to `KERNEL_STATUS_BASE + status`
   (`0x1000 + TL_ERR_*`). The host raises an error; the failed kernel may already have
@@ -456,7 +461,9 @@ barrier and does not release resources or drain DMA. See the
     power votes, execution threads, the worker pool, and resident DDR retain their
     Session lifetime. The context's VTCM address stays fixed; its contents are not
     preserved between runs. Cached take/give is the only resource lifecycle;
-    there is no separate resource-lifetime setting.
+    there is no separate resource-lifetime setting. A cooperative kernel also gives
+    the context back and takes it again within a run, at a checkpoint where a
+    release request is pending, and restores its VTCM.
   - **Resident buffers.** A `DeviceBuffer` is rpcmem, uncached on the CPU and mapped
     into the DSP once (`fastrpc_mmap` with `FASTRPC_MAP_FD`). Kernels reach it by fd
     (`HAP_mmap_get`, resolved once), so a 512 MB resident argument adds no per-call
@@ -514,7 +521,7 @@ barrier and does not release resources or drain DMA. See the
 ## 9. Status
 
 **Device-validated on v79** (the Hexagon test suite with device tests enabled, about 730
-tests, and the examples):
+tests, and the examples), and on **v73** (SA8650, Linux):
 
 - `T.gemm` on HMX: fp16 into fp16 or fp32, any tile-aligned shape, transposes, and K loops
   accumulated across calls; on HVX: floating point, fp16 GEMVs of HMX weight-layout
@@ -537,7 +544,8 @@ output. LFM2-1.2B ([`examples/hexagon/lfm`](../examples/hexagon/lfm/)) decodes a
 to text (`generate.py`), sampling on the device, and its WikiText-2 perplexity on the
 device (16.684) is that of the host reference with the device's arithmetic (16.683).
 LFM3-1.7B, unquantized in fp16, decodes at 16.6 t/s, the DMA's rate for its 3.46 GB a
-token. It runs to its checkpoint's 262144 positions over two DSP processes, which a
+token. (These figures predate the cooperative resource checkpoints that the LFM kernels
+now enable by default; see the LFM example.) It runs to its checkpoint's 262144 positions over two DSP processes, which a
 model past one process's 4 GB of addresses splits its layers over. The
 [LFM example](../examples/hexagon/lfm/README.md#lfm3s-long-contexts) gives the
 long-context prefill and decode measurements.

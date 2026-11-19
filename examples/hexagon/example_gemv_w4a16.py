@@ -14,7 +14,7 @@ scales and sx into fp32:
 
     y(n) = sx * sum_g S(n, g) * sum_{k in g} q(n, k) xq(k)
 
-Requires a Hexagon device + SDK over adb (see README.md).
+Requires a Hexagon device (adb or SSH) and the SDK (see README.md).
 
     python example_gemv_w4a16.py --k 2048 --n 8192
 """

@@ -249,6 +249,11 @@ The Docker image sets this to `/opt/board-runtime`. Local Linux builds use
 `aarch64-linux-gnu-gcc` by default. `TILELANG_HEXAGON_LINUX_CC` selects another
 compatible cross-compiler.
 
+The device's FastRPC library search path (`ADSP_LIBRARY_PATH` and the cDSP
+variants) starts with the run's own directory, followed by the platform's DSP
+library directories. `TILELANG_HEXAGON_DSP_LIBRARY_PATH`, a `;`-separated list,
+replaces those platform directories on Android and Linux alike.
+
 ### SA8650 BSP compatibility
 
 The SA8650 Automotive Linux BSP used for board validation requires two explicit
@@ -317,15 +322,15 @@ as skipped in this run. The board checks below use your selected device architec
 
 The SDK simulator runs on the development host. The reference environment
 includes its `libncurses.so.5` dependency. These opt-in tests cover conversions,
-HVX math and Q4 dequantization across v73, v75 and v79.
+arithmetic, HVX math, reductions, Q4 dequantization and the LFM decode attention
+across v73, v75 and v79. A few other files (`broadcast_bounds`,
+`crouton_regions`, `mixed_masks`) also have simulator cases behind the same
+variable.
 
 ```bash
 export HEXAGON_TOOLS_ROOT="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07"
 env -u TL_HEXAGON_DEVICE_TEST TL_HEXAGON_SIMULATOR_TEST=1 \
-  python -m pytest \
-  testing/python/hexagon/test_tilelang_hexagon_convert_sim.py \
-  testing/python/hexagon/test_tilelang_hexagon_math_sim.py \
-  testing/python/hexagon/test_tilelang_hexagon_dequant_sim.py -q
+  python -m pytest testing/python/hexagon/test_tilelang_hexagon_*_sim.py -q
 ```
 
 Device-only cases in these files are skipped by this command.

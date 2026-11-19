@@ -25,7 +25,7 @@ HMX accumulator can't be preloaded, so the `clear_accum=False` accumulation of `
 is decomposed into an overwrite gemm to `temp` plus the HVX rescale-and-add into
 `acc_o`.
 
-Requires a Hexagon device + SDK over adb (see README.md).
+Requires a Hexagon device (adb or SSH) and the SDK (see README.md).
 
     python example_flash_attention.py --seq 256
 """

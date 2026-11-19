@@ -7,6 +7,12 @@ v79 cDSP, every operation a TileLang kernel, at batch 1. LFM3-1.7B
 its fp16 bundle, its decode and its prefill are here (see [LFM3](#lfm3)). The
 other sections are LFM2's.
 
+The kernels yield the DSP's compute resources at cooperative checkpoints by
+default ([#262](https://github.com/xwhzz/tilelang-hexagon/pull/262), see
+[LFM3](#lfm3)). Unless a section says otherwise, its measurements predate them;
+every kernel factory takes `cooperative=False` to build the kernel they were
+measured with.
+
 | File | |
 |---|---|
 | `model.py` | LFM2 and LFM3 in plain PyTorch, on explicit decode state: the reference. |
@@ -57,7 +63,8 @@ slice, is one contiguous 128 KB with its 8 KB of scales.
 One kernel call generates the tokens of a generation (`Decoder.generate`): the
 loop over tokens runs on the DSP. Four worker programs meet at
 `T.sync_grid()` between a token's phases, four a layer and one after the LM
-head. Each worker owns matching shares of every layer, so nothing else needs
+head, and, with cooperative checkpoints, after each block of attention keys and
+every 16 blocks of the LM head. Each worker owns matching shares of every layer, so nothing else needs
 a barrier:
 
 - its slice of the model dimension: the rows of each projection that writes
@@ -152,6 +159,9 @@ The tiny-model Q4 regression tests use separate references and comparisons.
 
 ## On the device
 
+The commands push the bundle with `adb` (Android). On a Linux board reached over
+SSH, copy it to a path on the board (`scp`) and pass that path instead.
+
     adb push lfm2.bundle /data/local/tmp/lfm2.bundle
     python generate.py lfm2.bundle /data/local/tmp/lfm2.bundle LFM2-1.2B --prompt "What is 17 times 23?"
     python bench.py lfm2.bundle /data/local/tmp/lfm2.bundle --pp 512,1024 --tg 128
@@ -243,17 +253,18 @@ HMX. Both kernels declare it write-through
 (`T.annotate_write_through`): each key and value goes back to DDR as it is
 written, so that the prefill's many DMA loads of it skip their writeback.
 
-Both FP16 kernel factories enable cooperative resource checkpoints by default,
-for LFM2 as well as LFM3. They check for pending resource requests between layer
-phases, after each attention KV block, and after every 16 completed decode
-LM-head blocks. A yield drains pending DMA and preserves the VTCM state,
+All four kernel factories, the 4-bit LFM2 ones and the FP16 LFM2/LFM3 ones,
+enable cooperative resource checkpoints by default. They check for pending
+resource requests between layer phases, after each attention KV block, and after
+every 16 completed decode LM-head blocks. A yield drains pending DMA and preserves the VTCM state,
 including prefetched weights/KV and the running attention or sampling reductions.
 Without a request, these points synchronize the workers without releasing
 resources. The factories accept `cooperative=False` for controlled comparisons.
 Checkpoint placement bounds the work between checks, not a wall-clock response
 time; see the [cooperative kernel contract](../../../docs/hexagon_dsl_kernels.md).
-The FP16 performance figures below were measured before cooperative checkpoints
-were enabled.
+The performance figures below were measured before cooperative checkpoints were
+enabled. On SA8650 (v73) they changed LFM3-1.7B's pp2048 by +0.5% and its tg128
+by -4.5% (#262).
 
 On v79 (`bench.py`, tg128, timed on the phone around the kernel's FastRPC
 call), LFM3-1.7B decodes at **16.7 tokens/s, 60.0 ms a token**: 3461.9 MB a

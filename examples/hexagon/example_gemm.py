@@ -8,7 +8,7 @@ the product into the fp32 fragment `acc` on HVX; the first call overwrites `acc`
 instead (`clear_accum=(k == 0)`). Each call reduces its K in the HMX accumulator,
 so a larger BK means fewer HVX passes over `acc`.
 
-Requires a Hexagon device + SDK over adb (see README.md).
+Requires a Hexagon device (adb or SSH) and the SDK (see README.md).
 
     python example_gemm.py --m 256 --n 256 --k 1024 --block-k 256
 """
