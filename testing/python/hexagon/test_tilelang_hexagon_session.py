@@ -285,6 +285,43 @@ def test_session_dispatch_lifecycle_on_host(tmp_path):
             subprocess.run([str(executable), mode, failure], check=True, timeout=10)
 
 
+def test_session_pipeline_error_propagation_on_host(tmp_path):
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("a host C compiler is required for the pipeline error test")
+    # Compile the actual generated handler and launch function. Only the
+    # FastRPC/I/O boundary is replaced; pthread synchronization remains real.
+    agent = session.gen_agent("tl_session_x")
+    launch = agent[agent.index("struct launch_gate {") : agent.index("static int sync_buffer(")]
+    start = agent.index(f"  if (op == {session._OP_PIPELINE}) {{")
+    handler = agent[start : agent.index(f"  if (op == {session._OP_ALLOC}) {{", start)]
+    harness = Path(__file__).with_name("session_pipeline_host.c").read_text()
+    source, executable = tmp_path / "pipeline.c", tmp_path / "pipeline"
+    source.write_text(harness.replace("// GENERATED_PIPELINE_LAUNCH", launch).replace("// GENERATED_PIPELINE_HANDLER", handler))
+    subprocess.run(
+        [
+            compiler,
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            f"-DTEST_PIPELINE_OP={session._OP_PIPELINE}",
+            f"-DTEST_RESIDENT={session._RESIDENT}",
+            f"-DTEST_STEP={session._STEP}",
+            f"-DTEST_TURN_GAVE_UP={session._TURN_GAVE_UP}",
+            f"-DTEST_KERNEL_STATUS_BASE={fastrpc.KERNEL_STATUS_BASE}",
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        timeout=30,
+    )
+    subprocess.run([str(executable)], check=True, timeout=10)
+
+
 class _LocalAgent:
     """A session transport whose agent is a local shell command."""
 
