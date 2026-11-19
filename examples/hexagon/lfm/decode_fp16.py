@@ -158,6 +158,50 @@ STACKS = {
 PROCESS_BUDGET = 3960 << 20
 
 
+def embedding_nbytes(c: Config) -> int:
+    """The bytes of the row-major embedding [vocab, dim] (make_embedding)."""
+    return c.vocab * c.dim * 2
+
+
+def embedding_blocks(c: Config) -> int:
+    """The head's blocks of 32 tokens that a call of make_embedding moves: the
+    most, up to 256 (32 MiB at LFM3's 2048 dimensions), that divide them."""
+    blocks = c.vocab // TILE
+    return max(b for b in range(1, 257) if blocks % b == 0)
+
+
+def make_embedding(c: Config):
+    """The kernel that writes the tied embedding row-major, from the head's
+    HMX tiles: `blocks` (embedding_blocks) blocks of 32 tokens of `src`, the
+    head's bytes from token block `first` on, into rows first * 32 on of
+    `embed` [vocab, dim]. A token's row is then one transfer of 2 * dim bytes,
+    where in the tiles its D / 2 pairs of dimensions lie 128 bytes apart
+    (convert.embedding), which DMA moves 4 bytes a row. The Decoder runs it
+    once, when it opens the bundle."""
+    D, V = c.dim, c.vocab
+    P = D // 2  # a token's pairs: a block's rows of the tiles, as words
+    B = embedding_blocks(c)
+    assert V % TILE == 0 and D % (2 * TILE) == 0
+
+    @T.prim_func
+    def embedding(src: T.Tensor((B * P, TILE), "int32"), embed: T.Tensor((V, P), "int32"), first: T.int32):
+        with T.Kernel(B, num_workers=NW) as b:
+            tiles = T.alloc_shared((P, TILE), "int32")
+            rows = T.alloc_shared((TILE, P), "int32")
+            # By DMA both ways: the kernels read the embedding by DMA, from
+            # DDR, which an HVX store would leave in the DSP's cache.
+            T.dma_copy(src[b * P : (b + 1) * P, :], tiles)
+            T.dma_wait()
+            for t, p in T.Parallel(TILE, P):
+                rows[t, p] = tiles[p, t]
+            # Clamped, so that the transfer is provably in the embedding.
+            row = T.max(T.min(first + b, V // TILE - 1), 0) * TILE
+            T.dma_copy(rows, embed[row : row + TILE, :])
+            T.dma_wait()
+
+    return embedding
+
+
 def stack_range(c: Config, kind: str, layers: range) -> tuple:
     """The first index and the count, in a stack of `kind`, of the slices of
     `layers`."""
@@ -168,15 +212,21 @@ def stack_range(c: Config, kind: str, layers: range) -> tuple:
     return sum(of(i) for i in range(layers.start)), sum(of(i) for i in layers)
 
 
-def stage_bytes(c: Config, header: dict, max_pos: int, layers: range) -> int:
+def stage_bytes(c: Config, header: dict, max_pos: int, layers: range, row_major_embedding: bool = False) -> int:
     """The bytes a stage of `layers` maps that grow with the model and the
-    context: its slices of the weights, the head at either end, its KV cache
-    and the RoPE tables."""
+    context: its slices of the weights, the head in the last stage and the
+    embedding in the first (the head again, or a row-major copy:
+    make_embedding), its KV cache and the RoPE tables."""
     total = sum(
         stack_range(c, STACKS[name], layers)[1] * (t["nbytes"] // t["shape"][0]) for name, t in header["tensors"].items() if name in STACKS
     )
-    if layers.start == 0 or layers.stop == c.layers:
-        total += header["tensors"]["head"]["nbytes"]
+    head = header["tensors"]["head"]["nbytes"]
+    if layers.stop == c.layers:
+        total += head
+    if layers.start == 0 and row_major_embedding:
+        total += embedding_nbytes(c)
+    elif layers.start == 0 and layers.stop != c.layers:
+        total += head
     total += 2 * c.kv_heads * kv_plan(c, max_pos, layers)[2] * c.head_dim * 2
     if any(c.is_attention(i) for i in layers):
         total += 2 * len(c.rope) * max_pos * (c.head_dim // 2) * 4
@@ -203,6 +253,17 @@ def plan_stages(c: Config, header: dict, max_pos: int, processes="auto") -> list
         if processes != "auto" or best[0] <= PROCESS_BUDGET:
             return best[1]
     raise ValueError(f"LFM at {max_pos} positions takes more than {most} DSP processes")
+
+
+def row_major_embedding(c: Config, header: dict, max_pos: int, stages: list) -> bool:
+    """Whether the first of `stages` (plan_stages) embeds from a row-major
+    copy of the embedding (make_embedding), a transfer of 2 * dim bytes a
+    token, rather than from the head's tiles, where a token's pairs lie 128
+    bytes apart (about six times slower in the prefill on v79). Only where
+    the copy takes no process more: past one stage, whose first maps it
+    instead of the head, and in one if it maps beside the head (up to 10K
+    positions of LFM3-1.7B). A process more costs more than the copy saves."""
+    return len(stages) > 1 or stage_bytes(c, header, max_pos, stages[0], True) <= PROCESS_BUDGET
 
 
 def kv_layouts(kv_k, kv_v) -> dict:
@@ -491,7 +552,9 @@ def add_branch(xf, branch, bf, sums, s, post, D: int, nw: int, sandwich: bool, e
             xf[i, k] = xf[i, k] + bf[i, k]
 
 
-def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None = None, *, cooperative: bool = True):
+def make_decode(
+    c: Config, max_pos: int, max_tokens: int, layers: range | None = None, *, cooperative: bool = True, row_major_embedding: bool = True
+):
     """The fp16 decode kernel of config c (convert.py's bundle): step t of a
     generation, position pos0 + t, a call. The Decoder runs the steps as a
     pipeline (Session.pipeline).
@@ -501,7 +564,9 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
     step's token, the last runs the head and samples, and the residual goes
     from each to the next through `xs` by DMA, which crosses processes. A
     stage's tensors are its layers' slices; those of a kind it has none of,
-    and the head away from the ends, are placeholders. Cooperative checkpoints
+    and the head away from the ends, are placeholders. The first embeds from a
+    row-major copy of the embedding (make_embedding), or without
+    `row_major_embedding` from the head's tiles. Cooperative checkpoints
     preserve live state between attention blocks, completed LM-head batches and
     layer phases.
     """
@@ -531,7 +596,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
     Lc1, La1 = max(Lc, 1), max(La, 1)
     KV_ROWS, ROPE = (KV_ROWS, max_pos) if La else (EMPTY_ROWS, EMPTY_ROWS)
     HEAD = (D, V) if has_head else (TILE, TILE)
-    HEAD_ROWS = (V // TILE * D // 2, 2 * TILE) if has_embedding else (TILE, 2 * TILE)
+    EMBED = ((V, D) if row_major_embedding else (V // TILE * D // 2, 2 * TILE)) if has_embedding else (1, TILE)
     VL = V if has_head else TILE
     l0 = layers.start
 
@@ -543,9 +608,10 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
         w13_w: T.Tensor((L, D, 2 * F), "float16"),
         w2_w: T.Tensor((L, F, D), "float16"),
         head: T.Tensor(HEAD, "float16"),
-        # The head's bytes again, row-major: a token's embedding is D / 2 of
-        # its pairs, a register of 32 tokens' apart (convert.embedding).
-        head_rows: T.Tensor(HEAD_ROWS, "float16"),
+        # The embedding: row-major (make_embedding), or the head's bytes as
+        # rows of 32 tokens' pairs, a token's D / 2 of them a register apart
+        # (convert.embedding).
+        embed: T.Tensor(EMBED, "float16"),
         op_norm: T.Tensor((L, D), "float32"),
         ffn_norm: T.Tensor((L, D), "float32"),
         post_op_norm: T.Tensor((L, D), "float32"),
@@ -594,7 +660,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
             ga = T.alloc_fragment((1, TILE), "float32")
             ffo = T.alloc_fragment((1, FW), "float16")
             bcx = T.alloc_shared((3, TILE), "float32")
-            erow = T.alloc_shared((D // 2, 2), "float16")
+            erow = T.alloc_shared((1, D) if row_major_embedding else (D // 2, 2), "float16")
             # The DMA ends of the residual between stages, and of the token
             # the first stage reads.
             xv = T.alloc_shared((1, D), "float32") if not (has_embedding and has_head) else None
@@ -669,8 +735,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
             if has_embedding:
                 # The step's token, forced or the one the step before
                 # generated (by DMA, from the last stage on another process),
-                # and its embedding, which every worker reads whole: its pairs
-                # from the head's tiles.
+                # and its embedding, which every worker reads whole.
                 if has_head:
                     token = T.max(T.min(tokens[t], V - 1), 0)
                 else:
@@ -678,12 +743,18 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
                     T.dma_copy(tokens[at : at + 1], tv[0:1])
                     T.dma_wait(0)
                     token = T.max(T.min(tv[0], V - 1), 0)
-                T.dma_copy(
-                    head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow
-                )
-                T.dma_wait(0)
-                for i, k in T.Parallel(1, D):
-                    xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
+                if row_major_embedding:
+                    T.dma_copy(embed[token : token + 1, :], erow)
+                    T.dma_wait(0)
+                    for i, k in T.Parallel(1, D):
+                        xf[i, k] = T.Cast("float32", erow[i, k])
+                else:
+                    T.dma_copy(
+                        embed[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], erow
+                    )
+                    T.dma_wait(0)
+                    for i, k in T.Parallel(1, D):
+                        xf[i, k] = T.Cast("float32", erow[k // 2, k % 2])
             else:
                 # The residual the stage before left.
                 T.dma_copy(xs, xv)
@@ -824,7 +895,7 @@ def make_decode(c: Config, max_pos: int, max_tokens: int, layers: range | None =
 
 # The kernel's parameters from the bundle, in order. Without sandwich norms,
 # the post norms are the pre norms, unread.
-WEIGHT_ARGS = ("conv.in_proj", "attn.qkv", "out_proj", "ffn.w13", "ffn.w2", "head", "head")
+WEIGHT_ARGS = ("conv.in_proj", "attn.qkv", "out_proj", "ffn.w13", "ffn.w2", "head", "embed")
 NORM_ARGS = ("op_norm", "ffn_norm", "post_op_norm", "post_ffn_norm", "q_norm", "k_norm", "conv", "final_norm")
 
 

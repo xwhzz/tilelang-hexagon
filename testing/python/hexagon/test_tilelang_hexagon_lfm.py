@@ -335,6 +335,23 @@ def test_fp16_decode_is_one_step_of_phases(model, arch, cooperative, fp16_bundle
     assert "tl_hvx_gemm_weight<" in source and "TL_GEMM" not in source
 
 
+def test_fp16_embeds_row_major_where_it_takes_no_process_more(fp16_bundle, monkeypatch):
+    """The copy maps in the first of several stages instead of the head, and
+    in one stage beside the head only if both fit a process."""
+    header = bundle.read_header(fp16_bundle("lfm3"))
+    c = Config.from_dict(header["config"])
+    one, two = [range(4)], [range(2), range(2, 4)]
+    head = header["tensors"]["head"]["nbytes"]
+    alone = decode_fp16.stage_bytes(c, header, 256, range(4))
+    assert decode_fp16.stage_bytes(c, header, 256, range(4), True) == alone + decode_fp16.embedding_nbytes(c)
+    assert decode_fp16.stage_bytes(c, header, 256, range(2)) == decode_fp16.stage_bytes(c, header, 256, range(2), True)
+    assert decode_fp16.embedding_nbytes(c) == head
+    for budget, rows in ((alone + head, True), (alone + head - 1, False)):
+        monkeypatch.setattr(decode_fp16, "PROCESS_BUDGET", budget)
+        assert decode_fp16.row_major_embedding(c, header, 256, one) is rows
+        assert decode_fp16.row_major_embedding(c, header, 256, two)
+
+
 @pytest.mark.parametrize("cooperative", [False, True])
 def test_fp16_stages_split_the_layers(cooperative, fp16_bundle):
     """A model over several DSP processes: each stage a run of the layers, the
@@ -407,6 +424,27 @@ def test_fp16_decode_matches_the_reference(model, processes, fp16_bundle):
         decoder.close()
 
 
+@DEVICE
+@pytest.mark.parametrize(
+    ("processes", "blocks"), [(1, None), (1, 32), pytest.param(2, None, marks=MULTI_PROCESS), pytest.param(2, 32, marks=MULTI_PROCESS)]
+)
+def test_fp16_embedding_is_the_head_row_major(processes, blocks, fp16_bundle, monkeypatch):
+    """The Decoder writes the embedding row-major from the head's tiles
+    (decode_fp16.make_embedding): from the head the first process maps, or
+    from the bundle a part at a time; in one call, or (`blocks`) several."""
+    if blocks is not None:
+        monkeypatch.setattr(decode_fp16, "embedding_blocks", lambda c: blocks)
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    decoder = Decoder(path, max_pos=256, max_tokens=128, prefill_rows=None, processes=processes)
+    try:
+        assert len(decoder.stages) == processes
+        rows = torch.frombuffer(bytearray(decoder.embedding.read()), dtype=torch.float16).view(c.vocab, c.dim)
+        assert torch.equal(rows, w["model.embed_tokens.weight"].half())
+    finally:
+        decoder.close()
+
+
 def _assert_prefill_norm_path(source, direct=False):
     if not direct:
         assert re.search(r"\bvoid\* rows =", source)
@@ -442,9 +480,11 @@ def test_fp16_prefill_is_one_loop_over_the_layers(model, arch, cooperative, fp16
 
 @pytest.mark.parametrize("model", ["lfm2", "lfm3"])
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
-def test_fp16_kernels_lower_v73_two_dimensional_dma(model, phase, fp16_bundle):
+@pytest.mark.parametrize("row_major", [True, False])
+def test_fp16_kernels_lower_v73_dma_descriptors(model, phase, row_major, fp16_bundle):
     c = Config.from_dict(bundle.read_header(fp16_bundle(model))["config"])
-    kernel = decode_fp16.make_decode(c, 256, 64) if phase == "decode" else prefill_fp16.make_prefill(c, 128, 256, 64)
+    options = {"row_major_embedding": row_major}
+    kernel = decode_fp16.make_decode(c, 256, 64, **options) if phase == "decode" else prefill_fp16.make_prefill(c, 128, 256, 64, **options)
     ((_, source, _, _),) = lower_kernels([(kernel, [])], target={"kind": "hexagon", "mcpu": "hexagonv73"})
     calls = [line for line in source.splitlines() if "tl_hexagon_dma_async_submit(" in line]
     geometry = [
@@ -452,7 +492,13 @@ def test_fp16_kernels_lower_v73_two_dimensional_dma(model, phase, fp16_bundle):
         for line in calls
         if (match := re.search(r"\(uint32_t\)(\d+), \(uint32_t\)(\d+), \(uint32_t\)(\d+), \(uint32_t\)(\d+), \d+\)\)", line))
     ]
-    assert len(geometry) == len(calls) and any(rows > 1 for _, _, _, rows in geometry)
+    assert len(geometry) == len(calls) and calls
+    # The embedding is a row of the row-major copy (make_embedding), D fp16,
+    # or D / 2 rows of a token's pair from the head's tiles.
+    if row_major:
+        assert (2 * c.dim, 2 * c.dim, 2 * c.dim, 1) in geometry
+    else:
+        assert (4, 128, 4, c.dim // 2) in geometry
     for dst_stride, src_stride, width, rows in geometry:
         if rows > 1:
             assert 0 < width <= min(dst_stride, src_stride) <= max(dst_stride, src_stride) <= 65535
@@ -474,7 +520,12 @@ def _kv_errors(decoder, state, n, rel) -> list:
 
 @DEVICE
 @pytest.mark.parametrize(("model", "processes"), STAGES)
-def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
+@pytest.mark.parametrize("row_major", [True, False])
+def test_fp16_prefill_matches_the_reference(model, processes, row_major, fp16_bundle, monkeypatch):
+    """The prefill, then the decode, against the reference: the first stage
+    embeds from the row-major copy, or from the head's tiles where the copy
+    would take a process more (decode_fp16.row_major_embedding)."""
+    monkeypatch.setattr(decode_fp16, "row_major_embedding", lambda *args: row_major)
     path = fp16_bundle(model)
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
@@ -483,6 +534,7 @@ def test_fp16_prefill_matches_the_reference(model, processes, fp16_bundle):
     n, max_pos = 200, 512
     prompt = torch.randint(0, c.vocab, (n,))
     decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes)
+    assert decoder.row_major_embedding is row_major
     try:
         decoder.reset()
         decoder.prefill(prompt.tolist())
@@ -756,7 +808,8 @@ def test_decoder_passes_one_resolved_target_to_factory_and_session(fp16, arch, m
     decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = 256, 64, 128
     if fp16:
         monkeypatch.setattr(decode_fp16, "plan_stages", lambda *args: [range(3)])
-        monkeypatch.setattr(decode_fp16, "make_decode", lambda *args: "decode")
+        monkeypatch.setattr(decode_fp16, "row_major_embedding", lambda *args: True)
+        monkeypatch.setattr(decode_fp16, "make_decode", lambda *args, **kwargs: "decode")
         monkeypatch.setattr(prefill_fp16, "make_prefill", factory)
         with pytest.raises(StopBeforeTransport):
             decoder._open_fp16("unused", None, 1)

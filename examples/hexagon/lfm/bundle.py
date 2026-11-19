@@ -145,7 +145,13 @@ def load_part(buf, path: str, header: dict, name: str, start: int = 0, count: in
     `device_path` on the device when given, else written from `path`."""
     t = header["tensors"][name]
     count = t["shape"][0] - start if count is None else count
-    at, nbytes = header["data_offset"] + t["offset"] + part_nbytes(header, name, start), part_nbytes(header, name, count)
+    load_bytes(buf, path, header, name, part_nbytes(header, name, start), part_nbytes(header, name, count), device_path)
+
+
+def load_bytes(buf, path: str, header: dict, name: str, start: int, nbytes: int, device_path: str | None = None) -> None:
+    """Bytes [start, start + nbytes) of tensor `name` into the resident buffer
+    `buf`, as load_part."""
+    at = header["data_offset"] + header["tensors"][name]["offset"] + start
     if device_path is None:
         with open(path, "rb") as f:
             f.seek(at)

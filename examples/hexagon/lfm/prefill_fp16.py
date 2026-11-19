@@ -83,7 +83,17 @@ def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     return rows
 
 
-def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range | None = None, *, target=None, cooperative: bool = True):
+def make_prefill(
+    c: Config,
+    R: int,
+    max_pos: int,
+    max_tokens: int,
+    layers: range | None = None,
+    *,
+    target=None,
+    cooperative: bool = True,
+    row_major_embedding: bool = True,
+):
     """The fp16 prefill kernel of config c, in chunks of R rows: chunk `chunk`
     of the n tokens from pos0 a call. The Decoder runs the chunks as a
     pipeline (Session.pipeline).
@@ -91,7 +101,9 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     A model split over DSP processes has a kernel for each run of `layers`
     (all of them by default), a stage of the pipeline, its tensors the
     layers' slices (decode_fp16.make_decode): the first embeds the chunk,
-    the others normalize the residual x the stage before left in DDR.
+    from a row-major copy of the embedding or without `row_major_embedding`
+    from the head's tiles, the others normalize the residual x the stage
+    before left in DDR.
     Without an explicit target, normalization keeps staged FP32 rows and pack;
     an explicit target must also be used when compiling this kernel.
 
@@ -134,7 +146,10 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
     # a kind the stage has none of, and of the embedding away from the first.
     Lc1, La1 = max(Lc, 1), max(La, 1)
     KV_ROWS, ROPE = (KV_ROWS, max_pos) if La else (decode_fp16.EMPTY_ROWS, decode_fp16.EMPTY_ROWS)
-    HEAD_ROWS = (c.vocab // TILE * D // 2, 2 * TILE) if has_embedding else (TILE, 2 * TILE)
+    if not has_embedding:
+        EMBED = (1, TILE)
+    else:
+        EMBED = (c.vocab, D) if row_major_embedding else (c.vocab // TILE * D // 2, 2 * TILE)
     assert R <= decode_fp16.RING_PAD and RING % KEYS == 0 and decode_fp16.RING_PAD % KEYS == 0
     assert D <= 64 * TILE, "a slot of the ring holds a projection's whole K"
     eps = c.eps
@@ -181,23 +196,33 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             T.copy(bf.rows, bf.a[row : row + RB, :])
 
     @T.macro
-    def embed(bf, chunk, n, tokens, head_rows, weight):
-        """The chunk's embeddings, the worker's rows of x, RB at a time: each
-        token's pairs from the head's tiles. Each batch goes to x by DMA, and
-        is normalized by weight[k] into a, the first layer's input."""
+    def embed(bf, chunk, n, tokens, embedding, weight):
+        """The chunk's embeddings, the worker's rows of x, RB at a time: a
+        transfer a token from the row-major embedding, or each token's pairs
+        from the head's tiles. Each batch goes to x by DMA, and is normalized
+        by weight[k] into a, the first layer's input."""
         T.copy(weight, bf.nw)
         for rb in T.serial(RW // RB):
             r = bf.w * RW + rb * RB
             for i in T.serial(RB):
                 t = chunk * R + r + i
                 token = T.max(T.min(T.if_then_else(t < n, tokens[T.min(t, n - 1)], 0), c.vocab - 1), 0)
-                T.dma_copy(
-                    head_rows[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2], bf.erow
-                )
-                # The pairs are in, and the batch before is stored.
+                if row_major_embedding:
+                    T.dma_copy(embedding[token : token + 1, :], bf.erow[i : i + 1, :])
+                else:
+                    T.dma_copy(
+                        embedding[token // TILE * (D // 2) : (token // TILE + 1) * (D // 2), token % TILE * 2 : token % TILE * 2 + 2],
+                        bf.erow,
+                    )
+                    # The pairs are in, and the batch before is stored.
+                    T.dma_wait(0)
+                    for k in T.Parallel(D):
+                        bf.xr[0, i, k] = T.Cast("float32", bf.erow[k // 2, k % 2])
+            if row_major_embedding:
+                # The batch's rows are in, and the batch before is stored.
                 T.dma_wait(0)
-                for k in T.Parallel(D):
-                    bf.xr[0, i, k] = T.Cast("float32", bf.erow[k // 2, k % 2])
+                for i, k in T.Parallel(RB, D):
+                    bf.xr[0, i, k] = T.Cast("float32", bf.erow[i, k])
             T.dma_copy(bf.xr[0, :, :], bf.x[r : r + RB, :])
             normalize(bf, 0, r)
         T.dma_wait(0)
@@ -482,7 +507,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
         out_w: T.Tensor((L, D, D), "float16"),
         w13_w: T.Tensor((L, D, 2 * F), "float16"),
         w2_w: T.Tensor((L, F, D), "float16"),
-        head_rows: T.Tensor(HEAD_ROWS, "float16"),
+        embedding: T.Tensor(EMBED, "float16"),
         op_norm: T.Tensor((L, D), "float32"),
         ffn_norm: T.Tensor((L, D), "float32"),
         post_op_norm: T.Tensor((L, D), "float32"),
@@ -535,7 +560,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
             sw = T.alloc_shared((RW,), "float32")
             nw = T.alloc_shared((D,), "float32")
             pw = T.alloc_shared((D,), "float32")
-            erow = T.alloc_shared((D // 2, 2), "float16")
+            erow = T.alloc_shared((RB, D) if row_major_embedding else (D // 2, 2), "float16")
             # q/k norms and RoPE: a head of the chunk's rows, its rows' sums of
             # squares, and the head normalized and rotated.
             hd = T.alloc_shared((R, HD), "float32")
@@ -598,7 +623,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
                     sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
 
             if has_embedding:
-                embed(bf, chunk, n, tokens, head_rows, op_norm[0, :])
+                embed(bf, chunk, n, tokens, embedding, op_norm[0, :])
             else:
                 stage_input(bf, op_norm[0, :])
             T.sync_grid()
@@ -674,7 +699,7 @@ def make_prefill(c: Config, R: int, max_pos: int, max_tokens: int, layers: range
 
 # The kernel's parameters from the bundle, in order (decode_fp16.bundle_args'
 # names): without sandwich norms, the post norms are the pre norms, unread.
-PREFILL_ARGS = ("conv.in_proj", "attn.qkv", "out_proj", "ffn.w13", "ffn.w2", "head")
+PREFILL_ARGS = ("conv.in_proj", "attn.qkv", "out_proj", "ffn.w13", "ffn.w2", "embed")
 PREFILL_NORMS = ("op_norm", "ffn_norm", "post_op_norm", "post_ffn_norm", "q_norm", "k_norm", "conv")
 
 

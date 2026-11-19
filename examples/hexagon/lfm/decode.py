@@ -596,9 +596,15 @@ class Decoder:
         D, F, HD, NK = c.dim, c.ff, c.head_dim, len(c.rope)
         ranges = decode_fp16.plan_stages(c, header, max_pos, processes)
         P = len(ranges)
-        kernels = [(decode_fp16.make_decode(c, max_pos, self.max_tokens, r), []) for r in ranges]
+        row_major = self.row_major_embedding = decode_fp16.row_major_embedding(c, header, max_pos, ranges)
+        kernels = [(decode_fp16.make_decode(c, max_pos, self.max_tokens, r, row_major_embedding=row_major), []) for r in ranges]
         if R:
-            kernels += [(prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r, target=target), []) for r in ranges]
+            kernels += [
+                (prefill_fp16.make_prefill(c, R, max_pos, self.max_tokens, r, target=target, row_major_embedding=row_major), [])
+                for r in ranges
+            ]
+        if row_major:
+            kernels.append((decode_fp16.make_embedding(c), []))
         self.session = Session(kernels, target=target, processes=P)
 
         # The buffers, asked for by name and then allocated the largest first,
@@ -622,10 +628,12 @@ class Decoder:
 
         # Every process maps what the stages share: the tokens, the head's
         # outputs, the residual one stage hands the next (the decode's and a
-        # prefill chunk's), and the final norm; the head, at either end, for
-        # the first stage's embedding and the last's LM head; and the RoPE
-        # tables, in each stage that attends.
-        ends = sorted({0, P - 1})
+        # prefill chunk's), and the final norm. The last stage maps the head,
+        # and the first the embedding: row-major (decode_fp16.make_embedding)
+        # or the head's tiles (decode_fp16.row_major_embedding). Each stage
+        # that attends maps the RoPE tables.
+        last = P - 1
+        heads = [last] if row_major else sorted({0, last})
         attends = [p for p, layers in enumerate(ranges) if any(c.is_attention(i) for i in layers)]
         for key, nbytes in (
             ("tokens", self.max_tokens * 4),
@@ -638,7 +646,9 @@ class Decoder:
         if R:
             ask("x", R * D * 4)
         tensor("final_norm", "final_norm")
-        tensor("head", "head", ends)
+        tensor("head", "head", heads)
+        if row_major:
+            ask("embed", decode_fp16.embedding_nbytes(c), [0])
         for key, t in zip(("cos", "sin"), decode_fp16.rope_tables(c, max_pos)):
             data(key, t, attends)
         for p, layers in enumerate(ranges):
@@ -652,8 +662,10 @@ class Decoder:
             for name, kind in decode_fp16.STACKS.items():
                 if name in header["tensors"]:
                     tensor((p, name), name, [p], *decode_fp16.stack_range(c, kind, layers))
-            if p not in ends:
+            if p not in heads:
                 ask((p, "head"), decode_fp16.TILE * 2 * decode_fp16.TILE * 2, [p])
+            if p != 0:
+                ask((p, "embed"), decode_fp16.TILE * 2, [p])
             if p not in attends:
                 for key in ("cos", "sin"):
                     ask((p, key), NK * decode_fp16.EMPTY_ROWS * HD // 2 * 4, [p])
@@ -674,13 +686,18 @@ class Decoder:
             if fill is not None:
                 fill(bufs[key])
 
+        if row_major:
+            self._write_embedding(bufs["embed"], bufs["head"] if 0 in heads else None, bundle_path, device_path)
+        self.embedding = bufs["embed"] if row_major else bufs["head"]
+
         self.tokens, self.logits, self.scores, self.sampling = (bufs[k] for k in ("tokens", "logits", "scores", "sampling"))
         shared = [self.tokens, self.logits, self.scores, self.sampling, bufs["xs"]]
         self.stages = []
         for p, layers in enumerate(ranges):
             w = {name: bufs[p, name] for name in decode_fp16.STACKS if name in header["tensors"]}
             w["final_norm"] = bufs["final_norm"]
-            w["head"] = bufs["head"] if p in ends else bufs[p, "head"]
+            w["head"] = bufs["head"] if p in heads else bufs[p, "head"]
+            w["embed"] = (bufs["embed"] if row_major else bufs["head"]) if p == 0 else bufs[p, "embed"]
             tables = [bufs[k] if p in attends else bufs[p, k] for k in ("cos", "sin")]
             kv = [bufs[p, "kv_k"], bufs[p, "kv_v"]]
             stage = SimpleNamespace(layers=layers, kv=kv, conv_state=bufs[p, "conv_state"])
@@ -698,6 +715,26 @@ class Decoder:
                     self.tokens,
                 ]
             self.stages.append(stage)
+
+    def _write_embedding(self, embed, head, bundle_path: str, device_path: str | None) -> None:
+        """The row-major embedding into `embed`, on process 0, from the head
+        (decode_fp16.make_embedding): a call a part of the head's blocks, read
+        from `head` when process 0 maps it, else from the bundle into a
+        buffer of a part."""
+        import decode_fp16
+
+        c = self.c
+        blocks = decode_fp16.embedding_blocks(c)
+        nbytes = blocks * decode_fp16.TILE * c.dim * 2
+        kernel = self.session.kernels[-1]
+        part = self.session.buffer(nbytes, [0]) if head is None else None
+        for first in range(0, c.vocab // decode_fp16.TILE, blocks):
+            start = first * decode_fp16.TILE * c.dim * 2
+            if head is None:
+                bundle.load_bytes(part, bundle_path, self.header, "head", start, nbytes, device_path)
+            kernel(part if head is None else head.at(start, nbytes), embed, first, process=0)
+        if part is not None:
+            part.free()
 
     # A call to the agent may take Session's CALL_TIMEOUT (600 s), so a long
     # prompt's chunks, or a long generation's steps, go in several calls of at

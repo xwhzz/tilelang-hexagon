@@ -307,7 +307,11 @@ places:
 - the residual adds and norms, HVX passes over each chunk's rows (16 ms);
 - the barriers (8 ms);
 - the embedding, each token's row gathered from the head's tiles as 1024 DMA
-  rows of 4 bytes (3.5 ms).
+  rows of 4 bytes (3.5 ms). Where it takes no DSP process more, the Decoder
+  now writes a row-major copy of the embedding when it opens the bundle
+  (`decode_fp16.make_embedding`), a token's row one 4 KB transfer: the phase
+  alone, 1024 tokens over four workers, went from 3.1 to 0.5 ms (#203), below
+  the end-to-end runs' noise of a few ms.
 
 [OPTIMIZATION.md](OPTIMIZATION.md#lfm3-17b-in-fp16) has how each step got
 here and what did not work.
@@ -377,8 +381,12 @@ the Decoder splits the layers into stages, one per DSP process of its session
 (`processes="auto"`, `decode_fp16.plan_stages`):
 - Each process maps its stage's slices of the weights, its own KV cache and
   conv state, and the RoPE tables if it attends.
-- The head is mapped at both ends: the first stage embeds the token, and the
-  last runs the LM head.
+- The last stage maps the head, which runs the LM head. The first embeds the
+  token from a row-major copy of the embedding, which it maps instead of the
+  head; in one process, the copy maps beside the head up to 10K positions,
+  and past them the token's pairs come from the head's tiles
+  (`decode_fp16.row_major_embedding`): a process more would cost more than
+  the copy saves (pp1024 +1.8%, tg128 +1.7% at 16K).
 - The cut keeps the largest stage as small as can be. From 64K to 256K that
   is two stages, layers [0, 12) and [12, 24).
 
