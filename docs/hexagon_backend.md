@@ -377,9 +377,11 @@ barrier and does not release resources or drain DMA. See the
   its cooperative kernels give it back at their next checkpoint when asked (§6).
   The initial take waits up to 1 s. The BSP's legacy resource-attribute initializer
   option (`TILELANG_HEXAGON_LEGACY_COMPUTE_RES`) remains independent.
-  Multi-process sessions currently require Android's default cDSP domain;
-  Linux and other domains fail before building. New platform combinations need
-  independent device qualification.
+  Multi-process sessions run on Android's default cDSP domain, whose further
+  sessions the agent reserves (`FASTRPC_RESERVE_NEW_SESSION`), and on the SA8650
+  Linux BSP, whose `libcdsprpc` has no reservation request: the agent opens
+  session p from the URI's `&_session=p` and maps buffers into it as the extended
+  domain `domain | p << 16`. Other Android domains fail before building.
 
 - **The worker pool follows the reported HW/HVX capacity.** Its workers run
   pack/unpack/softmax/copies in parallel within the cached limit described above;

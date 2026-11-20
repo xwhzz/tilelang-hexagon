@@ -33,8 +33,8 @@ from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 FP16_SOURCE_TARGET = {"kind": "hexagon", "mcpu": "hexagonv79"}
 MULTI_PROCESS = pytest.mark.skipif(
-    hlos() != "android" or domain_id() != 3,
-    reason="multiple DSP processes require Android's default cDSP domain",
+    hlos() == "android" and domain_id() != 3,
+    reason="multiple DSP processes on Android require the default cDSP domain",
 )
 
 

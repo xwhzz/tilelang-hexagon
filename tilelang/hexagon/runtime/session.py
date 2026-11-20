@@ -437,7 +437,13 @@ def gen_agent(iface: str, kernels=()) -> str:
 #include "{iface}.h"
 
 // The session's DSP processes (user PDs), each with its own 4 GB of
-// addresses: process 0 is the default session, the others are reserved.
+// addresses: process 0 is the default session of the domain, the others
+// further sessions of it. Android reserves them (FASTRPC_RESERVE_NEW_SESSION,
+// FASTRPC_GET_URI). The SA8650 Linux BSP's libcdsprpc has neither request; it
+// opens session s of a domain from the URI's "&_session=s" instead, and maps
+// buffers into it as the extended domain domain | s << 16
+// (get_extended_domains_id). Its PD controls take the domain itself and apply
+// to all of the domain's sessions.
 #define MAX_PROCESSES 4
 static remote_handle64 g_handles[MAX_PROCESSES];
 static int g_domains[MAX_PROCESSES];
@@ -495,29 +501,37 @@ static uint8_t* grow(uint8_t* buf, uint32_t* size, uint32_t need) {{
 // session's skel loaded.
 static int open_process(int p) {{
   int domain_id = g_domain;
+  int mapped = domain_id;  // the domain buffers map into
   char uri[512];
   if (p == 0) {{
     domain* d = get_domain(domain_id);
     if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
     snprintf(uri, sizeof(uri), "%s%s", {iface}_URI, d->uri);
   }} else {{
+#ifndef __ANDROID__
+    domain* d = get_domain(domain_id);
+    if (!d) {{ fprintf(stderr, "get_domain failed\\n"); return -1; }}
+    snprintf(uri, sizeof(uri), "%s%s&_session=%d", {iface}_URI, d->uri, p);
+    mapped = domain_id | p << 16;
+#else
     char name[16]; snprintf(name, sizeof(name), "tl_process%d", p);
     remote_rpc_reserve_new_session_t r; memset(&r, 0, sizeof(r));
     r.domain_name = (char*)CDSP_DOMAIN_NAME; r.domain_name_len = strlen(CDSP_DOMAIN_NAME);
     r.session_name = name; r.session_name_len = strlen(name);
     int e = remote_session_control(FASTRPC_RESERVE_NEW_SESSION, &r, sizeof(r));
     if (e != AEE_SUCCESS) {{ fprintf(stderr, "reserving process %d failed: 0x%x\\n", p, e); return -1; }}
-    domain_id = (int)r.effective_domain_id;
+    domain_id = mapped = (int)r.effective_domain_id;
     remote_rpc_get_uri_t u; memset(&u, 0, sizeof(u));
     u.domain_name = (char*)CDSP_DOMAIN_NAME; u.domain_name_len = strlen(CDSP_DOMAIN_NAME);
     u.session_id = r.session_id; u.module_uri = (char*){iface}_URI; u.module_uri_len = strlen({iface}_URI);
     u.uri = uri; u.uri_len = sizeof(uri);
     e = remote_session_control(FASTRPC_GET_URI, &u, sizeof(u));
     if (e != AEE_SUCCESS) {{ fprintf(stderr, "the URI of process %d failed: 0x%x\\n", p, e); return -1; }}
+#endif
   }}
 {fastrpc.PD_SETUP}  int e = {iface}_open(uri, &g_handles[p]);
   if (e != AEE_SUCCESS) {{ fprintf(stderr, "opening process %d failed: 0x%x\\n", p, e); return -1; }}
-  g_domains[p] = domain_id;
+  g_domains[p] = mapped;
   return 0;
 }}
 
@@ -1129,8 +1143,10 @@ class Session:
         if not 1 <= processes <= Session.MAX_PROCESSES:
             raise ValueError(f"a session runs on 1 to {Session.MAX_PROCESSES} DSP processes, not {processes}")
         self.processes = processes
-        if processes > 1 and (hlos() != "android" or domain_id() != 3):
-            raise NotImplementedError("multiple DSP processes require Android's default cDSP domain")
+        # Android reserves its sessions on the default cDSP; the Linux BSP
+        # opens them by URI on either cDSP (the agent's open_process).
+        if processes > 1 and hlos() == "android" and domain_id() != 3:
+            raise NotImplementedError("multiple DSP processes on Android require the default cDSP domain")
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")

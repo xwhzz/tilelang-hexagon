@@ -430,6 +430,12 @@ nothing measurable (15.22 against 15.24 s). A token took 0.8 ms more (11001
 against 10900 ms for 128 tokens); 0.14 ms of that was the VTCM's two handoffs,
 which the resource manager zeroes.
 
+The SA8650 Linux board (v73) runs the stages too, as further sessions of its
+cDSP that the agent opens by URI. At 65536 positions, over two processes, a
+65280-token prompt took 119.4 s (547 t/s), and tg128 after it ran at 8.4 t/s.
+At 32K, one process and two gave the same tokens and bitwise-identical logits
+(prefill 38.0 against 39.2 s).
+
 The decode reads the full-attention layers' whole cache every token. At 128K
 that is 1.6 GB on top of the 3.46 GB of weights, so 11.4 t/s at the DMA's
 rate; at 256K it is 3.2 GB, so 8.6 t/s. The

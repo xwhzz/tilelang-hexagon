@@ -17,8 +17,8 @@ from tilelang.hexagon.runtime.config import domain_id, hlos
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
 MULTI_PROCESS = pytest.mark.skipif(
-    hlos() != "android" or domain_id() != 3,
-    reason="multiple DSP processes require Android's default cDSP domain",
+    hlos() == "android" and domain_id() != 3,
+    reason="multiple DSP processes on Android require the default cDSP domain",
 )
 
 N = 4096
@@ -281,8 +281,15 @@ def test_pipeline_stages_take_resident_buffers_and_scalars_on_their_processes():
 def test_session_agent_maps_a_buffer_into_the_processes_it_names():
     agent = session.gen_agent("tl_session_x")
     assert "rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED" in agent
-    # Processes past the first are reserved sessions of the cDSP.
+    # Processes past the first are further sessions of the cDSP: reserved on
+    # Android, opened by URI on Linux, whose BSP has no reservation request,
+    # with PD controls on the domain and mappings on the session's extended
+    # domain.
     assert "remote_session_control(FASTRPC_RESERVE_NEW_SESSION" in agent
+    linux = agent[agent.index("#ifndef __ANDROID__") : agent.index("#else", agent.index("#ifndef __ANDROID__"))]
+    assert '"%s%s&_session=%d", tl_session_x_URI, d->uri, p' in linux
+    assert "mapped = domain_id | p << 16;" in linux
+    assert "g_domains[p] = mapped;" in agent
     assert "fastrpc_mmap(g_domains[q], fd, p, 0, size, FASTRPC_MAP_FD)" in agent
     # A host access syncs the lines every process caches.
     assert "if (ok) ok = sync_buffer(id, offset, size, 1) == AEE_SUCCESS;" in agent
@@ -657,13 +664,13 @@ def test_a_failing_stage_ends_the_pipeline():
         b.free()
 
 
-@pytest.mark.parametrize("hlos,domain", [("linux", "3"), ("linux", "4"), ("android", "0"), ("android", "4")])
+@pytest.mark.parametrize("domain", ["0", "4"])
 @pytest.mark.parametrize("processes", [2, 3, 4])
-def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, hlos, domain, processes):
-    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", hlos)
+def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, domain, processes):
+    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", "android")
     monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", domain)
     monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
-    with pytest.raises(NotImplementedError, match="multiple DSP processes require Android"):
+    with pytest.raises(NotImplementedError, match="multiple DSP processes on Android require the default cDSP"):
         session.Session.of_lowered([], processes=processes)
 
 
