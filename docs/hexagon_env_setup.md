@@ -242,8 +242,8 @@ agent connection.
 The SA8650 has two cDSPs, domains 3 and 4. `TILELANG_HEXAGON_DOMAIN` selects the
 cDSP that compiled kernels and sessions use by default. A program that uses
 both opens a session on each with `Session(..., domain=3)` and
-`Session(..., domain=4)`; see
-[`example_dual_cdsp.py`](../examples/hexagon/example_dual_cdsp.py).
+`Session(..., domain=4)`; see Sessions in the
+[backend guide](hexagon_backend.md).
 
 For a local environment, set the captured runtime directory as well.
 
