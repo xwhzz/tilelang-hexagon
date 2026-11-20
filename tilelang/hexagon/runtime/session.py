@@ -1083,7 +1083,13 @@ class Session:
     that maps the buffer. A pipeline (:meth:`pipeline`) runs steps of kernels
     on several processes with one FastRPC call each, the processes taking
     their turns on the DSP. Calls on one Session must be serialized, including
-    buffer operations, pipeline and run_sequence."""
+    buffer operations, pipeline and run_sequence.
+
+    A session runs on one DSP, the FastRPC ``domain`` it opens. On a SoC with
+    two cDSPs (the SA8650's domains 3 and 4), a session on each runs kernels at
+    the same time: separate sessions may be called from separate threads. The
+    cDSPs share no VTCM, addresses or caches, so data passes between their
+    sessions through the host (``DeviceBuffer.read`` and ``write``)."""
 
     # The processes one agent can open: a v79 opens 4.
     MAX_PROCESSES = 4
@@ -1100,14 +1106,17 @@ class Session:
         verbose: bool = False,
         ready_timeout: float = 30.0,
         processes: int = 1,
+        domain: int | None = None,
     ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
-        the DSP the target names, which ``processes`` DSP processes load."""
+        the DSP the target names, which ``processes`` DSP processes load.
+        ``domain`` is the FastRPC domain of the DSP the session runs on (3 for
+        cDSP0, 4 for cDSP1), ``TILELANG_HEXAGON_DOMAIN`` when None."""
         from tilelang.backend.target import determine_target
         from tilelang.hexagon.target import hexagon_arch
 
         target = determine_target(target, return_object=True)
-        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes)
+        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes, domain)
 
     @classmethod
     def of_lowered(
@@ -1120,17 +1129,28 @@ class Session:
         verbose: bool = False,
         ready_timeout: float = 30.0,
         processes: int = 1,
+        domain: int | None = None,
     ) -> Session:
         """A session of kernels lowered already, (name, source, params,
         out_idx) each as :func:`lower_kernels` gives them: a compiled kernel
         (tilelang.compile) is a session of one."""
         session = cls.__new__(cls)
-        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes)
+        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain)
         return session
 
-    def _open(self, lowered, sdk, dsp_arch: str | None, serial: str | None, verbose: bool, ready_timeout: float, processes: int) -> None:
+    def _open(
+        self,
+        lowered,
+        sdk,
+        dsp_arch: str | None,
+        serial: str | None,
+        verbose: bool,
+        ready_timeout: float,
+        processes: int,
+        domain: int | None = None,
+    ) -> None:
         from .build import build_cmake_fastrpc
-        from .config import device_serial, domain_id, hlos, remote_dir
+        from .config import check_domain, device_serial, domain_id, hlos, remote_dir
         from .device import AdbConnection
         from .env import HexagonSDK
 
@@ -1143,9 +1163,10 @@ class Session:
         if not 1 <= processes <= Session.MAX_PROCESSES:
             raise ValueError(f"a session runs on 1 to {Session.MAX_PROCESSES} DSP processes, not {processes}")
         self.processes = processes
+        self._domain = domain_id() if domain is None else check_domain(domain)
         # Android reserves its sessions on the default cDSP; the Linux BSP
         # opens them by URI on either cDSP (the agent's open_process).
-        if processes > 1 and hlos() == "android" and domain_id() != 3:
+        if processes > 1 and hlos() == "android" and self._domain != 3:
             raise NotImplementedError("multiple DSP processes on Android require the default cDSP domain")
         self.verbose = verbose
         # The session's FastRPC project and build tree, removed with it.
@@ -1155,7 +1176,6 @@ class Session:
         sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, dsp_arch=dsp_arch, verbose=verbose)
         self.kernels = [SessionKernel(self, i, name, params, out) for i, (name, _, params, out) in enumerate(lowered)]
-        self._domain = domain_id()
         if hlos() == "linux":
             from .linux_runtime import LinuxConnection
 
@@ -1175,6 +1195,11 @@ class Session:
                 self.close()
             raise
         atexit.register(self.close)
+
+    @property
+    def domain(self) -> int:
+        """The FastRPC domain of the DSP the session runs on."""
+        return self._domain
 
     # ---- lifecycle --------------------------------------------------------
     def _start(self, ready_timeout: float) -> None:

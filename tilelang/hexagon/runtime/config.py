@@ -59,12 +59,16 @@ def device_serial() -> str | None:
     return serials[0]
 
 
+def check_domain(domain, name: str = "domain") -> int:
+    """A FastRPC domain: a nonnegative int32 (3 is cDSP0, 4 cDSP1 where a SoC has it)."""
+    if isinstance(domain, bool) or not isinstance(domain, int) or not 0 <= domain < 1 << 31:
+        raise ValueError(f"{name} must be a nonnegative int32, not {domain!r}")
+    return domain
+
+
 def domain_id() -> int:
     """FastRPC domain, independent of the DSP ISA and transport (default cDSP 3)."""
-    domain = int(os.environ.get("TILELANG_HEXAGON_DOMAIN", "3"))
-    if not 0 <= domain < 1 << 31:
-        raise ValueError("TILELANG_HEXAGON_DOMAIN must be a nonnegative int32")
-    return domain
+    return check_domain(int(os.environ.get("TILELANG_HEXAGON_DOMAIN", "3")), "TILELANG_HEXAGON_DOMAIN")
 
 
 def cache_identity() -> dict:

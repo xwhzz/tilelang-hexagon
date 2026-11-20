@@ -13,6 +13,7 @@ for what makes a kernel fast.
 | `example_flash_attention.py` | two HMX gemms and an HVX online softmax on their Crouton tiles, composed on-chip |
 | `example_ffn.py` | a gated FFN: three HMX gemms and an HVX `silu(h1) * h3` gate on Crouton tiles |
 | `example_rmsnorm.py` | HVX `map` + `reduce` (square, rowsum, rsqrt, normalize) |
+| `example_dual_cdsp.py` | two GEMMs at once on the SA8650's two cDSPs (`Session(..., domain=d)`, resident buffers), then a stage that depends on both |
 | `example_gemv_w4a16.py` | a w4a16 decode GEMV: `T.gemm_blockscaled` of int16 activations by 4-bit panel-layout weights on HVX, streamed by DMA across `num_workers` workers |
 | [`lfm/`](lfm/) | LFM2-1.2B end to end: GPTQ weights, a decode megakernel that runs every token of a generation in one call, and an HMX prefill of a whole prompt in one call; LFM2 and LFM3-1.7B in fp16, over several DSP processes at long contexts |
 
@@ -43,6 +44,7 @@ python example_flash_attention.py --seq 256
 python example_ffn.py
 python example_rmsnorm.py --m 64 --n 256
 python example_gemv_w4a16.py --k 2048 --n 8192
+python example_dual_cdsp.py --domains 3 4   # --domains 3 3 on a device with one cDSP
 ```
 
 Each prints its error against a torch reference and `PASS` or `FAIL`. The LFM example
@@ -54,6 +56,8 @@ has its own [README](lfm/README.md).
 Building kernels takes most of their time, so they can run in parallel workers
 (pytest-xdist) that share a device lock: an adapter holds the lock from deployment
 to `close()`, so one session at a time uses the device while the other workers build.
+On a device with two cDSPs, `TL_HEXAGON_DOMAINS=3,4` runs the concurrent-session
+test on both; by default it opens both sessions on `TILELANG_HEXAGON_DOMAIN`.
 
 ```bash
 TL_HEXAGON_DEVICE_TEST=1 TILELANG_HEXAGON_DEVICE_LOCK=/tmp/tl_hexagon_device.lock \

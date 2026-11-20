@@ -1,5 +1,6 @@
 """Device sessions: several kernels sharing resident buffers in one FastRPC session."""
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
@@ -382,6 +383,7 @@ class _LocalAgent:
         return local
 
     def start_host_binary(self, exe, args):
+        self.args = args
         return subprocess.Popen(["sh", "-c", self.agent], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     def forward_port(self, port):
@@ -394,12 +396,12 @@ class _LocalAgent:
         pass
 
 
-def _start(monkeypatch, agent):
+def _start(monkeypatch, agent, domain=3):
     sock = SimpleNamespace(setsockopt=lambda *args: None, settimeout=lambda timeout: None)
     monkeypatch.setattr(session, "socket", SimpleNamespace(create_connection=lambda *args, **kwargs: sock, IPPROTO_TCP=0, TCP_NODELAY=0))
     s = session.Session.__new__(session.Session)
     s._conn, s._closed, s._holds_device = _LocalAgent(agent), False, False
-    s._device_dir, s._domain = "/tmp/session", 3
+    s._device_dir, s._domain = "/tmp/session", domain
     s.processes = 1
     s._artifacts = SimpleNamespace(dsp_skel="skel.so", agent_exe="agent")
     try:
@@ -413,6 +415,16 @@ def _start(monkeypatch, agent):
 def test_a_session_reports_what_its_agent_printed_when_it_exits(monkeypatch):
     with pytest.raises(RuntimeError, match=r"exited \(3\) before ready:\ncannot load the skel"):
         _start(monkeypatch, "echo 'cannot load the skel'; exit 3")
+
+
+@pytest.mark.parametrize("domain", [3, 4])
+def test_a_session_starts_its_agent_on_its_domain(monkeypatch, domain):
+    s = _start(monkeypatch, "echo 'AGENT_READY port=1'; sleep 30", domain)
+    assert s.domain == domain
+    assert s._conn.args[2] == str(domain)
+    s._proc.kill()
+    s._broken = True
+    s.close()
 
 
 @pytest.mark.parametrize("newline", ["\\n", "\\r\\n"])
@@ -672,6 +684,54 @@ def test_unsupported_multi_process_platforms_fail_before_build(monkeypatch, doma
     monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
     with pytest.raises(NotImplementedError, match="multiple DSP processes on Android require the default cDSP"):
         session.Session.of_lowered([], processes=processes)
+
+
+class _Built(Exception):
+    pass
+
+
+def _stop_at_build(*args):
+    raise _Built
+
+
+@pytest.mark.parametrize(("environment", "domain", "rejected"), [("3", 4, True), ("4", 3, False), ("4", None, True)])
+def test_a_session_domain_overrides_the_environment(monkeypatch, environment, domain, rejected):
+    # Android's multi-process guard sees the session's domain, not the variable.
+    monkeypatch.setenv("TILELANG_HEXAGON_HLOS", "android")
+    monkeypatch.setenv("TILELANG_HEXAGON_DOMAIN", environment)
+    monkeypatch.setattr(session, "write_project", _stop_at_build)
+    with pytest.raises(NotImplementedError if rejected else _Built):
+        session.Session.of_lowered([], processes=2, domain=domain)
+
+
+@pytest.mark.parametrize("domain", [-1, 1 << 31, True, "4", 4.0])
+def test_an_invalid_session_domain_fails_before_build(monkeypatch, domain):
+    monkeypatch.setattr(session, "write_project", lambda *a: pytest.fail("must reject before building"))
+    with pytest.raises(ValueError, match="domain must be a nonnegative int32"):
+        session.Session.of_lowered([], domain=domain)
+
+
+# The FastRPC domains of the device's cDSPs, "3,4" on an SA8650.
+DOMAINS = [int(d) for d in os.environ.get("TL_HEXAGON_DOMAINS", str(domain_id())).split(",")]
+
+
+@DEVICE
+def test_sessions_on_each_cdsp_run_at_the_same_time():
+    # A session on each cDSP (two on the one cDSP of a device that has one),
+    # called from two threads; then a kernel on the first adds what both made.
+    domains = (DOMAINS * 2)[:2]
+    sessions = [session.Session([(fill, [1]), (add, [2])], domain=d) for d in domains]
+    try:
+        assert [s.domain for s in sessions] == domains
+        values = [torch.tensor([1.5]), torch.tensor([-4.0])]
+        with ThreadPoolExecutor(2) as pool:
+            made = list(pool.map(lambda i: [sessions[i].kernels[0](values[i]) for _ in range(20)][-1], range(2)))
+        for value, out in zip(values, made):
+            torch.testing.assert_close(out, value.expand(N))
+        torch.testing.assert_close(sessions[0].kernels[1](*made), torch.full((N,), -2.5))
+    finally:
+        for s in sessions:
+            s.close()
 
 
 def test_vtcm_cached_context_releases_partial_grants_on_host(tmp_path):
