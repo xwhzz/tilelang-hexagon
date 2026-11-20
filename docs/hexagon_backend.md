@@ -521,25 +521,9 @@ barrier and does not release resources or drain DMA. See the
   - **Domains.** A Session runs on one DSP: `Session(..., domain=d)` picks its
     FastRPC domain, `TILELANG_HEXAGON_DOMAIN` by default. The SA8650 has two cDSPs,
     domains 3 and 4; Sessions on both, called from two threads, run at the same
-    time. The cDSPs share no VTCM, addresses or caches, so data passes between
-    their Sessions through the host:
-
-    ```python
-    from concurrent.futures import ThreadPoolExecutor
-
-    first = Session([(gemm, [2]), (add, [2])], domain=3)
-    second = Session([(gemm, [2])], domain=4)
-    with ThreadPoolExecutor(2) as pool:  # X1 = A1 @ B1 and X2 = A2 @ B2 at once
-        runs = [pool.submit(first.kernels[0], a1, b1, x1), pool.submit(second.kernels[0], a2, b2, x2)]
-        for run in runs:
-            run.result()
-    x2_on_first.write(x2.read())  # X2 reaches the first cDSP through the host
-    first.kernels[1](x1, x2_on_first, y)  # Y = X1 + X2
-    ```
-
-    Here the arguments are resident buffers of their Session. On the SA8650, two
-    2048³ HMX GEMMs take 43.9 ms this way, against 81.5 ms one after the other;
-    two streaming kernels each keep 94% of their DDR bandwidth.
+    time (two 2048³ HMX GEMMs: 43.9 ms, against 81.5 ms one after the other). The
+    cDSPs share no VTCM, addresses or caches, so data passes between their
+    Sessions through the host.
 
 ---
 
