@@ -409,9 +409,8 @@ On the same v79 phone, `bench.py` tg128 at depth 130816 goes from 6.46 to
 
 - **Attention's HVX work.** exp2 (already the fp16 fast path, in qf16) and
   the row sums take 14.4M cycles a worker at pp1024, most of attention's 36M.
-- **The embedding.** A token's row is a column of the head's tiles, which the
-  DMA gathers as 1024 rows of 4 bytes: 7.3M cycles a worker at pp1024. A
-  row-major copy of the 524 MB embedding would make it one 4 KB transfer a
-  token, but would bring one process's buffers to about 3.99 GB, at the edge
-  of what its address space maps. Split over two processes (#219), the
-  first stage has room for it.
+- Thoughts: For exps, maybe we can use Schraudolph calculation and precalculate.
+  Specifically, Schraudolph for exps, precalculate for accuracy.
+- Previous Attempt: For row sums, change code form reduce_sum to gemm(P @ 1).
+  And to avert bank conflict, attempt lets different row_sum result in
+  different col. However, experiments did not approve that method works.

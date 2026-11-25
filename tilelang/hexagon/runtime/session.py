@@ -999,12 +999,20 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         os.replace(tmp, path)
     return match.group(1), source
 
+from pathlib import Path
+def _rewrite_kernel(change_kernel_path: str = None) -> str:
+    # read and return c kernel code form change_kernel_path
+    return Path(change_kernel_path).read_text(encoding="utf-8")
 
-def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:
+def lower_kernels(kernels, target="hexagon", change_kernel_name: str = None, change_kernel_path: str = None) -> list[tuple[str, str, list, list]]:
     """The (name, source, params, out_idx) of each (prim_func, out_idx) pair,
     each lowered under its own pass configs (``T.annotate_pass_configs``), as
     ``tilelang.compile`` lowers it. Lowered sources are cached on disk
     (``$TILELANG_CACHE_DIR/hexagon_lowered``), as built skels are."""
+    """
+    change_kernel_path: the address of your kernel
+    change_kernel_name: the name of your kernel. In this program, it is prefill_kernel or decode_kernel(?)
+    """
     from tilelang.backend.target import determine_target
     from tilelang.engine.lower import extrac_params
 
@@ -1015,6 +1023,14 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
         name, source = _lower(func, target, configs)
         out = list(out_idx) if isinstance(out_idx, (list, tuple)) else ([] if out_idx is None else [out_idx])
         lowered.append((name, source, extrac_params(func), out))
+
+    if change_kernel_path is not None:
+        matches = [i for i, item in enumerate(lowered) if item[0] == change_kernel_name]
+        assert len(matches) == 1, f"expected one {change_kernel_name}, got {matches}"
+        idx = matches[0]
+        name, source, *rest = lowered[idx]
+        lowered[idx] = (name, _rewrite_kernel(change_kernel_path), *rest)
+
     return lowered
 
 
