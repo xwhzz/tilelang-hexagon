@@ -379,9 +379,10 @@ def attend(
         else:
             T.dma_wait()
         T.gemm(qg, kb[slot, :, :], sc, transpose_B=True, clear_accum=True)
-        for g, j in T.Parallel(group, POS_BLOCK):
-            key = pb * POS_BLOCK + j
-            sc[g, j] = T.if_then_else(key <= pos and key >= first, sc[g, j], T.float32(-3.0e38))
+        if pb * POS_BLOCK < first or (pb + 1) * POS_BLOCK - 1 > pos:
+            for g, j in T.Parallel(group, POS_BLOCK):
+                key = pb * POS_BLOCK + j
+                sc[g, j] = T.if_then_else(key <= pos and key >= first, sc[g, j], T.float32(-3.0e38))
         T.reduce_max(sc, mb, dim=1)
         for g in T.Parallel(group):
             alpha[g] = T.exp(m[g] - T.max(m[g], mb[g]))
