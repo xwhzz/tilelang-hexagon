@@ -314,24 +314,27 @@ def make_prefill(
             bf.rot[i, d] = T.Cast("float16", v * bf.hss[i])
 
     @T.macro
-    def in_proj_block(bf, b, ring, k, ci, valid):
-        """Part b % 3 (B, x, C, as the stream visits them) of channel panel
-        b // 3: after x, B * x and its causal conv over time, from the state
-        before the chunk; after C, the gated output into hid."""
-        ch = bf.w * DW + b // 3 * TILE
-        gemm(bf, bf.a, D, ring, k, bf.cc[b % 3 % 2, :, :], True)
-        if b % 3 == 1:
+    def in_proj_block(bf, b, ring, k, ci, valid, parts: int):
+        """For each channel panel, B and x update the convolution state. A
+        three-part stream also convolves their product and gates it with C
+        for the following output projection."""
+        ch = bf.w * DW + b // parts * TILE
+        gemm(bf, bf.a, D, ring, k, bf.cc[b % parts % 2, :, :], True)
+        if b % parts == 1:
             for i, j in T.Parallel(R, TILE):
                 bf.cc[0, i, j] = bf.cc[0, i, j] * bf.cc[1, i, j]
-            # y[t] = sum_j w_j bx[t - (taps - 1) + j], bx before the chunk
-            # from the state.
-            for i, j in T.Parallel(R, TILE):
-                y = bf.conv_w[ci, taps - 1, ch + j] * bf.cc[0, i, j]
-                for tap in list(range(taps - 1)):
-                    back = taps - 1 - tap
-                    prev = T.if_then_else(i >= back, bf.cc[0, T.max(i - back, 0), j], bf.conv_state[ci, T.min(i + tap, taps - 2), ch + j])
-                    y = y + bf.conv_w[ci, tap, ch + j] * prev
-                bf.cc[1, i, j] = y
+            if parts == 3:
+                # y[t] = sum_j w_j bx[t - (taps - 1) + j], bx before the chunk
+                # from the state.
+                for i, j in T.Parallel(R, TILE):
+                    y = bf.conv_w[ci, taps - 1, ch + j] * bf.cc[0, i, j]
+                    for tap in list(range(taps - 1)):
+                        back = taps - 1 - tap
+                        prev = T.if_then_else(
+                            i >= back, bf.cc[0, T.max(i - back, 0), j], bf.conv_state[ci, T.min(i + tap, taps - 2), ch + j]
+                        )
+                        y = y + bf.conv_w[ci, tap, ch + j] * prev
+                    bf.cc[1, i, j] = y
             # The state the next chunk, or the decode, starts from: the last
             # taps - 1 valid rows' B * x, the state's own rows before them.
             for s, j in T.Parallel(taps - 1, TILE):
@@ -341,10 +344,17 @@ def make_prefill(
                 )
             for s, j in T.Parallel(taps - 1, TILE):
                 bf.conv_state[ci, s, ch + j] = bf.st[s, j]
-        if b % 3 == 2:
+        if b % parts == 2:
             for i, j in T.Parallel(R, TILE):
                 bf.cc[0, i, j] = bf.cc[0, i, j] * bf.cc[1, i, j]
             T.copy(bf.cc[0, :, :], bf.hid[:, ch : ch + TILE])
+
+    def run_conv(bf, ci, valid, weights, rings, parts: int):
+        # The stored panels are B, C, x. Visit B, x first to form the state.
+        phase = Phase(weights, ci, parts * DW // TILE, lambda b: bf.w * 3 * DW + (b // parts * 3 + b % parts * 2 % 3) * TILE)
+        stream = Stream([phase], DEPTH, rings=rings)
+        stream.prologue()
+        stream.run(0, lambda b, ring, k: in_proj_block(bf, b, ring, k, ci, valid, parts))
 
     @T.macro
     def store_kv(bf, cache, kvh, kv0, window, base, src):
@@ -642,11 +652,6 @@ def make_prefill(
                 # output projection and the FFN's, each part's w1/w3
                 # panels and then its w2 slab. The streams run one after
                 # another.
-                st_conv = Stream(
-                    [Phase(p_in, ci, 3 * DW // TILE, lambda b: w * 3 * DW + b // 3 * 3 * TILE + (b % 3) * 2 % 3 * TILE)],
-                    DEPTH,
-                    rings=rings,
-                )
                 st_attn = Stream([Phase.rows(p_qkv, ai, w * QW, QW // TILE)], DEPTH, rings=rings)
                 rest = [Phase.rows(p_out, layer, w * DW, DW // TILE)]
                 for part in list(range(PARTS)):
@@ -664,9 +669,11 @@ def make_prefill(
                         ),
                     )
                     attention(bf, kv0, base, window)
+                elif has_last_layer and not c.is_attention(c.layers - 1) and layer == L - 1:
+                    # Only B*x history survives the model's final convolution.
+                    run_conv(bf, ci, valid, p_in, rings, 2)
                 else:
-                    st_conv.prologue()
-                    st_conv.run(0, lambda b, ring, k, ci=ci, valid=valid: in_proj_block(bf, b, ring, k, ci, valid))
+                    run_conv(bf, ci, valid, p_in, rings, 3)
                 T.sync_grid()
                 # The model's last layer's output projection and FFN feed
                 # nothing the prefill leaves: the decode runs the prompt's
