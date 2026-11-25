@@ -1053,9 +1053,13 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
             imports_c |= node.attr_key == "pragma_import_c"
         elif isinstance(node, tvm.tirx.SBlock):
             imports_c |= "pragma_import_c" in node.annotations
+        # Imported C is attached to a statement. Skip arithmetic subtrees.
+        return not imports_c and isinstance(node, tvm.tirx.Stmt)
 
     for func, _ in kernels:
-        tvm.tirx.stmt_functor.post_order_visit(func.body, check_import)
+        tvm.tirx.stmt_functor.pre_order_visit(func.body, check_import)
+        if imports_c:
+            break
     target = determine_target(target, return_object=True)
     lowered = []
     for func, out_idx in kernels:
