@@ -952,7 +952,7 @@ def test_device_arithmetic_lowering_and_session_arch_agree(arch, case, monkeypat
     class BeforeOpen(Exception):
         pass
 
-    def before_open(self, lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes):
+    def before_open(self, lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain=None):
         calls.append(dsp_arch)
         assert dsp_arch == arch and processes == 1
         assert lowered and all("TL_HEXAGON_IEEE_ARITHMETIC" in source for _, source, _, _ in lowered)
