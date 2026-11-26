@@ -194,6 +194,25 @@ def test_dsp_compiler_dependencies_include_transitive_and_project_relative_heade
     assert build._external_headers(str(project), "other", sdk, artifacts) is None
 
 
+def test_build_does_not_publish_under_a_retargeted_directory_symlink(tmp_path):
+    from tilelang.hexagon.runtime import build
+
+    for dirname, value in (("first", "11"), ("second", "77")):
+        (tmp_path / dirname).mkdir()
+        (tmp_path / dirname / "value.h").write_text(value)
+    link = tmp_path / "active"
+    link.symlink_to("first")
+    (tmp_path / "includes").symlink_to("active")
+    headers = ["includes/value.h"]
+    first = build._header_variant("entry", tmp_path, headers)
+    # Use filesystem ctimes so the check also exercises coarse timestamp resolution.
+    link.unlink()
+    link.symlink_to("second")
+    assert build._header_variant("entry", tmp_path, headers, link.lstat().st_ctime_ns) is None
+    second = build._header_variant("entry", tmp_path, headers)
+    assert second != first
+
+
 def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):
     builds.run()
     monkeypatch.setenv("TILELANG_HEXAGON_LINUX_CC", "/other/gcc")

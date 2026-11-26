@@ -184,6 +184,23 @@ def _external_headers(project_dir: str, name: str, sdk: HexagonSDK, artifacts: F
     return sorted(headers)
 
 
+def _links_changed(path: Path, since: int) -> bool:
+    """A directory symlink can redirect the compiler to a different, older file."""
+    pending = [path]
+    visited = set()
+    while pending:
+        part = pending.pop()
+        if part in visited:
+            continue
+        visited.add(part)
+        pending.append(part.parent)
+        if part.is_symlink():
+            if part.lstat().st_ctime_ns >= since:
+                return True
+            pending.append(part.parent / part.readlink())
+    return False
+
+
 def _header_variant(entry: str, project_dir: str, headers: list[str], build_start: int = 0) -> str | None:
     digest = hashlib.sha256()
     for header in headers:
@@ -191,7 +208,7 @@ def _header_variant(entry: str, project_dir: str, headers: list[str], build_star
         with path.open("rb") as f:
             digest.update(os.fsencode(header) + b"\0" + hashlib.sha256(f.read()).digest())
             # A header edited during compilation may differ from what the compiler read.
-            if build_start and max(os.fstat(f.fileno()).st_ctime_ns, path.lstat().st_ctime_ns) >= build_start:
+            if build_start and (os.fstat(f.fileno()).st_ctime_ns >= build_start or _links_changed(path, build_start)):
                 return None
     return os.path.join(entry, digest.hexdigest())
 
