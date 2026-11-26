@@ -50,6 +50,8 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tilelang.hexagon.codegen import _GeneratedSource
+
 from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
@@ -246,7 +248,9 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
     # An opaque source in this translation unit can redefine a sibling's helpers.
-    managed = all(src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels)
+    managed = all(
+        isinstance(src, _GeneratedSource) and src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels
+    )
     for i, (_, source, plans) in enumerate(kernels):
         args = ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
@@ -1005,10 +1009,13 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         with contextlib.suppress(OSError, ValueError, KeyError):
             with open(path) as f:
                 entry = json.load(f)
-            return entry["name"], entry["source"]
+            source = entry["source"]
+            if entry.get("source_digest") == hashlib.sha256(source.encode()).hexdigest():
+                source = _GeneratedSource(source)
+            return entry["name"], source
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-    source = str(art.kernel_source)
+    source = _GeneratedSource(art.kernel_source)
     match = _KERNEL_RE.search(source)
     if not match:
         raise RuntimeError("could not find the kernel function in the generated source")
@@ -1016,7 +1023,7 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": match.group(1), "source": source}, f)
+            json.dump({"name": match.group(1), "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
     return match.group(1), source
 
