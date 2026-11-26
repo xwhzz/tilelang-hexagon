@@ -319,6 +319,11 @@ column-contiguous fp16 matrix (a transposed weight in row-major storage) goes th
 
 HVX code works on Crouton buffers directly, so chained gemms and the maps between them
 (the flash attention softmax on `S`, an FFN gate `silu(h1) * h3`) convert no layouts.
+A `T.copy` between two matching Crouton layouts moves tile-aligned FP16
+regions a register at a time. For stacks, each pair of corresponding matrices
+moves in leading-axis order. Slices may start at different matrices or tiles
+at each endpoint.
+
 A Crouton layout's physical shape is `[tiles, 16 row pairs, 64 lanes]`, and a
 single-thread `T.Parallel` that writes every element of a buffer with a layout iterates
 in that buffer's physical order (`LowerTileOp`): a loop over tiles and their row pairs,
