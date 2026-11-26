@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import convert  # noqa: E402
 from convert import TILE, qkv_group  # noqa: E402
 from decode import NOISE_KEYS  # noqa: E402
-from model import CONV, SLIDING, Config, Model, rope_angles  # noqa: E402
+from model import CONV, SLIDING, Config, Model, rope_angles, rotary_pairs  # noqa: E402
 from stream import Phase, Stream, Weights  # noqa: E402
 
 NW = 4  # workers
@@ -63,25 +63,42 @@ SLICE_TILES = 64  # a block's K tiles at most: 128 KB of weights
 EMPTY_ROWS = 128
 
 
-def kinds(c: Config) -> list:
-    """The attention kinds of config c, in its RoPE tables' order."""
-    return list(c.rope)
+class RopeLayout:
+    """A row of FP32 frequencies, the active half-head pairs for each kind."""
+
+    def __init__(self, c: Config):
+        self.spans = {}
+        self.width = 0
+        for kind, (_, fraction) in c.rope.items():
+            pairs = rotary_pairs(c.head_dim, fraction)
+            if not 0 <= pairs <= c.head_dim // 2:
+                raise ValueError(f"rotary fraction {fraction} exceeds the head")
+            self.spans[kind] = range(self.width, self.width + pairs)
+            self.width += pairs
+
+    def shape(self, rows: int) -> tuple:
+        # FastRPC buffers require storage even if every pair passes through.
+        return (rows, self.width) if self.width else (1, 1)
+
+    def nbytes(self, rows: int) -> int:
+        height, width = self.shape(rows)
+        return height * width * 4
 
 
 def rope_tables(c: Config, max_pos: int) -> tuple:
-    """cos and sin [kinds, max_pos, head_dim / 2] of each attention kind's RoPE
-    angles, as model.rope_angles computes them."""
-    cos = torch.empty((len(c.rope), max_pos, c.head_dim // 2), dtype=torch.float32)
+    """Contiguous cosine and sine tables, one compact row per position."""
+    layout = RopeLayout(c)
+    cos = torch.empty(layout.shape(max_pos), dtype=torch.float32)
     sin = torch.empty_like(cos)
-    # At head_dim=128, 2048 positions need 1 MiB of FP64 angles per kind.
+    if not layout.width:
+        return cos.fill_(1), sin.zero_()
     chunk_rows = 2048
-    for table, kind in enumerate(kinds(c)):
+    for kind, span in layout.spans.items():
         for start in range(0, max_pos, chunk_rows):
             stop = min(start + chunk_rows, max_pos)
-            positions = torch.arange(start, stop)
-            angles = rope_angles(positions, c.head_dim, *c.rope[kind])
-            cos[table, start:stop] = angles.cos()
-            sin[table, start:stop] = angles.sin()
+            angles = rope_angles(torch.arange(start, stop), c.head_dim, *c.rope[kind], active_only=True)
+            cos[start:stop, span.start : span.stop] = angles.cos()
+            sin[start:stop, span.start : span.stop] = angles.sin()
     return cos, sin
 
 
@@ -239,7 +256,7 @@ def stage_bytes(c: Config, header: dict, max_pos: int, layers: range, row_major_
         total += head
     total += 2 * c.kv_heads * kv_plan(c, max_pos, layers)[2] * c.head_dim * 2
     if any(c.is_attention(i) for i in layers):
-        total += 2 * len(c.rope) * max_pos * (c.head_dim // 2) * 4
+        total += 2 * RopeLayout(c).nbytes(max_pos)
     return total
 
 
@@ -307,19 +324,33 @@ def gemv(a, ring, k, acc, k0, cols: int, clear):
     T.gemm(a[:, k0 : k0 + cols], ring[k, :, :], acc, clear_accum=clear)
 
 
+def rope_coefficient(table, row, lane, half: int, span: range, width: int, identity: float):
+    """Load a full head-half vector from the compact row, filling inactive lanes."""
+    if not len(span):
+        return T.float32(identity)
+    col = span.start + lane
+    # Keep unused vector lanes within this row when the last kind is partial.
+    if span.start + half > width:
+        col = col % width
+    value = table[row, col]
+    return T.Select(lane < len(span), value, T.float32(identity)) if len(span) < half else value
+
+
 @T.macro
-def norm_rope(v, o, weight, cos, sin, kind: int, pos, t, sq, s, HD: int, eps: float):
+def norm_rope(v, o, weight, cos, sin, span, width: int, pos, t, sq, s, HD: int, eps: float):
     """The head at v[0, o : o + HD]: RMS norm by weight(d), then RoPE at pos,
     rotating its halves."""
-    half = HD // 2
     for i, d in T.Parallel(1, HD):
         sq[i, d] = v[0, o + d] * v[0, o + d]
     T.reduce_sum(sq, s, dim=1)
     for i, d in T.Parallel(1, HD):
         t[i, d] = v[0, o + d] * T.rsqrt(s[0] / T.float32(HD) + T.float32(eps)) * weight(d)
+    half = HD // 2
     for i, d in T.Parallel(1, HD):
         sign = T.if_then_else(d < half, T.float32(-1), T.float32(1))
-        v[0, o + d] = t[i, d] * cos[kind, pos, d % half] + sign * t[i, (d + half) % HD] * sin[kind, pos, d % half]
+        cv = rope_coefficient(cos, pos, d % half, half, span, width, 1.0)
+        sv = rope_coefficient(sin, pos, d % half, half, span, width, 0.0)
+        v[0, o + d] = t[i, d] * cv + sign * t[i, (d + half) % HD] * sv
 
 
 @T.macro
@@ -595,8 +626,7 @@ def make_decode(
     KH = KVH // NW  # its KV heads
     QW = KH * g.width  # its columns of attn.qkv
     S2 = F // slice_cols(F)  # slices of w2's K
-    NK = len(c.rope)
-    kind = {k: i for i, k in enumerate(kinds(c))}
+    layout = RopeLayout(c)
     eps = c.eps
     kv_first, kv_ring, KV_ROWS = kv_plan(c, max_pos, layers)
     # Every layer's rows, and a ring's, start on a block (kv_block).
@@ -630,8 +660,8 @@ def make_decode(
         k_norm: T.Tensor((La1, HD), "float32"),
         conv_w: T.Tensor((Lc1, taps, D), "float32"),
         final_norm: T.Tensor((D,), "float32"),
-        rope_cos: T.Tensor((NK, ROPE, HD // 2), "float32"),
-        rope_sin: T.Tensor((NK, ROPE, HD // 2), "float32"),
+        rope_cos: T.Tensor(layout.shape(ROPE), "float32"),
+        rope_sin: T.Tensor(layout.shape(ROPE), "float32"),
         kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         conv_state: T.Tensor((Lc1, taps - 1, D), "float32"),
@@ -777,14 +807,14 @@ def make_decode(
             for layer in list(layers):
                 rms_norm(xf, lambda k, layer=layer: op_norm[layer - l0, k], h16, sq, s1, D, eps)
                 if c.is_attention(layer):
-                    ki = kind[c.layer_types[layer]]
+                    span = layout.spans[c.layer_types[layer]]
                     first = T.max(pos - c.window + 1, 0) if c.layer_types[layer] == SLIDING else 0
                     # The layer's cache row of a position, and block of a block of them.
                     row = lambda p, ai=ai: kv_row(c, kv_first[ai], kv_ring[ai], p)  # noqa: E731
                     block = lambda b, ai=ai: kv_block(c, kv_first[ai], kv_ring[ai], b)  # noqa: E731
                     st.run(i_ph, lambda b, ring, k: store_block(b, ring, k, h16, acc, D, qkv, 0))
                     i_ph += 1
-                    rope = (rope_cos, rope_sin, ki, pos, t_hd, sq_hd, s1, HD, eps)
+                    rope = (rope_cos, rope_sin, span, layout.width, pos, t_hd, sq_hd, s1, HD, eps)
                     for h in list(range(KH)):
                         base = h * g.width
                         kvh = w * KH + h

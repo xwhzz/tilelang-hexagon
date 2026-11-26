@@ -161,21 +161,29 @@ def test_reference_decodes_past_the_window():
     torch.testing.assert_close(torch.stack(got), want[89:119], rtol=0, atol=1e-5 * want.abs().max().item())
 
 
-def test_fp16_rope_tables_match_reference_across_chunks(monkeypatch):
-    c = Config(head_dim=128, rope={SLIDING: (1e4, 1.0), FULL: (1e6, 0.5)})
+@pytest.mark.parametrize("fractions", [(1.0, 0.5), (0.125, 0.0), (0.0, 0.0)])
+def test_fp16_rope_tables_match_reference_across_chunks(monkeypatch, fractions):
+    c = Config(head_dim=128, rope={SLIDING: (1e4, fractions[0]), FULL: (1e6, fractions[1])})
     positions = torch.arange(4099)
-    angles = torch.stack([rope_angles(positions, c.head_dim, *params) for params in c.rope.values()])
+    layout = decode_fp16.RopeLayout(c)
 
-    def chunk_angles(rows, *args):
+    def chunk_angles(rows, *args, **kwargs):
         assert len(rows) < len(positions)
-        return rope_angles(rows, *args)
+        return rope_angles(rows, *args, **kwargs)
 
     monkeypatch.setattr(decode_fp16, "rope_angles", chunk_angles)
     cos, sin = decode_fp16.rope_tables(c, len(positions))
-    for actual, expected in ((cos, angles.cos()), (sin, angles.sin())):
-        assert actual.dtype == torch.float32 and actual.is_contiguous()
-        assert torch.equal(actual.view(torch.int32), expected.float().view(torch.int32))
-    assert (cos[1, :, 32:] == 1).all() and (sin[1, :, 32:] == 0).all()
+    assert cos.shape == sin.shape == layout.shape(len(positions))
+    assert cos.numel() * cos.element_size() == layout.nbytes(len(positions))
+    for kind, span in layout.spans.items():
+        reference = rope_angles(positions, c.head_dim, *c.rope[kind])
+        if not layout.width:
+            assert cos.item() == 1 and sin.item() == 0
+            continue
+        for actual, expected in ((cos, reference.cos()), (sin, reference.sin())):
+            assert actual.dtype == torch.float32 and actual.is_contiguous()
+            assert torch.equal(actual[:, span.start : span.stop].view(torch.int32), expected[:, : len(span)].float().view(torch.int32))
+        assert (reference[:, len(span) :] == 0).all()
 
 
 def test_crouton_weight_is_the_hmx_weight_layout():
@@ -1045,3 +1053,18 @@ def test_prefill_factory_keeps_staging_for_unqualified_vector_capability(fp16, c
         original = make_prefill(c, shapes, 128, 256, 64)
         candidate = make_prefill(c, shapes, 128, 256, 64, target=target)
     tvm.ir.assert_structural_equal(original, candidate)
+
+
+def test_compact_rope_coefficients_stay_inside_each_row():
+    # A short final kind wraps speculative vector lanes within the row. The
+    # identity still applies to each pair beyond that kind's active span.
+    c = Config(head_dim=128, rope={SLIDING: (1e4, 0.125), FULL: (1e6, 0.34375)})
+    layout = decode_fp16.RopeLayout(c)
+    values = {(0, i): tvm.tirx.FloatImm("float32", i + 2) for i in range(layout.width)}
+    analyzer = tvm.arith.Analyzer()
+    for span in layout.spans.values():
+        for lane in range(c.head_dim // 2):
+            for identity in (0.0, 1.0):
+                coeff = decode_fp16.rope_coefficient(values, 0, lane, c.head_dim // 2, span, layout.width, identity)
+                expected = span.start + lane + 2 if lane < len(span) else identity
+                assert analyzer.simplify(coeff).value == expected

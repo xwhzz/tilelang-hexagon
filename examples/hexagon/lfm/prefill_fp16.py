@@ -68,7 +68,7 @@ LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     """Per layer of `layers` (all by default): whether it is attention, its
     index among the stage's layers of its kind, its RoPE table
-    (decode_fp16.kinds), its window (0: none) and, for an attention layer, its
+    index, its window (0: none) and, for an attention layer, its
     first row of the stage's KV cache (decode_fp16.kv_plan) in blocks of KEYS
     rows, which DMA moves whole tiles of."""
     layers = range(c.layers) if layers is None else layers
@@ -135,7 +135,8 @@ def make_prefill(
     FQ = slice_cols(F)  # hidden units of a part of the FFN
     PARTS = F // FQ
     FQW = FQ // NW  # a worker's of a part
-    NK = len(c.rope)
+    layout = decode_fp16.RopeLayout(c)
+    spans = list(layout.spans.values())
     half = HD // 2
     assert R % ROWS == 0 and RW % (2 * RB) == 0 and max_pos % KEYS == 0 and FQW % TILE == 0
     # A chunk's write runs past a ring's end by at most its rows, into the pad
@@ -304,14 +305,15 @@ def make_prefill(
         sums of squares are in hss."""
         for i in T.Parallel(R):
             bf.hss[i] = T.rsqrt(bf.hss[i] * T.float32(1 / HD) + T.float32(eps)) * extra
-        for i, d in T.Parallel(R, HD):
-            d2 = (d + half) % HD
-            sign = T.if_then_else(d < half, T.float32(-1), T.float32(1))
-            v = (
-                bf.hd[i, d] * weight(d) * bf.cos_rows[table, i, d % half]
-                + sign * bf.hd[i, d2] * weight(d2) * bf.sin_rows[table, i, d % half]
-            )
-            bf.rot[i, d] = T.Cast("float16", v * bf.hss[i])
+        for k, span in list(enumerate(spans)):
+            if table == k:
+                for i, d in T.Parallel(R, HD):
+                    d2 = (d + half) % HD
+                    sign = T.if_then_else(d < half, T.float32(-1), T.float32(1))
+                    cv = decode_fp16.rope_coefficient(bf.cos_rows, i, d % half, half, span, layout.width, 1.0)
+                    sv = decode_fp16.rope_coefficient(bf.sin_rows, i, d % half, half, span, layout.width, 0.0)
+                    v = bf.hd[i, d] * weight(d) * cv + sign * bf.hd[i, d2] * weight(d2) * sv
+                    bf.rot[i, d] = T.Cast("float16", v * bf.hss[i])
 
     @T.macro
     def in_proj_block(bf, b, ring, k, ci, valid):
@@ -515,8 +517,8 @@ def make_prefill(
         q_norm: T.Tensor((La1, HD), "float32"),
         k_norm: T.Tensor((La1, HD), "float32"),
         conv_w: T.Tensor((Lc1, taps, D), "float32"),
-        rope_cos: T.Tensor((NK, ROPE, half), "float32"),
-        rope_sin: T.Tensor((NK, ROPE, half), "float32"),
+        rope_cos: T.Tensor(layout.shape(ROPE), "float32"),
+        rope_sin: T.Tensor(layout.shape(ROPE), "float32"),
         kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         conv_state: T.Tensor((Lc1, taps - 1, D), "float32"),
@@ -545,8 +547,8 @@ def make_prefill(
             f = T.alloc_global((R, D), "float32", scope="global.vtcm")
             # The workers' parts of f's rows' sums of squares.
             psum = T.alloc_global((NW, R), "float32", scope="global.vtcm")
-            cos_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
-            sin_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
+            cos_rows = T.alloc_global(layout.shape(R), "float32", scope="global.vtcm")
+            sin_rows = T.alloc_global(layout.shape(R), "float32", scope="global.vtcm")
 
             # A worker's: the outputs of up to two panels, or of a head's;
             # the rows it normalizes or embeds RB at a time.
@@ -616,11 +618,11 @@ def make_prefill(
             valid = T.min(R, n - chunk * R)
             # The chunk's rows of the RoPE tables, into VTCM: worker w's
             # rows. Rows past the tables, the padding's, take their last.
-            if La:
-                for t, i, d in T.Parallel(NK, RW, half):
+            if La and layout.width:
+                for i, d in T.Parallel(RW, layout.width):
                     r = w * RW + i
-                    cos_rows[t, r, d] = rope_cos[t, T.min(base + r, max_pos - 1), d]
-                    sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
+                    cos_rows[r, d] = rope_cos[T.min(base + r, max_pos - 1), d]
+                    sin_rows[r, d] = rope_sin[T.min(base + r, max_pos - 1), d]
 
             if has_embedding:
                 embed(bf, chunk, n, tokens, embedding, op_norm[0, :])
@@ -634,7 +636,7 @@ def make_prefill(
                 # is provably in its tensor.
                 ci = clamped(kinds[layer, 1], Lc)
                 ai = clamped(kinds[layer, 1], La)
-                table = clamped(kinds[layer, 2], NK)
+                table = clamped(kinds[layer, 2], len(spans))
                 window = attention_window(layer, kinds)
                 kv0 = kinds[layer, 4]
                 # The layer's phases, worker w's blocks of each, in order:

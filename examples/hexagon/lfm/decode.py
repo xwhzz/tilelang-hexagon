@@ -595,7 +595,8 @@ class Decoder:
         target = determine_target("hexagon", return_object=True)
 
         c, header, max_pos, R = self.c, self.header, self.max_pos, self.prefill_rows
-        D, F, HD, NK = c.dim, c.ff, c.head_dim, len(c.rope)
+        D, F, HD = c.dim, c.ff, c.head_dim
+        rope_layout = decode_fp16.RopeLayout(c)
         ranges = decode_fp16.plan_stages(c, header, max_pos, processes)
         P = len(ranges)
         row_major = self.row_major_embedding = decode_fp16.row_major_embedding(c, header, max_pos, ranges)
@@ -670,7 +671,7 @@ class Decoder:
                 ask((p, "embed"), decode_fp16.TILE * 2, [p])
             if p not in attends:
                 for key in ("cos", "sin"):
-                    ask((p, key), NK * decode_fp16.EMPTY_ROWS * HD // 2 * 4, [p])
+                    ask((p, key), rope_layout.nbytes(decode_fp16.EMPTY_ROWS), [p])
             rows = decode_fp16.kv_plan(c, max_pos, layers)[2] if p in attends else decode_fp16.EMPTY_ROWS
             for key in ("kv_k", "kv_v"):
                 ask((p, key), c.kv_heads * rows * HD * 2, [p])
