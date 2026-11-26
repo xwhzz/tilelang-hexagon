@@ -398,10 +398,11 @@ def make_prefill(
         T.dma_copy(bf.kv_v[kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
 
     @T.macro
-    def attention(bf, kv0, base, window):
+    def attention(bf, kv0, base, window, valid):
         """The worker's query heads, ROWS rows at a time: softmax(q K^T) V
         over the cache's positions [base + i - window + 1 (or 0), base + i]
         for row i, gated, into hid, in base 2 (the queries carry log2 e).
+        Round the valid query count up to a whole HMX block.
 
         A head's scores stay in the fp16 tiles HMX stores them in, where the
         mask and the row maxima work; exp2 writes P into another buffer's
@@ -411,7 +412,7 @@ def make_prefill(
         for h in T.serial(KH):
             kvh = bf.w * KH + h
             for hq in T.serial(group):
-                for rb in T.serial(R // ROWS):
+                for rb in T.serial(T.ceildiv(valid, ROWS)):
                     row0 = base + rb * ROWS
                     T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
                     for i, d in T.Parallel(ROWS, HD):
@@ -663,7 +664,7 @@ def make_prefill(
                             bf, b, ring, k, ai, kv0, window, table, base
                         ),
                     )
-                    attention(bf, kv0, base, window)
+                    attention(bf, kv0, base, window, valid)
                 else:
                     st_conv.prologue()
                     st_conv.run(0, lambda b, ring, k, ci=ci, valid=valid: in_proj_block(bf, b, ring, k, ci, valid))
