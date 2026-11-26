@@ -26,6 +26,7 @@ from tilelang.cpu.op.gemm.gemm_scalar import GemmScalar
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import TILE, TILE_ELEMS, CroutonLayout
 from tilelang.hexagon.intrinsics.panel import PanelLayout, make_hvx_panel_layout
+from tilelang.language.eager.utils import construct_strides
 from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
@@ -64,6 +65,20 @@ def scale_group(gemm, operand: str, g) -> tuple:
     return g, k0 // g
 
 
+def _external_strided_view(buf, layout_map):
+    """Preserve the physical strides in an explicitly strided global ABI."""
+    if buf.scope() != "global" or not buf.strides or buf not in layout_map:
+        return buf
+    analyzer = arith.Analyzer()
+    if all(analyzer.can_prove_equal(s, d) for s, d in zip(buf.strides, construct_strides(buf.shape))):
+        return buf
+    if not _row_major(buf, layout_map):
+        raise ValueError(f"Hexagon GEMM: {buf.name} combines noncompact global strides with a non-row-major layout")
+    # LowerTileOp remaps annotated loads to compact storage. The global ABI
+    # has its original strides, so access it through its unannotated view.
+    return tirx.decl_buffer(buf.shape, buf.dtype, data=buf.data, strides=buf.strides, elem_offset=buf.elem_offset, name=buf.name)
+
+
 def _sfb_row_stride(buf, layout_map, origin, groups, cols):
     """The physical row stride if this slice has contiguous columns."""
     analyzer = arith.Analyzer()
@@ -97,6 +112,7 @@ def group_major_sfb(region, layout_map, first_group, groups, cols):
     if len(origin) < 2:
         raise ValueError(f"T.gemm_blockscaled: SFB {buf.name} must have one row per scale group")
     origin = (*origin[:-2], origin[-2] + first_group, origin[-1])
+    buf = _external_strided_view(buf, layout_map)
     ld = _sfb_row_stride(buf, layout_map, origin, groups, cols)
     if ld is not None:
         ptr = T.access_ptr(buf[origin], "r", (groups - 1) * ld + cols)

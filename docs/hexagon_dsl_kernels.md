@@ -211,6 +211,7 @@ A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 f
 per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
 group-major scales directly, including a padded row stride. For another physical layout
 they pack the scale rows and columns used by the call into group-major VTCM storage.
+Global scales with explicit noncompact strides accept an identity layout annotation.
 The HVX GEMM is one
 `tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
 fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
