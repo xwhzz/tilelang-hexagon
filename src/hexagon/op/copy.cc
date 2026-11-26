@@ -7,8 +7,8 @@
  * region, in the matrix's coordinates: any sub-region, a DDR or VTCM endpoint
  * with any strides, and fp32 <-> fp16 on the way. A region of a stack of
  * matrices loops over the stack's axes. A copy between two Crouton buffers of
- * the same tile order, of whole tiles in both, is one tl_crouton_move_tiles
- * call, a register at a time. Other copies reuse LowerNormalCopy.
+ * the same tile order, of whole tiles in both, uses tl_crouton_move_tiles
+ * once per matrix, a register at a time. Other copies reuse LowerNormalCopy.
  *
  * A software pipeline's async copy (the injector marks it, and commits and
  * waits for its stage) becomes the descriptors of a User-DMA transfer when
@@ -35,7 +35,6 @@
 
 #include <tvm/tirx/builtin.h>
 
-#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -78,6 +77,67 @@ const CroutonLayoutNode *CroutonOf(const Buffer &buffer,
   return layout ? layout.value().as<CroutonLayoutNode>() : nullptr;
 }
 
+// Pair the non-singleton leading axes in source order. A singleton selects
+// one matrix coordinate and need not appear on the other operand.
+struct MatrixStack {
+  Array<Range> src, dst;
+  std::vector<std::pair<Var, PrimExpr>> axes;
+
+  Stmt ForEach(Stmt body) const {
+    for (auto it = axes.rbegin(); it != axes.rend(); ++it) {
+      const auto &[var, extent] = *it;
+      body = For(var, make_zero(var.dtype()), extent, ForKind::kSerial, body);
+    }
+    return body;
+  }
+};
+
+std::optional<MatrixStack> MatchMatrixStack(const Array<Range> &src,
+                                            const Array<Range> &dst,
+                                            arith::Analyzer *analyzer) {
+  MatrixStack stack{src, dst, {}};
+  size_t i = 0, j = 0;
+  while (true) {
+    while (i + 2 < src.size() && is_one(src[i]->extent))
+      ++i;
+    while (j + 2 < dst.size() && is_one(dst[j]->extent))
+      ++j;
+    if (i + 2 == src.size() && j + 2 == dst.size())
+      return stack;
+    if (i + 2 == src.size() || j + 2 == dst.size() ||
+        !analyzer->CanProveEqual(src[i]->extent, dst[j]->extent))
+      return std::nullopt;
+
+    PrimExpr extent = src[i]->extent;
+    Var var("m" + std::to_string(stack.axes.size()), extent.dtype());
+    stack.axes.emplace_back(var, extent);
+    stack.src.Set(i, Range::FromMinExtent(src[i]->min + var, 1));
+    stack.dst.Set(j, Range::FromMinExtent(dst[j]->min + var, 1));
+    ++i;
+    ++j;
+  }
+}
+
+// Crouton stores each physical matrix in a compact block of whole tiles.
+// A stacked move substitutes a full-register helper for the element loop,
+// so both regions must lie inside these blocks and their buffers.
+bool CanMoveStack(const Buffer &buf, const Array<Range> &region,
+                  const CroutonLayoutNode *layout, arith::Analyzer *analyzer) {
+  if (layout->InputDim() != region.size() ||
+      !IsBufferContiguous(buf, analyzer) ||
+      !analyzer->CanProveEqual(buf->elem_offset, 0))
+    return false;
+  for (size_t d = 0; d < region.size(); ++d) {
+    const Range &r = region[d];
+    if (!analyzer->CanProveEqual(layout->InputShape()[d], buf->shape[d]) ||
+        !analyzer->CanProve(r->min >= 0) ||
+        !analyzer->CanProve(r->extent >= 0) ||
+        !analyzer->CanProve(r->min + r->extent <= buf->shape[d]))
+      return false;
+  }
+  return true;
+}
+
 // The pointer to the matrix of `region` (on the axes before the last two, of
 // one element each) in a Crouton buffer, for `access` over the matrix.
 PrimExpr CroutonMatrixPtr(const Buffer &buffer, const Array<Range> &region,
@@ -106,13 +166,6 @@ std::optional<Stmt> LowerCroutonMove(const CopyNode &op, const LowerArgs &T,
   const Array<Range> &sr = op.src_range, &dr = op.dst_range;
   if (sr.size() < 2 || dr.size() < 2)
     return std::nullopt;
-  // One matrix on each side.
-  for (const Array<Range> *region : {&sr, &dr}) {
-    for (size_t i = 0; i + 2 < region->size(); ++i) {
-      if (!is_one((*region)[i]->extent))
-        return std::nullopt;
-    }
-  }
   const Range &s_rows = sr[src->RowAxis()], &s_cols = sr[src->ColAxis()];
   const Range &d_rows = dr[dst->RowAxis()], &d_cols = dr[dst->ColAxis()];
   if (!analyzer->CanProveEqual(s_rows->extent, d_rows->extent) ||
@@ -126,14 +179,20 @@ std::optional<Stmt> LowerCroutonMove(const CopyNode &op, const LowerArgs &T,
   }
   auto i32 = [](const PrimExpr &e) { return cast(DataType::Int(32), e); };
   auto tiles = [](int64_t n) { return make_const(DataType::Int(32), n); };
-  return Evaluate(
+  auto stack = MatchMatrixStack(sr, dr, analyzer);
+  if (!stack ||
+      (!stack->axes.empty() && (op.src->data.same_as(op.dst->data) ||
+                                !CanMoveStack(op.src, sr, src, analyzer) ||
+                                !CanMoveStack(op.dst, dr, dst, analyzer))))
+    return std::nullopt;
+  return stack->ForEach(Evaluate(
       Call(DataType::Void(), hexagon_crouton_move_tiles(),
            {StringImm(src->column_tiles ? "true" : "false"),
-            CroutonMatrixPtr(op.dst, dr, dst, 2), tiles(dst->RowTiles()),
-            tiles(dst->ColTiles()), i32(d_rows->min), i32(d_cols->min),
-            CroutonMatrixPtr(op.src, sr, src, 1), tiles(src->RowTiles()),
-            tiles(src->ColTiles()), i32(s_rows->min), i32(s_cols->min),
-            i32(s_rows->extent), i32(s_cols->extent)}));
+            CroutonMatrixPtr(op.dst, stack->dst, dst, 2),
+            tiles(dst->RowTiles()), tiles(dst->ColTiles()), i32(d_rows->min),
+            i32(d_cols->min), CroutonMatrixPtr(op.src, stack->src, src, 1),
+            tiles(src->RowTiles()), tiles(src->ColTiles()), i32(s_rows->min),
+            i32(s_cols->min), i32(s_rows->extent), i32(s_cols->extent)})));
 }
 
 std::optional<Stmt> LowerCroutonCopy(const CopyNode &op, const LowerArgs &T,
@@ -163,25 +222,9 @@ std::optional<Stmt> LowerCroutonCopy(const CopyNode &op, const LowerArgs &T,
                                  matrix_region[mn - k]->extent))
       return std::nullopt;
   }
-  // The matrices of the region: the axes before the last two, which the two
-  // endpoints span alike (a matrix side of rank 2 selects one matrix).
-  auto stacked = [](const Array<Range> &region) {
-    std::vector<size_t> axes;
-    for (size_t i = 0; i + 2 < region.size(); ++i) {
-      if (!is_one(region[i]->extent))
-        axes.push_back(i);
-    }
-    return axes;
-  };
-  std::vector<size_t> tile_axes = stacked(tile_region);
-  std::vector<size_t> matrix_axes = stacked(matrix_region);
-  if (tile_axes.size() != matrix_axes.size())
+  auto stack = MatchMatrixStack(op.src_range, op.dst_range, analyzer);
+  if (!stack)
     return std::nullopt;
-  for (size_t a = 0; a < tile_axes.size(); ++a) {
-    if (!analyzer->CanProveEqual(tile_region[tile_axes[a]]->extent,
-                                 matrix_region[matrix_axes[a]]->extent))
-      return std::nullopt;
-  }
 
   // The matrix's rows and columns in buffer axes: the last two, swapped for
   // a transposed Crouton layout, on both endpoints alike.
@@ -191,40 +234,13 @@ std::optional<Stmt> LowerCroutonCopy(const CopyNode &op, const LowerArgs &T,
   PrimExpr rs = matrix_strides[mn - 1 - (last - row_axis)];
   PrimExpr cs = matrix_strides[mn - 1 - (last - col_axis)];
 
-  // One loop per stacked axis; the region's matrix `vars` of the stack.
-  std::vector<Var> vars;
-  for (size_t a = 0; a < tile_axes.size(); ++a)
-    vars.emplace_back("m" + std::to_string(a), DataType::Int(32));
-  // A region's matrix at `vars`, from `whole`: the region itself on the last
-  // two axes, or, for the Crouton side, the whole matrix from (0, 0).
-  auto matrix_at = [&vars](const Array<Range> &region,
-                           const std::vector<size_t> &axes, bool whole) {
-    Array<Range> one;
-    for (size_t i = 0; i < region.size(); ++i) {
-      if (i + 2 >= region.size()) {
-        one.push_back(
-            whole ? Range::FromMinExtent(make_zero(DataType::Int(32)), 1)
-                  : region[i]);
-        continue;
-      }
-      auto it = std::find(axes.begin(), axes.end(), i);
-      PrimExpr min = region[i]->min;
-      if (it != axes.end())
-        min = min + vars[it - axes.begin()];
-      one.push_back(Range::FromMinExtent(min, 1));
-    }
-    return one;
-  };
-  PrimExpr matrix_elems =
-      make_const(DataType::Int(32), crouton->Rows() * crouton->Cols());
-  PrimExpr tiles_ptr = MakeAccessPtrAtRegion(
-      tiles, matrix_at(tile_region, tile_axes, true), GetBufferStrides(tiles),
-      pack ? 2 : 1, matrix_elems);
+  PrimExpr tiles_ptr = CroutonMatrixPtr(tiles, pack ? stack->dst : stack->src,
+                                        crouton, pack ? 2 : 1);
   PrimExpr rows = tile_region[row_axis]->extent;
   PrimExpr cols = tile_region[col_axis]->extent;
   PrimExpr matrix_ptr = MakeAccessPtrAtRegion(
-      matrix, matrix_at(matrix_region, matrix_axes, false), matrix_strides,
-      pack ? 1 : 2, (rows - 1) * rs + (cols - 1) * cs + 1);
+      matrix, pack ? stack->src : stack->dst, matrix_strides, pack ? 1 : 2,
+      (rows - 1) * rs + (cols - 1) * cs + 1);
   auto i32 = [](const PrimExpr &e) { return cast(DataType::Int(32), e); };
   Stmt body = Evaluate(
       Call(DataType::Void(), hexagon_crouton_copy(),
@@ -234,10 +250,7 @@ std::optional<Stmt> LowerCroutonCopy(const CopyNode &op, const LowerArgs &T,
             make_const(DataType::Int(32), crouton->ColTiles()),
             i32(tile_region[row_axis]->min), i32(tile_region[col_axis]->min),
             i32(rows), i32(cols), matrix_ptr, i32(rs), i32(cs)}));
-  for (size_t a = vars.size(); a-- > 0;)
-    body = For(vars[a], make_zero(DataType::Int(32)),
-               i32(tile_region[tile_axes[a]]->extent), ForKind::kSerial, body);
-  return body;
+  return stack->ForEach(body);
 }
 
 } // namespace

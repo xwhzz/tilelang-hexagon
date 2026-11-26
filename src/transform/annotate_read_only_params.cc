@@ -10,6 +10,7 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace tvm {
@@ -32,89 +33,91 @@ public:
     return written_;
   }
 
-  // Try to resolve the underlying buffer data Var from a pointer-like
-  // argument. Supports:
-  //  - address_of(BufferLoad(...)) -> returns buffer->data
-  //  - BufferLoad(...)             -> returns buffer->data
-  // Otherwise returns nullptr.
-  const VarNode *ResolveDataVarFromPtrArg(const PrimExpr &arg) const {
-    if (const auto *call = arg.as<CallNode>()) {
-      if (call->op.same_as(builtin::address_of())) {
-        if (call->args.size() == 1U) {
-          if (const auto *load = call->args[0].as<BufferLoadNode>()) {
-            return load->buffer->data.get();
-          }
-        }
-      }
-    } else if (const auto *load = arg.as<BufferLoadNode>()) {
-      return load->buffer->data.get();
+private:
+  void MarkData(const Var &var) {
+    if (param_or_data_vars_.count(var.get())) {
+      written_.insert(var.get());
+    } else if (auto it = bindings_.find(var.get()); it != bindings_.end()) {
+      if (expanded_.insert(var.get()).second)
+        MarkPointer(it->second);
     }
-    return nullptr;
   }
 
-  void VisitStmt_(const BufferStoreNode *op) final {
-    const VarNode *data = op->buffer->data.get();
-    if (param_or_data_vars_.count(data)) {
-      written_.insert(data);
+  // Follow possible pointer bases. An explicit access_ptr mask describes
+  // how a callee uses that address. Numeric loads in an offset or predicate
+  // are not destinations.
+  void MarkPointer(const PrimExpr &ptr) {
+    if (const auto *var = ptr.as<VarNode>()) {
+      MarkData(GetRef<Var>(var));
+      return;
     }
+    PreOrderVisit(ptr, [&](const ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>()) {
+        MarkData(GetRef<Var>(var));
+      } else if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(builtin::tvm_access_ptr())) {
+          MarkAccess(call);
+          return false;
+        }
+        if (call->op.same_as(builtin::handle_add_byte_offset())) {
+          MarkPointer(call->args[0]);
+          return false;
+        }
+        if (call->op.same_as(builtin::address_of())) {
+          if (const auto *load = call->args[0].as<BufferLoadNode>())
+            MarkData(load->buffer->data);
+          return false;
+        }
+        if (call->op.same_as(builtin::if_then_else())) {
+          MarkPointer(call->args[1]);
+          MarkPointer(call->args[2]);
+          return false;
+        }
+      } else if (const auto *select = node.as<SelectNode>()) {
+        MarkPointer(select->true_value);
+        MarkPointer(select->false_value);
+        return false;
+      }
+      return !node.as<BufferLoadNode>();
+    });
+  }
+
+  void MarkAccess(const CallNode *call) {
+    const auto *mask = call->args[4].as<IntImmNode>();
+    if (!mask || (mask->value & 2))
+      MarkPointer(call->args[1]);
+  }
+
+  void VisitStmt_(const BindNode *op) final {
+    bindings_[op->var.get()] = op->value;
     StmtExprVisitor::VisitStmt_(op);
   }
-
+  void VisitExpr_(const LetNode *op) final {
+    bindings_[op->var.get()] = op->value;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    MarkData(op->buffer->data);
+    StmtExprVisitor::VisitStmt_(op);
+  }
   void VisitExpr_(const CallNode *op) final {
-    // Detect tvm_access_ptr writes. Be conservative if rw_mask is non-constant.
     if (op->op.same_as(builtin::tvm_access_ptr())) {
-      if (op->args.size() == 5U) {
-        if (const VarNode *buf = op->args[1].as<VarNode>()) {
-          const IntImmNode *flag = op->args[4].as<IntImmNode>();
-          bool maybe_write = true; // default conservative
-          if (flag) {
-            maybe_write = (flag->value & 2) != 0; // write bit set
-          }
-          if (maybe_write && param_or_data_vars_.count(buf)) {
-            written_.insert(buf);
-          }
-        }
-      }
+      MarkAccess(op);
     } else {
-      // Generic fallback: mark buffers that appear as
-      // address_of(BufferLoad(...)) in call arguments as written. This matches
-      // patterns like
-      //   tl.tma_store(address_of(smem[..]), address_of(gmem[..]), ...)
-      //   call_extern("AtomicAdd*", address_of(gmem[..]), ...)
-      // and avoids over-marking plain BufferLoad used for reads.
-      //
-      // For call_extern specifically, also conservatively mark bare buffer data
-      // vars as written, since we cannot know whether the extern writes through
-      // the pointer. This matches patterns like:
-      //   call_extern("store_val", Out.data, value)
-      const bool is_call_extern = op->op.same_as(builtin::call_extern());
-
-      for (const PrimExpr &a : op->args) {
-        if (const auto *c = a.as<CallNode>()) {
-          if (c->op.same_as(builtin::address_of()) && c->args.size() == 1U) {
-            if (const auto *bl = c->args[0].as<BufferLoadNode>()) {
-              const VarNode *data = bl->buffer->data.get();
-              if (param_or_data_vars_.count(data)) {
-                written_.insert(data);
-              }
-            }
-          }
-        } else if (is_call_extern) {
-          // Bare data var passed to call_extern: conservatively assume
-          // the callee may write through it. We only apply this to call_extern,
-          // not to pure intrinsics or other calls with known semantics.
-          if (const auto *v = a.as<VarNode>()) {
-            if (param_or_data_vars_.count(v)) {
-              written_.insert(v);
-            }
-          }
+      const bool opaque = op->op.same_as(builtin::call_extern());
+      for (const PrimExpr &arg : op->args) {
+        const auto *call = arg.as<CallNode>();
+        if ((opaque && arg.dtype().is_handle()) ||
+            (call && call->op.same_as(builtin::address_of()))) {
+          MarkPointer(arg);
         }
       }
     }
     StmtExprVisitor::VisitExpr_(op);
   }
 
-private:
+  std::unordered_map<const VarNode *, PrimExpr> bindings_;
+  std::unordered_set<const VarNode *> expanded_;
   std::unordered_set<const VarNode *> param_or_data_vars_;
   std::unordered_set<const VarNode *> written_;
 };
@@ -130,8 +133,6 @@ private:
 static tirx::PrimFunc MarkReadOnlyParams(tirx::PrimFunc f) {
   // Gather handle params and their corresponding buffer data vars (aliases).
   std::unordered_set<const VarNode *> param_or_data_vars;
-  // Map back from data var to parameter index for result attribution.
-  std::unordered_map<const VarNode *, size_t> data_var_to_param_idx;
 
   for (size_t i = 0; i < f->params.size(); ++i) {
     const Var &p = f->params[i];
@@ -142,7 +143,6 @@ static tirx::PrimFunc MarkReadOnlyParams(tirx::PrimFunc f) {
     if (auto opt = f->buffer_map.Get(p)) {
       const VarNode *data = opt.value()->data.get();
       param_or_data_vars.insert(data);
-      data_var_to_param_idx[data] = i;
     }
   }
   if (param_or_data_vars.empty())
@@ -176,12 +176,13 @@ static tirx::PrimFunc MarkReadOnlyParams(tirx::PrimFunc f) {
     }
   }
 
-  if (!readonly_indices.empty()) {
-    Map<String, Any> attrs;
-    attrs.Set(String("tl.readonly_param_indices"), readonly_indices);
-    f = WithAttrs(std::move(f), attrs);
+  constexpr const char *key = "tl.readonly_param_indices";
+  if (readonly_indices.empty()) {
+    if (f->GetAttr<Array<Integer>>(key))
+      return WithoutAttr(std::move(f), key);
+    return f;
   }
-  return f;
+  return WithAttr(std::move(f), key, readonly_indices);
 }
 
 namespace transform {

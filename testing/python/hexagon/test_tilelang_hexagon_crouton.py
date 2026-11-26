@@ -523,3 +523,71 @@ def test_reductions_of_crouton_tiles_match_torch(kind, op, dtype, dim, shape):
         torch.testing.assert_close(y, expected, rtol=1e-3, atol=1e-2)
     finally:
         kernel.adapter.close()
+
+
+def _stacked_move(kind, split):
+    src_shape, dst_shape = (2, 1, 4, 64, 96), (2, 4, 1, 64, 96)
+
+    @T.prim_func
+    def move(X: T.Tensor(src_shape, "float16"), Y: T.Tensor(dst_shape, "float16")):
+        with T.Kernel(1):
+            src = T.alloc_shared(src_shape, "float16")
+            dst = T.alloc_shared(dst_shape, "float16")
+            T.annotate_layout({src: KINDS[kind](src), dst: KINDS[kind](dst)})
+            T.copy(X, src)
+            T.fill(dst, -1)
+            if split:
+                for b, h in T.grid(2, 3):
+                    T.copy(src[b, 0, h, 0:32, 32:96], dst[b, h + 1, 0, 32:64, 0:64])
+            else:
+                T.copy(src[:, 0, 0:3, 0:32, 32:96], dst[:, 1:4, 0, 32:64, 0:64])
+            T.copy(dst, Y)
+
+    return move
+
+
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_crouton_stack_moves_match_explicit_slice_per_matrix(kind):
+    for arch in ("v73", "v79"):
+        target = tvm.target.Target({"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+        with target, tvm.transform.PassContext(opt_level=3):
+            actual = tilelang.lower(_stacked_move(kind, False), target=target)
+            reference = tilelang.lower(_stacked_move(kind, True), target=target)
+        assert "tl_crouton_move_tiles" in actual.kernel_source
+        tvm.ir.assert_structural_equal(actual.device_mod, reference.device_mod)
+
+
+@pytest.mark.parametrize("case", ["alias", "tile_order", "partial_tile", "bounds"])
+def test_crouton_stack_keeps_the_element_copy_when_tiles_cannot_move(case):
+    @T.prim_func
+    def copy(A: T.Tensor((4, 64, 64), "float16"), O: T.Tensor((4, 64, 64), "float16")):
+        with T.Kernel(1):
+            if case == "tile_order":
+                T.annotate_layout({A: KINDS["activation"](A), O: KINDS["weight"](O)})
+            else:
+                T.annotate_layout({A: KINDS["activation"](A), O: KINDS["activation"](O)})
+            if case == "alias":
+                T.copy(A[:3, :, :], A[1:, :, :])
+            elif case == "partial_tile":
+                T.copy(A[:, :, 1:33], O[:, :, :32])
+            elif case == "bounds":
+                T.copy(A[2:5, :, :], O[:3, :, :])
+            else:
+                T.copy(A, O)
+
+    assert "tl_crouton_move_tiles" not in _source(copy)
+
+
+@DEVICE
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_crouton_stack_moves_write_only_selected_matrices_and_tiles(kind):
+    import torch
+
+    kernel = tilelang.compile(_stacked_move(kind, False), target="hexagon", out_idx=1)
+    try:
+        x = (torch.arange(2 * 4 * 64 * 96) % 1921).reshape(2, 1, 4, 64, 96).half()
+        expected = torch.full((2, 4, 1, 64, 96), -1, dtype=torch.float16)
+        expected[:, 1:4, 0, 32:64, :64] = x[:, 0, :3, :32, 32:96]
+        assert torch.equal(kernel(x), expected)
+    finally:
+        kernel.adapter.close()

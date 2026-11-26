@@ -11,9 +11,9 @@ class _GeneratedSource(str):
     """Unmodified Hexagon codegen output. String edits produce ordinary text."""
 
 
-def kernel_entry_name(device_mod) -> str:
-    """Return the symbol that Hexagon codegen emits for a single device kernel."""
+def single_device_kernel(device_mod):
+    """Return the lowered function whose attributes describe the kernel ABI."""
     if len(device_mod.functions) != 1:
         raise ValueError(f"Hexagon dispatch requires exactly one device kernel, got {len(device_mod.functions)}")
     (func,) = device_mod.functions.values()
-    return str(func.attrs["global_symbol"])
+    return func

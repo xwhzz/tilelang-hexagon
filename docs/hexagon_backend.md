@@ -440,6 +440,12 @@ barrier and does not release resources or drain DMA. See the
   separately from ARM FastRPC time: the ADB or SSH round trip depends on the
   transport and device. Agent replies combine their header and payload to avoid
   a delayed ACK between small writes.
+- **JIT tensor arguments.** Both eager JIT and `tilelang.compile` copy a supplied
+  writable PyTorch tensor back into its original view after the kernel succeeds.
+  Supply `None` or omit the designated `out_idx` arguments to receive newly
+  allocated outputs. Supplying every output returns `None`. Kernels can read the
+  initial values of supplied outputs. Writable views must have distinct elements
+  and separate address ranges from other inline arguments.
 - **Sessions** (`tilelang.hexagon.runtime.session.Session`) serve models.
   - **Kernels.** Several kernels build into one skel and share one agent and one
     FastRPC session: one persistent worker pool per DSP process. Each lowers under its
