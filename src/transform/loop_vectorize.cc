@@ -32,6 +32,7 @@
 #include "backend/common/target_utils.h"
 #include "common/int64_promoter.h"
 #include "common/loop_vectorization_utils.h"
+#include "hexagon/target_utils.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 #include <iostream>
@@ -55,8 +56,7 @@ namespace {
 
 // Whether the current target selects lane by lane
 // ("supports_vector_predicate").
-bool TargetHasVectorPredicates() {
-  Target target = Target::Current(false);
+bool TargetHasVectorPredicates(const Target &target = Target::Current(false)) {
   return target.defined() &&
          target->GetAttr<Bool>("supports_vector_predicate", Bool(false))
              .value();
@@ -1582,7 +1582,10 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 For VectorizeLoop(const For &loop, const arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
   For body = loop;
-  if (TargetHasVectorPredicates() && NeedsPredicateRewrite(loop)) {
+  const Target target = Target::Current(false);
+  // Hexagon skips the analyzer walk for maps without predicates.
+  if (TargetHasVectorPredicates(target) &&
+      (!TargetIsHexagon(target) || NeedsPredicateRewrite(loop))) {
     auto select_analyzer = analyzer->Clone();
     body = Downcast<For>(IfThenElseToSelect(select_analyzer.get())(loop));
   }
