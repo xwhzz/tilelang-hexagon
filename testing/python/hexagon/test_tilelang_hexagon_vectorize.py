@@ -123,6 +123,25 @@ def test_scalar_math_fallback_keeps_neighboring_map_vectorized(fn):
     assert "tl_hvx_erf(*(float32*)(A + " in source
 
 
+@pytest.mark.parametrize("key", ["hexagon.FLowerIntrinsic", "hexagon.FLegalize"])
+def test_scalar_math_fallback_respects_target_rules(key):
+    @T.prim_func
+    def kernel(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
+        with T.Kernel(1):
+            for j in T.serial(32):
+                B[j] = T.sin(A[j])
+
+    op = tvm.ir.Op.get("tirx.sin")
+    previous = op.get_attr(key) if op.has_attr(key) else None
+    op.set_attr(key, lambda call: tvm.tirx.call_pure_extern(call.dtype, "custom_sin", *call.args), 99)
+    try:
+        assert "custom_sin(A[" in _source(kernel)
+    finally:
+        op.reset_attr(key)
+        if previous is not None:
+            op.set_attr(key, previous)
+
+
 # DSL function: the hvx_math.h function it prints as.
 MATH = {fn: f"tl_hvx_{fn}" for fn in ["exp", "exp2", "log", "log2", "sqrt", "rsqrt", "tanh", "sigmoid", "erf"]}
 MATH["abs"] = "tl_hvx_fabs"

@@ -81,8 +81,14 @@ private:
       return call;
     static const auto rules =
         Op::GetAttrMap<FLowerIntrinsic>("default.FLowerIntrinsic");
-    if (auto lower = rules.get(GetRef<Op>(op_node), nullptr);
-        lower != nullptr) {
+    Op intrinsic = GetRef<Op>(op_node);
+    if (auto lower = rules.get(intrinsic, nullptr); lower != nullptr) {
+      // A target rule takes precedence over the default in LowerIntrin.
+      for (const char *key : {"hexagon.FLowerIntrinsic", "hexagon.FLegalize"}) {
+        if (Op::HasAttrMap(key) &&
+            Op::GetAttrMap<FLowerIntrinsic>(key).count(intrinsic))
+          return call;
+      }
       PrimExpr lowered = lower(call);
       if (const auto *libm = lowered.as<CallNode>();
           libm && libm->op.same_as(builtin::call_pure_extern()))
