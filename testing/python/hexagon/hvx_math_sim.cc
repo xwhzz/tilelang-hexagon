@@ -24,8 +24,9 @@ int main(int argc, char **argv) {
     alignas(128) HVX_Vector x;
     if (fread(&x, sizeof(x), 1, in) != 1)
       return 4;
-    HVX_Vector result[] = {tl_hvx_log_vsf(x), tl_hvx_log2_vsf(x),
-                           tl_hvx_log_fast_vsf(x), tl_hvx_log2_fast_vsf(x)};
+    HVX_Vector result[] = {tl_hvx_log_vsf(x),      tl_hvx_log2_vsf(x),
+                           tl_hvx_log_fast_vsf(x), tl_hvx_log2_fast_vsf(x),
+                           tl_hvx_exp2_vsf(x),     tl_hvx_exp_vsf(x)};
     fwrite(result, sizeof(result), 1, out);
   }
   for (int function = 0; function < 3; ++function) {
