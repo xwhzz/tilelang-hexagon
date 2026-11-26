@@ -25,7 +25,7 @@ import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
 from decode import Decoder, make_decode  # noqa: E402
-from model import CONV, FULL, Config, Model, load_hf_weights  # noqa: E402
+from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
 from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
@@ -159,6 +159,23 @@ def test_reference_decodes_past_the_window():
         logits, state = model.prefill(ids[:90])
         got = [logits] + [model.decode(int(t), state) for t in ids[90:119]]
     torch.testing.assert_close(torch.stack(got), want[89:119], rtol=0, atol=1e-5 * want.abs().max().item())
+
+
+def test_fp16_rope_tables_match_reference_across_chunks(monkeypatch):
+    c = Config(head_dim=128, rope={SLIDING: (1e4, 1.0), FULL: (1e6, 0.5)})
+    positions = torch.arange(4099)
+    angles = torch.stack([rope_angles(positions, c.head_dim, *params) for params in c.rope.values()])
+
+    def chunk_angles(rows, *args):
+        assert len(rows) < len(positions)
+        return rope_angles(rows, *args)
+
+    monkeypatch.setattr(decode_fp16, "rope_angles", chunk_angles)
+    cos, sin = decode_fp16.rope_tables(c, len(positions))
+    for actual, expected in ((cos, angles.cos()), (sin, angles.sin())):
+        assert actual.dtype == torch.float32 and actual.is_contiguous()
+        assert torch.equal(actual.view(torch.int32), expected.float().view(torch.int32))
+    assert (cos[1, :, 32:] == 1).all() and (sin[1, :, 32:] == 0).all()
 
 
 def test_crouton_weight_is_the_hmx_weight_layout():

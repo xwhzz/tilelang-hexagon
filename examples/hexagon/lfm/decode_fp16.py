@@ -71,9 +71,18 @@ def kinds(c: Config) -> list:
 def rope_tables(c: Config, max_pos: int) -> tuple:
     """cos and sin [kinds, max_pos, head_dim / 2] of each attention kind's RoPE
     angles, as model.rope_angles computes them."""
-    positions = torch.arange(max_pos)
-    angles = torch.stack([rope_angles(positions, c.head_dim, *c.rope[k]) for k in kinds(c)])
-    return angles.cos().float().contiguous(), angles.sin().float().contiguous()
+    cos = torch.empty((len(c.rope), max_pos, c.head_dim // 2), dtype=torch.float32)
+    sin = torch.empty_like(cos)
+    # At head_dim=128, 2048 positions need 1 MiB of FP64 angles per kind.
+    chunk_rows = 2048
+    for table, kind in enumerate(kinds(c)):
+        for start in range(0, max_pos, chunk_rows):
+            stop = min(start + chunk_rows, max_pos)
+            positions = torch.arange(start, stop)
+            angles = rope_angles(positions, c.head_dim, *c.rope[kind])
+            cos[table, start:stop] = angles.cos()
+            sin[table, start:stop] = angles.sin()
+    return cos, sin
 
 
 def ring(c: Config) -> int:
