@@ -174,6 +174,12 @@ the header: a copy of the file's first `data_offset` bytes
 `generate.py` renders the checkpoint's chat template and tokenizes on the
 host (it needs `tokenizers` and `jinja2`), prefills the prompt and streams the
 reply, a decode call per 16 tokens; `--temperature` and `--seed` sample.
+Interactive `--chat` reuses the token prefix already consumed by the DSP.
+A checkpoint of the convolution state also lets the next turn reuse its prior
+prompt when EOS interrupted a decoded chunk. A changed chat template or an
+overwritten sliding window can require replaying the prompt. Each `--prompt`
+starts from an empty context.
+
 Greedy, on v79:
 
     > What is 17 times 23?

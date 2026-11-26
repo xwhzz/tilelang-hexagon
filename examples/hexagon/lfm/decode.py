@@ -527,6 +527,7 @@ class Decoder:
             self._open_fp16(bundle_path, device_path, processes)
         else:
             self._open_4bit(bundle_path, device_path)
+        self._chat_backup = None
         self.reset()
 
     def _open_4bit(self, bundle_path: str, device_path: str | None) -> None:
@@ -781,9 +782,55 @@ class Decoder:
             parts.append(state.view(-1, self.c.conv_taps - 1, self.c.dim)[:count])
         return torch.cat(parts)
 
+    def _conv_buffers(self):
+        return [st.conv_state for st in self.stages] if self.fp16 else [self.conv_state]
+
+    def _copy_chat_conv(self, *, restore: bool) -> None:
+        from tilelang.hexagon.runtime.session import Copy
+
+        states = self._conv_buffers()
+        if self._chat_backup is None:
+            # The agent copies all stages' convolution states in one request.
+            # Only the backup needs an extra mapping, on one process.
+            self._chat_backup = self.session.buffer(sum(st.nbytes for st in states), processes=[0])
+        operations, offset = [], 0
+        for st in states:
+            if restore:
+                operations.append(Copy(self._chat_backup, st, st.nbytes, src_offset=offset))
+            else:
+                operations.append(Copy(st, self._chat_backup, st.nbytes, dst_offset=offset))
+            offset += st.nbytes
+        self.session.run_sequence(operations)
+
+    def _chat_position(self, prompt: list) -> int:
+        """The number of prompt inputs the retained KV and convolution state represent."""
+        seen = self._chat_tokens
+        self._chat_tokens = None
+        if seen is not None:
+            if len(seen) < len(prompt) and prompt[: len(seen)] == seen:
+                return len(seen)
+            # A decode chunk can consume more than the answer displayed before
+            # EOS. The prompt checkpoint precedes all of that turn's decode
+            # writes. Full attention retains its KV. A ring retains its whole
+            # visible window until enough new positions wrap onto that window.
+            pos = self._chat_saved_pos
+            if 0 < pos < len(prompt) and prompt[:pos] == seen[:pos]:
+                if self.fp16 and self.c.window:
+                    from decode_fp16 import ring
+
+                    retained = len(seen) - pos <= ring(self.c) - self.c.window
+                else:
+                    retained = True
+                if retained:
+                    self._copy_chat_conv(restore=True)
+                    return pos
+        self.reset()
+        return 0
+
     def reset(self) -> None:
         """Forget the context: the conv state starts from zeros."""
-        for state in [st.conv_state for st in self.stages] if self.fp16 else [self.conv_state]:
+        self._chat_tokens = None
+        for state in self._conv_buffers():
             state.write(bytes(state.nbytes))
 
     def run(self, tokens: list, pos0: int, n: int, n_forced: int, temperature: float = 0.0, seed: int = 0) -> tuple:
@@ -793,6 +840,7 @@ class Decoder:
         a sample of their softmax, which `seed` (below 2^24) makes
         reproducible."""
         assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos and 0 <= seed < 1 << 24
+        self._chat_tokens = None
         self.tokens.write(torch.tensor(list(tokens[:n_forced]), dtype=torch.int32))
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
         if self.fp16:
@@ -822,6 +870,7 @@ class Decoder:
         entries and the conv state they leave, in chunks of prefill_rows."""
         n, R = len(tokens), self.prefill_rows
         assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
+        self._chat_tokens = None
         self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
         if self.fp16:
             # A chunk a step, through the stages in turn (prefill_fp16.make_prefill).
@@ -839,22 +888,56 @@ class Decoder:
         self.run(tokens, 0, n, n + 1)
         return torch.frombuffer(bytearray(self.scores.read(n * 4)), dtype=torch.float32).tolist()
 
-    def stream(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0, chunk: int = 16, timings: list | None = None):
-        """The `n_new` tokens after `prompt`, from an empty context, in lists of
+    def stream(
+        self,
+        prompt: list,
+        n_new: int,
+        temperature: float = 0.0,
+        seed: int = 0,
+        chunk: int = 16,
+        timings: list | None = None,
+        *,
+        reuse: bool = False,
+    ):
+        """The `n_new` tokens after `prompt`, in lists of
         up to `chunk`: a decode call each, so that a caller can show them as
         they come. The prefill runs the prompt but its last token, which the
         decode's first step runs and the LM head reads. `timings`, if given,
-        gets (kernel, tokens, seconds on the DSP) for each call."""
+        gets (kernel, tokens, seconds on the DSP) for each call. With `reuse`,
+        a matching prefix from the previous streamed turn is already on the
+        device. By default every prompt starts from an empty context."""
 
         def timed(kernel: str, tokens: int) -> None:
             if timings is not None:
                 timings.append((kernel, tokens, self.last_run_seconds()))
 
-        self.reset()
-        if self.prefill_rows and len(prompt) > 1:
-            self.prefill(prompt[:-1])
-            timed("prefill", len(prompt) - 1)
+        if reuse:
+            start = self._chat_position(prompt)
+        else:
+            self.reset()
+            start = 0
+        if reuse or (self.prefill_rows and len(prompt) > 1):
             last, pos, done = prompt[-1], len(prompt) - 1, 0
+            if start and self.prefill_rows and not self.fp16:
+                # The quantized prefill needs a whole physical chunk to fit.
+                # An unaligned suffix near the end can require a fresh replay.
+                rows = self.prefill_rows
+                if start + -(-(pos - start) // rows) * rows > self.max_pos:
+                    self.reset()
+                    start = 0
+            if pos > start:
+                suffix = prompt[start:pos]
+                if self.prefill_rows:
+                    self.prefill(suffix, start)
+                    timed("prefill", len(suffix))
+                else:
+                    self.run(suffix, start, len(suffix), len(suffix))
+                    timed("decode", len(suffix))
+            if reuse:
+                if pos:
+                    self._copy_chat_conv(restore=False)
+                self._chat_saved_pos = pos
+                self._chat_tokens = consumed = prompt[:pos]
         else:
             k = min(chunk, n_new)
             tokens, _ = self.run(prompt, 0, len(prompt) + k - 1, len(prompt), temperature, seed)
@@ -862,8 +945,15 @@ class Decoder:
             yield tokens[len(prompt) :]
             last, pos, done = tokens[-1], len(prompt) - 1 + k, k
         while done < n_new:
+            if reuse and self._chat_tokens is not consumed:
+                raise RuntimeError("Decoder state changed between streamed chunks")
             k = min(chunk, n_new - done)
             tokens, _ = self.run([last], pos, k, 1, temperature, seed)
+            if reuse:
+                # The last output is a prediction. The other k token IDs have
+                # actually advanced the device state, even if the caller stops.
+                consumed.extend(tokens[:-1])
+                self._chat_tokens = consumed
             timed("decode", k)
             yield tokens[1:]
             last, pos, done = tokens[-1], pos + k, done + k

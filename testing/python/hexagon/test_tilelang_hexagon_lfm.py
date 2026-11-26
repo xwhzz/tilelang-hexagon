@@ -612,6 +612,114 @@ def test_fp16_prefill_matches_the_reference(model, processes, row_major, fp16_bu
         decoder.close()
 
 
+@pytest.mark.parametrize("rows", [None, 128])
+def test_chat_reuses_only_consumed_state(rows):
+    class TrackingDecoder(Decoder):
+        def __init__(self):
+            self.prefill_rows, self.fp16, self.max_pos = rows, False, 4096
+            self.calls = []
+            self.reset()
+
+        def reset(self):
+            self._chat_tokens = None
+            self.state = []
+
+        def _copy_chat_conv(self, *, restore):
+            if restore:
+                self.state = self.saved.copy()
+            else:
+                self.saved = self.state.copy()
+
+        def prefill(self, tokens, pos0=0):
+            assert pos0 == len(self.state)
+            self._chat_tokens = None
+            self.calls.append((pos0, len(tokens)))
+            self.state.extend(tokens)
+
+        def run(self, tokens, pos0, n, n_forced, temperature=0.0, seed=0):
+            assert pos0 == len(self.state)
+            self._chat_tokens = None
+            self.calls.append((pos0, n))
+            result = list(tokens)
+            for i in range(n):
+                self.state.append(result[i])
+                if i + 1 >= n_forced:
+                    result.append((sum(self.state) + len(self.state)) % 101)
+            return result, None
+
+    d = TrackingDecoder()
+    prompt = [2, 5, 7, 11]
+    stream = d.stream(prompt, 16, chunk=4, reuse=True)
+    predicted = next(stream)
+    assert d.state == prompt + predicted[:-1]
+    stream.close()  # The caller can stop in the middle of the first result.
+
+    def turn(tokens, start):
+        d.calls.clear()
+        (actual,) = d.stream(tokens, 1, reuse=True)
+        assert d.calls[0][0] == start
+        assert d.state == tokens
+        reference = TrackingDecoder()
+        (expected,) = reference.stream(tokens, 1, reuse=True)
+        assert actual == expected
+
+    # A chunk's final prediction has not advanced KV or the convolution.
+    more = prompt + predicted + [1, 3]
+    turn(more, len(prompt) + 3)
+    # The template changed the just-consumed final prompt token. The input
+    # before it is exactly the previous prefill checkpoint.
+    changed = more[:-1] + [6, 7]
+    turn(changed, len(more) - 1)
+    # Early EOS discards multiple predictions that the DSP already consumed.
+    chunk = next(d.stream(changed + [9, 10], 16, chunk=4, reuse=True))
+    trimmed = changed + [9, 10, chunk[0], (chunk[1] + 1) % 101, 23]
+    turn(trimmed, len(changed) + 1)
+    turn([99, 87, 33], 0)  # Re-rendering changed even the saved prefix.
+    d.reset()
+    turn([99, 87, 33, 19], 0)
+
+
+def test_chat_checkpoint_cannot_restore_overwritten_sliding_keys():
+    from types import SimpleNamespace
+
+    d = Decoder.__new__(Decoder)
+    d.fp16, d.c = True, SimpleNamespace(window=48)
+    limit = decode_fp16.ring(d.c) - d.c.window
+    saved = 2200
+    called = []
+    d._chat_saved_pos = saved
+    d._copy_chat_conv = lambda *, restore: called.append("restore")
+    d.reset = lambda: called.append("reset")
+    prompt = [2] * saved + [8, 3]
+    for length, result in ((limit, saved), (limit + 1, 0)):
+        d._chat_tokens = [2] * saved + [5] * length
+        assert d._chat_position(prompt) == result
+    assert called == ["restore", "reset"]
+
+
+@DEVICE
+@pytest.mark.parametrize("model,processes", [("quantized", 1), ("lfm2", 1), pytest.param("lfm3", 2, marks=MULTI_PROCESS)])
+def test_chat_continuation_matches_full_replay(model, processes, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=512, max_tokens=256, prefill_rows=128, processes=processes)
+    first = list(range(24, 84))
+    try:
+        predictions = next(decoder.stream(first, 16, chunk=8, reuse=True))
+        # Treat the second returned ID as EOS. The remaining IDs in the
+        # result still advanced the resident state despite the caller's break.
+        second = first + predictions[:1] + [(predictions[1] + 1) % decoder.c.vocab, 53, 77]
+        timings = []
+        (actual,) = decoder.stream(second, 1, reuse=True, timings=timings)
+        logits = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+        assert timings[0][:2] == ("prefill", len(second) - len(first))
+        (expected,) = decoder.stream(second, 1)
+        reference = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+        assert actual == expected
+        torch.testing.assert_close(logits, reference, rtol=0, atol=0.01 * reference.abs().max().item())
+    finally:
+        decoder.close()
+
+
 @DEVICE
 @pytest.mark.parametrize(("model", "processes"), STAGES[:3])
 def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):

@@ -22,12 +22,12 @@ from decode import Decoder  # noqa: E402
 from text import Detokenizer, Text  # noqa: E402
 
 
-def reply(decoder: Decoder, text: Text, messages: list, args) -> str:
+def reply(decoder: Decoder, text: Text, messages: list, args, *, reuse: bool = False) -> str:
     """The assistant's next message, printed as it comes, then the speeds."""
     prompt = text.chat(messages, **({"enable_thinking": False} if args.no_think else {}))
     shown, ids, timings = Detokenizer(text), [], []
     t0 = time.perf_counter()
-    for part in decoder.stream(prompt, args.max_new, args.temperature, args.seed, timings=timings):
+    for part in decoder.stream(prompt, args.max_new, args.temperature, args.seed, timings=timings, reuse=reuse):
         stop = text.eos in part
         part = part[: part.index(text.eos)] if stop else part
         ids += part
@@ -73,7 +73,7 @@ def main():
             if not line.strip():
                 continue
             messages.append({"role": "user", "content": line.strip()})
-            messages.append({"role": "assistant", "content": reply(decoder, text, messages, args)})
+            messages.append({"role": "assistant", "content": reply(decoder, text, messages, args, reuse=True)})
     finally:
         decoder.close()
 
