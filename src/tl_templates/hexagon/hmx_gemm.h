@@ -82,9 +82,9 @@ template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
 // an HVX epilogue writes or adds into C. config holds the conversion config.
 //
 // M, N and K need not be multiples of 32 (Tails): HMX multiplies the tiles
-// that cover them. A's and B's padding along K is zeroed first, so that
-// whatever it held adds nothing (the padding of a B weight source stays zero:
-// its prepare() fills whole tiles), and the last tiles of a row or a column
+// that cover them. A partial K tile reads private masked copies of A and B;
+// the original buffers can contain live channels past this region. The
+// last tiles of a row or a column
 // store only C's rows and columns (tl_crouton_tile_store_part). Direct needs
 // M and N whole tiles. Without Tails, the loop has none of this code: its
 // epilogue stays small enough to inline and to overlap HMX as it did.
@@ -124,21 +124,26 @@ TL_HMX_INLINE void tl_hmx_gemm_tiles(int M, int N, int K, D *c, int ldc,
   // C's rows and columns of the last row and column of tiles.
   [[maybe_unused]] const int m_last = M - (MT - 1) * TL_HMX_T;
   [[maybe_unused]] const int n_last = N - (NT - 1) * TL_HMX_T;
-  if (const int k_last = K - (KT - 1) * TL_HMX_T; Tails && k_last < TL_HMX_T) {
-    half *a_tail = const_cast<half *>(a) + (KT - 1) * TL_HMX_TILE_ELMS;
-    tl_crouton_zero_columns(a_tail, a_row_tile, MT, k_last);
-    if constexpr (std::is_same_v<B, tl_hmx_weight_tiles>)
-      tl_crouton_zero_rows(const_cast<half *>(b.tiles) +
-                               (KT - 1) * TL_HMX_TILE_ELMS,
-                           b.stride, NT, k_last);
-  }
-
+  constexpr bool can_mask_k = Tails && std::is_same_v<B, tl_hmx_weight_tiles>;
+  const int tail = can_mask_k ? K % TL_HMX_T : 0;
+  const int full = KT - (tail != 0);
   auto multiply = [&](int mt, int nt) TL_HEXAGON_VECTOR_INLINE {
     const half *row = a + mt * a_row_tile;
     const half *col = b.column(nt);
-    for (int k = 0; k < KT; k += 32)
+    for (int k = 0; k < full; k += 32)
       tl_hmx_mac_tiles(row + k * TL_HMX_TILE_ELMS, col + k * TL_HMX_TILE_ELMS,
-                       KT - k < 32 ? KT - k : 32);
+                       full - k < 32 ? full - k : 32);
+    if constexpr (can_mask_k) {
+      if (tail) {
+        half *a_tail = Direct ? stage : stage + 2 * TL_HMX_TILE_ELMS;
+        half *b_tail = a_tail + TL_HMX_TILE_ELMS;
+        tl_crouton_copy_columns(a_tail, row + full * TL_HMX_TILE_ELMS, tail);
+        // Each output column shares its masked weight tile across all rows.
+        if (mt == 0)
+          tl_crouton_copy_rows(b_tail, col + full * TL_HMX_TILE_ELMS, tail);
+        tl_hmx_mac_tiles(a_tail, b_tail, 1);
+      }
+    }
   };
   // Where tile (mt, nt) leaves HMX: C's own tile, or staging tile `slot`.
   auto target = [&](int mt, int nt, int slot)

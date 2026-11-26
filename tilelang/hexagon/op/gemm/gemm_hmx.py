@@ -19,9 +19,9 @@ calls), each output tile is a critical section of its own instead, and its
 epilogue runs outside it, while another worker multiplies.
 
 M, N and K need not be multiples of 32. A and B then fill the tiles that
-cover them, their buffers padded (``PadHMXOperands``); the call zeroes the
-padding along K before it multiplies, so that whatever the padding held adds
-nothing, and writes only C's own rows and columns of its last tiles, or
+cover them, their buffers padded (``PadHMXOperands``); the call masks the
+last partial K tile in private staging before it multiplies. It writes only
+C's own rows and columns of its last tiles, or
 whole tiles when C is padded too (``hexagon.padded_c``, which
 ``PadHMXOperands`` sets when the call writes all of C). A C of fp16 that is not
 whole tiles stays row-major.
@@ -162,9 +162,7 @@ class GemmHMX(GemmBase):
         A_buf = self.ARegion.buffer
         row_tile = _tiles(A_buf.shape[-2] if self.trans_A else A_buf.shape[-1]) * TILE_ELEMS
         extent = (_tiles(self.M) - 1) * row_tile + _tiles(self.K) * TILE_ELEMS
-        # The call zeroes A's padding along K.
-        mode = "r" if _whole(self.K) else "rw"
-        return T.access_ptr(_first(self.ARegion), mode, extent), row_tile
+        return T.access_ptr(_first(self.ARegion), "r", extent), row_tile
 
     def _c(self, kind: str, M: int, N: int):
         """C's first element, its leading dimension (elements, or tiles of
@@ -205,8 +203,7 @@ class GemmHMX(GemmBase):
         a, a_row_tile = self._a()
         B_buf = self.BRegion.buffer
         b_column_tile = _tiles(B_buf.shape[-1] if self.trans_B else B_buf.shape[-2]) * TILE_ELEMS
-        b_mode = "r" if _whole(self.K) else "rw"
-        b = T.access_ptr(_first(self.BRegion), b_mode, (_tiles(self.N) - 1) * b_column_tile + _tiles(self.K) * TILE_ELEMS)
+        b = T.access_ptr(_first(self.BRegion), "r", (_tiles(self.N) - 1) * b_column_tile + _tiles(self.K) * TILE_ELEMS)
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm")
         shared = _flag(self._shared())
         M, N, K = M_c, N_c, self.K
@@ -215,10 +212,14 @@ class GemmHMX(GemmBase):
         if self.gemm_node.annotations.get(_ROWS, None) is not None and not _whole(M):
             raise ValueError(f"{name}: run-time rows need M a multiple of {TILE}, not {M}")
 
+        # A partial K needs one masked tile per operand. Direct output leaves
+        # the two existing staging slots free for these operands.
+        stage_elems = (2 if _whole(K) or direct else 4) * TILE_ELEMS
+
         def call(c, ldc, rows_major: bool, aligned: bool, clear, stage, config):
             flags = [_flag(rows_major), _flag(aligned), shared, _flag(direct)]
             args = [rows, N, K, c, ldc, a, a_row_tile, b, b_column_tile, T.Cast("bool", clear)]
-            args += [T.access_ptr(stage[0], "rw", 2 * TILE_ELEMS), T.access_ptr(config[0], "rw", CONFIG_WORDS)]
+            args += [T.access_ptr(stage[0], "rw", stage_elems), T.access_ptr(config[0], "rw", CONFIG_WORDS)]
             return tirx.call_intrin("void", gemm, *flags, *args)
 
         if kind != "elements":
@@ -229,7 +230,7 @@ class GemmHMX(GemmBase):
                 # Two staging tiles, HMX storing one while the epilogue reads
                 # the other, and the conversion config.
                 config = T.alloc_shared((CONFIG_WORDS,), "uint32", align=256)
-                stage = T.alloc_shared((2 * TILE_ELEMS,), "float16", align=2048)
+                stage = T.alloc_shared((stage_elems,), "float16", align=2048)
                 T.evaluate(call(c, ldc, kind == "rows", aligned, clear, stage, config))
 
             return _gemm_hmx
@@ -253,7 +254,7 @@ class GemmHMX(GemmBase):
         @T.prim_func
         def _gemm_hmx_elements() -> None:
             config = T.alloc_shared((CONFIG_WORDS,), "uint32", align=256)
-            stage = T.alloc_shared((2 * TILE_ELEMS,), "float16", align=2048)
+            stage = T.alloc_shared((stage_elems,), "float16", align=2048)
             # The product, row-major, which C's elements then take.
             product = T.alloc_shared((M, N), C_buf.dtype)
             T.evaluate(call(T.access_ptr(product[0, 0], "w", M * N), N, True, True, True, stage, config))

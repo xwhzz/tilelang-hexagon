@@ -701,32 +701,25 @@ TL_DEVICE void tl_crouton_tile_store_part(D *__restrict__ dst, int ldc,
   }
 }
 
-// Zeroes the columns from `cols` on (1..31) of the Crouton tiles at `tile`,
-// `count` of them `stride` halves apart: the padding along K of an HMX
-// activation's last K tile.
-TL_DEVICE void tl_crouton_zero_columns(half *tile, int stride, int count,
-                                       int cols) {
+// Copy the active K lanes of one Crouton tile into private HMX staging.
+// The lanes beyond the region can belong to another use of the same buffer.
+TL_DEVICE void tl_crouton_copy_columns(half *dst, const half *src, int cols) {
+  auto *out = reinterpret_cast<HVX_Vector *>(dst);
+  auto *in = reinterpret_cast<const HVX_Vector *>(src);
   HVX_VectorPred keep = Q6_Q_vsetq2_R(cols * 4);
-  for (int i = 0; i < count; ++i) {
-    HVX_Vector *v = reinterpret_cast<HVX_Vector *>(tile + i * stride);
-    for (int q = 0; q < 16; ++q)
-      v[q] = Q6_V_vmux_QVV(keep, v[q], Q6_V_vzero());
-  }
+  for (int q = 0; q < 16; ++q)
+    out[q] = Q6_V_vmux_QVV(keep, in[q], Q6_V_vzero());
 }
 
-// Zeroes the rows from `rows` on (1..31) of the Crouton tiles at `tile`,
-// `count` of them `stride` halves apart: the padding along K of an HMX
-// weight's last K tile.
-TL_DEVICE void tl_crouton_zero_rows(half *tile, int stride, int count,
-                                    int rows) {
-  for (int i = 0; i < count; ++i) {
-    HVX_Vector *v = reinterpret_cast<HVX_Vector *>(tile + i * stride);
-    // An odd count keeps the even rows (low halves) of its last row pair.
-    if (rows & 1)
-      v[rows / 2] = Q6_V_vand_VV(v[rows / 2], Q6_V_vsplat_R(0x0000FFFF));
-    for (int q = (rows + 1) / 2; q < 16; ++q)
-      v[q] = Q6_V_vzero();
-  }
+TL_DEVICE void tl_crouton_copy_rows(half *dst, const half *src, int rows) {
+  auto *out = reinterpret_cast<HVX_Vector *>(dst);
+  auto *in = reinterpret_cast<const HVX_Vector *>(src);
+  for (int q = 0; q < rows / 2; ++q)
+    out[q] = in[q];
+  if (rows & 1)
+    out[rows / 2] = Q6_V_vand_VV(in[rows / 2], Q6_V_vsplat_R(0x0000FFFF));
+  for (int q = (rows + 1) / 2; q < 16; ++q)
+    out[q] = Q6_V_vzero();
 }
 
 // ---------------------------------------------------------------------------
