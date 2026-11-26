@@ -1,5 +1,6 @@
 """Parallel maps into regions of physically laid-out buffers."""
 
+import json
 import os
 from pathlib import Path
 import re
@@ -53,6 +54,18 @@ def _source(func, arch="v73"):
     target = tvm.target.Target({"kind": "hexagon", "mcpu": f"hexagon{arch}"})
     with target, tvm.transform.PassContext(opt_level=3):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_serialized_crouton_map_lowers_to_the_same_source(legacy):
+    kernel = _map_region("activation", "whole")
+    graph = json.loads(tvm.ir.save_json(kernel))
+    if legacy:
+        for node in graph["nodes"]:
+            if node["type"] == "tl.hexagon.CroutonLayout":
+                del node["data"]["placeholder_vars"]
+    restored = tvm.ir.load_json(json.dumps(graph))
+    assert _source(restored) == _source(kernel)
 
 
 @pytest.mark.parametrize("kind", ["activation", "activation_t"])

@@ -150,6 +150,9 @@ public:
 protected:
   virtual ffi::Map<tirx::Var, Range> GetVarMap() const;
   void UpdateAnalyzer(arith::Analyzer *analyzer) const;
+  void InitForwardIndex(const ffi::Array<PrimExpr> &forward_index);
+  void RestoreIndexVars();
+  ffi::Array<tirx::Var> placeholder_vars_;
   ffi::Array<PrimExpr> forward_index_;
   ffi::Array<PrimExpr> input_size_;
 };
@@ -232,6 +235,7 @@ public:
 
 protected:
   ffi::Map<tirx::Var, Range> GetVarMap() const final;
+  void RestoreThreadVars();
   Range thread_range_;
   PrimExpr forward_thread_;
   PrimExpr replicate_size_;
