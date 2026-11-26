@@ -190,6 +190,44 @@ def test_fp16_bundle_holds_the_weights(tiny_lfm3_bundle):
         assert torch.equal(convert.embedding(head, token, c.dim), w["model.embed_tokens.weight"][token].half())
 
 
+def test_fp16_projection_stream_matches_stacked_bundle(tmp_path):
+    c = Config(vocab=32, dim=32, ff=32, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL, CONV))
+    w = random_weights(c)
+    tensors = convert.build_tensors(c, w)
+    tail = tensors["final_norm"]
+    projection = tensors["ffn.w2"]
+    streamed = tmp_path / "streamed.bundle"
+    header = bundle.write(streamed, c.to_dict(), {"ffn.w2": projection, "final_norm": tail}, {})
+
+    packed = convert.crouton_weight(torch.stack([w[f"model.layers.{i}.feed_forward.w2.weight"].half() for i in range(c.layers)]))
+    assert torch.equal(next(projection[0]()), packed[0])
+    stacked = tmp_path / "stacked.bundle"
+    bundle.write(stacked, c.to_dict(), {"ffn.w2": (packed, *projection[1:]), "final_norm": tail}, {})
+    assert header["tensors"]["ffn.w2"]["nbytes"] == 6144
+    assert header["tensors"]["final_norm"]["offset"] == 8192
+    assert streamed.read_bytes() == stacked.read_bytes()
+
+
+def test_fp16_projection_checks_each_layer_shape(tmp_path):
+    c = Config(vocab=32, dim=32, ff=64, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL))
+    w = random_weights(c)
+    key = "model.layers.1.feed_forward.w2.weight"
+    w[key] = w[key].T
+    projection = convert.build_tensors(c, w)["ffn.w2"]
+    with pytest.raises(ValueError, match="ffn.w2 layer 1 has shape"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"ffn.w2": projection}, {})
+
+
+@pytest.mark.parametrize("length", [2, 4])
+def test_bundle_checks_streamed_byte_count(tmp_path, length):
+    def chunks():
+        yield torch.ones(2, dtype=torch.uint8)
+        yield torch.ones(length, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="weights.*5"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"weights": (chunks, "uint8", (5,), "row_major")}, {})
+
+
 @pytest.mark.parametrize("arch", ("v73", "v75", "v79"))
 @pytest.mark.parametrize("cooperative", (False, True))
 def test_decode_is_one_cycle_of_phases(tiny_bundle, arch, cooperative):
