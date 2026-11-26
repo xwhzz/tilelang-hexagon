@@ -106,6 +106,23 @@ def test_vector_min_and_max_are_hvx_instructions(dtype, vector):
     assert ") < (" in source
 
 
+@pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc", "sin", "cos"])
+def test_scalar_math_fallback_keeps_neighboring_map_vectorized(fn):
+    op = getattr(T, fn)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((64,), "float32"), B: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            for j in T.Parallel(64):
+                B[j] = op(A[j])
+            for j in T.Parallel(64):
+                C[j] = T.erf(A[j])
+
+    source = _source(kernel)
+    assert f"{fn}f(A[" in source
+    assert "tl_hvx_erf(*(float32*)(A + " in source
+
+
 # DSL function: the hvx_math.h function it prints as.
 MATH = {fn: f"tl_hvx_{fn}" for fn in ["exp", "exp2", "log", "log2", "sqrt", "rsqrt", "tanh", "sigmoid", "erf"]}
 MATH["abs"] = "tl_hvx_fabs"
