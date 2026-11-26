@@ -52,6 +52,20 @@ def test_fp32_literals_preserve_their_bits():
         assert literal in source
 
 
+@pytest.mark.parametrize("value", ["1e39", "-1e39"])
+def test_deserialized_fp32_literal_out_of_range(value):
+    @T.prim_func
+    def literal(A: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            A[0] = T.float32(1.25)
+
+    serialized = tvm.ir.save_json(literal)
+    assert serialized.count("1.25") == 1
+    invalid = tvm.ir.load_json(serialized.replace("1.25", value))
+    with pytest.raises(ValueError, match="exceeds the float32 range"):
+        _source(invalid)
+
+
 @pytest.mark.parametrize("imports", [{"prelude": "// imported source"}, {"imported": "// imported source"}])
 def test_headers_then_imports_then_kernel(imports):
     source = _source(_copy_kernel(dma=True, **imports))

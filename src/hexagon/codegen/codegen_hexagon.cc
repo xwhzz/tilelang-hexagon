@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -977,6 +978,10 @@ void CodeGenTileLangHexagon::VisitStmt_(const BindNode *op) {
 void CodeGenTileLangHexagon::VisitExpr_(const FloatImmNode *op,
                                         std::ostream &os) { // NOLINT(*)
   if (op->dtype == DataType::Float(32) && std::isfinite(op->value)) {
+    // Deserialized FloatImm nodes can bypass the constructor's range check.
+    TVM_FFI_CHECK_LE(std::abs(op->value), std::numeric_limits<float>::max(),
+                     ValueError)
+        << "Literal value " << op->value << " exceeds the float32 range";
     std::string literal =
         FlexibleHexFormat(static_cast<float>(op->value)) + "f";
     MarkConst(literal);
