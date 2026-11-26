@@ -3,6 +3,7 @@ deployments: the one place the runtime reads its environment's settings."""
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -125,3 +126,7 @@ def cache_identity() -> dict:
             )
         }
     return identity
+
+
+def deployment_cache_key() -> str:
+    return json.dumps(cache_identity(), sort_keys=True)

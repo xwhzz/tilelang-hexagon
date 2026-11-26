@@ -278,3 +278,51 @@ def test_ssh_transfer_timeout_changes_only_live_cache_identity(cache, monkeypatc
     assert key(cache) == original
     monkeypatch.setenv("TILELANG_HEXAGON_SSH_TRANSFER_TIMEOUT", "1800")
     assert key(cache) != original
+
+
+@pytest.mark.parametrize("mode", ["lazy", "eager"])
+def test_decorated_jit_uses_current_deployment(mode, monkeypatch):
+    import torch
+    import tilelang
+    from tilelang.hexagon import language as T
+    from tilelang.hexagon.runtime.config import hlos, remote_dir
+    from tilelang.hexagon.runtime.env import HexagonSDK
+    from tilelang.hexagon.runtime.session import Session
+
+    opened = []
+
+    def open_session(cls, *args, **kwargs):
+        parent = remote_dir(hlos())
+        opened.append(parent)
+        return SimpleNamespace(kernels=[lambda x: parent], close=lambda: None)
+
+    monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
+    monkeypatch.setattr(HexagonSDK, "validate", lambda self: self)
+    monkeypatch.setattr(Session, "of_lowered", classmethod(open_session))
+
+    @tilelang.jit(target="hexagon", out_idx=1)
+    def lazy(n):
+        @T.prim_func
+        def copy(x: T.Tensor((n,), "float32"), y: T.Tensor((n,), "float32")):
+            with T.Kernel(1):
+                for i in T.Parallel(n):
+                    y[i] = x[i]
+
+        return copy
+
+    @tilelang.jit(target="hexagon")
+    def eager(x):
+        x: T.Tensor[[32], T.float32]
+        y = T.empty((32,), T.float32)
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                y[i] = x[i]
+        return y
+
+    x = torch.empty(32)
+    for parent in ("first", "second", "first"):
+        monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", parent)
+        for _ in range(2):
+            result = lazy(32)(x) if mode == "lazy" else eager(x)
+            assert result == parent
+    assert opened == ["first", "second"]

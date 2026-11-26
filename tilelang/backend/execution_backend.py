@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +34,9 @@ class ExecutionBackendSpec:
     # Optional target-owned decoration, applied once when JIT installs
     # the adapter. None preserves the original execution callable.
     wrap_callable: CallableWrapper | None = None
+
+    # Live deployments can depend on runtime settings beyond the compiled target.
+    runtime_cache_key: Callable[[], Hashable] | None = None
 
     def matches(self, target: Target) -> bool:
         return True if self.supports_target is None else self.supports_target(target)

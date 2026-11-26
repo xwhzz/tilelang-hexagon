@@ -365,6 +365,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                 self.debug_root_path = path.abspath(self.debug_root_path)
         self._kernel_cache: dict[tuple, Kernel] = {}
         self._call_form_cache: _CallFormCache = _CallFormCache()
+        self._runtime_cache_key = None
+        self._deployment_caches = {}
         self._tuner_cache: dict[tuple, Kernel] = {}
 
     def _get_frontend_target_context(self):
@@ -478,6 +480,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             compile_flags=self.compile_flags,
         )
 
+        self._runtime_cache_key = kernel_result.execution_backend_spec.runtime_cache_key
+
         if self.debug_root_path:
             if isinstance(self.func, PrimFunc):
                 func_name = self.func.attrs["global_symbol"]
@@ -518,6 +522,12 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         # JIT functions that have no runtime tensor arguments to extract.
         return not has_tune_params and isinstance(self.func, JITFunc) and not self.func.tensor_args
 
+    def _deployment_cache(self):
+        key = self._runtime_cache_key()
+        if key not in self._deployment_caches:
+            self._deployment_caches[key] = ({}, _CallFormCache())
+        return self._deployment_caches[key]
+
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
         # Separate out the tuning parameters from the user's kwargs
         # Whether to return the compile arguments (out_idx, target, target_host, etc.) for autotuner cache
@@ -543,20 +553,28 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             self.mode = self._infer_jit_mode(*args, **kwargs)
             self.func.set_mode(self.mode)
 
+        kernel_cache, call_forms = self._kernel_cache, self._call_form_cache
+        if self._runtime_cache_key is not None:
+            kernel_cache, call_forms = self._deployment_cache()
+
         call_form_key = None
         if self.is_lazy_mode() and self._can_use_call_form_cache(has_tune_params):
-            kernel, call_form_key = self._call_form_cache.lookup(args, kwargs)
+            kernel, call_form_key = call_forms.lookup(args, kwargs)
             if kernel is not _CALL_FORM_CACHE_MISS:
                 return kernel
 
         key, kernel_args = self.func.parse_args(*args, **kwargs)
-        kernel = self._kernel_cache.get(key, None)
+        kernel = kernel_cache.get(key, None)
         if kernel is None:
             kernel = self.compile(*args, **kwargs)
-            self._kernel_cache[key] = kernel
+            # The first compilation resolves the execution backend. Publish its
+            # result in the same deployment cache used by the next lookup.
+            if self._runtime_cache_key is not None and kernel_cache is self._kernel_cache:
+                kernel_cache, call_forms = self._deployment_cache()
+            kernel_cache[key] = kernel
 
         if call_form_key is not None and self.is_lazy_mode() and not kernel_args:
-            self._call_form_cache.store(call_form_key, kernel)
+            call_forms.store(call_form_key, kernel)
 
         # eager mode: execute kernel immediately and return result
         # lazy mode: return kernel object for manual invocation
