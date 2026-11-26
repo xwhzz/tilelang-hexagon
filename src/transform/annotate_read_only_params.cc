@@ -176,7 +176,13 @@ static tirx::PrimFunc MarkReadOnlyParams(tirx::PrimFunc f) {
     }
   }
 
-  return WithAttr(std::move(f), "tl.readonly_param_indices", readonly_indices);
+  constexpr const char *key = "tl.readonly_param_indices";
+  if (readonly_indices.empty()) {
+    if (f->GetAttr<Array<Integer>>(key))
+      return WithoutAttr(std::move(f), key);
+    return f;
+  }
+  return WithAttr(std::move(f), key, readonly_indices);
 }
 
 namespace transform {

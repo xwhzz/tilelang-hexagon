@@ -188,6 +188,9 @@ def test_rank_zero_buffers_reach_jit_and_resident_calls():
     kernel = tilelang.compile(rank_zero, target="hexagon", out_idx=3)
     try:
         torch.testing.assert_close(kernel(x, bias, scale), expected)
+        supplied = torch.zeros(())
+        assert kernel(x, bias, scale, supplied) is None
+        torch.testing.assert_close(supplied, expected)
     finally:
         kernel.adapter.close()
 
@@ -375,6 +378,8 @@ def test_by_value_float32_reaches_jit_and_resident_calls():
 
 def test_imported_helper_preceding_the_kernel_entry(monkeypatch):
     import tilelang
+    from tilelang import tvm
+    from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
     from tilelang.hexagon.runtime.env import HexagonSDK
 
     @T.prim_func
@@ -394,6 +399,11 @@ def test_imported_helper_preceding_the_kernel_entry(monkeypatch):
     monkeypatch.setattr(session.Session, "of_lowered", classmethod(lambda cls, kernels, **kwargs: captured.extend(kernels) or fake))
     tilelang.compile(add_one, target="hexagon", out_idx=[1])
     assert captured[0][:2] == lowered[:2]
+    # The exported C symbol and the IRModule's lookup key can differ.
+    func = add_one.with_attr("global_symbol", name).with_attr("tl.readonly_param_indices", [0])
+    mod = tvm.IRModule({"internal": func})
+    adapter = HexagonKernelAdapter(lowered[2], [1], None, source, device_mod=mod)
+    assert adapter.kernel_name == name and adapter._run._writable == (1,)
 
 
 def test_session_kernels_lower_under_their_own_pass_configs():

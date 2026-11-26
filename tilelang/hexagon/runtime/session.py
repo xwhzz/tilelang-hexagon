@@ -50,7 +50,7 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from tilelang.hexagon.codegen import kernel_entry_name
+from tilelang.hexagon.codegen import single_device_kernel
 
 from . import fastrpc
 from .device import DEVICE_LOCK
@@ -1018,7 +1018,7 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
     source = str(art.kernel_source)
-    name = kernel_entry_name(art.device_mod)
+    name = str(single_device_kernel(art.device_mod).attrs["global_symbol"])
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"

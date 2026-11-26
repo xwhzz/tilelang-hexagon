@@ -17,7 +17,7 @@ import contextlib
 import re
 import weakref
 
-from tilelang.hexagon.codegen import kernel_entry_name
+from tilelang.hexagon.codegen import single_device_kernel
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
@@ -53,7 +53,8 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         verbose: bool = False,
     ) -> None:
         self.kernel_source = kernel_source
-        self.kernel_name = kernel_entry_name(device_mod) if device_mod is not None else _kernel_name(kernel_source)
+        func = single_device_kernel(device_mod) if device_mod is not None else None
+        self.kernel_name = str(func.attrs["global_symbol"]) if func is not None else _kernel_name(kernel_source)
         self.target = target
         self.verbose = verbose
         # The target names the DSP architecture; HEXAGON_DSP_ARCH only seeds
@@ -63,11 +64,11 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self.dsp_arch = dsp_arch or self.sdk.dsp_arch
         self._param_list = list(params)
         self._writable = ()
-        if device_mod is not None:
+        if func is not None:
             # KeepKernelParams restores the caller's parameter order before
             # AnnotateReadOnlyParams marks the lowered kernel's buffer reads.
-            readonly = {int(i) for i in device_mod[self.kernel_name].attrs.get("tl.readonly_param_indices", ())}
-            self._writable = tuple(i for i, p in enumerate(params) if not p.is_scalar() and i not in readonly)
+            readonly = {int(i) for i in func.attrs.get("tl.readonly_param_indices", ())}
+            self._writable = tuple(i for i, p in enumerate(self._param_list) if not p.is_scalar() and i not in readonly)
         n = len(self._param_list)
         ri = list(result_idx) if isinstance(result_idx, (list, tuple)) else ([] if result_idx is None else [result_idx])
         self._result_idx = [i if i >= 0 else n + i for i in ri]
