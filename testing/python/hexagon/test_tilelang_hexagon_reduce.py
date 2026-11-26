@@ -91,11 +91,11 @@ def test_hvx_row_helper_requires_unit_column_stride():
         assert ("tl_hvx_reduce_rows<" in src) == (stride == 1)
 
 
-def _compact_identity_reduction():
+def _compact_identity_reduction(offset):
     @T.prim_func
     def kernel(a: T.Tensor((2, 32), "float32"), out: T.Tensor((2,), "float32")):
         with T.Kernel(1):
-            src = T.sblock_alloc_buffer((2, 32), "float32", strides=(64, 2), scope="shared.dyn")
+            src = T.sblock_alloc_buffer((2, 32), "float32", strides=(65, 2), elem_offset=offset, scope="shared.dyn")
             dst = T.sblock_alloc_buffer((2,), "float32", strides=(3,), scope="shared.dyn")
             T.annotate_layout({src: T.Layout((2, 32), lambda r, k: [r, k]), dst: T.Layout((2,), lambda r: [r])})
             for r, k in T.grid(2, 32):
@@ -107,9 +107,11 @@ def _compact_identity_reduction():
     return kernel
 
 
-def test_row_reduction_uses_the_remapped_private_tile_pitch():
-    source = _source(_compact_identity_reduction())
-    assert "tl_hvx_reduce_rows<" in source and ", 2, 32, 32, 1, (bool)1);" in source
+@pytest.mark.parametrize(("offset", "aligned"), [(0, "true"), (1, "false")])
+def test_row_reduction_uses_the_remapped_private_tile_pitch(offset, aligned):
+    source = _source(_compact_identity_reduction(offset))
+    assert f"tl_hvx_reduce_rows<TL_REDUCE_SUM, float, {aligned}>" in source
+    assert ", 2, 32, 32, 1, (bool)1);" in source
 
 
 @DEVICE

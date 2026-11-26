@@ -231,7 +231,7 @@ private:
   // buffers start on one: VTCM arena buffers and stack arrays are 128-byte
   // aligned.
   bool RowsAligned(const BufferLoad &first, const PrimExpr &row_stride) const {
-    PrimExpr offset = make_zero(DataType::Int(64));
+    PrimExpr offset = cast(DataType::Int(64), op_.src->elem_offset);
     for (size_t d = 0; d < first->indices.size(); ++d)
       offset = offset + cast(DataType::Int(64), first->indices[d]) *
                             cast(DataType::Int(64), Stride(op_.src, d));
