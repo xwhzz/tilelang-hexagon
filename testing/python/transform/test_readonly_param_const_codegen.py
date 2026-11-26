@@ -1,7 +1,13 @@
+import re
+
+import pytest
+
 import tilelang.language as T
+import tilelang.testing
+from tilelang import tvm
 from tilelang.engine.lower import lower
 from tilelang.jit.adapter.utils import match_declare_kernel
-import tilelang.testing
+from tvm import IRModule, tirx
 
 
 def _simple_add_kernel():
@@ -50,6 +56,35 @@ def test_codegen_emits_const_for_readonly_params():
     assert ro is not None, "Expected tl.readonly_param_indices to be present"
     ro_list = [int(i) for i in ro]
     assert 0 in ro_list and 1 not in ro_list
+
+
+@pytest.mark.parametrize("backend", ["cuda", "metal"])
+def test_codegen_qualifiers_for_pointer_with_bound_index(backend):
+    build = tvm.get_global_func(f"target.build.tilelang_{backend}_without_compile", allow_missing=True)
+    if build is None:
+        pytest.skip(f"{backend} source generation is not built")
+
+    pointer = tvm.ir.PointerType(tvm.ir.PrimType("int32"), "global")
+    state, guard = [tirx.Var(name, pointer) for name in ("state", "guard")]
+    buf = tirx.decl_buffer((2,), "int32", data=state)
+    index = tirx.Var("index", "int32")
+    offset = tirx.Cast("int32", tirx.call_intrin("bool", "tirx.isnullptr", guard))
+    address = tirx.Let(index, offset, tirx.call_intrin("handle", "tirx.address_of", buf[index]))
+    func = tirx.PrimFunc([state, guard], tirx.Evaluate(tirx.call_extern("void", "update", address)))
+    func = func.with_attr("global_symbol", "update_at").with_attr("calling_conv", tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH)
+    func = func.with_attr("tirx.kernel_launch_params", ["threadIdx.x"])
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"} if backend == "cuda" else backend)
+    with target:
+        mod = tilelang.transform.AnnotateReadOnlyParams()(IRModule({"update_at": func}))
+        source = build(mod, target).inspect_source()
+
+    # Check both the CUDA forward declaration and definition, and the Metal
+    # argument bindings. Only state is passed to the external writer.
+    qualifier = "device " if backend == "metal" else ""
+    assert set(re.findall(r"((?:const )?(?:device )?int\*) (state|guard)\b", source)) == {
+        (f"{qualifier}int*", "state"),
+        (f"const {qualifier}int*", "guard"),
+    }
 
 
 if __name__ == "__main__":

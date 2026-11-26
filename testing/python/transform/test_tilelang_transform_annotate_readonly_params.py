@@ -61,5 +61,20 @@ def test_opaque_writes_follow_bound_pointer_bases_and_respect_read_masks():
     assert list(result["main"].attrs["tl.readonly_param_indices"]) == [2]
 
 
+def test_opaque_write_uses_let_result_and_visits_initializer_effects():
+    state, control, scratch = [tirx.decl_buffer((8,), "int32", name=n) for n in ("state", "control", "scratch")]
+    base = tirx.Var("base", "handle")
+    condition = tirx.Var("condition", "bool")
+    # Computing the condition can write scratch even though the address
+    # returned to update always points into state.
+    predicate = tirx.call_extern("bool", "check", scratch.data, tirx.call_intrin("bool", "tirx.isnullptr", control.data))
+    next_element = tirx.call_intrin("handle", "tirx.handle_add_byte_offset", base, 4)
+    chosen = tirx.Let(condition, predicate, tirx.if_then_else(condition, base, next_element))
+    address = tirx.Let(base, state.data, chosen)
+    func = tirx.PrimFunc([state, control, scratch], tirx.Evaluate(tirx.call_extern("void", "update", address)))
+    result = tilelang.transform.AnnotateReadOnlyParams()(IRModule({"main": func}))
+    assert list(result["main"].attrs["tl.readonly_param_indices"]) == [1]
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

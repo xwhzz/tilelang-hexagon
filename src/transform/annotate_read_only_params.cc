@@ -19,9 +19,7 @@ using namespace tirx;
 using namespace ffi;
 
 /*!
- * \brief A simple visitor that marks handle parameters as written when they
- *        appear on the LHS of a BufferStore or in a tvm_access_ptr with write
- * flag.
+ * \brief Find parameter addresses that a store or call may write through.
  */
 class ReadWriteMarker : public StmtExprVisitor {
 public:
@@ -77,6 +75,11 @@ private:
         MarkPointer(select->true_value);
         MarkPointer(select->false_value);
         return false;
+      } else if (const auto *let = node.as<LetNode>()) {
+        // The initializer can compute an index or predicate. Follow its
+        // binding when the address returned by the body uses that base.
+        MarkPointer(let->body);
+        return false;
       }
       return !node.as<BufferLoadNode>();
     });
@@ -101,6 +104,8 @@ private:
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const CallNode *op) final {
+    // Collect any Let bindings in the arguments before resolving their bases.
+    StmtExprVisitor::VisitExpr_(op);
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       MarkAccess(op);
     } else {
@@ -113,7 +118,6 @@ private:
         }
       }
     }
-    StmtExprVisitor::VisitExpr_(op);
   }
 
   std::unordered_map<const VarNode *, PrimExpr> bindings_;
