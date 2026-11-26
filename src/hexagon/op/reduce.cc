@@ -74,16 +74,6 @@ DataType AccType(const ReduceOpNode &op) {
   return DataType::Float(32);
 }
 
-// The stride of `axis` in a compact row-major buffer, in elements.
-PrimExpr Stride(const Buffer &buffer, int axis) {
-  if (!buffer->strides.empty())
-    return buffer->strides[axis];
-  PrimExpr stride = make_const(DataType::Int(32), 1);
-  for (size_t d = axis + 1; d < buffer->shape.size(); ++d)
-    stride = stride * buffer->shape[d];
-  return stride;
-}
-
 Stmt Loop(const Var &var, PrimExpr extent, ForKind kind, Stmt body) {
   return For(var, make_zero(DataType::Int(32)), cast(DataType::Int(32), extent),
              kind, std::move(body));
@@ -156,6 +146,17 @@ public:
   }
 
 private:
+  // A row-major layout remaps a private tile into compact physical storage.
+  // An unannotated view keeps its declared strides.
+  PrimExpr Stride(const Buffer &buffer, int axis) const {
+    if (!buffer->strides.empty() && !layout_map_.count(buffer))
+      return buffer->strides[axis];
+    PrimExpr stride = make_const(DataType::Int(32), 1);
+    for (size_t d = axis + 1; d < buffer->shape.size(); ++d)
+      stride = stride * buffer->shape[d];
+    return stride;
+  }
+
   bool Innermost() const { return op_.dim == ndim_ - 1; }
   PrimExpr Extent(int d) const { return op_.srcRegion_->region[d]->extent; }
 
