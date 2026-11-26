@@ -54,7 +54,7 @@ from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
-from .tensor import buffer_bytes, unpack_buffer
+from .tensor import buffer_bytes, pack_buffer, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -1529,9 +1529,7 @@ class Session:
                 outputs.append((i, out_bytes))
                 out_bytes = _align(out_bytes + plan.nbytes)
             else:
-                raw = buffer_bytes(value, kernel.params[i], plan.storage_axes)
-                if len(raw) != plan.nbytes:
-                    raise ValueError(f"argument {i} of {kernel.name} has {len(raw)} bytes, the kernel takes {plan.nbytes}")
+                raw = pack_buffer(value, kernel.params[i], plan, kernel.name)
                 args += [_INPUT, len(inputs), 0]
                 inputs += raw + bytes(_align(len(raw)) - len(raw))
         # The outputs come back in out_idx order, as a compiled kernel's do;

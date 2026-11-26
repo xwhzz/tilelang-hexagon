@@ -28,24 +28,31 @@ def storage_layout(param) -> tuple[int, tuple[int, ...] | None]:
     return extent, tuple(axes) if active != sorted(active) else ()
 
 
-def buffer_bytes(data, param=None, storage_axes=()) -> bytes:
-    """Pack logical elements in storage order. Raw and sub-byte buffers are already packed."""
+def buffer_bytes(data) -> bytes:
     if isinstance(data, (bytes, bytearray, memoryview)):
         return bytes(data)
-    if storage_axes != () and str(param.dtype) not in ("int4", "uint4"):
-        if storage_axes is None:
-            raise NotImplementedError("pass raw bytes or a resident buffer for non-dense Hexagon inputs")
-        if not isinstance(data, torch.Tensor):
-            data = np.asarray(data)
-        if tuple(data.shape) != tuple(param.shape):
-            raise ValueError(f"expected shape {tuple(param.shape)} for strided input, got {tuple(data.shape)}")
-        data = data.permute(storage_axes) if isinstance(data, torch.Tensor) else data.transpose(storage_axes)
     if isinstance(data, torch.Tensor):
         data = data.detach().to("cpu").contiguous()
         if data.dtype == torch.bfloat16:
             data = data.view(torch.int16)
         return data.numpy().tobytes()
     return np.ascontiguousarray(data).tobytes()
+
+
+def pack_buffer(data, param, plan, kernel_name) -> bytes:
+    """Pack logical elements in storage order. Raw and sub-byte buffers are already packed."""
+    if plan.storage_axes != () and not isinstance(data, (bytes, bytearray, memoryview)) and str(param.dtype) not in ("int4", "uint4"):
+        if plan.storage_axes is None:
+            raise NotImplementedError("pass raw bytes or a resident buffer for non-dense Hexagon inputs")
+        if not isinstance(data, torch.Tensor):
+            data = np.asarray(data)
+        if tuple(data.shape) != tuple(param.shape):
+            raise ValueError(f"expected shape {tuple(param.shape)} for strided input, got {tuple(data.shape)}")
+        data = data.permute(plan.storage_axes) if isinstance(data, torch.Tensor) else data.transpose(plan.storage_axes)
+    raw = buffer_bytes(data)
+    if len(raw) != plan.nbytes:
+        raise ValueError(f"argument {plan.index} of {kernel_name} has {len(raw)} bytes, the kernel takes {plan.nbytes}")
+    return raw
 
 
 def unpack_buffer(raw, param):

@@ -18,7 +18,7 @@ import uuid
 import weakref
 from dataclasses import dataclass, field
 
-from .tensor import buffer_bytes, unpack_buffer
+from .tensor import pack_buffer, unpack_buffer
 
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
 from .config import device_serial, domain_id, remote_dir, ssh_host, ssh_transfer_timeout
@@ -304,7 +304,7 @@ class OneShotKernel:
                 pulls.append((local, fname, i))
             else:
                 with open(local, "wb") as f:
-                    f.write(buffer_bytes(values[i], p, self._plans[i].storage_axes))
+                    f.write(pack_buffer(values[i], p, self._plans[i], self._iface))
                 self._conn.push(local, fname)
             argv.append(fname)
         rc, out = self._conn.run_host_binary(self._exe, argv, timeout=120)
