@@ -208,7 +208,10 @@ read element by element.
 Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
 the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
 A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
-per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). It is one
+per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
+group-major scales directly, including a padded row stride. For another physical layout
+they pack the scale rows and columns used by the call into group-major VTCM storage.
+The HVX GEMM is one
 `tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
 fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
