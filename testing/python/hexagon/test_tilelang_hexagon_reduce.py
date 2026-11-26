@@ -130,13 +130,34 @@ def test_strided_row_reduction_matches_logical_elements(op, dtype):
         kernel.adapter.close()
 
 
-def test_outer_axes_loop_around_the_call():
+def test_contiguous_outer_axes_form_one_row_reduction():
     source = _source(_make("sum", (4, 24, 96), 2, "float32", "float32"))
-    assert "for (int32_t i0 = 0; i0 < 4; ++i0) {" in source
-    assert (
-        "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[(i0 * 24)])), (&(((float*)src)[(i0 * 2304)])), 24, 96, 96, 1, (bool)1);"
-        in source
-    )
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[0])), (&(((float*)src)[0])), 96, 96, 96, 1, (bool)1);" in source
+
+
+def _pitched_head_reduce(q, src_pitch, dst_pitch):
+    @T.prim_func
+    def kernel(
+        a: T.Tensor((3, src_pitch, 16), "float32"), seed: T.Tensor((3, dst_pitch), "float32"), out: T.Tensor((3, dst_pitch), "float32")
+    ):
+        with T.Kernel(1):
+            x = T.alloc_shared((3, src_pitch, 16), "float32")
+            y = T.alloc_shared((3, dst_pitch), "float32")
+            T.copy(a, x)
+            T.copy(seed, y)
+            T.reduce_sum(x[:, :q, 3:11], y[:, :q], dim=2, clear=False)
+            T.copy(y, out)
+
+    return kernel
+
+
+@pytest.mark.parametrize(
+    ("q", "src_pitch", "dst_pitch", "geometry"),
+    [(2, 2, 2, "6, 8, 16, 1"), (2, 3, 2, "2, 8, 16, 1"), (2, 2, 3, "2, 8, 16, 1"), (1, 3, 4, "3, 8, 48, 4")],
+)
+def test_row_coalescing_proves_both_boundary_pitches(q, src_pitch, dst_pitch, geometry):
+    source = _source(_pitched_head_reduce(q, src_pitch, dst_pitch))
+    assert f", {geometry}, (bool)0);" in source
 
 
 def _make_regions(op, clear=True):
