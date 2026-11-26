@@ -40,8 +40,9 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   void PrintFuncPrefix(std::ostream &os) final;       // NOLINT(*)
 
-  void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
-  void VisitStmt_(const BindNode *op) final;        // NOLINT(*)
+  void VisitStmt_(const AllocBufferNode *op) final;                // NOLINT(*)
+  void VisitStmt_(const BindNode *op) final;                       // NOLINT(*)
+  void VisitExpr_(const FloatImmNode *op, std::ostream &os) final; // NOLINT(*)
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   // Declare the DMA queue, and return the status of failing runtime calls.

@@ -177,7 +177,7 @@ def test_fast_division_by_a_constant_multiplies():
 
     source = _source(kernel, fast_math=True)
     assert "tl_hvx_div" not in source
-    assert "1.250000e-01f" in source
+    assert "0x1p-3f" in source
 
 
 # ---------------------------------------------------------------------------

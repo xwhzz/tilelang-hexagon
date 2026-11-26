@@ -3,6 +3,7 @@
  */
 #include "codegen_hexagon.h"
 #include "arith/pattern_match.h"
+#include "backend/common/codegen/codegen_utils.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/op/utils.h" // kGridVTCMScope
 #include "op/builtin.h"
@@ -18,6 +19,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -969,6 +971,18 @@ void CodeGenTileLangHexagon::VisitStmt_(const BindNode *op) {
     // otherwise-exclusive slice so LLVM retains accesses across that call.
     PrintIndent();
     stream << "tl_escape(" << GetVarID(op->var.get()) << ");\n";
+  }
+}
+
+void CodeGenTileLangHexagon::VisitExpr_(const FloatImmNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  if (op->dtype == DataType::Float(32) && std::isfinite(op->value)) {
+    std::string literal =
+        FlexibleHexFormat(static_cast<float>(op->value)) + "f";
+    MarkConst(literal);
+    os << literal;
+  } else {
+    CodeGenTileLangCBase::VisitExpr_(op, os);
   }
 }
 

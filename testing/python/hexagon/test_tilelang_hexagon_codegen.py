@@ -36,6 +36,22 @@ def _copy_kernel(prelude=None, imported=None, dma=False):
     return kernel
 
 
+def test_fp32_literals_preserve_their_bits():
+    @T.prim_func
+    def literals(A: T.Tensor((6,), "float32")):
+        with T.Kernel(1):
+            A[0] = T.float32(1.0 + 2.0**-23)
+            A[1] = T.float32(2.0**-24)
+            A[2] = T.float32(-0.0)
+            A[3] = T.float32(2.0**-149)
+            A[4] = T.float32(-(2.0 - 2.0**-23) * 2.0**127)
+            A[5] = T.float32(1.0 + 2.0**-24)  # halfway, rounds to even
+
+    source = _source(literals)
+    for literal in ("0x1.000002p+0f", "0x1p-24f", "-0x0p+0f", "0x1p-149f", "-0x1.fffffep+127f", "0x1p+0f"):
+        assert literal in source
+
+
 @pytest.mark.parametrize("imports", [{"prelude": "// imported source"}, {"imported": "// imported source"}])
 def test_headers_then_imports_then_kernel(imports):
     source = _source(_copy_kernel(dma=True, **imports))
