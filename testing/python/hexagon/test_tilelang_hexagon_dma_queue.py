@@ -192,6 +192,16 @@ def test_synchronous_pipeline_does_not_construct_a_dma_queue():
     assert "tl_dma_async" not in artifact.kernel_source
 
 
+def test_explicit_wait_without_transfers():
+    @T.prim_func
+    def wait_only(a: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            T.dma_wait(7)
+            a[0] = 9
+
+    assert not _ops(_lower(wait_only))
+
+
 def test_empty_group_keeps_its_place_after_a_real_submission():
     @T.prim_func
     def copy(a: T.Tensor((256,), "float16"), b: T.Tensor((256,), "float16")):

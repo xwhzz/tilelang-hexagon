@@ -298,7 +298,7 @@ class RemoveEmptyGroups : public StmtExprMutator {
       PendingGroups(op);
     else if (!op->op.same_as(hexagon_dma_commit()))
       return StmtExprMutator::VisitExpr_(op);
-    return make_zero(op->dtype);
+    return Integer(0);
   }
 };
 
