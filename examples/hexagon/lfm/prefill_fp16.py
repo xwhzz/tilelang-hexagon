@@ -474,8 +474,12 @@ def make_prefill(
                     col = (kvh * group + hq) * HD
                     T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
         # The output projection reads all R rows, including the padding.
-        for rb in T.serial(query_blocks, R // ROWS):
-            T.clear(bf.hid[rb * ROWS : (rb + 1) * ROWS, bf.w * DW : (bf.w + 1) * DW])
+        if query_blocks < R // ROWS:
+            T.clear(bf.acc_o)
+            for rb in T.serial(query_blocks, R // ROWS):
+                for head in T.serial(KH * group):
+                    col = (bf.w * KH * group + head) * HD
+                    T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
 
     @T.macro
     def branch_block(bf, b, ring, k, A, K: int, first, sums):
