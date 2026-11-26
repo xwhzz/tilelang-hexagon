@@ -154,6 +154,46 @@ def test_jit_copies_dense_strided_tensors(src_strides, dst_strides):
         HexagonKernelAdapter.close_all()
 
 
+@DEVICE
+def test_by_value_float32_reaches_jit_and_resident_calls():
+    import tilelang
+
+    @T.prim_func
+    def scale(x: T.Tensor((32,), "float32"), y: T.Tensor((32,), "float32"), alpha: T.float32):
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                y[i] = x[i] * alpha
+
+    x = torch.arange(1, 33, dtype=torch.float32)
+    coefficients = (0.375, -0.5, 0.0, -0.0)
+    jit = tilelang.compile(scale, target="hexagon", out_idx=1)
+    try:
+        for alpha in coefficients:
+            assert torch.equal(jit(x, alpha).view(torch.int32), (x * alpha).view(torch.int32))
+    finally:
+        jit.adapter.close()
+
+    with session.Session([(scale, [1])]) as s:
+        (kernel,) = s.kernels
+        src, dst = s.buffer(128), s.buffer(128)
+        src.write(x)
+        for alpha in coefficients:
+            expected = (x * alpha).numpy().tobytes()
+            args = (src, dst, alpha)
+            poison = bytes([0xA5]) * 128
+            dst.write(poison)
+            kernel(*args)
+            assert dst.read() == expected
+            dst.write(poison)
+            s.pipeline([(kernel, 0, args)], 2)
+            assert dst.read() == expected
+            dst.write(poison)
+            s.run_sequence([session.Run(kernel, args)])
+            assert dst.read() == expected
+        with pytest.raises(ValueError, match="integer scalar"):
+            s.pipeline([(kernel, 0, (src, dst, s.STEP))], 1)
+
+
 def test_session_kernels_lower_under_their_own_pass_configs():
     (_, fast, _, _), (_, accurate, _, _) = session.lower_kernels([(_exp(True), [1]), (_exp(False), [1])])
     assert "tl_hvx_exp_fast(" in fast

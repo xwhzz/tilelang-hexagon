@@ -2,6 +2,7 @@
 and T.gemm_blockscaled of 8- and 4-bit B: on HVX by integer A, on HMX by fp16
 A."""
 
+import json
 import os
 
 import pytest
@@ -55,9 +56,15 @@ def _random(shape, dtype):
     return v
 
 
-def test_panel_layout_places_each_element():
+@pytest.mark.parametrize("representation", ["native", "json", "legacy_json"])
+def test_panel_layout_places_each_element(representation):
     rows, cols, lane = 64, 24, 4
     layout = make_hvx_panel_layout((rows, cols), "int8")
+    if representation != "native":
+        graph = json.loads(tvm.ir.save_json(layout))
+        if representation == "legacy_json":
+            del graph["nodes"][graph["root_index"]]["data"]["placeholder_vars"]
+        layout = tvm.ir.load_json(json.dumps(graph))
     for r, c in ((0, 0), (1, 0), (0, 1), (31, 3), (32, 4), (37, 23), (63, 23)):
         expected = [r // 32, c // lane, r % 32, c % lane]
         assert [int(x) for x in layout.map_forward_index([r, c])] == expected

@@ -753,6 +753,9 @@ class Decoder:
             self.session.pipeline(stages, min(self.CALL_STEPS, steps - s0))
             self.seconds += self.session.last_run_seconds()
 
+    def _fp16_decode_steps(self, pos0: int, n: int, n_forced: int) -> None:
+        self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+
     def last_run_seconds(self) -> float:
         """How long the last run or prefill took on the DSP: its FastRPC
         calls, each timed by the agent on the device, without the host's
@@ -845,7 +848,7 @@ class Decoder:
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
         if self.fp16:
             # A token a step, through the stages in turn (decode_fp16.make_decode).
-            self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+            self._fp16_decode_steps(pos0, n, n_forced)
         else:
             args = [
                 *self.args,
@@ -869,13 +872,29 @@ class Decoder:
         """Positions pos0 .. pos0 + len(tokens) - 1 from `tokens`: their KV cache
         entries and the conv state they leave, in chunks of prefill_rows."""
         n, R = len(tokens), self.prefill_rows
-        assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
+        assert R and pos0 >= 0 and 1 <= n <= self.max_tokens and pos0 + n <= self.max_pos
+        chunks = -(-n // R)
+        fits = pos0 + chunks * R <= self.max_pos
+        assert self.fp16 or fits
         self._chat_tokens = None
-        self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
+        ids = torch.tensor(list(tokens), dtype=torch.int32)
         if self.fp16:
-            # A chunk a step, through the stages in turn (prefill_fp16.make_prefill).
-            self._pipeline(len(self.stages), [[*st.prefill, pos0, n] for st in self.stages], -(-n // R))
+            # A prefill step accesses R physical KV rows, even for a short last
+            # chunk. Finish a chunk that would cross the cache end one token at
+            # a time, using the resident decode stages and their exact KV stores.
+            batched = n if fits else (chunks - 1) * R
+            if batched:
+                self.tokens.write(ids[:batched])
+                self._pipeline(len(self.stages), [[*st.prefill, pos0, batched] for st in self.stages], -(-batched // R))
+            if batched < n:
+                seconds = self.seconds if batched else 0.0
+                # Match the prefill embedding's token clamp. Forced decode also
+                # uses the next token as an index when computing its score.
+                self.tokens.write(ids[batched:].clamp_(0, self.c.vocab - 1))
+                self._fp16_decode_steps(pos0 + batched, n - batched, n - batched)
+                self.seconds += seconds
         else:
+            self.tokens.write(ids)
             state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
             self.seconds = self.session.last_run_seconds()

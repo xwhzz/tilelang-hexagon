@@ -728,6 +728,67 @@ def test_chat_continuation_matches_full_replay(model, processes, tiny_bundle, fp
         decoder.close()
 
 
+@pytest.mark.parametrize(
+    ("pos0", "n", "capacity", "calls"),
+    [
+        (128, 65, 65, [(1, 128, 65, 1)]),
+        (255, 1, 1, [(0, 255, 1, 1)]),
+        (120, 136, 136, [(1, 120, 128, 1), (0, 248, 8, 8)]),
+    ],
+)
+def test_fp16_prefill_only_decodes_chunks_that_cross_the_cache_end(pos0, n, capacity, calls):
+    from types import SimpleNamespace
+
+    decoder = Decoder.__new__(Decoder)
+    decoder.fp16, decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = True, 256, capacity, 128
+    decoder.c = SimpleNamespace(vocab=4096)
+    writes, actual = [], []
+    decoder.tokens = SimpleNamespace(write=lambda ids: writes.extend(ids.tolist()))
+    decoder.stages = [SimpleNamespace(prefill=[], decode=[])]
+    decoder.seconds = 99.0
+
+    def pipeline(first, args, steps):
+        actual.append((first, *args[0], steps))
+        decoder.seconds = 1.0
+
+    decoder._pipeline = pipeline
+    ids = list(range(n))
+    decoder.prefill(ids, pos0)
+    assert writes == ids and actual == calls
+    assert decoder.last_run_seconds() == len(calls)
+    with pytest.raises(AssertionError):
+        decoder.prefill([1], decoder.max_pos)
+    assert writes == ids and actual == calls
+
+
+@DEVICE
+def test_fp16_incremental_prefill_at_context_end(fp16_bundle):
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    seq = torch.randint(c.vocab, (256,), generator=torch.Generator().manual_seed(3))
+    # The suffix ends inside the cache but its last physical 128-row chunk
+    # would extend beyond it. The final decode consumes the last legal slot.
+    with torch.no_grad():
+        want, state = ref.prefill(seq)
+    decoder = Decoder(path, max_pos=256, max_tokens=256, prefill_rows=128, processes=1)
+    try:
+        decoder.prefill(seq[:120].tolist())
+        decoder.prefill(seq[120:-1].tolist(), 120)
+        _, logits = decoder.run(seq[-1:].tolist(), 255, 1, 1)
+
+        def relative(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        errors = _kv_errors(decoder, state, len(seq), relative)
+        states = decoder.conv_states()
+        errors.extend(relative(got, expected) for got, expected in zip(states, state.conv))
+        errors.append(relative(logits, want))
+        assert all(error < 1e-2 for error in errors), errors
+    finally:
+        decoder.close()
+
+
 @DEVICE
 @pytest.mark.parametrize(("model", "processes"), STAGES[:3])
 def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):

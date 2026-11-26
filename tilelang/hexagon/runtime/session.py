@@ -9,8 +9,8 @@ cache maintenance FastRPC does for the buffers of every call. Weights, KV
 caches and recurrent state stay on the device across calls and kernels.
 
 A kernel parameter takes, per call, a :class:`DeviceBuffer` (resident: no
-copy), a tensor (copied in, as with a standalone kernel), or for an int32
-scalar a Python int. Its ``out_idx`` parameters come back as tensors unless a
+copy), a tensor (copied in, as with a standalone kernel), or a Python number for an
+int32 or float32 scalar. Its ``out_idx`` parameters come back as tensors unless a
 :class:`DeviceBuffer` is passed for them too.
 
 The host writes a buffer's bytes with :meth:`DeviceBuffer.write`, or has the
@@ -246,7 +246,7 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
     for i, (_, source, plans) in enumerate(kernels):
-        args = ", ".join(f"({pl.ctype})(intptr_t)a[{j}]" if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
+        args = ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
             f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
@@ -1397,9 +1397,11 @@ class Session:
                 if isinstance(value, _Step):
                     if not plan.is_scalar:
                         raise ValueError(f"argument {i} of {kernel.name} is a buffer; Session.STEP stands for a scalar")
+                    if plan.ctype == "float":
+                        raise ValueError("Session.STEP requires an integer scalar parameter")
                     words += [_STEP, value.first, 0]
                 elif plan.is_scalar:
-                    words += [_SCALAR, int(value), 0]
+                    words += [_SCALAR, plan.scalar_word(value), 0]
                 elif isinstance(value, DeviceBuffer):
                     self._check_resident(kernel, i, value, process)
                     words += [_RESIDENT, value.id, value.offset]
@@ -1526,7 +1528,7 @@ class Session:
         for i, plan in enumerate(kernel.plans):
             value = given[i]
             if plan.is_scalar:
-                args += [_SCALAR, int(value), 0]
+                args += [_SCALAR, plan.scalar_word(value), 0]
             elif isinstance(value, DeviceBuffer):
                 self._check_resident(kernel, i, value, process)
                 args += [_RESIDENT, value.id, value.offset]

@@ -478,7 +478,9 @@ barrier and does not release resources or drain DMA. See the
     bytes back and drops them, so a dirty line a kernel left cannot overwrite the
     host's bytes later; before a host read, it writes them back.
   - **Arguments.** Each parameter takes, per call, a `DeviceBuffer`, a tensor (copied
-    inline) or an int32 scalar.
+    inline), or a by-value int32 or float32 scalar. The host converts a Python coefficient
+    to FP32 and sends the resulting bits, including signed zero, in one wire word. Pipeline
+    stages accept constant coefficients. `Session.STEP` requires an integer parameter.
   - **Resident sequences.** `Session.run_sequence` accepts an explicit, finite list
     of `Run(kernel, args)` and `Copy(src, dst, nbytes, src_offset=0, dst_offset=0)`
     descriptors, imported from `tilelang.hexagon.runtime.session`. It sends the list
@@ -490,8 +492,8 @@ barrier and does not release resources or drain DMA. See the
     for a longer sequence; the timeout must be finite and positive. A timeout
     closes the Session without replaying the list, and the ordinary socket
     timeout is restored after a completed sequence.
-    Each Run targets process 0 and supplies every parameter, using resident buffers and int32 scalars;
-    inline tensors are unsupported. A Run buffer remains 128-byte aligned and must
+    Each Run targets process 0 and supplies every parameter, using resident buffers
+    and int32 or float32 scalars. A Run buffer remains 128-byte aligned and must
     contain the kernel's full static extent. Copy uses arbitrary byte offsets
     relative to its views, checks cache synchronization in every mapping process, and supports overlap
     via `memmove`. No loop, branch, automatic retry, or model logic is implicit.
