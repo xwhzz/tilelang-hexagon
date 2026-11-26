@@ -117,6 +117,8 @@ class JITKernel(Generic[_P, _T]):
         self.target = backend_context.target
         self.target_host = backend_context.target_host
         self.execution_backend_spec = backend_context.execution_backend
+        key = self.execution_backend_spec.runtime_cache_key
+        self.runtime_cache_key = key() if key is not None else None
         self.execution_backend = self.execution_backend_spec.name
 
         if self.execution_backend == "cython":

@@ -294,6 +294,9 @@ def test_decorated_jit_uses_current_deployment(mode, monkeypatch):
     def open_session(cls, *args, **kwargs):
         parent = remote_dir(hlos())
         opened.append(parent)
+        if len(opened) == 1:
+            # Simulate a configuration change after the first session opens.
+            monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "second")
         return SimpleNamespace(kernels=[lambda x: parent], close=lambda: None)
 
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
@@ -320,9 +323,10 @@ def test_decorated_jit_uses_current_deployment(mode, monkeypatch):
         return y
 
     x = torch.empty(32)
-    for parent in ("first", "second", "first"):
-        monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", parent)
-        for _ in range(2):
-            result = lazy(32)(x) if mode == "lazy" else eager(x)
-            assert result == parent
+    monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "first")
+    for parent in ("first", "second", "second", "first", "first"):
+        if parent == "first" and len(opened) == 2:
+            monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", parent)
+        result = lazy(32)(x) if mode == "lazy" else eager(x)
+        assert result == parent
     assert opened == ["first", "second"]

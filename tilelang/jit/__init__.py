@@ -522,8 +522,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         # JIT functions that have no runtime tensor arguments to extract.
         return not has_tune_params and isinstance(self.func, JITFunc) and not self.func.tensor_args
 
-    def _deployment_cache(self):
-        key = self._runtime_cache_key()
+    def _deployment_cache(self, key):
         if key not in self._deployment_caches:
             self._deployment_caches[key] = ({}, _CallFormCache())
         return self._deployment_caches[key]
@@ -555,7 +554,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
 
         kernel_cache, call_forms = self._kernel_cache, self._call_form_cache
         if self._runtime_cache_key is not None:
-            kernel_cache, call_forms = self._deployment_cache()
+            kernel_cache, call_forms = self._deployment_cache(self._runtime_cache_key())
 
         call_form_key = None
         if self.is_lazy_mode() and self._can_use_call_form_cache(has_tune_params):
@@ -569,8 +568,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             kernel = self.compile(*args, **kwargs)
             # The first compilation resolves the execution backend. Publish its
             # result in the same deployment cache used by the next lookup.
-            if self._runtime_cache_key is not None and kernel_cache is self._kernel_cache:
-                kernel_cache, call_forms = self._deployment_cache()
+            if self._runtime_cache_key is not None:
+                kernel_cache, call_forms = self._deployment_cache(kernel.runtime_cache_key)
             kernel_cache[key] = kernel
 
         if call_form_key is not None and self.is_lazy_mode() and not kernel_args:
