@@ -133,6 +133,19 @@ runs one chain of dependent instructions at a time, about one instruction per pa
 
 `T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).
+To transpose a VTCM tile, call `T.transpose(src, dst)` on distinct shared
+buffers. Regions with shapes `(..., M, N)` and `(..., N, M)` keep their leading
+axes and swap the final two. The operation uses the buffers' logical indices,
+including their region offsets and layouts. Pass slices of the allocated buffers
+directly when transposing a subregion.
+
+Use `T.cumsum(src, dst, dim=-1)` for an inclusive prefix sum along each row
+of a compact row-major shared tile. Each sum starts with the first element in its slice
+and accumulates in the buffer dtype. Other axes and `reverse=True` use the
+same ordering along the selected axis. Omit `dst` to update the input in
+place. Equal-shaped slices of one buffer can also be scanned into each other
+when the compiler can prove they are disjoint.
+
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
 reads and writes shared buffers and fragments in place. Reducing the innermost axis is
@@ -208,9 +221,15 @@ read element by element.
 Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
 the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
 A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
-per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). It is one
-`tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
-fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
+per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
+group-major scales directly, including a padded row stride. For another physical layout
+they pack the scale rows and columns used by the call into group-major VTCM storage.
+Global scales with explicit noncompact strides accept an identity layout annotation.
+For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
+With interleaved activation or output columns it stages just the affected row, gathering
+the previous output only for accumulation. The sums leave the vrmpy accumulators once per
+group, into fp32 accumulators, and a signed B's offset comes off each group with that
+group's sum of A.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one

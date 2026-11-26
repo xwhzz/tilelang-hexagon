@@ -69,6 +69,29 @@ DecodedRegionCall DecodeRegionCall(const ffi::Array<PrimExpr> &args) {
 
 } // namespace
 
+bool IsBufferContiguous(const Buffer &buffer, arith::Analyzer *analyzer) {
+  if (buffer->strides.empty()) {
+    return true;
+  }
+  if (buffer->strides.size() != buffer->shape.size()) {
+    return false;
+  }
+  // For row-major layout:
+  // strides[n-1] = 1
+  // strides[i] = strides[i+1] * shape[i+1]
+  int n = buffer->shape.size();
+  PrimExpr expected_stride = make_const(buffer->shape[0].dtype(), 1);
+  for (int i = n - 1; i >= 0; --i) {
+    if (!analyzer->CanProveEqual(buffer->strides[i], expected_stride)) {
+      return false;
+    }
+    if (i > 0) {
+      expected_stride = expected_stride * buffer->shape[i];
+    }
+  }
+  return true;
+}
+
 bool IsZeroBitPattern(const PrimExpr &expr) {
   if (const auto *broadcast = expr.as<BroadcastNode>()) {
     return IsZeroBitPattern(broadcast->value);

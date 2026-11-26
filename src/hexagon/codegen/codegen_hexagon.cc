@@ -564,19 +564,19 @@ private:
 
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
 
-void CodeGenTileLangHexagon::CheckLoadOnlyDMAModule(const IRModule &module) {
+void CodeGenTileLangHexagon::CheckManagedCalls(const IRModule &module) {
+  for (const auto &[gvar, base] : module->functions) {
+    const auto *func = base.as<PrimFuncNode>();
+    if (!func || !HasOnlyManagedDMACalls(func->body)) {
+      has_only_managed_calls_ = false;
+      break;
+    }
+  }
   dma_load_only_module_ =
+      has_only_managed_calls_ &&
       !tvm::transform::PassContext::Current()
            ->GetConfig<Bool>("tl.hexagon_disable_dma_load_only", Bool(false))
            .value();
-  for (const auto &[gvar, base] : module->functions) {
-    const auto *func = base.as<PrimFuncNode>();
-    if (!func) {
-      dma_load_only_module_ = false;
-      continue;
-    }
-    dma_load_only_module_ &= HasOnlyManagedDMACalls(func->body);
-  }
 }
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
@@ -588,6 +588,13 @@ void CodeGenTileLangHexagon::Init(bool output_ssa) {
 void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
   // What the session that runs the kernel acquires for it (the skel's open,
   // runtime/fastrpc.py): HMX, or the VTCM alone.
+  if (has_only_managed_calls_) {
+    // The Session can trust the per-module resource declarations only when
+    // none of the combined sources introduce opaque C or external calls.
+    os << "// compute resources: "
+       << (uses_hmx_ || uses_vtcm_ || uses_cooperative_ ? "managed" : "none")
+       << "\n";
+  }
   if (uses_hmx_)
     os << "#define TL_HEXAGON_USES_HMX 1\n";
   if (uses_vtcm_)

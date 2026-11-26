@@ -151,10 +151,18 @@ KERNEL_STATUS = {
 }
 
 
-def run_kernel_entry(source: str) -> str:
+# These lines precede includes and imported text in the generated source.
+_RESOURCE_DECL = "// tilelang Hexagon (cDSP) kernel\n// compute resources: "
+NO_RESOURCES = _RESOURCE_DECL + "none\n"
+MANAGED_RESOURCES = _RESOURCE_DECL + "managed\n"
+
+
+def run_kernel_entry(source: str, *, managed_session: bool = False) -> str:
     """Choose a kernel's resource policy before sources share a translation unit."""
     if re.search(r"^#define TL_HEXAGON_USES_COOPERATIVE 1[ \t]*$", source, re.MULTILINE):
         return "tl_hexagon_run_kernel<true>"
+    if managed_session and source.startswith(NO_RESOURCES):
+        return "tl_hexagon_run_kernel<false, false>"
     return "tl_hexagon_run_kernel"
 
 
@@ -235,41 +243,32 @@ static inline int tl_hexagon_open(void) {{
 
 // A kernel's run, between take and give; a nonzero status comes back from
 // run() as KERNEL_STATUS_BASE + status, an error FastRPC passes through.
-template <bool Cooperative = false, typename Fn>
+template <bool Cooperative = false, bool NeedsResources = true, typename Fn>
 static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
 #if defined(TL_HEXAGON_USES_COOPERATIVE)
   int tl_rc = tl_resource_prepare(Cooperative);
   if (tl_rc != TL_OK) return (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
-  if constexpr (Cooperative) {{
-    if constexpr (std::is_void_v<decltype(fn())>)
-      fn();
-    else
-      tl_rc = (int)fn();
-  }} else {{
-    tl_rc = tl_hexagon_take();
-    if (tl_rc == TL_OK) {{
-      if constexpr (std::is_void_v<decltype(fn())>)
-        fn();
-      else
-        tl_rc = (int)fn();
-      // Publish the body status before cleanup can record a secondary error.
-      if (tl_rc != TL_OK) tl_resource_fail(&tl_resource_state, tl_rc);
-      int tl_cleanup = tl_hexagon_give();
-      if (tl_rc == TL_OK) tl_rc = tl_cleanup;
-    }}
-  }}
-  tl_rc = tl_resource_finish(tl_rc);
 #else
   static_assert(!Cooperative, "Cooperative kernel needs its runtime header");
-  int tl_rc = tl_hexagon_take();
+  int tl_rc = TL_OK;
+#endif
+  if constexpr (!Cooperative && NeedsResources) tl_rc = tl_hexagon_take();
   if (tl_rc == TL_OK) {{
     if constexpr (std::is_void_v<decltype(fn())>)
       fn();
     else
       tl_rc = (int)fn();
-    int tl_cleanup = tl_hexagon_give();
-    if (tl_rc == TL_OK) tl_rc = tl_cleanup;
+    if constexpr (!Cooperative && NeedsResources) {{
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+      // Publish the body status before cleanup can record a secondary error.
+      if (tl_rc != TL_OK) tl_resource_fail(&tl_resource_state, tl_rc);
+#endif
+      int tl_cleanup = tl_hexagon_give();
+      if (tl_rc == TL_OK) tl_rc = tl_cleanup;
+    }}
   }}
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+  tl_rc = tl_resource_finish(tl_rc);
 #endif
   return tl_rc == TL_OK ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
 }}

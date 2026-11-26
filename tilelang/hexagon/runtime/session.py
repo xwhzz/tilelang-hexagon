@@ -50,6 +50,8 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tilelang.hexagon.codegen import _GeneratedSource, kernel_entry_name
+
 from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
@@ -91,8 +93,6 @@ _TURN_GAVE_UP = fastrpc.KERNEL_STATUS_BASE + 0xFF
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
 _MAX_BUFFERS = 256
-
-_KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def _align(n: int) -> int:
@@ -259,6 +259,10 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]], external: dict
         else:
             parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
+    # An opaque source in this translation unit can redefine a sibling's helpers.
+    managed = all(
+        isinstance(src, _GeneratedSource) and src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels
+    )
     for i, (_, source, plans) in enumerate(kernels):
         if external and i in external:
             source = external[i]
@@ -267,7 +271,7 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]], external: dict
             call = f"tl_session_kernel_{i}({_kernel_args(plans)})"
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return {call}; }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source, managed_session=managed)}([&]() {{ return {call}; }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -1044,20 +1048,21 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         with contextlib.suppress(OSError, ValueError, KeyError):
             with open(path) as f:
                 entry = json.load(f)
-            return entry["name"], entry["source"]
+            source = entry["source"]
+            if entry.get("source_digest") == hashlib.sha256(source.encode()).hexdigest():
+                source = _GeneratedSource(source)
+            return entry["name"], source
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-    source = str(art.kernel_source)
-    match = _KERNEL_RE.search(source)
-    if not match:
-        raise RuntimeError("could not find the kernel function in the generated source")
+    source = _GeneratedSource(art.kernel_source)
+    name = kernel_entry_name(art.device_mod)
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": match.group(1), "source": source}, f)
+            json.dump({"name": name, "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
-    return match.group(1), source
+    return name, source
 
 
 def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:

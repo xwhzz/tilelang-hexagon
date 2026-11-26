@@ -499,7 +499,9 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step).
+    the decode, a token a step). Generation uses as many calls as needed to
+    fit each call in the `max_tokens` scratch slots and the full request in
+    the `max_pos` context positions.
 
     The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
     weights and its cache of max_pos positions fit), each a stage of the
@@ -752,6 +754,9 @@ class Decoder:
             self.session.pipeline(stages, min(self.CALL_STEPS, steps - s0))
             self.seconds += self.session.last_run_seconds()
 
+    def _fp16_decode_steps(self, pos0: int, n: int, n_forced: int) -> None:
+        self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+
     def last_run_seconds(self) -> float:
         """How long the last run or prefill took on the DSP: its FastRPC
         calls, each timed by the agent on the device, without the host's
@@ -797,7 +802,7 @@ class Decoder:
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
         if self.fp16:
             # A token a step, through the stages in turn (decode_fp16.make_decode).
-            self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+            self._fp16_decode_steps(pos0, n, n_forced)
         else:
             args = [
                 *self.args,
@@ -821,12 +826,28 @@ class Decoder:
         """Positions pos0 .. pos0 + len(tokens) - 1 from `tokens`: their KV cache
         entries and the conv state they leave, in chunks of prefill_rows."""
         n, R = len(tokens), self.prefill_rows
-        assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
-        self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
+        assert R and pos0 >= 0 and 1 <= n <= self.max_tokens and pos0 + n <= self.max_pos
+        chunks = -(-n // R)
+        fits = pos0 + chunks * R <= self.max_pos
+        assert self.fp16 or fits
+        ids = torch.tensor(list(tokens), dtype=torch.int32)
         if self.fp16:
-            # A chunk a step, through the stages in turn (prefill_fp16.make_prefill).
-            self._pipeline(len(self.stages), [[*st.prefill, pos0, n] for st in self.stages], -(-n // R))
+            # A prefill step accesses R physical KV rows, even for a short last
+            # chunk. Finish a chunk that would cross the cache end one token at
+            # a time, using the resident decode stages and their exact KV stores.
+            batched = n if fits else (chunks - 1) * R
+            if batched:
+                self.tokens.write(ids[:batched])
+                self._pipeline(len(self.stages), [[*st.prefill, pos0, batched] for st in self.stages], -(-batched // R))
+            if batched < n:
+                seconds = self.seconds if batched else 0.0
+                # Match the prefill embedding's token clamp. Forced decode also
+                # uses the next token as an index when computing its score.
+                self.tokens.write(ids[batched:].clamp_(0, self.c.vocab - 1))
+                self._fp16_decode_steps(pos0 + batched, n - batched, n - batched)
+                self.seconds += seconds
         else:
+            self.tokens.write(ids)
             state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
             self.seconds = self.session.last_run_seconds()
@@ -850,23 +871,49 @@ class Decoder:
             if timings is not None:
                 timings.append((kernel, tokens, self.last_run_seconds()))
 
+        if n_new < 0:
+            raise ValueError("the number of new tokens must be nonnegative")
+        if n_new == 0:
+            return
+        if len(prompt) == 0 or chunk < 1 or self.max_tokens < 2:
+            raise ValueError("generation needs a prompt, a positive chunk, and token storage for an input and an output")
+        if len(prompt) - 1 + n_new > self.max_pos:
+            raise ValueError("the prompt and requested decode steps exceed the context")
+
         self.reset()
-        if self.prefill_rows and len(prompt) > 1:
-            self.prefill(prompt[:-1])
-            timed("prefill", len(prompt) - 1)
-            last, pos, done = prompt[-1], len(prompt) - 1, 0
-        else:
-            k = min(chunk, n_new)
-            tokens, _ = self.run(prompt, 0, len(prompt) + k - 1, len(prompt), temperature, seed)
-            timed("decode", len(prompt) + k - 1)
-            yield tokens[len(prompt) :]
-            last, pos, done = tokens[-1], len(prompt) - 1 + k, k
+        pos, end = 0, len(prompt) - 1
+        rows, capacity = self.prefill_rows, self.max_tokens
+        while rows and pos < end:
+            remaining = end - pos
+            # Use whole prefill tiles between calls when the token buffer fits
+            # them. A single call keeps its original chunk boundaries.
+            n = remaining if remaining <= capacity else (capacity // rows * rows or capacity)
+            if not self.fp16 and pos + -(-n // rows) * rows > self.max_pos:
+                # The quantized prefill stores full physical rows. Finish the
+                # physical tail with the same forced decode path as below.
+                n = (self.max_pos - pos) // rows * rows
+                if not n:
+                    break
+            self.prefill(prompt[pos : pos + n], pos)
+            timed("prefill", n)
+            pos += n
+
+        while len(prompt) - pos >= capacity:
+            # The overlapping token is a forced output of this call and the
+            # first input of the next. Every position advances KV exactly once.
+            n = capacity - 1
+            self.run(prompt[pos : pos + capacity], pos, n, capacity, temperature, seed)
+            timed("decode", n)
+            pos += n
+
+        forced, done = prompt[pos:], 0
         while done < n_new:
-            k = min(chunk, n_new - done)
-            tokens, _ = self.run([last], pos, k, 1, temperature, seed)
-            timed("decode", k)
-            yield tokens[1:]
-            last, pos, done = tokens[-1], pos + k, done + k
+            k = min(chunk, n_new - done, capacity - len(forced))
+            steps = len(forced) - 1 + k
+            tokens, _ = self.run(forced, pos, steps, len(forced), temperature, seed)
+            timed("decode", steps)
+            yield tokens[len(forced) :]
+            forced, pos, done = tokens[-1:], pos + steps, done + k
 
     def generate(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0) -> list:
         """The `n_new` tokens after `prompt`, from an empty context: greedy, or
