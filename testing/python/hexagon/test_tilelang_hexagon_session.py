@@ -308,6 +308,32 @@ def test_jit_writes_dma_only_destination():
 
 
 @DEVICE
+def test_jit_writes_through_derived_external_pointer():
+    import tilelang
+
+    @T.prim_func
+    def store(x: T.Tensor((8,), "int32"), y: T.Tensor((8,), "int32"), choose: T.int32, index: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            T.import_source("static inline void store_i32(void *p) { *(int32_t*)p = 31; }")
+            address = T.handle_add_byte_offset(T.if_then_else(choose > 0, x.data, y.data), index[0] * 4)
+            T.evaluate(T.call_extern("void", "store_i32", address))
+
+    kernel = tilelang.compile(store, target="hexagon")
+    try:
+        x, y = torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32)
+        index = torch.tensor([2], dtype=torch.int32)
+        version = index._version
+        kernel(x, y, 1, index)
+        index[0] = 5
+        kernel(x, y, 0, index)
+        assert x.tolist() == [0, 0, 31, 0, 0, 0, 0, 0]
+        assert y.tolist() == [0, 0, 0, 0, 0, 31, 0, 0]
+        assert index._version == version + 1
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
 def test_by_value_float32_reaches_jit_and_resident_calls():
     import tilelang
 
