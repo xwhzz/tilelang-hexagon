@@ -409,10 +409,11 @@ def make_prefill(
         tiles, which HMX multiplies by V and whose rows sum in fp32. The
         blocks of keys and values come by DMA, a block ahead, straight into
         HMX's operands: the cache keeps them in its tiles."""
+        query_blocks = T.ceildiv(valid, ROWS)
         for h in T.serial(KH):
             kvh = bf.w * KH + h
             for hq in T.serial(group):
-                for rb in T.serial(T.ceildiv(valid, ROWS)):
+                for rb in T.serial(query_blocks):
                     row0 = base + rb * ROWS
                     T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
                     for i, d in T.Parallel(ROWS, HD):
@@ -472,6 +473,9 @@ def make_prefill(
                         bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
                     col = (kvh * group + hq) * HD
                     T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
+        # The output projection reads all R rows, including the padding.
+        for rb in T.serial(query_blocks, R // ROWS):
+            T.clear(bf.hid[rb * ROWS : (rb + 1) * ROWS, bf.w * DW : (bf.w + 1) * DW])
 
     @T.macro
     def branch_block(bf, b, ring, k, A, K: int, first, sums):
