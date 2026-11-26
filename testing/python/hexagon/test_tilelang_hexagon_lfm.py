@@ -712,10 +712,18 @@ def test_chat_continuation_matches_full_replay(model, processes, tiny_bundle, fp
         (actual,) = decoder.stream(second, 1, reuse=True, timings=timings)
         logits = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
         assert timings[0][:2] == ("prefill", len(second) - len(first))
-        (expected,) = decoder.stream(second, 1)
-        reference = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
-        assert actual == expected
-        torch.testing.assert_close(logits, reference, rtol=0, atol=0.01 * reference.abs().max().item())
+        # At a chunk boundary the whole consumed prefix matches. Only the
+        # prediction and the next user input still need to run.
+        third = second + actual + [55, 79]
+        timings.clear()
+        (third_token,) = decoder.stream(third, 1, reuse=True, timings=timings)
+        third_logits = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+        assert timings[0][:2] == ("prefill", 2)
+        for prompt, token, actual_logits in ((second, actual, logits), (third, third_token, third_logits)):
+            (expected,) = decoder.stream(prompt, 1)
+            reference = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+            assert token == expected
+            torch.testing.assert_close(actual_logits, reference, rtol=0, atol=0.01 * reference.abs().max().item())
     finally:
         decoder.close()
 
