@@ -20,12 +20,13 @@ from __future__ import annotations
 import logging
 
 import tvm_ffi
-from tvm import DataType, arith, tirx
+from tvm import DataType, arith, ir, tirx
 
 from tilelang.cpu.op.gemm.gemm_scalar import GemmScalar
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import TILE, TILE_ELEMS, CroutonLayout
 from tilelang.hexagon.intrinsics.panel import PanelLayout, make_hvx_panel_layout
+from tilelang.language.eager.utils import construct_strides
 from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
@@ -62,6 +63,69 @@ def scale_group(gemm, operand: str, g) -> tuple:
             "nor split into whole ones"
         )
     return g, k0 // g
+
+
+def _external_strided_view(buf, layout_map):
+    """Preserve the physical strides in an explicitly strided global ABI."""
+    if buf.scope() != "global" or not buf.strides or buf not in layout_map:
+        return buf
+    analyzer = arith.Analyzer()
+    if all(analyzer.can_prove_equal(s, d) for s, d in zip(buf.strides, construct_strides(buf.shape))):
+        return buf
+    if not _row_major(buf, layout_map):
+        raise ValueError(f"Hexagon GEMM: {buf.name} combines noncompact global strides with a non-row-major layout")
+    # LowerTileOp remaps annotated loads to compact storage. The global ABI
+    # has its original strides, so access it through its unannotated view.
+    return tirx.decl_buffer(buf.shape, buf.dtype, data=buf.data, strides=buf.strides, elem_offset=buf.elem_offset, name=buf.name)
+
+
+def _sfb_row_stride(buf, layout_map, origin, groups, cols):
+    """The physical row stride if this slice has contiguous columns."""
+    analyzer = arith.Analyzer()
+    layout = layout_map.get(buf, None)
+    if layout is None:
+        strides = _strides(buf)
+        return strides[-2] if analyzer.can_prove_equal(strides[-1], 1) else None
+    if _row_major(buf, layout_map):
+        return buf.shape[-1]  # LowerTileOp remaps layouts to compact physical buffers.
+
+    # A submatrix can be directly addressable even within a non-row-major
+    # buffer, e.g. its batch axes have a different physical order.
+    axes = layout.get_forward_vars()
+    if len(axes) != len(origin):
+        return None
+    g, n = tirx.Var("g", origin[-2].dtype), tirx.Var("n", origin[-1].dtype)
+    analyzer.bind(g, ir.Range.from_min_extent(0, groups))
+    analyzer.bind(n, ir.Range.from_min_extent(0, cols))
+    indices = (*origin[:-2], origin[-2] + g, origin[-1] + n)
+    linear = tirx.stmt_functor.substitute(layout.get_linearized_forward_index(), dict(zip(axes, indices)))
+    coeffs = arith.detect_linear_equation(analyzer.simplify(linear), [g, n])
+    if coeffs and analyzer.can_prove_equal(coeffs[1], 1) and analyzer.can_prove(coeffs[0] >= 0):
+        return coeffs[0]
+    return None
+
+
+def group_major_sfb(region, layout_map, first_group, groups, cols):
+    """Return a reader and row stride for the GEMM's [group, column] scales."""
+    buf = region.buffer
+    origin = tuple(r.min for r in region.region)
+    if len(origin) < 2:
+        raise ValueError(f"T.gemm_blockscaled: SFB {buf.name} must have one row per scale group")
+    origin = (*origin[:-2], origin[-2] + first_group, origin[-1])
+    buf = _external_strided_view(buf, layout_map)
+    ld = _sfb_row_stride(buf, layout_map, origin, groups, cols)
+    if ld is not None:
+        ptr = T.access_ptr(buf[origin], "r", (groups - 1) * ld + cols)
+        return lambda: ptr, ld
+
+    @T.macro
+    def pack():
+        packed_sfb = T.alloc_shared((groups, cols), buf.dtype)
+        for g, n in T.Parallel(groups, cols):
+            packed_sfb[g, n] = buf[(*origin[:-2], origin[-2] + g, origin[-1] + n)]
+        return T.access_ptr(packed_sfb[0, 0], "r", groups * cols)
+
+    return pack, cols
 
 
 def _is_integer(dtype) -> bool:
@@ -250,13 +314,8 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
         if len(sfa_origin) < 2 and M > 1:
             raise ValueError(f"T.gemm_blockscaled: SFA {sfa_region.buffer.name} holds one row of factors for {M} rows of A")
         ld_sfa = int(_strides(sfa_region.buffer)[-2]) if len(sfa_origin) >= 2 else 0
-        sfb_origin = [r.min for r in sfb_region.region]
-        if len(sfb_origin) < 2:
-            raise ValueError(f"T.gemm_blockscaled: SFB {sfb_region.buffer.name} is [K / {gb}, N], group-major")
-        sfb_origin[-2] = sfb_origin[-2] + first_b
-        ld_sfb = int(_strides(sfb_region.buffer)[-2])
         sfa = T.access_ptr(sfa_region.buffer[tuple(sfa_origin)], "r", (M - 1) * ld_sfa + K // ga)
-        sfb = T.access_ptr(sfb_region.buffer[tuple(sfb_origin)], "r", (K // gb - 1) * ld_sfb + N)
+        read_sfb, ld_sfb = group_major_sfb(sfb_region, layout_map, first_b, K // gb, N)
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int_scaled")
         flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, ga, gb, tirx.const(bool(align_c), "bool")]
         clear = self.clear_accum
@@ -264,7 +323,9 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
         @T.prim_func
         def _gemm_hvx_blockscaled() -> None:
             T.evaluate(
-                tirx.call_intrin("void", gemm, M, N, K, *flags, c, a, b, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, T.Cast("bool", clear))
+                tirx.call_intrin(
+                    "void", gemm, M, N, K, *flags, c, a, b, panel_bytes, sfa, ld_sfa, read_sfb(), ld_sfb, T.Cast("bool", clear)
+                )
             )
 
         return _gemm_hvx_blockscaled

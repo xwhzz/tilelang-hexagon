@@ -499,7 +499,9 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step).
+    the decode, a token a step). Generation uses as many calls as needed to
+    fit each call in the `max_tokens` scratch slots and the full request in
+    the `max_pos` context positions.
 
     The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
     weights and its cache of max_pos positions fit), each a stage of the
@@ -930,52 +932,71 @@ class Decoder:
             if timings is not None:
                 timings.append((kernel, tokens, self.last_run_seconds()))
 
+        if n_new < 0:
+            raise ValueError("the number of new tokens must be nonnegative")
+        if n_new == 0:
+            return
+        if len(prompt) == 0 or chunk < 1 or self.max_tokens < 2:
+            raise ValueError("generation needs a prompt, a positive chunk, and token storage for an input and an output")
+        if len(prompt) - 1 + n_new > self.max_pos:
+            raise ValueError("the prompt and requested decode steps exceed the context")
+
         if reuse:
-            start = self._chat_position(prompt)
+            pos = self._chat_position(prompt)
         else:
             self.reset()
-            start = 0
-        if reuse or (self.prefill_rows and len(prompt) > 1):
-            last, pos, done = prompt[-1], len(prompt) - 1, 0
-            if start and self.prefill_rows and not self.fp16:
-                # The quantized prefill needs a whole physical chunk to fit.
-                # An unaligned suffix near the end can require a fresh replay.
-                rows = self.prefill_rows
-                if start + -(-(pos - start) // rows) * rows > self.max_pos:
-                    self.reset()
-                    start = 0
-            if pos > start:
-                suffix = prompt[start:pos]
-                if self.prefill_rows:
-                    self.prefill(suffix, start)
-                    timed("prefill", len(suffix))
-                else:
-                    self.run(suffix, start, len(suffix), len(suffix))
-                    timed("decode", len(suffix))
-            if reuse:
-                if pos:
-                    self._copy_chat_conv(restore=False)
-                self._chat_saved_pos = pos
-                self._chat_tokens = consumed = prompt[:pos]
-        else:
-            k = min(chunk, n_new)
-            tokens, _ = self.run(prompt, 0, len(prompt) + k - 1, len(prompt), temperature, seed)
-            timed("decode", len(prompt) + k - 1)
-            yield tokens[len(prompt) :]
-            last, pos, done = tokens[-1], len(prompt) - 1 + k, k
+            pos = 0
+        end = len(prompt) - 1
+        rows, capacity = self.prefill_rows, self.max_tokens
+        while rows and pos < end:
+            remaining = end - pos
+            # Use whole prefill tiles between calls when the token buffer fits
+            # them. A single call keeps its original chunk boundaries.
+            n = remaining if remaining <= capacity else (capacity // rows * rows or capacity)
+            if not self.fp16 and pos + -(-n // rows) * rows > self.max_pos:
+                # The quantized prefill stores full physical rows. Finish the
+                # physical tail with the same forced decode path as below.
+                n = (self.max_pos - pos) // rows * rows
+                if not n:
+                    break
+            self.prefill(prompt[pos : pos + n], pos)
+            timed("prefill", n)
+            pos += n
+
+        while len(prompt) - pos >= capacity:
+            # The overlapping token is a forced output of this call and the
+            # first input of the next. Every position advances KV exactly once.
+            n = capacity - 1
+            self.run(prompt[pos : pos + capacity], pos, n, capacity, temperature, seed)
+            timed("decode", n)
+            pos += n
+
+        if reuse:
+            if pos < end:
+                # Finish the forced suffix so the checkpoint is immediately
+                # before the prompt's last token, even with no prefill kernel.
+                self.run(prompt[pos:], pos, end - pos, end - pos + 1, temperature, seed)
+                timed("decode", end - pos)
+            pos = end
+            if pos:
+                self._copy_chat_conv(restore=False)
+            self._chat_saved_pos = pos
+            self._chat_tokens = consumed = prompt[:pos]
+
+        forced, done = prompt[pos:], 0
         while done < n_new:
             if reuse and self._chat_tokens is not consumed:
                 raise RuntimeError("Decoder state changed between streamed chunks")
-            k = min(chunk, n_new - done)
-            tokens, _ = self.run([last], pos, k, 1, temperature, seed)
+            k = min(chunk, n_new - done, capacity - len(forced))
+            steps = len(forced) - 1 + k
+            tokens, _ = self.run(forced, pos, steps, len(forced), temperature, seed)
             if reuse:
-                # The last output is a prediction. The other k token IDs have
-                # actually advanced the device state, even if the caller stops.
+                # The returned chunk's final prediction has not advanced state.
                 consumed.extend(tokens[:-1])
                 self._chat_tokens = consumed
-            timed("decode", k)
-            yield tokens[1:]
-            last, pos, done = tokens[-1], pos + k, done + k
+            timed("decode", steps)
+            yield tokens[len(forced) :]
+            forced, pos, done = tokens[-1:], pos + steps, done + k
 
     def generate(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0) -> list:
         """The `n_new` tokens after `prompt`, from an empty context: greedy, or

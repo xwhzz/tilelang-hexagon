@@ -209,6 +209,101 @@ def _blockscaled(M, N, K, G, a_dtype, b_dtype, clear, GA=None, split=1):
     return gemm
 
 
+def _sfb_layout_gemm(hmx, storage):
+    M, N, K = (32 if hmx else 1), 32, 128
+    ad, bd = ("float16", "uint4") if hmx else ("int16", "uint8")
+    shape = (2, 5, 64)
+    raw = storage.startswith(("strided", "pitched"))
+    strides = (320, 1, 5) if storage.startswith("strided") else (400, 80, 1)
+    sb_type = T.StridedTensor(shape, strides, "float16") if raw else T.Tensor(shape, "float16")
+
+    @T.prim_func
+    def gemm(
+        A: T.Tensor((M, K), ad), B: T.Tensor((N, K), bd), SA: T.Tensor((M, 1), "float32"), SB: sb_type, C: T.Tensor((M, N), "float32")
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), ad)
+            b = T.alloc_shared((N, K), bd)
+            c = T.alloc_shared((M, N), "float32")
+            sb = T.alloc_shared(shape, "float16")
+            T.annotate_layout({B: make_hvx_panel_layout(B)})
+            if storage in ("strided_identity", "pitched_identity"):
+                T.annotate_layout({SB: T.Layout(shape, lambda i, g, n: [i, g, n])})
+            elif storage == "strided_conflict":
+                T.annotate_layout({SB: T.Layout(shape, lambda i, g, n: [i, n, g])})
+            elif storage == "transpose":
+                T.annotate_layout({sb: T.Layout(shape, lambda i, g, n: [i, n, g])})
+            elif storage == "batch_reverse":
+                T.annotate_layout({sb: T.Layout(shape, lambda i, g, n: [1 - i, g, n])})
+            elif storage == "identity":
+                T.annotate_layout({sb: T.Layout(shape, lambda i, g, n: [i, g, n])})
+            T.copy(A, a)
+            T.copy(B, b)
+            if not raw:
+                T.copy(SB, sb)
+            scales = SB if raw else sb
+            T.gemm_blockscaled(
+                a,
+                b,
+                c,
+                SA,
+                scales[1, 1:5, 16:48],
+                transpose_B=True,
+                clear_accum=True,
+                k_start=64,
+                sf_a_granularity_k=256,
+                sf_b_granularity_k=64,
+            )
+            T.copy(c, C)
+
+    return gemm
+
+
+@pytest.mark.parametrize("hmx", [False, True])
+def test_sfb_layout_prepares_only_non_group_major_scales(hmx):
+    direct = _lower(_sfb_layout_gemm(hmx, "dense")).kernel_source
+    identity = _lower(_sfb_layout_gemm(hmx, "identity")).kernel_source
+    packed = _lower(_sfb_layout_gemm(hmx, "transpose")).kernel_source
+    assert direct == identity
+    assert "packed_sfb" not in direct
+    batch = _lower(_sfb_layout_gemm(hmx, "batch_reverse")).kernel_source
+    assert "packed_sfb" not in batch
+    assert "[144])), 64," in batch
+    assert "packed_sfb" in packed
+    strided = _lower(_sfb_layout_gemm(hmx, "strided")).kernel_source
+    assert "packed_sfb" in strided
+    pitched = _lower(_sfb_layout_gemm(hmx, "pitched")).kernel_source
+    assert "packed_sfb" not in pitched
+    assert "[576])), 80," in pitched
+    assert _lower(_sfb_layout_gemm(hmx, "pitched_identity")).kernel_source == pitched
+    assert _lower(_sfb_layout_gemm(hmx, "strided_identity")).kernel_source == strided
+    with pytest.raises(Exception, match="combines noncompact global strides with a non-row-major layout"):
+        _lower(_sfb_layout_gemm(hmx, "strided_conflict"))
+
+
+@DEVICE
+@pytest.mark.parametrize("hmx", [False, True])
+@pytest.mark.parametrize("storage", ["transpose", "strided", "batch_reverse", "strided_identity", "pitched_identity"])
+def test_sfb_layout_reads_offset_and_first_group(hmx, storage):
+    m = 32 if hmx else 1
+    kernel = tilelang.compile(_sfb_layout_gemm(hmx, storage), out_idx=[4], target="hexagon")
+    try:
+        a = torch.ones((m, 128), dtype=torch.float16 if hmx else torch.int16)
+        b = pack_panel(torch.ones((32, 128), dtype=torch.int64), 4 if hmx else 8)
+        sa = torch.ones((m, 1))
+        sb = torch.arange(2 * 5 * 64).reshape(2, 5, 64).remainder(29).half()
+        sb_arg = sb
+        if storage == "pitched_identity":
+            backing = torch.full((784,), -1, dtype=torch.float16)
+            backing.as_strided(sb.shape, (400, 80, 1)).copy_(sb)
+            sb_arg = backing.numpy().tobytes()
+        result = kernel(a, b, sa, sb_arg)
+        expected = 64 * sb[1, 2:4, 16:48].float().sum(0)
+        torch.testing.assert_close(result, expected.expand(m, 32), rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_blockscaled_gemm_is_one_fused_call():
     source = _lower(_blockscaled(1, 128, 2048, 64, "int16", "int4", True)).kernel_source
     # Groups of 64 for B, one factor per row of A; SFB rows of 128 factors.
