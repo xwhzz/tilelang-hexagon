@@ -88,15 +88,19 @@ bool SafeToEvaluate(const PrimExpr &expr, arith::Analyzer *analyzer) {
   return safe;
 }
 
-// IRMutatorWithAnalyzer also folds conditional statements and normalizes
-// existing Selects. All other loops can bypass the predicate rewrite.
-bool HasConditional(const Stmt &stmt) {
+// The analyzer mutator also folds conditional statements, normalizes Selects,
+// and flattens statement sequences before vector width selection.
+bool NeedsPredicateRewrite(const Stmt &stmt) {
   bool found = false;
   PreOrderVisit(stmt, [&](const ObjectRef &node) {
     if (!found) {
-      const auto *call = node.as<CallNode>();
-      found = node.as<IfThenElseNode>() || node.as<SelectNode>() ||
-              (call && call->op.same_as(builtin::if_then_else()));
+      if (const auto *seq = node.as<SeqStmtNode>()) {
+        found = !SeqStmt::Flatten(GetRef<Stmt>(seq)).same_as(node);
+      } else {
+        const auto *call = node.as<CallNode>();
+        found = node.as<IfThenElseNode>() || node.as<SelectNode>() ||
+                (call && call->op.same_as(builtin::if_then_else()));
+      }
     }
     return !found;
   });
@@ -1608,7 +1612,7 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 For VectorizeLoop(const For &loop, const arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
   For body = loop;
-  if (TargetHasVectorPredicates() && HasConditional(loop)) {
+  if (TargetHasVectorPredicates() && NeedsPredicateRewrite(loop)) {
     auto select_analyzer = analyzer->Clone();
     body = Downcast<For>(IfThenElseToSelect(select_analyzer.get())(loop));
   }

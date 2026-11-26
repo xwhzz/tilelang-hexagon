@@ -30,6 +30,25 @@ def test_maps_use_whole_hvx_registers(dtype, vector):
     assert f"(*({vector}*)(A + " in source
 
 
+def test_noop_keeps_single_store_vector_width():
+    def make(with_noop):
+        @T.prim_func
+        def narrow(A: T.Tensor((128,), "int16"), B: T.Tensor((128,), "int8")):
+            with T.Kernel(1):
+                values = T.alloc_fragment((128,), "int16")
+                T.copy(A, values)
+                for i in T.Parallel(128):
+                    if with_noop:
+                        T.evaluate(0)
+                    B[i] = T.Cast("int8", values[i])
+
+        return narrow
+
+    source = _source(make(False))
+    assert "*(int8_t128*)(B + 0)" in source
+    assert _source(make(True)) == source
+
+
 def test_a_narrow_input_fills_whole_registers():
     @T.prim_func
     def widen(A: T.Tensor((4, 512), "uint8"), B: T.Tensor((4, 512), "float16")):
