@@ -467,6 +467,9 @@ def test_blockscaled_gemm_splits_k_by_its_start():
     "M,N,K,G,GA,split",
     [
         (1, 128, 2048, 64, None, 1),
+        # Four-panel blocks with one or three panels left in the tail.
+        (1, 160, 2048, 64, None, 1),
+        (2, 224, 1024, 128, 64, 2),
         (2, 96, 512, 128, None, 1),
         (1, 64, 8192, 64, None, 1),
         # A's factors per group, finer than B's and coarser, over two calls.

@@ -145,13 +145,13 @@ class GemmHVX(GemmBase):
             return {self.B: make_hvx_panel_layout(self.B)}
         return {}
 
-    def _operand(self, region, rows: int, cols: int, access: str, compact=False):
+    def _operand(self, region, rows: int, cols: int, access: str, layout_map):
         """A pointer to the region's first element that covers `rows` rows of
         `cols` elements, the row stride, and whether the region starts on a
         register boundary."""
 
-        buffer = region.buffer
-        strides = _strides(buffer, compact)
+        buffer = _external_strided_view(region.buffer, layout_map)
+        strides = _strides(buffer, buffer in layout_map)
         ld = int(strides[-2])
         origin = [r.min for r in region.region]
         offset = sum((m * s for m, s in zip(origin, strides)), tirx.Cast("int64", buffer.elem_offset))
@@ -187,8 +187,8 @@ class GemmHVX(GemmBase):
     def _lower_integer(self, layout_map):
         M, N, K = self.M, self.N, self.K
         b, panel_bytes, bits, signed = self._integer_weights(layout_map)
-        a, lda, _ = self._operand(self.ARegion, M, K, "r")
-        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw")
+        a, lda, _ = self._operand(self.ARegion, M, K, "r", layout_map)
+        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw", layout_map)
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int")
         flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, tirx.const(bool(align_c), "bool")]
         clear = self.clear_accum
@@ -221,10 +221,10 @@ class GemmHVX(GemmBase):
             return f"{self.B.name}'s region is not whole Crouton tiles"
         return ""
 
-    def _lower_weight(self):
+    def _lower_weight(self, layout_map):
         M, N, K = self.M, self.N, self.K
-        a, lda, align_a = self._operand(self.ARegion, M, K, "r")
-        c, ldc, _ = self._operand(self.CRegion, M, N, "rw")
+        a, lda, align_a = self._operand(self.ARegion, M, K, "r", layout_map)
+        c, ldc, _ = self._operand(self.CRegion, M, N, "rw", layout_map)
         # A panel's tiles span the matrix's K. B's pointer is at its region's
         # logical start, which LowerTileOp moves through the layout to its tile.
         k_axis, _ = self._weight_axes()
@@ -254,15 +254,15 @@ class GemmHVX(GemmBase):
             logger.warning("T.gemm(%s, %s, %s) runs as a scalar loop, not on HVX: %s", self.A.name, self.B.name, self.C.name, why)
             return GemmScalar.lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr)
         if isinstance(layout, CroutonLayout):
-            return self._lower_weight()
+            return self._lower_weight(layout_map)
         logger.debug(
             "T.gemm(%s, %s, %s) runs on HVX, not on HMX: %s", self.A.name, self.B.name, self.C.name, _hmx_rejection(self.gemm_node)
         )
 
         M, N, K = self.M, self.N, self.K
-        a, lda, align_a = self._operand(self.ARegion, *((K, M) if self.trans_A else (M, K)), "r")
-        b, ldb, align_b = self._operand(self.BRegion, *((N, K) if self.trans_B else (K, N)), "r")
-        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw")
+        a, lda, align_a = self._operand(self.ARegion, *((K, M) if self.trans_A else (M, K)), "r", layout_map)
+        b, ldb, align_b = self._operand(self.BRegion, *((N, K) if self.trans_B else (K, N)), "r", layout_map)
+        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw", layout_map)
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm")
         flags = [tirx.const(bool(x), "bool") for x in (self.trans_A, self.trans_B)]
         aligned = [tirx.const(bool(x), "bool") for x in (align_a, align_b, align_c)]
@@ -297,7 +297,7 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
             return buf, None, cols, True
         if not buf.same_as(region.buffer):
             region = tirx.BufferRegion(buf, region.region)
-        ptr, ld, aligned = self._operand(region, self.M, cols, access, compact)
+        ptr, ld, aligned = self._operand(region, self.M, cols, access, layout_map)
         return buf, ptr, ld, aligned
 
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):

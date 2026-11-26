@@ -13,6 +13,7 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon import language as T
 from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remote_dir
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
@@ -24,7 +25,7 @@ import bundle  # noqa: E402
 import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
-from decode import Decoder, make_decode  # noqa: E402
+from decode import Decoder, add_gumbel, make_decode  # noqa: E402
 from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
@@ -395,6 +396,28 @@ def test_generation_with_short_token_buffer_matches_single_steps(model, tiny_bun
             assert decoder.generate(prompt, 15, temperature, 17) == expected
     finally:
         decoder.close()
+
+
+@DEVICE
+def test_sampling_highest_bin():
+    # At seed 26, position 0, the hash of vocabulary index 118408 ends
+    # in the highest bin. Its fp32 midpoint rounds to 1 before clamping.
+    @T.prim_func
+    def sample(scores: T.Tensor((1, 32), "float32")):
+        with T.Kernel(1):
+            hx = T.alloc_shared((1, 32), "uint32")
+            hy = T.alloc_shared((1, 32), "uint32")
+            add_gumbel(scores, T.float32(1), 26, 0, 118400, hx, hy)
+
+    kernel = tilelang.compile(sample, target="hexagon")
+    try:
+        scores = torch.zeros((1, 32))
+        kernel(scores)
+        assert scores.isfinite().all()
+        expected = -torch.log(-torch.log(torch.tensor(1.0 - 2.0**-24)))
+        torch.testing.assert_close(scores[0, 8], expected)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE

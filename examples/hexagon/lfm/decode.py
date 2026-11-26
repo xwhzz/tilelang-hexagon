@@ -192,6 +192,8 @@ def add_gumbel(logit, scale, seed, pos, first, hx, hy):
         # 24 bits, through int32: an unsigned conversion to float is not safe
         # on HVX (hexagon-clang 19 selects IEEE instructions v79 does not run).
         u = (T.Cast("float32", T.Cast("int32", hy[i, j] >> T.uint32(8))) + T.float32(0.5)) * T.float32(1.0 / (1 << 24))
+        # The last bin midpoint rounds to 1 in fp32. Keep both logs finite.
+        u = T.min(u, T.float32(1.0 - 2.0**-24))
         logit[i, j] = logit[i, j] * scale + -T.log(-T.log(u))
 
 

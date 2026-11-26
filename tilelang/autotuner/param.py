@@ -381,7 +381,7 @@ class AutotuneResult:
             if verbose:
                 logger.debug(f"Loading kernel parameters from file: {params_path}")
             with open(params_path) as f:
-                kernel_params = load_kernel_params(f.read())
+                kernel_params = load_kernel_params(f.read(), func=func)
         except Exception as e:
             logger.error(f"Error loading kernel parameters from disk: {e}")
 

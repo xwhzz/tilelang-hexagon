@@ -28,7 +28,7 @@ using namespace ffi;
 Module BuildTileLangHexagon(IRModule mod, Target target) {
   CodeGenTileLangHexagon cg;
   cg.Init(/*output_ssa=*/false);
-  cg.CheckLoadOnlyDMAModule(mod);
+  cg.CheckManagedCalls(mod);
   cg.SetEmitLineDirectives(tl::tl_config::EmitLineDirectivesEnabled());
 
   std::vector<std::pair<GlobalVar, PrimFunc>> funcs;

@@ -50,11 +50,13 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tilelang.hexagon.codegen import _GeneratedSource, single_device_kernel
+
 from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
-from .tensor import byte_buffer, pack_buffer, unpack_buffer
+from .tensor import byte_buffer, check_writeback, pack_buffer, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -80,6 +82,7 @@ _INPUT = 1  # (byte offset into the inputs, 0)
 _OUTPUT = 2  # (byte offset into the outputs, 0)
 _SCALAR = 3  # (value, 0)
 _STEP = 4  # a pipeline stage's step index plus `first`, filled in at each step: (first, 0)
+_INOUT = 5  # (shared byte offset in the inline input and output blocks, size)
 
 # Agent operations.
 _OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_LOAD, _OP_TIMING, _OP_PIPELINE = range(10)
@@ -91,8 +94,6 @@ _TURN_GAVE_UP = fastrpc.KERNEL_STATUS_BASE + 0xFF
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
 _MAX_BUFFERS = 256
-
-_KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def _align(n: int) -> int:
@@ -238,18 +239,22 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     every kernel's entry renamed to its index."""
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
-        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <type_traits>\n",
+        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\n#include <type_traits>\n",
         f'#include "{iface}.h"\n\n',
         fastrpc.SKEL_INCLUDES,
     ]
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
+    # An opaque source in this translation unit can redefine a sibling's helpers.
+    managed = all(
+        isinstance(src, _GeneratedSource) and src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels
+    )
     for i, (_, source, plans) in enumerate(kernels):
         args = ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source, managed_session=managed)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -342,7 +347,7 @@ AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, 
 }}
 
 AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int argsLen, const uint8* inputs, int inputsLen, uint8* outputs, int outputsLen) {{
-  (void)h; (void)inputsLen; (void)outputsLen;
+  (void)h;
   void* a[{max_params}];
   int n = argsLen / 3;
   if (n > {max_params}) return AEE_EBADPARM;
@@ -356,6 +361,15 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
       a[i] = (void*)(inputs + v);
     }} else if (kind == {_OUTPUT}) {{
       a[i] = (void*)(outputs + v);
+    }} else if (kind == {_INOUT}) {{
+      if (v < 0 || o < 0 || v > inputsLen || o > inputsLen - v ||
+          v > outputsLen || o > outputsLen - v) return AEE_EBADPARM;
+      a[i] = (void*)(outputs + v);
+      if (o) {{
+        memcpy(a[i], inputs + v, o);
+        // The kernel may read or overwrite this memory exclusively by DMA.
+        if (qurt_mem_cache_clean((qurt_addr_t)a[i], o, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE) != QURT_EOK) return AEE_EFAILED;
+      }}
     }} else {{
       a[i] = (void*)(intptr_t)v;
     }}
@@ -942,6 +956,7 @@ class SessionKernel:
         self.params = list(params)
         n = len(self.params)
         self.out_idx = [i if i >= 0 else n + i for i in out_idx]
+        self._writable = ()  # Set by JIT adapters with lowered parameter access metadata.
         self.plans = fastrpc._plan(self.params, [])
 
     def __call__(self, *args, process: int = 0):
@@ -1003,20 +1018,21 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         with contextlib.suppress(OSError, ValueError, KeyError):
             with open(path) as f:
                 entry = json.load(f)
-            return entry["name"], entry["source"]
+            source = entry["source"]
+            if entry.get("source_digest") == hashlib.sha256(source.encode()).hexdigest():
+                source = _GeneratedSource(source)
+            return entry["name"], source
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-    source = str(art.kernel_source)
-    match = _KERNEL_RE.search(source)
-    if not match:
-        raise RuntimeError("could not find the kernel function in the generated source")
+    source = _GeneratedSource(art.kernel_source)
+    name = str(single_device_kernel(art.device_mod).attrs["global_symbol"])
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": match.group(1), "source": source}, f)
+            json.dump({"name": name, "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
-    return match.group(1), source
+    return name, source
 
 
 def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:
@@ -1524,10 +1540,25 @@ class Session:
 
     def _run(self, kernel: SessionKernel, given: list, process: int):
         args, inputs, outputs = [], bytearray(), []
-        out_bytes = 0
+        # Inline read/write parameters occupy a common prefix in both wire
+        # blocks. Their initial values and updates travel in the same RUN.
+        writebacks = {}
+        for i in kernel._writable:
+            value = given[i]
+            if value is None or isinstance(value, DeviceBuffer):
+                continue
+            plan = kernel.plans[i]
+            check_writeback(kernel.params, kernel.plans, given, i)
+            raw = pack_buffer(value, kernel.params[i], plan, kernel.name)
+            writebacks[i] = len(inputs)
+            outputs.append((i, len(inputs)))
+            inputs += raw + bytes(_align(len(raw)) - len(raw))
+        out_bytes = len(inputs)
         for i, plan in enumerate(kernel.plans):
             value = given[i]
-            if plan.is_scalar:
+            if i in writebacks:
+                args += [_INOUT, writebacks[i], plan.nbytes]
+            elif plan.is_scalar:
                 args += [_SCALAR, plan.scalar_word(value), 0]
             elif isinstance(value, DeviceBuffer):
                 self._check_resident(kernel, i, value, process)
@@ -1556,7 +1587,11 @@ class Session:
             param = kernel.params[i]
             plan = kernel.plans[i]
             chunk = raw[offset : offset + plan.nbytes]
-            results.append(unpack_buffer(chunk, param))
+            result = unpack_buffer(chunk, param)
+            if i in writebacks:
+                given[i].detach().copy_(result.reshape(given[i].shape))
+            else:
+                results.append(result)
         if not results:
             return None
         return results[0] if len(results) == 1 else results

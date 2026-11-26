@@ -172,8 +172,9 @@ call zeroes A's and B's padding along K before it multiplies, and writes only C'
 columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
 tiles stays row-major. On v79, an M x 512 x 512 GEMM from VTCM takes about 1.3 µs on HMX
 for any M from 2 to 32, against 16 µs (M = 2) to 135 µs (M = 16) on HVX. A GEMV (M = 1)
-stays on HVX, as do the GEMMs whose A or B has a layout of its own (`T.annotate_layout`),
-such as the LFM decode's, whose weights stream by DMA in the HMX weight layout.
+stays on HVX. An explicit row-major layout on A or B also selects HVX for compatible
+operands, including on whole tiles. HVX can read a row-major A together with B in the
+HMX weight layout, as in LFM decode. Matching HMX operand annotations preserve HMX.
 
 Any other GEMM of row-major matrices runs on HVX (`GemmHVX`, `tl.hexagon.GemmHVXRejection`):
 fp16 operands into an fp16 or fp32 C, fp32 operands into an fp32 C, any M, N and K, at most
@@ -319,6 +320,11 @@ column-contiguous fp16 matrix (a transposed weight in row-major storage) goes th
 
 HVX code works on Crouton buffers directly, so chained gemms and the maps between them
 (the flash attention softmax on `S`, an FFN gate `silu(h1) * h3`) convert no layouts.
+A `T.copy` between two matching Crouton layouts moves tile-aligned FP16
+regions a register at a time. For stacks, each pair of corresponding matrices
+moves in leading-axis order. Slices may start at different matrices or tiles
+at each endpoint.
+
 A Crouton layout's physical shape is `[tiles, 16 row pairs, 64 lanes]`, and a
 single-thread `T.Parallel` that writes every element of a buffer with a layout iterates
 in that buffer's physical order (`LowerTileOp`): a loop over tiles and their row pairs,
