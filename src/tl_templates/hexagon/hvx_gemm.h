@@ -44,6 +44,7 @@
 #include <tl_templates/hexagon/common.h>
 #include <tl_templates/hexagon/hvx_lanes.h>
 
+#include <limits>
 #include <type_traits>
 
 #ifndef TL_DEVICE
@@ -1065,12 +1066,10 @@ TL_GEMM void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
 //             dot_g(i, j)
 //
 // over the groups g of G = min(GA, GB) columns of K, with dot_g(i, j) the
-// exact int32 sum over group g of A[i, k] B(j, k): B as in tl_hvx_gemm_int,
+// exact integer sum over group g of A[i, k] B(j, k): B as in tl_hvx_gemm_int,
 // the scales fp32 (SFA, one per GA columns) and fp16 (SFB, one per GB columns,
 // group-major). GA and GB divide K, or equal it for one factor per row. Each
-// group's int32 sums leave the vrmpy accumulators once, into fp32 accumulators
-// that weigh them by the group's scales: the scaling costs a few operations
-// per group of 32 outputs, against a vrmpy for every 4 or 8 columns of them.
+// group converts its integer dot to fp32 once, before applying its scales.
 
 // The fp32 values of NB runs of 32 consecutive fp16 from p: two runs per
 // conversion, its pair of even and odd lanes shuffled back in order. Scales
@@ -1227,6 +1226,53 @@ constexpr int tl_gemm_int_block(int panels) {
   return panels % 4 == 0 ? 4 : panels % 3 == 0 ? 3 : panels % 2 == 0 ? 2 : 1;
 }
 
+// A 256-column dot and its signed-weight correction fit in int32 even for
+// int16 x uint8. Accumulate these exact pieces in int64 before applying
+// the common scale, so large opposite partials can cancel down to one.
+template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
+          int GA, int GB, typename TA>
+TL_DEVICE void tl_gemm_wide_groups(float *C, const TA *A, const uint8_t *B,
+                                   int panel_bytes, const float *sfa,
+                                   int ld_sfa, const half *sfb, int ld_sfb,
+                                   bool clear) {
+  constexpr int Group = tl_gemm_min(GA, GB);
+  constexpr int Lane = 32 / BBits;
+  constexpr int NB = tl_gemm_int_block(N / 32);
+  constexpr int Cols = 32 * NB;
+  tl_gemm_int_row<TA, BBits, 256> row;
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; n += Cols) {
+      alignas(128) float total[Cols] = {};
+      for (int g = 0; g < K; g += Group) {
+        alignas(128) int64_t sum[Cols] = {};
+        for (int k = 0; k < Group; k += 256) {
+          const int count = tl_gemm_min(Group - k, 256);
+          row.stage(A + m * LdA + g + k, count, BSigned);
+          alignas(128) int32_t chunk[Cols];
+          tl_gemm_int_panels<TA, BBits, BSigned, NB, 256, true>(
+              chunk, row, B + (n / 32) * panel_bytes + ((g + k) / Lane) * 128,
+              panel_bytes, count / Lane, true);
+          for (int j = 0; j < Cols; ++j)
+            sum[j] += chunk[j];
+        }
+        for (int j = 0; j < Cols; ++j) {
+          float scale = sfb[(g / GB) * ld_sfb + n + j];
+          if constexpr (GA < K)
+            scale *= sfa[m * ld_sfa + g / GA];
+          total[j] += static_cast<float>(sum[j]) * scale;
+        }
+      }
+      for (int j = 0; j < Cols; ++j) {
+        float result = total[j];
+        if constexpr (GA == K)
+          result *= sfa[m * ld_sfa];
+        float &dst = C[m * LdC + n + j];
+        dst = clear ? result : dst + result;
+      }
+    }
+  }
+}
+
 template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
           int GA, int GB, bool AlignC, typename TA>
 TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
@@ -1244,6 +1290,14 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
   static_assert(N % 32 == 0 && K % GA == 0 && K % GB == 0 &&
                     Group % lane == 0 && GA % Group == 0 && GB % Group == 0,
                 "HVX block-scaled GEMM: whole panels and whole scale groups");
+  constexpr int MaxA = std::is_signed_v<TA> ? -std::numeric_limits<TA>::min()
+                                            : std::numeric_limits<TA>::max();
+  constexpr int MaxB = BSigned ? (1 << (BBits - 1)) : (1 << BBits) - 1;
+  if constexpr (int64_t{Group} * MaxA * MaxB > INT32_MAX) {
+    tl_gemm_wide_groups<M, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
+        C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear);
+    return;
+  }
   // Columns per staged chunk of A's row, whole groups; panels per block.
   constexpr int KC = Group >= 512 ? Group : tl_gemm_min(K, 512 / Group * Group);
   constexpr int NB = tl_gemm_int_block(N / 32);

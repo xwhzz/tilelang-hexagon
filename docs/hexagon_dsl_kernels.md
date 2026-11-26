@@ -219,7 +219,7 @@ the lane. 4-bit buffers are addressed by whole registers only: copied and multip
 read element by element.
 
 Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
-the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
+the integer GEMM above into an fp32 C, each group's integer sums weighed by an fp32 factor of
 A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
 per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
 group-major scales directly, including a padded row stride. For another physical layout
@@ -227,9 +227,10 @@ they pack the scale rows and columns used by the call into group-major VTCM stor
 Global scales with explicit noncompact strides accept an identity layout annotation.
 For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
 With interleaved activation or output columns it stages just the affected row, gathering
-the previous output only for accumulation. The sums leave the vrmpy accumulators once per
-group, into fp32 accumulators, and a signed B's offset comes off each group with that
-group's sum of A.
+the previous output only for accumulation. For groups whose operand ranges fit an int32
+dot product, HVX combines the byte planes in registers. A larger group uses bounded
+int32 partial dots and accumulates them in int64 before converting to fp32. This
+preserves cancellation across the group, including for signed weights.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one

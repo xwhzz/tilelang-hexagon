@@ -496,6 +496,58 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
         kernel.adapter.close()
 
 
+@DEVICE
+@pytest.mark.parametrize(
+    "dtype,ga,gb,clear",
+    [
+        ("uint8", 512, 512, True),
+        ("uint8", 1280, 640, False),
+        ("int8", 576, 1152, True),
+        ("int8", 512, 512, False),
+        ("int4", 8192, 8192, True),
+        ("uint4", 4480, 4480, False),
+    ],
+)
+def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear):
+    m, n, k, group = 4, 64, max(ga, gb), min(ga, gb)
+    a = torch.empty((m, k), dtype=torch.int16)
+    a[0], a[1], a[2] = 20000, -32768, 32767
+    w = torch.empty((n, k), dtype=torch.int64)
+    bits = BITS[dtype]
+    signed = dtype.startswith("int")
+    low = -(1 << (bits - 1)) if signed else 0
+    high = -low - 1 if signed else (1 << bits) - 1
+    extreme = low if signed else high
+    w[:16] = 220 if dtype == "uint8" else extreme
+    w[16:32] = high
+    w[32:] = extreme
+    for start in range(0, k, group):
+        mid = start + group // 2
+        a[3, start:mid], a[3, mid : start + group] = 32767, -32767
+        a[3, mid] += 1
+        w[32:, start], w[32:, mid] = 1, 1
+    sa = torch.ones(m, k // ga)
+    sb = torch.full((k // gb, n), 1 / 256, dtype=torch.float16)
+    sb[:, 32:] = 1
+    sa[:, 1:] *= 2
+    sb[1:] *= 2
+    c0 = (torch.arange(m * n) % 7 - 3).reshape(m, n).float()
+    expected = torch.zeros_like(c0)
+    for start in range(0, k, group):
+        cols = slice(start, start + group)
+        dots = a[:, cols].long() @ w[:, cols].T
+        # The last row's large opposite partials leave exactly one.
+        assert (dots[3, 32:] == 1).all()
+        expected += dots.float() * sa[:, start // ga, None] * sb[start // gb].float()
+    if not clear:
+        expected += c0
+    kernel = tilelang.compile(_blockscaled(m, n, k, gb, "int16", dtype, clear, ga), out_idx=[5], target="hexagon")
+    try:
+        torch.testing.assert_close(kernel(a, sa, pack_panel(w, bits), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1, normal_scales=False):
     """C = C0 + SA * (A @ (B * SB)^T) on HMX, for an fp16 A, a factor per row
     of A and an fp16 one per G columns of each row of B (group-major).
