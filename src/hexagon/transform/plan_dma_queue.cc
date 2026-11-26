@@ -25,7 +25,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
-#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -192,19 +191,12 @@ private:
       return;
     const auto *extent = op->extent.as<IntImmNode>();
     if (extent && extent->value <= kMaxSimulatedTrips) {
-      size_t previous_size = queue_.groups.size();
       for (int64_t i = 0; i < extent->value; ++i) {
-        // Copy the queue only while its length is stable. A loop that keeps
-        // submitting without waiting would otherwise copy a growing queue.
-        size_t size = queue_.groups.size();
-        std::optional<Queue> before;
-        if (size == previous_size)
-          before.emplace(queue_);
+        bool was_drained = Drained();
         VisitStmt(op->body);
-        // The same input queue repeats the same peaks and wait completions.
-        if (before && queue_ == *before)
+        // Starting empty again repeats the same peaks and wait completions.
+        if (was_drained && Drained())
           break;
-        previous_size = size;
       }
       return;
     }
