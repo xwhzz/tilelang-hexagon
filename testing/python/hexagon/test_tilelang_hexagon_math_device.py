@@ -88,13 +88,22 @@ def test_fp32_exponent_upper_range(fn, lanes):
     # round(log2(result)) is 128 but the result is still finite.
     cutoff = torch.tensor(128.0 if fn == "exp2" else 88.72283935546875)
     points = [126.0, 126.5, 127.0, 127.5, 127.75] if fn == "exp2" else [87.0, 87.5, 88.0, 88.5, 88.7]
-    x = torch.cat([torch.tensor(points), torch.nextafter(cutoff, torch.tensor(0.0))[None], cutoff[None], torch.tensor([130.0])])
-    x = x.repeat(max(1, lanes // x.numel()))
+    x = torch.cat(
+        [
+            torch.tensor(points),
+            torch.nextafter(cutoff, torch.tensor(0.0))[None],
+            cutoff[None],
+            torch.tensor([130.0, -0.0, 0.0, float("nan")]),
+        ]
+    )
+    if lanes > 1:
+        x = x.repeat((lanes + x.numel() - 1) // x.numel())[:lanes]
     kernel = tilelang.compile(exponent, out_idx=[1], target="hexagon")
     try:
         result = torch.cat([kernel(chunk) for chunk in x.split(lanes)])
         expected = getattr(torch, fn)(x.double()).float()
-        torch.testing.assert_close(result, expected, rtol=1e-5, atol=0)
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=0, equal_nan=True)
+        assert (result[x == 0] == 1).all()
         if fn == "exp2":
             assert (result[x == 127.0] == 2.0**127).all()
     finally:

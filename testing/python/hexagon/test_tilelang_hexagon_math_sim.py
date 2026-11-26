@@ -150,6 +150,8 @@ def test_hvx_math_accuracy_on_simulator(arch, tmp_path):
         with np.errstate(over="ignore"):
             expected = reference(log[near].astype(np.float64)).astype(np.float32)
         np.testing.assert_allclose(actual[near], expected, rtol=1e-5, atol=0)
+        assert (actual[log == 0] == 1.0).all()
+        assert np.isnan(actual[np.isnan(log)]).all()
     assert (results[4, log == 127.0] == 2.0**127).all()
 
     for name, values, reference, kind, bound in zip(

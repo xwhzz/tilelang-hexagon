@@ -95,7 +95,9 @@ tl_hvx_exp_impl(HVX_Vector input) {
   }
 #if __HVX_ARCH__ < 79
   // The qf32 constant term can round one ulp away from one at integral x.
-  p = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(x, kf), tl_hvx_splat_f(1.0f), p);
+  HVX_Vector abs_f = Q6_V_vand_VV(f, Q6_V_vsplat_R(0x7fffffff));
+  p = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(abs_f, Q6_V_vzero()),
+                    tl_hvx_splat_f(1.0f), p);
 #endif
   // Add k directly to the biased exponent. For k == 128 and f < 0 the
   // scaled polynomial still fits in fp32, although 2^k would overflow.
@@ -107,7 +109,11 @@ tl_hvx_exp_impl(HVX_Vector input) {
         Q6_Q_vcmp_gt_VsfVsf(input, tl_hvx_splat_f(88.72283172607421875f));
     r = Q6_V_vmux_QVV(overflow, Q6_V_vsplat_R(0x7f800000), r);
   }
-  return r;
+  // min/max with a NaN can select the clamp bound. Keep NaNs distinct from
+  // numerical overflow, including when the input was a signaling NaN.
+  HVX_Vector magnitude = Q6_V_vand_VV(input, Q6_V_vsplat_R(0x7fffffff));
+  return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(magnitude, Q6_V_vsplat_R(0x7f800000)),
+                       Q6_V_vsplat_R(0x7fc00000), r);
 }
 
 // ---------------------------------------------------------------------------
