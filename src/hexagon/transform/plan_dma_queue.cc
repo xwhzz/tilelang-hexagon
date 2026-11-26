@@ -49,13 +49,27 @@ bool IsDMACall(const CallNode *call) {
          call->op.same_as(hexagon_dma_wait());
 }
 
-bool UsesDMA(const Stmt &stmt) {
-  bool found = false;
-  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
-    if (const auto *call = node.as<CallNode>())
-      found |= IsDMACall(call);
+enum class DMAUse { kNone, kGroupsOnly, kTransfers };
+
+DMAUse GetDMAUse(const Stmt &stmt) {
+  DMAUse use = DMAUse::kNone;
+  PostOrderVisit(stmt, [&use](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>();
+        call && use != DMAUse::kTransfers) {
+      if (call->op.same_as(hexagon_dma_submit()))
+        use = DMAUse::kTransfers;
+      else if (IsDMACall(call))
+        use = DMAUse::kGroupsOnly;
+    }
   });
-  return found;
+  return use;
+}
+
+int64_t PendingGroups(const CallNode *wait) {
+  const auto *pending = wait->args[0].as<IntImmNode>();
+  ICHECK(pending && pending->value >= 0)
+      << "T.dma_wait needs a constant, nonnegative count";
+  return pending->value;
 }
 
 // A buffer of the tile program's VTCM arena, whose space
@@ -156,11 +170,9 @@ private:
       queue_.open = Group();
       groups = std::max(groups, static_cast<int64_t>(queue_.groups.size()));
     } else {
-      const auto *pending = call->args[0].as<IntImmNode>();
-      ICHECK(pending && pending->value >= 0)
-          << "T.dma_wait needs a constant, nonnegative count";
+      int64_t pending = PendingGroups(call);
       std::set<int> &done = completes[call];
-      while (static_cast<int64_t>(queue_.groups.size()) > pending->value) {
+      while (static_cast<int64_t>(queue_.groups.size()) > pending) {
         const std::set<int> &retired = queue_.groups.front().buffers;
         done.insert(retired.begin(), retired.end());
         queue_.groups.pop_front();
@@ -187,7 +199,7 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    if (!UsesDMA(op->body))
+    if (GetDMAUse(op->body) == DMAUse::kNone)
       return;
     const auto *extent = op->extent.as<IntImmNode>();
     if (extent && extent->value <= kMaxSimulatedTrips) {
@@ -204,7 +216,7 @@ private:
   }
 
   void VisitStmt_(const WhileNode *op) final {
-    if (UsesDMA(op->body))
+    if (GetDMAUse(op->body) != DMAUse::kNone)
       Iterate(op->body, /*known_trips=*/false);
   }
 
@@ -277,13 +289,32 @@ private:
   const QueueBound &bound_;
 };
 
+// With no submissions anywhere in a tile program, its group operations
+// have no transfers to order. In a program with submissions even empty
+// groups must be kept: they count towards a later wait's pending groups.
+class RemoveEmptyGroups : public StmtExprMutator {
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(hexagon_dma_wait()))
+      PendingGroups(op);
+    else if (!op->op.same_as(hexagon_dma_commit()))
+      return StmtExprMutator::VisitExpr_(op);
+    return make_zero(op->dtype);
+  }
+};
+
 // Declares the queue at the start of every tile program that uses DMA and
 // drains it at the end.
 class DMAQueuePlanner : public StmtMutator {
 private:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key != attr::kTileProgramScope || !UsesDMA(op->body))
+    if (op->attr_key != attr::kTileProgramScope)
       return StmtMutator::VisitStmt_(op);
+    const DMAUse use = GetDMAUse(op->body);
+    if (use == DMAUse::kNone)
+      return GetRef<Stmt>(op);
+    if (use == DMAUse::kGroupsOnly)
+      return AttrStmt(op->node, op->attr_key, op->value,
+                      RemoveEmptyGroups()(op->body), op->span);
     QueueBound bound;
     bound.Run(op->body);
     auto capacity = [](int64_t n) {

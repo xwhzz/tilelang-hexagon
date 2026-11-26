@@ -176,3 +176,34 @@ def test_too_many_copies_in_flight_are_rejected():
 
     with pytest.raises(Exception, match="more than 256 DMA transfers in flight"):
         _lower(flood)
+
+
+def test_synchronous_pipeline_does_not_construct_a_dma_queue():
+    @T.prim_func
+    def convert(a: T.Tensor((256, 4, 32), "float16"), b: T.Tensor((256, 4, 16), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((4, 16), "float16")
+            for k in T.Pipelined(256, num_stages=2):
+                T.copy(a[k, :, :16], s)
+                T.copy(s, b[k, :, :])
+
+    artifact = _lower(convert)
+    assert not _ops(artifact)
+    assert "tl_dma_async" not in artifact.kernel_source
+
+
+def test_empty_group_keeps_its_place_after_a_real_submission():
+    @T.prim_func
+    def copy(a: T.Tensor((256,), "float16"), b: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            T.dma_copy(a, s)
+            T.evaluate(T.call_intrin("int32", tvm.ir.Op.get("tl.hexagon_dma_commit")))
+            T.dma_wait(1)
+            T.copy(s, b)
+
+    artifact = _lower(copy)
+    assert _ops(artifact) == ["queue", "submit", "commit", "commit", "wait", "wait"]
+    assert _queue(artifact) == (1, 2)
+    waits = [call for call in _dma_calls(artifact) if call.op.name == "tl.hexagon_dma_wait"]
+    assert [str(arg) for arg in waits[0].args[1:]] == ["s"]
