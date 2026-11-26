@@ -154,6 +154,46 @@ def test_jit_copies_dense_strided_tensors(src_strides, dst_strides):
         HexagonKernelAdapter.close_all()
 
 
+@DEVICE
+def test_by_value_float32_reaches_jit_and_resident_calls():
+    import tilelang
+
+    @T.prim_func
+    def scale(x: T.Tensor((32,), "float32"), y: T.Tensor((32,), "float32"), alpha: T.float32):
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                y[i] = x[i] * alpha
+
+    x = torch.arange(1, 33, dtype=torch.float32)
+    coefficients = (0.375, -0.5, 0.0, -0.0)
+    jit = tilelang.compile(scale, target="hexagon", out_idx=1)
+    try:
+        for alpha in coefficients:
+            assert torch.equal(jit(x, alpha).view(torch.int32), (x * alpha).view(torch.int32))
+    finally:
+        jit.adapter.close()
+
+    with session.Session([(scale, [1])]) as s:
+        (kernel,) = s.kernels
+        src, dst = s.buffer(128), s.buffer(128)
+        src.write(x)
+        for alpha in coefficients:
+            expected = (x * alpha).numpy().tobytes()
+            args = (src, dst, alpha)
+            poison = bytes([0xA5]) * 128
+            dst.write(poison)
+            kernel(*args)
+            assert dst.read() == expected
+            dst.write(poison)
+            s.pipeline([(kernel, 0, args)], 2)
+            assert dst.read() == expected
+            dst.write(poison)
+            s.run_sequence([session.Run(kernel, args)])
+            assert dst.read() == expected
+        with pytest.raises(ValueError, match="integer scalar"):
+            s.pipeline([(kernel, 0, (src, dst, s.STEP))], 1)
+
+
 def test_session_kernels_lower_under_their_own_pass_configs():
     (_, fast, _, _), (_, accurate, _, _) = session.lower_kernels([(_exp(True), [1]), (_exp(False), [1])])
     assert "tl_hvx_exp_fast(" in fast
@@ -901,6 +941,36 @@ def _wire_session(sock):
     instance._buffer_generations = {0: 1}
     instance.kernels = [session.SessionKernel(instance, 0, "empty", [], [])]
     return instance, session.DeviceBuffer(instance, 0, 128, _allocation=allocation)
+
+
+def test_resident_writes_keep_large_contiguous_storage_and_preserve_byte_order():
+    import numpy as np
+
+    sock = _WireSocket(reply=b"\0" * 8)
+    instance, buffer = _wire_session(sock)
+    data = torch.arange(32769, dtype=torch.int32)
+    size = data.numel() * data.element_size()
+    buffer.nbytes = buffer._allocation.nbytes = size + 128
+    buffer.write(data, 128)
+    head, payload = sock.sent
+    assert struct.unpack("<BiQQ", head) == (session._OP_WRITE, 0, 128, size)
+    assert np.shares_memory(np.frombuffer(payload, dtype=np.int32), data.numpy())
+    assert bytes(payload) == data.numpy().tobytes()
+
+    array = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    for value, expected in [
+        (memoryview(array[:, ::2]), array[:, ::2].tobytes()),
+        (torch.from_numpy(array.T), array.T.tobytes()),
+        (memoryview(array), array.tobytes()),
+        (torch.ones(4, dtype=torch.bfloat16), torch.ones(4, dtype=torch.bfloat16).view(torch.int16).numpy().tobytes()),
+        (b"", b""),
+    ]:
+        sock.sent.clear()
+        buffer.write(value)
+        assert sock.sent == [struct.pack("<BiQQ", session._OP_WRITE, 0, 0, len(expected)) + expected]
+    with pytest.raises(ValueError, match="overrun"):
+        buffer.write(data, 129)
+    instance._closed = True
 
 
 @pytest.mark.parametrize("failure", [TimeoutError, KeyboardInterrupt])

@@ -9,8 +9,8 @@ cache maintenance FastRPC does for the buffers of every call. Weights, KV
 caches and recurrent state stay on the device across calls and kernels.
 
 A kernel parameter takes, per call, a :class:`DeviceBuffer` (resident: no
-copy), a tensor (copied in, as with a standalone kernel), or for an int32
-scalar a Python int. Its ``out_idx`` parameters come back as tensors unless a
+copy), a tensor (copied in, as with a standalone kernel), or a Python number for an
+int32 or float32 scalar. Its ``out_idx`` parameters come back as tensors unless a
 :class:`DeviceBuffer` is passed for them too.
 
 The host writes a buffer's bytes with :meth:`DeviceBuffer.write`, or has the
@@ -54,7 +54,7 @@ from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
-from .tensor import buffer_bytes, pack_buffer, unpack_buffer
+from .tensor import byte_buffer, pack_buffer, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -234,7 +234,7 @@ static AEEResult tl_session_dispatch_close() {{
 
 
 def _kernel_args(plans) -> str:
-    return ", ".join(f"({pl.ctype})(intptr_t)a[{j}]" if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
+    return ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
 
 
 def _skel_headers(iface: str) -> str:
@@ -947,7 +947,7 @@ class DeviceBuffer:
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
         self._live_allocation()
-        raw = buffer_bytes(data)
+        raw = byte_buffer(data)
         if offset < 0 or offset + len(raw) > self.nbytes:
             raise ValueError(f"{len(raw)} bytes at {offset} overrun a buffer of {self.nbytes}")
         self.session._write(self.id, self.offset + offset, raw)
@@ -1435,9 +1435,11 @@ class Session:
                 if isinstance(value, _Step):
                     if not plan.is_scalar:
                         raise ValueError(f"argument {i} of {kernel.name} is a buffer; Session.STEP stands for a scalar")
+                    if plan.ctype == "float":
+                        raise ValueError("Session.STEP requires an integer scalar parameter")
                     words += [_STEP, value.first, 0]
                 elif plan.is_scalar:
-                    words += [_SCALAR, int(value), 0]
+                    words += [_SCALAR, plan.scalar_word(value), 0]
                 elif isinstance(value, DeviceBuffer):
                     self._check_resident(kernel, i, value, process)
                     words += [_RESIDENT, value.id, value.offset]
@@ -1497,10 +1499,16 @@ class Session:
             allocation.alive = False
             del self._allocations[bid]
 
-    def _write(self, bid: int, offset: int, raw: bytes) -> None:
-        wire = bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw
+    def _write(self, bid: int, offset: int, raw: bytes | memoryview) -> None:
+        header = struct.pack("<BiQQ", _OP_WRITE, bid, offset, len(raw))
         with self._exchange():
-            self._sock.sendall(wire)
+            # Send a small request in one socket write for ADB latency. Large
+            # payloads go directly from the caller's storage to the socket.
+            if len(raw) <= 64 * 1024:
+                self._sock.sendall(header + raw)
+            else:
+                self._sock.sendall(header)
+                self._sock.sendall(raw)
             self._status("a buffer write")
 
     def _read(self, bid: int, offset: int, n: int) -> bytes:
@@ -1558,7 +1566,7 @@ class Session:
         for i, plan in enumerate(kernel.plans):
             value = given[i]
             if plan.is_scalar:
-                args += [_SCALAR, int(value), 0]
+                args += [_SCALAR, plan.scalar_word(value), 0]
             elif isinstance(value, DeviceBuffer):
                 self._check_resident(kernel, i, value, process)
                 args += [_RESIDENT, value.id, value.offset]

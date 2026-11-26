@@ -88,6 +88,25 @@ bool SafeToEvaluate(const PrimExpr &expr, arith::Analyzer *analyzer) {
   return safe;
 }
 
+// The analyzer mutator also folds conditional statements, normalizes Selects,
+// and flattens statement sequences before vector width selection.
+bool NeedsPredicateRewrite(const Stmt &stmt) {
+  bool found = false;
+  PreOrderVisit(stmt, [&](const ObjectRef &node) {
+    if (!found) {
+      if (const auto *seq = node.as<SeqStmtNode>()) {
+        found = !SeqStmt::Flatten(GetRef<Stmt>(seq)).same_as(node);
+      } else {
+        const auto *call = node.as<CallNode>();
+        found = node.as<IfThenElseNode>() || node.as<SelectNode>() ||
+                (call && call->op.same_as(builtin::if_then_else()));
+      }
+    }
+    return !found;
+  });
+  return found;
+}
+
 // An if_then_else whose branches are both safe to evaluate is a Select: a
 // lane-wise select computes it once the loop vectorizes.
 bool SelectsLaneWise(const CallNode *call, arith::Analyzer *analyzer) {
@@ -1593,7 +1612,7 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 For VectorizeLoop(const For &loop, const arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
   For body = loop;
-  if (TargetHasVectorPredicates()) {
+  if (TargetHasVectorPredicates() && NeedsPredicateRewrite(loop)) {
     auto select_analyzer = analyzer->Clone();
     body = Downcast<For>(IfThenElseToSelect(select_analyzer.get())(loop));
   }

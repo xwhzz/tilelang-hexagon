@@ -3,7 +3,7 @@
  */
 #include "hexagon/layout/crouton.h"
 
-#include <tvm/ffi/reflection/registry.h>
+#include "layout/reflection.h"
 #include <tvm/tirx/op.h>
 
 namespace tvm {
@@ -80,11 +80,20 @@ CroutonLayout::CroutonLayout(Array<PrimExpr> shape, bool column_tiles,
   data_ = make_object<CroutonLayoutNode>(shape, column_tiles, transposed);
 }
 
+void CroutonLayoutNode::RestoreLegacyIndex() {
+  // Earlier JSON stored the forward expression without its binding Vars.
+  if (placeholder_vars_.empty()) {
+    InitForwardIndex(CroutonPosition(input_size_, column_tiles, transposed));
+  }
+}
+
 void CroutonLayoutNode::RegisterReflection() {
   namespace refl = reflection;
   refl::ObjectDef<CroutonLayoutNode>()
       .def_ro("column_tiles", &CroutonLayoutNode::column_tiles)
-      .def_ro("transposed", &CroutonLayoutNode::transposed);
+      .def_ro("transposed", &CroutonLayoutNode::transposed,
+              RestoreAfterSet<&CroutonLayoutNode::transposed,
+                              &CroutonLayoutNode::RestoreLegacyIndex>());
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

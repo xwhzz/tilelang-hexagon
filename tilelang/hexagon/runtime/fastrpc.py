@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from dataclasses import dataclass
 
 from tvm import DataType
@@ -65,6 +66,18 @@ class BufferPlan:
     nbytes: int  # for buffers
     storage_axes: tuple[int, ...] | None = ()  # outermost to innermost for dense buffers, None otherwise
 
+    def scalar_word(self, value) -> int:
+        """Encode a by-value argument in the signed FastRPC wire word."""
+        if self.ctype == "float":
+            return struct.unpack("<i", struct.pack("<f", value))[0]
+        return int(value)
+
+    def scalar_expr(self, word: str) -> str:
+        """Convert a wire word into the C++ kernel argument."""
+        if self.ctype == "float":
+            return f"__builtin_bit_cast(float, (int32_t){word})"
+        return f"({self.ctype}){word}"
+
 
 def _plan(params, result_idx) -> list[BufferPlan]:
     out = set(result_idx)
@@ -72,12 +85,8 @@ def _plan(params, result_idx) -> list[BufferPlan]:
     for i, p in enumerate(params):
         if p.is_scalar():
             dt = str(p.dtype)
-            if dt not in ("int32", "uint32"):
-                raise NotImplementedError(
-                    f"Hexagon adapter: scalar param dtype '{dt}' is not supported yet "
-                    "(only int32/uint32). float/int64 scalars would be silently truncated "
-                    "across the FastRPC int32 boundary."
-                )
+            if dt not in ("int32", "uint32", "float32"):
+                raise NotImplementedError(f"Hexagon adapter: scalar param dtype '{dt}' cannot be passed in a 32-bit FastRPC word")
             plans.append(BufferPlan(i, f"s{i}", True, False, _ctype(p.dtype), 0))
         else:
             elements, axes = storage_layout(p)
@@ -276,7 +285,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     for pl in plans:
         if pl.is_scalar:
             skel_args.append(f"int32 {pl.name}")
-            call_args.append(f"({pl.ctype}){pl.name}")
+            call_args.append(pl.scalar_expr(pl.name))
         elif pl.is_output:
             # QAIC maps `rout sequence<uint8>` to (ptr, len); the length is fixed
             # by the caller and the buffer is copied back, so no written-length.
