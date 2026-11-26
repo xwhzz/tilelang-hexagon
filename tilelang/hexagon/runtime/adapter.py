@@ -62,6 +62,12 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         self.sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self.dsp_arch = dsp_arch or self.sdk.dsp_arch
         self._param_list = list(params)
+        self._writable = ()
+        if device_mod is not None:
+            # KeepKernelParams restores the caller's parameter order before
+            # AnnotateReadOnlyParams marks the lowered kernel's buffer reads.
+            readonly = {int(i) for i in device_mod[self.kernel_name].attrs.get("tl.readonly_param_indices", ())}
+            self._writable = tuple(i for i, p in enumerate(params) if not p.is_scalar() and i not in readonly)
         n = len(self._param_list)
         ri = list(result_idx) if isinstance(result_idx, (list, tuple)) else ([] if result_idx is None else [result_idx])
         self._result_idx = [i if i >= 0 else n + i for i in ri]
@@ -82,6 +88,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
             lowered = [(self.kernel_name, self.kernel_source, self._param_list, self._result_idx)]
             self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
             self._run = self._device.kernels[0]
+            self._run._writable = self._writable
         return self._run
 
     def close(self) -> None:

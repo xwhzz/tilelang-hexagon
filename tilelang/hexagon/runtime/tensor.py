@@ -64,6 +64,52 @@ def pack_buffer(data, param, plan, kernel_name) -> bytes:
     return raw
 
 
+def _byte_span(data):
+    """Address interval of a tensor or a Python buffer, including stride gaps."""
+    if isinstance(data, torch.Tensor):
+        if data.layout != torch.strided or not data.numel():
+            return None
+        size, start = data.element_size(), data.data_ptr()
+        return data.device, start, start + size * (1 + sum((n - 1) * s for n, s in zip(data.shape, data.stride())))
+    try:
+        array = np.asarray(memoryview(data))
+    except TypeError:
+        return None
+    if not array.size:
+        return None
+    start = array.__array_interface__["data"][0]
+    steps = [(n - 1) * s for n, s in zip(array.shape, array.strides)]
+    return torch.device("cpu"), start + sum(min(0, step) for step in steps), start + sum(max(0, step) for step in steps) + array.itemsize
+
+
+def check_writeback(params, plans, args, index):
+    """Validate a caller-provided destination before sending the kernel."""
+    value = args[index]
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided or value.device.type == "meta":
+        raise TypeError(f"writable Hexagon argument {index} requires a strided PyTorch tensor or resident buffer")
+    param, plan = params[index], plans[index]
+    packed = str(param.dtype) in ("int4", "uint4")
+    dtype = torch.uint8 if packed else getattr(torch, str(param.dtype))
+    shape_ok = value.numel() == plan.nbytes if packed else tuple(value.shape) == tuple(param.shape)
+    if not shape_ok or value.dtype != dtype:
+        raise ValueError(f"writable Hexagon argument {index} has incompatible shape or dtype")
+    # Distinct logical elements must have distinct destinations. This proof
+    # covers transposes and ordinary strided slices, including ones with gaps.
+    if value.numel():
+        span = 1
+        for stride, n in sorted((s, n) for n, s in zip(value.shape, value.stride()) if n > 1):
+            if stride < span:
+                raise ValueError(f"cannot establish non-overlapping writes for Hexagon argument {index}")
+            span += (n - 1) * stride
+        device, lo, hi = _byte_span(value)
+        for j, other in enumerate(args):
+            if j == index or plans[j].is_scalar:
+                continue
+            bounds = _byte_span(other)
+            if bounds and bounds[0] == device and lo < bounds[2] and bounds[1] < hi:
+                raise ValueError(f"writable Hexagon argument {index} may overlap argument {j}")
+
+
 def unpack_buffer(raw, param):
     """Expose the returned storage as a logical tensor, except for packed 4-bit bytes."""
     dtype = str(param.dtype)

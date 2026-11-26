@@ -216,6 +216,97 @@ def test_jit_copies_dense_strided_tensors(src_strides, dst_strides):
         HexagonKernelAdapter.close_all()
 
 
+def test_writable_arguments_reject_overlap_and_invalid_destinations_before_dispatch():
+    from tilelang.engine.param import KernelParam
+
+    kernel = session.SessionKernel(session.Session.__new__(session.Session), 0, "update", [KernelParam("float32", [4])] * 2, [])
+    kernel.session.processes, kernel._writable = 1, (1,)
+    x = torch.arange(8, dtype=torch.float32)
+    for a, dest, message in [
+        (x[:4], x[2:6], "overlap"),
+        (x[2:6].numpy(), x[:4], "overlap"),
+        (x[:4], x[4:5].expand(4), "non-overlapping"),
+        (x[:4], torch.zeros(4, dtype=torch.int32), "shape or dtype"),
+        (x[:4], torch.zeros((2, 2)), "shape or dtype"),
+        (x[:4], bytearray(16), "PyTorch tensor"),
+    ]:
+        with pytest.raises((ValueError, TypeError), match=message):
+            kernel(a, dest)
+
+
+@DEVICE
+def test_jit_writes_state_and_keeps_allocated_output_order():
+    import tilelang
+
+    @T.prim_func
+    def update(x: T.Tensor((4, 3), "float32"), state: T.StridedTensor((4, 3), (1, 4), "float32"), out: T.Tensor((4, 3), "float32")):
+        with T.Kernel(1):
+            for i, j in T.grid(4, 3):
+                state[i, j] = state[i, j] + x[i, j]
+                out[i, j] = 2 * state[i, j]
+
+    kernel = tilelang.compile(update, out_idx=[2, 1], target="hexagon")
+    try:
+        x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        backing = torch.full((4, 6), 3.0)
+        state = backing[:, ::2]
+        x_version = x._version
+        out = kernel(x, state, None)
+        torch.testing.assert_close(state, x + 3)
+        torch.testing.assert_close(out, 2 * state)
+        out.fill_(-1)
+        assert kernel(x, state, out) is None
+        torch.testing.assert_close(state, 2 * x + 3)
+        torch.testing.assert_close(out, 2 * state)
+        assert (backing[:, 1::2] == 3).all() and x._version == x_version
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_eager_and_lazy_jit_write_supplied_state():
+    import tilelang
+    from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
+
+    @tilelang.jit(target="hexagon")
+    def eager(x, state):
+        x: T.Tensor[[32], T.float32]
+        state: T.Tensor[[32], T.float32]
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                state[i] = x[i] + state[i]
+
+    @T.prim_func
+    def lazy(x: T.Tensor((32,), "float32"), state: T.Tensor((32,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                state[i] = x[i] + state[i]
+
+    x, state = torch.arange(32, dtype=torch.float32), torch.full((32,), 3.0)
+    try:
+        assert eager(x, state) is None
+        torch.testing.assert_close(state, x + 3)
+        HexagonKernelAdapter.close_all()
+        kernel = tilelang.compile(lazy, target="hexagon")
+        assert kernel(x, state) is None
+        torch.testing.assert_close(state, 2 * x + 3)
+    finally:
+        HexagonKernelAdapter.close_all()
+
+
+@DEVICE
+def test_jit_writes_dma_only_destination():
+    import tilelang
+
+    kernel = tilelang.compile(dma_step, target="hexagon")
+    try:
+        x, out = torch.arange(N, dtype=torch.float32), torch.full((N,), -1.0)
+        assert kernel(x, out) is None
+        torch.testing.assert_close(out, x + 1)
+    finally:
+        kernel.adapter.close()
+
+
 @DEVICE
 def test_by_value_float32_reaches_jit_and_resident_calls():
     import tilelang
@@ -984,6 +1075,48 @@ def _wire_session(sock):
     instance._buffer_generations = {0: 1}
     instance.kernels = [session.SessionKernel(instance, 0, "empty", [], [])]
     return instance, session.DeviceBuffer(instance, 0, 128, _allocation=allocation)
+
+
+@pytest.mark.parametrize("reply_kind", ["success", "kernel error", "truncated"])
+def test_inline_writeback_waits_for_the_complete_success_reply(reply_kind):
+    from tilelang.engine.param import KernelParam
+
+    src, dest = torch.arange(4, dtype=torch.float32), torch.full((4,), 3.0)
+    block = struct.pack("<4f", 3, 4, 5, 6).ljust(128, b"\0")
+    reply = {"success": b"\0" + block * 2, "kernel error": b"\1", "truncated": b"\0" + block}[reply_kind]
+    sock = _WireSocket(reply)
+    instance, _ = _wire_session(sock)
+    kernel = session.SessionKernel(instance, 0, "update", [KernelParam("float32", [4])] * 3, [2])
+    kernel._writable = (1, 2)
+    if reply_kind == "success":
+        returned = kernel(src, dest)
+        torch.testing.assert_close(returned, src + 3)
+        torch.testing.assert_close(dest, src + 3)
+        (wire,) = sock.sent
+        assert struct.unpack_from("<B4i9iI", wire) == (
+            session._OP_RUN,
+            0,
+            3,
+            256,
+            0,
+            session._INPUT,
+            128,
+            0,
+            session._INOUT,
+            0,
+            16,
+            session._OUTPUT,
+            128,
+            0,
+            256,
+        )
+        assert wire[-256:-240] == struct.pack("<4f", 3, 3, 3, 3)
+    else:
+        with pytest.raises(RuntimeError):
+            kernel(src, dest)
+        assert (dest == 3).all()
+        assert instance._closed == (reply_kind == "truncated")
+    instance.close()
 
 
 def test_resident_writes_keep_large_contiguous_storage_and_preserve_byte_order():
