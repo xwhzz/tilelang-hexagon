@@ -118,16 +118,22 @@ def builds(monkeypatch, tmp_path):
         return build.FastRPCArtifacts(**paths)
 
     monkeypatch.setattr(build, "_build", fake_build)
+    headers = []
+    monkeypatch.setattr(build, "_external_headers", lambda *_: list(headers))
     sdk = SimpleNamespace(sdk_root="/sdk", ndk_root="/ndk", cmake_root="/cmake", dsp_arch="v79", validate=lambda: sdk)
     counter = iter(range(1000))
 
-    def run(source="kernel v1"):
+    def run(source="kernel v1", files=None):
         project = tmp_path / f"project{next(counter)}"
         project.mkdir()
         (project / "tl_k_dsp.cc").write_text(source)
+        for name, contents in (files or {}).items():
+            path = project / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
         return build.build_cmake_fastrpc(str(project), "tl_k", sdk=sdk)
 
-    return SimpleNamespace(run=run, runs=runs, templates=templates, tl_env=tl_env)
+    return SimpleNamespace(run=run, runs=runs, templates=templates, tl_env=tl_env, headers=headers)
 
 
 def test_an_unchanged_project_reuses_its_build(builds):
@@ -147,6 +153,45 @@ def test_sources_and_headers_are_part_of_the_key(builds):
     (builds.templates / "tl_templates" / "hexagon" / "common.h").write_text("// v2\n")
     builds.run()
     assert len(builds.runs) == 3
+
+
+def test_external_and_relocated_project_headers_invalidate_only_their_build(builds, tmp_path):
+    leaf = tmp_path / "user headers" / "weights.h"
+    leaf.parent.mkdir()
+    leaf.write_text("11")
+    builds.headers.extend(["include/bias.h", str(leaf)])
+    project_headers = {"include/bias.h": "weights.h"}
+    first = builds.run(files=project_headers)
+    assert builds.run(files=project_headers) == first
+    leaf.write_text("77")
+    second = builds.run(files=project_headers)
+    assert second != first and builds.run(files=project_headers) == second
+    assert builds.run(files={"include/bias.h": "other.h"}) != second
+    assert len(builds.runs) == 3
+
+
+def test_dsp_compiler_dependencies_include_transitive_and_project_relative_headers(tmp_path, monkeypatch):
+    from tilelang.hexagon.runtime import build
+
+    project = tmp_path / "project"
+    tree = project / "hexagon_ReleaseG_toolv19_v79"
+    tree.mkdir(parents=True)
+    (tree / ".ninja_deps").touch()
+    app = tmp_path / "app headers"
+    sdk = SimpleNamespace(ninja="ninja", sdk_root=str(tmp_path / "sdk"))
+    artifacts = build.FastRPCArtifacts(str(tree / "ship" / "libtl_k_skel.so"))
+    inputs = [
+        project / "tl_k_dsp.cc",
+        tree / "tl_k.h",
+        tmp_path / "sdk" / "stdio.h",
+        project / "parts" / "local.h",
+        app / "a.h",
+        app / "b.h",
+    ]
+    output = "object: #deps 6\n" + "".join(f"    {path}\n" for path in inputs)
+    monkeypatch.setattr(build.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=output, returncode=0))
+    assert build._external_headers(str(project), "tl_k", sdk, artifacts) == sorted([str(app / "a.h"), str(app / "b.h"), "parts/local.h"])
+    assert build._external_headers(str(project), "other", sdk, artifacts) is None
 
 
 def test_the_toolchain_is_part_of_the_key(builds, monkeypatch):

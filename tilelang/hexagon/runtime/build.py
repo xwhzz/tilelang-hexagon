@@ -7,8 +7,8 @@ This drives the Hexagon SDK's ``build_cmake`` over a generated project
   * the **HLOS host** binaries (aarch64 Android or Linux, open the FastRPC session).
 
 Build products are cached by content under the TileLang cache directory: the
-project files, the Hexagon template headers they include and the toolchain
-identify a build, so an unchanged kernel skips both CMake builds.
+project files, template and application headers, and the toolchain identify
+a build, so an unchanged kernel skips both CMake builds.
 
 Dependency-free (stdlib only).
 """
@@ -22,7 +22,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from . import config
 from .env import HexagonSDK
@@ -155,6 +157,45 @@ def _store_cached(entry: str, artifacts: FastRPCArtifacts) -> FastRPCArtifacts:
     return _load_cached(entry) or artifacts
 
 
+def _external_headers(project_dir: str, name: str, sdk: HexagonSDK, artifacts: FastRPCArtifacts) -> list[str] | None:
+    """Recover the DSP compiler's include dependencies from the SDK's Ninja build."""
+    from tilelang.env import TILELANG_TEMPLATE_PATH
+
+    project = Path(project_dir).resolve()
+    tree = next((p for p in Path(artifacts.dsp_skel).resolve().parents if p.parent == project), None)
+    if tree is None or not (tree / ".ninja_deps").is_file():
+        return None
+    result = subprocess.run([sdk.ninja, "-C", str(tree), "-t", "deps"], capture_output=True, text=True)
+    if result.returncode:
+        return None
+    # Ninja prints paths one per indented line, including paths containing spaces.
+    inputs = {Path(os.path.abspath(tree / line[4:])) for line in result.stdout.splitlines() if line.startswith("    ")}
+    if project / f"{name}_dsp.cc" not in inputs:
+        return None
+    # The base key covers top-level project files, templates and the SDK.
+    # QAIC generates the headers in the build tree from the project's IDL.
+    templates = Path(TILELANG_TEMPLATE_PATH, "tl_templates", "hexagon")
+    known_roots = (tree, templates.absolute(), templates.resolve(), Path(sdk.sdk_root).absolute(), Path(sdk.sdk_root).resolve())
+    headers = []
+    for path in inputs:
+        if path.parent == project or any(path.is_relative_to(root) for root in known_roots):
+            continue
+        headers.append(str(path.relative_to(project) if path.is_relative_to(project) else path))
+    return sorted(headers)
+
+
+def _header_variant(entry: str, project_dir: str, headers: list[str], build_start: int = 0) -> str | None:
+    digest = hashlib.sha256()
+    for header in headers:
+        path = Path(project_dir) / header
+        with path.open("rb") as f:
+            digest.update(os.fsencode(header) + b"\0" + hashlib.sha256(f.read()).digest())
+            # A header edited during compilation may differ from what the compiler read.
+            if build_start and max(os.fstat(f.fileno()).st_ctime_ns, path.lstat().st_ctime_ns) >= build_start:
+                return None
+    return os.path.join(entry, digest.hexdigest())
+
+
 def build_cmake_fastrpc(
     project_dir: str,
     name: str,
@@ -178,14 +219,35 @@ def build_cmake_fastrpc(
     dsp_arch = dsp_arch or sdk.dsp_arch
     hlos = config.hlos()
     entry = _cache_entry(project_dir, name, sdk, dsp_arch, hlos)
-    if entry:
-        cached = _load_cached(entry)
-        if cached:
-            if verbose:
-                print(f"[hexagon-build] cached: {entry}")
-            return cached
+    if not entry:
+        return _build(project_dir, name, sdk, dsp_arch, hlos, verbose)
+    manifest = Path(entry, "headers.json")
+    cached = None
+    try:
+        headers = json.loads(manifest.read_bytes())
+        if isinstance(headers, list) and (variant := _header_variant(entry, project_dir, headers)):
+            cached = _load_cached(variant)
+    except (OSError, ValueError, TypeError):
+        pass
+    if cached:
+        if verbose:
+            print(f"[hexagon-build] cached: {variant}")
+        return cached
+    started = time.time_ns()
     artifacts = _build(project_dir, name, sdk, dsp_arch, hlos, verbose)
-    return _store_cached(entry, artifacts) if entry else artifacts
+    try:
+        headers = _external_headers(project_dir, name, sdk, artifacts)
+        if headers is not None and (variant := _header_variant(entry, project_dir, headers, started)):
+            cached = _store_cached(variant, artifacts)
+            # Publish the include list only after its immutable artifacts are available.
+            with tempfile.TemporaryDirectory(dir=entry) as staging:
+                tmp = Path(staging) / manifest.name
+                tmp.write_text(json.dumps(headers))
+                tmp.replace(manifest)
+            return cached
+    except OSError:
+        pass
+    return artifacts
 
 
 def _build(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hlos: str, verbose: bool) -> FastRPCArtifacts:
