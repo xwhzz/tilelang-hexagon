@@ -133,15 +133,18 @@ public:
     res_ = decl_buffer({1}, acc_t_, "res", "local");
   }
 
-  Stmt Lower() {
+  Stmt Lower(arith::Analyzer *analyzer) {
     for (int d = 0; d < ndim_; ++d)
       vars_.emplace_back("i" + std::to_string(d), DataType::Int(32));
     if (auto crouton = CroutonReduce())
       return *crouton;
-    if (Innermost())
-      return RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_)
-                 ? RowReduce()
-                 : ScalarRowReduce();
+    if (Innermost()) {
+      // The row helper accepts a row pitch but indexes adjacent columns.
+      if (RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_) &&
+          analyzer->CanProveEqual(Stride(op_.src, op_.dim), 1))
+        return RowReduce();
+      return ScalarRowReduce();
+    }
     // Loops over the outputs: every axis but the reduced one and the innermost
     // one, which ColumnReduce walks itself.
     Stmt body = ColumnReduce();
@@ -438,7 +441,6 @@ private:
 struct Reduce {
   static Stmt Lower(const ReduceOpNode &op, const LowerArgs &lower_args,
                     arith::Analyzer *analyzer) {
-    (void)analyzer;
     if (!InPlace(op.src) || !InPlace(op.dst)) {
       LOG(FATAL) << "Hexagon reduce reads and writes shared, fragment or "
                     "local buffers, got `"
@@ -453,7 +455,8 @@ struct Reduce {
       LOG(FATAL) << "Hexagon reduce does not propagate NaN: HVX max and min "
                     "return the other operand";
     }
-    return ReduceLowering(op, lower_args.layout_map, lower_args.target).Lower();
+    return ReduceLowering(op, lower_args.layout_map, lower_args.target)
+        .Lower(analyzer);
   }
 };
 

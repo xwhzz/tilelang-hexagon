@@ -71,6 +71,42 @@ def test_rows_of_any_length_use_the_same_call():
     )
 
 
+def _strided_row_reduction(op, dtype, column_stride):
+    @T.prim_func
+    def kernel(a: T.Tensor((2, 8), dtype), out: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            storage = T.alloc_shared((2, 8), dtype)
+            T.copy(a, storage)
+            src = T.StridedTensor((2, 4), (8, column_stride), dtype, data=storage.data)
+            dst = T.alloc_shared((2,), "float32")
+            getattr(T, f"reduce_{op}")(src, dst, dim=1)
+            T.copy(dst, out)
+
+    return kernel
+
+
+def test_hvx_row_helper_requires_unit_column_stride():
+    for stride in [1, 2]:
+        src = _source(_strided_row_reduction("sum", "float32", stride))
+        assert ("tl_hvx_reduce_rows<" in src) == (stride == 1)
+
+
+@DEVICE
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_strided_row_reduction_matches_logical_elements(op, dtype):
+    import torch
+
+    data = torch.tensor([[1, 99, 2, 99, 3, 99, 4, 99], [5, 99, 6, 99, 7, 99, 8, 99]], dtype=getattr(torch, dtype))
+    kernel = tilelang.compile(_strided_row_reduction(op, dtype, 2), out_idx=1, target="hexagon")
+    try:
+        logical = data[:, ::2].float()
+        expected = logical.sum(dim=1) if op == "sum" else logical.amax(dim=1)
+        torch.testing.assert_close(kernel(data), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_outer_axes_loop_around_the_call():
     source = _source(_make("sum", (4, 24, 96), 2, "float32", "float32"))
     assert "for (int32_t i0 = 0; i0 < 4; ++i0) {" in source
