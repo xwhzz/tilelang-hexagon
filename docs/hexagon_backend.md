@@ -481,6 +481,14 @@ barrier and does not release resources or drain DMA. See the
     inline), or a by-value int32 or float32 scalar. The host converts a Python coefficient
     to FP32 and sends the resulting bits, including signed zero, in one wire word. Pipeline
     stages accept constant coefficients. `Session.STEP` requires an integer parameter.
+  - **Imported C.** By default the Session compiles all kernels in one C++
+    translation unit. Include guards can share static state across kernels.
+    Use `Session(kernels, isolate_imports=True)` when imported private helpers
+    or macros belong to each kernel individually. The Session compiles each
+    generated kernel with C imports in its own translation unit. Static
+    variables become local to that unit. Public symbols follow C++ linkage,
+    and the kernels share the Session's DSP resources. `Session.of_lowered`
+    accepts the same option with sources from `lower_kernels`.
   - **Resident sequences.** `Session.run_sequence` accepts an explicit, finite list
     of `Run(kernel, args)` and `Copy(src, dst, nbytes, src_offset=0, dst_offset=0)`
     descriptors, imported from `tilelang.hexagon.runtime.session`. It sends the list

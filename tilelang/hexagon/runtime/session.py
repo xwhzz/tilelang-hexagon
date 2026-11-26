@@ -841,32 +841,35 @@ int main(int argc, char** argv) {{
 """
 
 
-def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tuple[str, str]:
+def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]], *, isolate_imports: bool = False) -> tuple[str, str]:
     """Write the session's FastRPC project; returns (project_dir, iface)."""
     from tilelang.env import TILELANG_TEMPLATE_PATH
 
-    digest = hashlib.sha256("\0".join(source for _, source, _ in kernels).encode()).hexdigest()[:10]
-    iface = f"tl_session_{digest}"
+    digest = hashlib.sha256("\0".join(source for _, source, _ in kernels).encode())
+    if isolate_imports:
+        digest.update(b"\0isolated imports")
+    iface = f"tl_session_{digest.hexdigest()[:10]}"
     os.makedirs(workdir, exist_ok=True)
     external = {}
     units = {}
-    for i, (name, source, plans) in enumerate(kernels):
-        preamble, imported, _ = source.partition("\n// TL_HEXAGON_IMPORTED_SOURCE\n")
-        if len(kernels) > 1 and imported:
-            # The dispatcher's open/close still sees the union of the generated
-            # resource declarations. Each compiler invocation owns its C imports.
-            external[i] = preamble + "\n"
-            # An included header could redefine the backend's resource flags.
-            # Let the preprocessor catch a mismatch with the dispatcher's policy.
-            flags = ("TL_HEXAGON_USES_VTCM", "TL_HEXAGON_USES_HMX", "TL_HEXAGON_USES_COOPERATIVE")
-            declarations = preamble.splitlines()
-            changed = " || ".join(f"!defined({flag})" if f"#define {flag} 1" in declarations else f"defined({flag})" for flag in flags)
-            units[f"{iface}_kernel_{i}.cc"] = (
-                f"#define TL_HEXAGON_SEPARATE_KERNELS 1\n{_skel_headers(iface)}\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n"
-                f'#if {changed}\n#error "Imported source changed the generated Hexagon resource requirements"\n#endif\n'
-                f'extern "C" __attribute__((visibility("hidden"))) int tl_session_external_{i}(void** a) {{\n'
-                f"  (void)a; return tl_session_kernel_{i}({_kernel_args(plans)});\n}}\n"
-            )
+    if isolate_imports and len(kernels) > 1:
+        for i, (name, source, plans) in enumerate(kernels):
+            preamble, imported, _ = source.partition("\n// TL_HEXAGON_IMPORTED_SOURCE\n")
+            if imported:
+                # The dispatcher's open/close still sees the union of the generated
+                # resource declarations. Each compiler invocation owns its C imports.
+                external[i] = preamble + "\n"
+                # An included header could redefine the backend's resource flags.
+                # Let the preprocessor catch a mismatch with the dispatcher's policy.
+                flags = ("TL_HEXAGON_USES_VTCM", "TL_HEXAGON_USES_HMX", "TL_HEXAGON_USES_COOPERATIVE")
+                declarations = preamble.splitlines()
+                changed = " || ".join(f"!defined({flag})" if f"#define {flag} 1" in declarations else f"defined({flag})" for flag in flags)
+                units[f"{iface}_kernel_{i}.cc"] = (
+                    f"#define TL_HEXAGON_SEPARATE_KERNELS 1\n{_skel_headers(iface)}\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n"
+                    f'#if {changed}\n#error "Imported source changed the generated Hexagon resource requirements"\n#endif\n'
+                    f'extern "C" __attribute__((visibility("hidden"))) int tl_session_external_{i}(void** a) {{\n'
+                    f"  (void)a; return tl_session_kernel_{i}({_kernel_args(plans)});\n}}\n"
+                )
     files = {
         f"{iface}.idl": gen_idl(iface),
         f"{iface}_dsp.cc": gen_dsp(iface, kernels, external),
@@ -1136,6 +1139,7 @@ class Session:
         ready_timeout: float = 30.0,
         processes: int = 1,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
         the DSP the target names, which ``processes`` DSP processes load.
@@ -1145,7 +1149,9 @@ class Session:
         from tilelang.hexagon.target import hexagon_arch
 
         target = determine_target(target, return_object=True)
-        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes, domain)
+        self._open(
+            lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes, domain, isolate_imports
+        )
 
     @classmethod
     def of_lowered(
@@ -1159,12 +1165,13 @@ class Session:
         ready_timeout: float = 30.0,
         processes: int = 1,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ) -> Session:
         """A session of kernels lowered already, (name, source, params,
         out_idx) each as :func:`lower_kernels` gives them: a compiled kernel
         (tilelang.compile) is a session of one."""
         session = cls.__new__(cls)
-        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain)
+        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain, isolate_imports)
         return session
 
     def _open(
@@ -1177,6 +1184,7 @@ class Session:
         ready_timeout: float,
         processes: int,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ) -> None:
         from .build import build_cmake_fastrpc
         from .config import check_domain, device_serial, domain_id, hlos, remote_dir
@@ -1201,7 +1209,11 @@ class Session:
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")
         weakref.finalize(self, shutil.rmtree, self._workdir, True)
-        project, iface = write_project(self._workdir, [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered])
+        project, iface = write_project(
+            self._workdir,
+            [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered],
+            isolate_imports=isolate_imports,
+        )
         sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, dsp_arch=dsp_arch, verbose=verbose)
         self.kernels = [SessionKernel(self, i, name, params, out) for i, (name, _, params, out) in enumerate(lowered)]

@@ -264,7 +264,13 @@ def _imported_bias(factor, offset):
 
 def test_session_project_keeps_private_imports_and_shares_vtcm(tmp_path):
     lowered = session.lower_kernels([(_imported_bias(factor, offset), [1]) for factor, offset in ((1, 2), (2, 2), (3, 5))])
-    _, iface = session.write_project(str(tmp_path), [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered])
+    kernels = [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered]
+    default_project = tmp_path / "default"
+    _, unity_iface = session.write_project(str(default_project), kernels)
+    assert (default_project / f"{unity_iface}_dsp.cc").read_text().count("static inline float tile_bias") == 3
+    assert not list(default_project.glob("*_kernel_*.cc"))
+    _, iface = session.write_project(str(tmp_path), kernels, isolate_imports=True)
+    assert iface != unity_iface
     dispatcher = (tmp_path / f"{iface}_dsp.cc").read_text()
     assert "static inline float tile_bias" not in dispatcher
     assert "#define TL_HEXAGON_USES_VTCM 1" in dispatcher
@@ -278,9 +284,25 @@ def test_session_project_keeps_private_imports_and_shares_vtcm(tmp_path):
 def test_session_runs_kernels_with_private_imports():
     cases = ((1, 2), (2, 2), (3, 5))
     x = torch.arange(64, dtype=torch.float32).reshape(2, 32)
-    with session.Session([(_imported_bias(factor, offset), [1]) for factor, offset in cases]) as active:
+    with session.Session([(_imported_bias(factor, offset), [1]) for factor, offset in cases], isolate_imports=True) as active:
         for kernel, (factor, offset) in zip(active.kernels, cases):
             torch.testing.assert_close(kernel(x), (x + offset) * factor, rtol=0, atol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("isolated,expected", [(False, [1, 2, 3, 4]), (True, [1, 1, 2, 2])])
+def test_session_imported_static_state_scope(isolated, expected):
+    @T.prim_func
+    def count(step: T.float32, out: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            T.import_source(
+                "#ifndef COUNTER_H\n#define COUNTER_H\nstatic int count_calls;\nstatic inline int next_call(float step) { return count_calls += (int)(2 * step); }\n#endif"
+            )
+            out[0] = T.call_extern("int32", "next_call", step)
+
+    options = {"isolate_imports": True} if isolated else {}
+    with session.Session([(count, [1]), (count, [1])], **options) as active:
+        assert [active.kernels[i](0.5).item() for i in (0, 1, 0, 1)] == expected
 
 
 @pytest.mark.parametrize("arch", ["v73", "v79"])
@@ -829,7 +851,7 @@ class _Built(Exception):
     pass
 
 
-def _stop_at_build(*args):
+def _stop_at_build(*args, **kwargs):
     raise _Built
 
 
