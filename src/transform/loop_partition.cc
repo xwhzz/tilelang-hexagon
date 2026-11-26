@@ -343,6 +343,10 @@ Stmt LowerParallelLoop(For loop, const Fragment &loop_layout,
   result_loop.CopyOnWrite()->annotations.erase(
       attr::kParallelLoopRequiresPaddingGuard);
 
+  // Partitioning constructs fresh loops. Keep user-supplied scheduling
+  // constraints, such as coalesced_width, out of the automatic prefix split.
+  bool has_loop_constraints = !result_loop->annotations.empty();
+
   // Step 1: Partition the loop based on the layout (if this is a parallel loop)
   if (parallel_loop) {
     // Do not carry partitioning's local bindings into vectorization or back to
@@ -357,7 +361,7 @@ Stmt LowerParallelLoop(For loop, const Fragment &loop_layout,
   // (1 = scalar) from its access analysis.
   Stmt vectorized;
   if (Target target = Target::Current(true);
-      target.defined() && TargetIsHexagon(target) &&
+      !has_loop_constraints && target.defined() && TargetIsHexagon(target) &&
       loop->kind == ForKind::kParallel && loop->HasTrivialStep() &&
       loop->body.as<BufferStoreNode>()) {
     vectorized = hexagon::VectorizeMapTail(result_loop, analyzer, layout_map,

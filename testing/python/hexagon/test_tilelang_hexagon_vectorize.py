@@ -107,6 +107,18 @@ def test_vector_prefix_uses_the_element_width(dtype, lanes, vector):
     assert f"y[{lanes}] =" in source
 
 
+@pytest.mark.parametrize("width", [1, 4])
+def test_vector_prefix_respects_explicit_coalesced_width(width):
+    @T.prim_func
+    def activate(x: T.Tensor((65,), "float32"), y: T.Tensor((65,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(65, coalesced_width=tvm.tirx.IntImm("int32", width)):
+                y[i] = T.sigmoid(x[i])
+
+    source = _source(activate)
+    assert "i < 65" in source and "float32*" not in source
+
+
 def test_vector_prefix_honors_disabled_vectorization():
     @T.prim_func
     def activate(x: T.Tensor((65,), "float32"), y: T.Tensor((65,), "float32")):
