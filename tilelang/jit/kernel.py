@@ -448,6 +448,7 @@ class JITKernel(Generic[_P, _T]):
                 result_idx=out_idx,
                 target=target,
                 kernel_source=artifact.kernel_source,
+                device_mod=artifact.device_mod,
                 verbose=self.verbose,
             )
         else:

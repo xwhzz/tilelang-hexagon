@@ -194,6 +194,29 @@ def test_by_value_float32_reaches_jit_and_resident_calls():
             s.pipeline([(kernel, 0, (src, dst, s.STEP))], 1)
 
 
+def test_imported_helper_preceding_the_kernel_entry(monkeypatch):
+    import tilelang
+    from tilelang.hexagon.runtime.env import HexagonSDK
+
+    @T.prim_func
+    def add_one(x: T.Tensor((1,), "int32"), y: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            T.import_source("int increment(int x) { return x + 1; }\n")
+            y[0] = T.call_extern("int32", "increment", x[0])
+
+    (lowered,) = session.lower_kernels([(add_one, [1])])
+    name, source, _, _ = lowered
+    assert name == "add_one_kernel"
+    assert source.index("int increment(") < source.index(f"int32_t {name}(")
+
+    captured = []
+    monkeypatch.setattr(HexagonSDK, "validate", lambda self: self)
+    fake = SimpleNamespace(kernels=[lambda *args: None], close=lambda: None)
+    monkeypatch.setattr(session.Session, "of_lowered", classmethod(lambda cls, kernels, **kwargs: captured.extend(kernels) or fake))
+    tilelang.compile(add_one, target="hexagon", out_idx=[1])
+    assert captured[0][:2] == lowered[:2]
+
+
 def test_session_kernels_lower_under_their_own_pass_configs():
     (_, fast, _, _), (_, accurate, _, _) = session.lower_kernels([(_exp(True), [1]), (_exp(False), [1])])
     assert "tl_hvx_exp_fast(" in fast

@@ -17,13 +17,13 @@ import contextlib
 import re
 import weakref
 
+from tilelang.hexagon.codegen import kernel_entry_name
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
 from .env import HexagonSDK
 
-# The kernel entry is the generated function that returns its int32 status;
-# static helpers such as `<name>_worker` are not.
+# Legacy source-only adapter construction has no lowered module.
 _KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
@@ -47,12 +47,13 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         target,
         kernel_source: str,
         *,
+        device_mod=None,
         sdk: HexagonSDK | None = None,
         dsp_arch: str | None = None,
         verbose: bool = False,
     ) -> None:
         self.kernel_source = kernel_source
-        self.kernel_name = _kernel_name(kernel_source)
+        self.kernel_name = kernel_entry_name(device_mod) if device_mod is not None else _kernel_name(kernel_source)
         self.target = target
         self.verbose = verbose
         # The target names the DSP architecture; HEXAGON_DSP_ARCH only seeds
