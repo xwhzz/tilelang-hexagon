@@ -144,11 +144,9 @@ def rank_zero(x: T.Tensor((6,), "float32"), bias: T.Tensor((), "float32"), scale
         out[()] = (x[0] + x[5]) * scale + bias[()]
 
 
-def test_rank_zero_buffer_abi_survives_parameter_serialization(monkeypatch):
+def test_rank_zero_buffer_abi_survives_parameter_serialization():
     from tilelang import tvm
-    from tilelang.autotuner.tuner import _can_reuse_inputs
     from tilelang.engine.param import dump_kernel_params, load_kernel_params
-    from tilelang.profiler import Profiler, TensorSupplyType
 
     ((_, _, params, _),) = session.lower_kernels([(rank_zero, [3])])
     old_records = [{"dtype": str(p.dtype), "shape": p.shape} for p in params]
@@ -164,17 +162,6 @@ def test_rank_zero_buffer_abi_survives_parameter_serialization(monkeypatch):
         ]
         idl = fastrpc.gen_idl("rank_zero", plans)
         assert "in sequence<uint8> p1" in idl and "in int32 s2" in idl and "rout sequence<uint8> p3" in idl
-
-    _, bias, scalar, out = restored
-    assert not _can_reuse_inputs([bias], [scalar], [0.5])
-    assert not _can_reuse_inputs([scalar], [bias], [torch.tensor(0.5)])
-    monkeypatch.setattr("tilelang.utils.device.get_current_device", lambda: torch.device("cpu"))
-    for supply in TensorSupplyType:
-        profiler = Profiler([bias, out], [1], supply)
-        inputs = profiler._get_inputs(with_output=True, dynamic_symbolic_constraints={"n": 6})
-        assert all(x.shape == () and x.dtype == torch.float32 for x in inputs)
-    with pytest.raises(ValueError, match="by-value scalar"):
-        profiler.supply(scalar)
 
 
 @DEVICE

@@ -8,6 +8,16 @@ from tilelang.autotuner import AutoTuner
 from tilelang.autotuner.tuner import _BenchmarkWorkerState
 
 
+def test_rank_zero_buffer_and_scalar_inputs_are_not_interchangeable():
+    from tilelang.autotuner.tuner import _can_reuse_inputs
+    from tilelang.engine.param import KernelParam
+
+    buffer = KernelParam(tilelang.tvm.DataType("float32"), [], is_buffer=True)
+    scalar = KernelParam(buffer.dtype, [], is_buffer=False)
+    assert not _can_reuse_inputs([buffer], [scalar], [0.5])
+    assert not _can_reuse_inputs([scalar], [buffer], [torch.tensor(0.5)])
+
+
 def _benchmark_input_configs(kernel, supply, ref_prog):
     tuner = AutoTuner(kernel, configs=[{"variant": 0}, {"variant": 1}]).set_profile_args(
         supply_prog=supply, ref_prog=ref_prog, cache_input_tensors=True
