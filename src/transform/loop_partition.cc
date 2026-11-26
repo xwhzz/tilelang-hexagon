@@ -23,6 +23,8 @@
  */
 
 #include "loop_partition.h"
+#include "hexagon/target_utils.h"
+#include "hexagon/transform/vectorize_map_tail.h"
 #include "support/check.h"
 #include <tvm/ir/cast.h>
 
@@ -353,16 +355,26 @@ Stmt LowerParallelLoop(For loop, const Fragment &loop_layout,
 
   // Step 2: Vectorize the loop; the planner picks the size per loop
   // (1 = scalar) from its access analysis.
-  result_loop = VectorizeLoop(result_loop, analyzer, layout_map);
-
-  result_loop = PragmaUnrollLoop(result_loop);
+  Stmt vectorized;
+  if (Target target = Target::Current(true);
+      target.defined() && TargetIsHexagon(target) &&
+      loop->kind == ForKind::kParallel && loop->HasTrivialStep() &&
+      loop->body.as<BufferStoreNode>()) {
+    vectorized = hexagon::VectorizeMapTail(result_loop, analyzer, layout_map,
+                                           MinVectorBits(target))
+                     .value_or(Stmt());
+  }
+  if (!vectorized.defined()) {
+    vectorized =
+        PragmaUnrollLoop(VectorizeLoop(result_loop, analyzer, layout_map));
+  }
 
   // Step 3: Wrap with predicate if provided and this is a parallel loop
   if (predicate.defined() && parallel_loop) {
-    return IfThenElse(predicate.value(), result_loop, Stmt(), loop->span);
+    return IfThenElse(predicate.value(), vectorized, Stmt(), loop->span);
   }
 
-  return result_loop;
+  return vectorized;
 }
 
 } // namespace tl
