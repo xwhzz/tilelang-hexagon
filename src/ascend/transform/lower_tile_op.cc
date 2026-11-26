@@ -215,6 +215,7 @@ public:
     for (const auto &[_, buffer] : f->buffer_map) {
       substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
+    substituter.parameter_buffers_ = substituter.buffer_data_to_buffer_;
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
@@ -1238,6 +1239,7 @@ private:
         };
 
     LowerArgs lower_args;
+    lower_args.parameter_buffers = parameter_buffers_;
     lower_args.target = target_;
     lower_args.thread_bounds = thread_bounds;
     lower_args.thread_index = CurrentThreadIndex();
@@ -1549,6 +1551,7 @@ private:
   L0SFBindings mx_sf_bindings_;
 
   Map<Var, Buffer> buffer_data_to_buffer_;
+  Map<Var, Buffer> parameter_buffers_;
   Map<Var, PrimExpr> safe_value_map_;
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Layout> layout_remap_;

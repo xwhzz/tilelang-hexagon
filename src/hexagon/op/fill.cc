@@ -24,8 +24,9 @@ namespace tl {
 namespace hexagon {
 
 // A whole Crouton allocation is a dense permutation, so a uniform value may
-// be written directly in storage order. Restrict reads to DDR: a read from
-// this VTCM allocation or an alias could observe an earlier iteration.
+// be written directly in storage order. Restrict reads to DDR parameters: a
+// read from this VTCM allocation or an alias could observe an earlier
+// iteration.
 static std::optional<For> PhysicalFill(const FillNode &op, const LowerArgs &T,
                                        arith::Analyzer *analyzer) {
   auto layout = T.layout_map.Get(op.dst);
@@ -43,9 +44,10 @@ static std::optional<For> PhysicalFill(const FillNode &op, const LowerArgs &T,
   }
   bool uniform = true;
   PostOrderVisit(op.value, [&](const ObjectRef &node) {
-    if (const auto *load = node.as<BufferLoadNode>())
-      uniform &= IsGlobalBuffer(load->buffer);
-    else if (const auto *call = node.as<CallNode>())
+    if (const auto *load = node.as<BufferLoadNode>()) {
+      auto param = T.parameter_buffers.Get(load->buffer->data);
+      uniform &= param && IsGlobalBuffer(param.value());
+    } else if (const auto *call = node.as<CallNode>())
       uniform &= SideEffect(GetRef<PrimExpr>(call)) <= CallEffectKind::kPure;
   });
   if (!uniform)

@@ -139,6 +139,9 @@ struct LowerArgs {
   // alignment implied by the chosen swizzle mode here; LowerTileOp collects
   // the results into the kSmemAlignmentMap PrimFunc attribute.
   RequireSmemAlignmentCallback require_smem_alignment = nullptr;
+  // Function buffer parameters keyed by their storage Var, for lowerings that
+  // need to distinguish caller storage from a view constructed in the kernel.
+  ffi::Map<tirx::Var, tirx::Buffer> parameter_buffers;
 };
 
 /*! \brief One reducer_update site, as seen by layout analysis: the update

@@ -51,16 +51,21 @@ def test_full_vtcm_fill_uses_physical_order(kind, clear):
     assert "*(half64*)(X + " in _source(kernel)
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_vtcm_fill_preserves_logical_regions_and_dependent_reads(partial):
+@pytest.mark.parametrize("case", ["partial", "direct", "alias"])
+def test_vtcm_fill_preserves_logical_regions_and_dependent_reads(case):
+    from tilelang.language import make_tensor
+
     @T.prim_func
     def kernel(O: T.Tensor((R, C), "float16")):
         with T.Kernel(1):
             X = T.alloc_shared((R, C), "float16")
             T.annotate_layout({X: KINDS["activation"](X), O: KINDS["activation"](O)})
             T.copy(O, X)
-            if partial:
+            if case == "partial":
                 T.fill(X[1:R, 1:C], T.float16(1))
+            elif case == "alias":
+                Y = make_tensor(T.address_of(X[1, 0]), (1,), "float16")
+                T.fill(X, Y[0] + T.float16(1))
             else:
                 T.fill(X, X[1, 0] + T.float16(1))
             T.copy(X, O)
