@@ -139,6 +139,13 @@ axes and swap the final two. The operation uses the buffers' logical indices,
 including their region offsets and layouts. Pass slices of the allocated buffers
 directly when transposing a subregion.
 
+Use `T.cumsum(src, dst, dim=-1)` for an inclusive prefix sum along each row
+of a compact row-major shared tile. Each sum starts with the first element in its slice
+and accumulates in the buffer dtype. Other axes and `reverse=True` use the
+same ordering along the selected axis. Omit `dst` to update the input in
+place. Equal-shaped slices of one buffer can also be scanned into each other
+when the compiler can prove they are disjoint.
+
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
 reads and writes shared buffers and fragments in place. Reducing the innermost axis is

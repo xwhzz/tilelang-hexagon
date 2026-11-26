@@ -35,16 +35,16 @@ def _check_tile_ops(mod: IRModule) -> None:
             continue
         calls = []
         loops = []
-        transposes = []
+        view_sensitive_ops = []
         matched_data = set()
 
-        def collect(node, calls=calls, loops=loops, transposes=transposes, matched_data=matched_data):
+        def collect(node, calls=calls, loops=loops, view_sensitive_ops=view_sensitive_ops, matched_data=matched_data):
             if isinstance(node, tirx.Call):
                 name = getattr(node.op, "name", "")
                 if name == "tl.tileop.dma_copy":
                     calls.append(node)
-                elif name == "tl.tileop.transpose":
-                    transposes.append(node)
+                elif name in ("tl.tileop.transpose", "tl.tileop.cumsum"):
+                    view_sensitive_ops.append(node)
             elif isinstance(node, tirx.For):
                 loops.append(node)
             elif isinstance(node, tirx.SBlock):
@@ -52,9 +52,10 @@ def _check_tile_ops(mod: IRModule) -> None:
 
         tirx.stmt_functor.post_order_visit(func.body, collect)
         if matched_data:
-            for transpose in transposes:
-                if any(region.args[0].buffer.data in matched_data for region in transpose.args):
-                    raise ValueError("Hexagon T.transpose on a match_buffer view requires passing its source buffer region directly")
+            for call in view_sensitive_ops:
+                if any(region.args[0].buffer.data in matched_data for region in call.args[:2]):
+                    op = call.op.name.rsplit(".", 1)[-1]
+                    raise ValueError(f"Hexagon T.{op} on a match_buffer view requires passing its source buffer region directly")
         if calls:
             for loop in loops:
                 if any(str(key) == "num_stages" or str(key).startswith(("software_pipeline", "tl_pipeline")) for key in loop.annotations):
