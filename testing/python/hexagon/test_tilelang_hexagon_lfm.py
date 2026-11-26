@@ -306,6 +306,89 @@ def test_decode_matches_the_reference(tiny_bundle):
         decoder.close()
 
 
+@pytest.mark.parametrize(
+    "rows,capacity,n_prompt,n_new,chunk,fp16",
+    [
+        (None, 32, 1, 32, 32, False),
+        (None, 8, 23, 15, 12, True),
+        (None, 2, 5, 3, 1, False),
+        (8, 11, 29, 18, 16, True),
+        (8, 3, 10, 4, 16, False),
+        (8, 3, 10, 4, 16, True),
+        (None, 16, 4, 6, 16, False),
+    ],
+)
+def test_stream_bounds_token_storage_without_repeating_positions(rows, capacity, n_prompt, n_new, chunk, fp16):
+    class Calls(Decoder):
+        def reset(self):
+            self.consumed = []
+            self.calls = []
+
+        def prefill(self, ids, pos0):
+            assert pos0 == len(self.consumed)
+            assert len(ids) <= capacity
+            assert self.fp16 or pos0 + -(-len(ids) // rows) * rows <= self.max_pos
+            self.consumed.extend(ids)
+            self.calls.append("prefill")
+
+        def run(self, ids, pos0, n, n_forced, temperature, seed):
+            assert pos0 == len(self.consumed) and n + 1 <= capacity
+            assert n_forced == len(ids) and (temperature, seed) == (0.7, 21)
+            out = list(ids)
+            for step in range(n):
+                self.consumed.append(out[step])
+                if step + 1 >= n_forced:
+                    out.append((out[step] + pos0 + step + seed) % 101)
+            self.calls.append("decode")
+            return out, None
+
+    decoder = Calls.__new__(Calls)
+    decoder.prefill_rows, decoder.max_tokens, decoder.max_pos, decoder.fp16 = rows, capacity, n_prompt + n_new - 1, fp16
+    prompt, expected = list(range(n_prompt)), []
+    for pos in range(n_prompt - 1, n_prompt - 1 + n_new):
+        expected.append(((expected[-1] if expected else prompt[-1]) + pos + 21) % 101)
+    parts = list(decoder.stream(prompt, n_new, 0.7, 21, chunk))
+    assert all(1 <= len(part) <= chunk for part in parts)
+    assert [token for part in parts for token in part] == expected
+    assert decoder.consumed == prompt + expected[:-1]
+    if not rows and n_prompt + n_new <= capacity:
+        assert decoder.calls == ["decode"]
+    assert decoder.generate(prompt, n_new, 0.7, 21) == expected
+
+
+def test_generation_rejects_impossible_requests_before_mutating_state():
+    decoder = Decoder.__new__(Decoder)
+    decoder.max_pos, decoder.max_tokens = 4, 4
+    assert decoder.generate([1], 0) == []
+    for prompt, n, chunk in (([], 1, 1), ([1], -1, 1), ([1], 1, 0), ([1, 2], 4, 2)):
+        with pytest.raises(ValueError):
+            list(decoder.stream(prompt, n, chunk=chunk))
+    decoder.max_tokens = 1
+    with pytest.raises(ValueError, match="storage"):
+        decoder.generate([1], 1)
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["quantized", "lfm3"])
+def test_generation_with_short_token_buffer_matches_single_steps(model, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=256, max_tokens=8, prefill_rows=None)
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000, 5, 93, 78]
+    try:
+        for temperature in (0, 0.8):
+            decoder.reset()
+            for pos, token in enumerate(prompt[:-1]):
+                decoder.run([token, prompt[pos + 1]], pos, 1, 2, temperature, 17)
+            expected, token = [], prompt[-1]
+            for pos in range(len(prompt) - 1, len(prompt) - 1 + 15):
+                out, _ = decoder.run([token], pos, 1, 1, temperature, 17)
+                token = out[-1]
+                expected.append(token)
+            assert decoder.generate(prompt, 15, temperature, 17) == expected
+    finally:
+        decoder.close()
+
+
 @DEVICE
 def test_decode_samples_at_a_temperature(tiny_bundle):
     _, _, _, path = tiny_bundle

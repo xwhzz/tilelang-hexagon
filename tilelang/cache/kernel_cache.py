@@ -692,7 +692,7 @@ class KernelCache:
             if verbose:
                 self.logger.debug(f"Loading kernel parameters from file: {params_path}")
             with open(params_path) as f:
-                kernel_params = load_kernel_params(f.read())
+                kernel_params = load_kernel_params(f.read(), func=func)
         except Exception:
             self.logger.exception("Error loading kernel parameters from disk")
 

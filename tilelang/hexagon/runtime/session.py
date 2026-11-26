@@ -50,7 +50,7 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from tilelang.hexagon.codegen import _GeneratedSource
+from tilelang.hexagon.codegen import _GeneratedSource, kernel_entry_name
 
 from . import fastrpc
 from .device import DEVICE_LOCK
@@ -93,8 +93,6 @@ _TURN_GAVE_UP = fastrpc.KERNEL_STATUS_BASE + 0xFF
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
 _MAX_BUFFERS = 256
-
-_KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def _align(n: int) -> int:
@@ -1016,16 +1014,14 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
     source = _GeneratedSource(art.kernel_source)
-    match = _KERNEL_RE.search(source)
-    if not match:
-        raise RuntimeError("could not find the kernel function in the generated source")
+    name = kernel_entry_name(art.device_mod)
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": match.group(1), "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
+            json.dump({"name": name, "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
-    return match.group(1), source
+    return name, source
 
 
 def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:

@@ -39,13 +39,8 @@ _row_major = tvm_ffi.get_global_func("tl.hexagon.RowMajor")
 _hmx_rejection = tvm_ffi.get_global_func("tl.hexagon.GemmHMXRejection")
 
 
-def _strides(buffer) -> list:
-    if buffer.strides:
-        return list(buffer.strides)
-    strides = [1]
-    for extent in reversed(buffer.shape[1:]):
-        strides.insert(0, strides[0] * extent)
-    return strides
+def _strides(buffer, compact=False) -> list:
+    return list(construct_strides(buffer.shape) if compact or not buffer.strides else buffer.strides)
 
 
 def scale_group(gemm, operand: str, g) -> tuple:
@@ -150,16 +145,16 @@ class GemmHVX(GemmBase):
             return {self.B: make_hvx_panel_layout(self.B)}
         return {}
 
-    def _operand(self, region, rows: int, cols: int, access: str):
+    def _operand(self, region, rows: int, cols: int, access: str, compact=False):
         """A pointer to the region's first element that covers `rows` rows of
         `cols` elements, the row stride, and whether the region starts on a
         register boundary."""
 
         buffer = region.buffer
-        strides = _strides(buffer)
+        strides = _strides(buffer, compact)
         ld = int(strides[-2])
         origin = [r.min for r in region.region]
-        offset = sum((m * s for m, s in zip(origin, strides)), tirx.const(0, "int64"))
+        offset = sum((m * s for m, s in zip(origin, strides)), tirx.Cast("int64", buffer.elem_offset))
         # Buffers start on a register boundary: VTCM arena buffers and stack
         # arrays are 128-byte aligned.
         size = DataType(buffer.dtype).bits // 8
@@ -167,9 +162,8 @@ class GemmHVX(GemmBase):
         pointer = T.access_ptr(buffer[tuple(origin)], access, (rows - 1) * ld + cols)
         return pointer, ld, aligned
 
-    def _integer_operands(self, layout_map):
-        """A, C and B of an integer GEMM: B's pointer, the bytes between its
-        panels, its bits and its signedness."""
+    def _integer_weights(self, layout_map):
+        """Validate operand layouts and address the first panel of B."""
         layout = layout_map.get(self.B, None)
         if not isinstance(layout, PanelLayout):
             raise ValueError(
@@ -180,9 +174,7 @@ class GemmHVX(GemmBase):
             raise ValueError(
                 f"T.gemm({self.A.name}, {self.B.name}, {self.C.name}): HVX reads integer A and C row-major, not {', '.join(others)}"
             )
-        M, N, K = self.M, self.N, self.K
-        a, lda, _ = self._operand(self.ARegion, M, K, "r")
-        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw")
+        N, K = self.N, self.K
         # B's region starts on a panel: a pointer at its logical start, which
         # LowerTileOp moves through the layout to the panel's bytes.
         origin = [r.min for r in self.BRegion.region]
@@ -190,11 +182,13 @@ class GemmHVX(GemmBase):
         b = T.access_ptr(self.B[tuple(origin)], "r", N * K)
         panel_bytes = 32 * int(self.B.shape[-1]) * bits // 8
         signed = str(self.B.dtype).startswith("int")
-        return a, lda, c, ldc, align_c, b, panel_bytes, bits, signed
+        return b, panel_bytes, bits, signed
 
     def _lower_integer(self, layout_map):
         M, N, K = self.M, self.N, self.K
-        a, lda, c, ldc, align_c, b, panel_bytes, bits, signed = self._integer_operands(layout_map)
+        b, panel_bytes, bits, signed = self._integer_weights(layout_map)
+        a, lda, _ = self._operand(self.ARegion, M, K, "r")
+        c, ldc, align_c = self._operand(self.CRegion, M, N, "rw")
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int")
         flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, tirx.const(bool(align_c), "bool")]
         clear = self.clear_accum
@@ -282,8 +276,8 @@ class GemmHVX(GemmBase):
 
 
 class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
-    """``T.gemm_blockscaled``: ``C (+)= (A * SFA) @ (B * SFB)^T`` as one
-    ``tl_hvx_gemm_int_scaled`` call, an integer GEMM whose groups of K leave
+    """``T.gemm_blockscaled``: ``C (+)= (A * SFA) @ (B * SFB)^T`` via
+    ``tl_hvx_gemm_int_scaled``, an integer GEMM whose groups of K leave
     the vrmpy accumulators into fp32 sums, weighed by their scales.
 
     A, B and C are those of an integer ``T.gemm`` with ``transpose_B``, except
@@ -295,9 +289,20 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
     end.
     """
 
+    def _row_operand(self, region, cols, access, layout_map):
+        """Use a contiguous operand directly or reserve one aligned staging row."""
+        buf = _external_strided_view(region.buffer, layout_map)
+        compact = buf in layout_map
+        if not compact and not arith.Analyzer().can_prove_equal(_strides(buf)[-1], 1):
+            return buf, None, cols, True
+        if not buf.same_as(region.buffer):
+            region = tirx.BufferRegion(buf, region.region)
+        ptr, ld, aligned = self._operand(region, self.M, cols, access, compact)
+        return buf, ptr, ld, aligned
+
     def lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr=None):
         M, N, K = self.M, self.N, self.K
-        a, lda, c, ldc, align_c, b, panel_bytes, bits, signed = self._integer_operands(layout_map)
+        b, panel_bytes, bits, signed = self._integer_weights(layout_map)
         ga, first_a = scale_group(self, "A", self.sf_a_granularity_k)
         gb, first_b = scale_group(self, "B", self.sf_b_granularity_k)
         # A signed B's groups take whole int16 registers of A for their sums.
@@ -317,15 +322,59 @@ class GemmHVXBlockScaled(GemmBlockScaledMixin, GemmHVX):
         sfa = T.access_ptr(sfa_region.buffer[tuple(sfa_origin)], "r", (M - 1) * ld_sfa + K // ga)
         read_sfb, ld_sfb = group_major_sfb(sfb_region, layout_map, first_b, K // gb, N)
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_int_scaled")
-        flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, ga, gb, tirx.const(bool(align_c), "bool")]
         clear = self.clear_accum
+        abuf, a, lda, _ = self._row_operand(self.ARegion, K, "r", layout_map)
+        cbuf, c, ldc, align_c = self._row_operand(self.CRegion, N, "rw", layout_map)
+        pack_a, pack_c = a is None, c is None
+        flags = [tirx.const(bits, "int32"), tirx.const(signed, "bool"), lda, ldc, ga, gb, tirx.const(bool(align_c), "bool")]
+
+        def call(rows, ap, cp, sa, sb):
+            return tirx.call_intrin("void", gemm, rows, N, K, *flags, cp, ap, b, panel_bytes, sa, ld_sfa, sb, ld_sfb, T.Cast("bool", clear))
+
+        if not (pack_a or pack_c):
+
+            @T.prim_func
+            def _gemm_hvx_blockscaled() -> None:
+                T.evaluate(call(M, a, c, sfa, read_sfb()))
+
+            return _gemm_hvx_blockscaled
+
+        a_origin = tuple(r.min for r in self.ARegion.region)
+        c_origin = tuple(r.min for r in self.CRegion.region)
+        sabuf = sfa_region.buffer
+
+        def at(origin, i, j):
+            return (*origin[:-2], origin[-2] + i, origin[-1] + j)
+
+        def scale_row(i):
+            if len(sfa_origin) == 1:
+                return sfa
+            return T.access_ptr(sabuf[at(sfa_origin, i, 0)], "r", K // ga)
 
         @T.prim_func
-        def _gemm_hvx_blockscaled() -> None:
-            T.evaluate(
-                tirx.call_intrin(
-                    "void", gemm, M, N, K, *flags, c, a, b, panel_bytes, sfa, ld_sfa, read_sfb(), ld_sfb, T.Cast("bool", clear)
-                )
-            )
+        def _gemm_hvx_blockscaled_rows() -> None:
+            sb = T.meta_var(read_sfb())
+            if pack_a:
+                a_row = T.alloc_shared((K,), abuf.dtype, align=128)
+            if pack_c:
+                c_row = T.alloc_shared((N,), cbuf.dtype, align=128)
+            for i in T.serial(M):
+                if pack_a:
+                    for k in T.Parallel(K):
+                        a_row[k] = abuf[at(a_origin, i, k)]
+                    ap = T.meta_var(T.access_ptr(a_row[0], "r", K))
+                else:
+                    ap = T.meta_var(T.access_ptr(abuf[at(a_origin, i, 0)], "r", K))
+                if pack_c:
+                    if not clear:
+                        for j in T.Parallel(N):
+                            c_row[j] = cbuf[at(c_origin, i, j)]
+                    cp = T.meta_var(T.access_ptr(c_row[0], "rw", N))
+                else:
+                    cp = T.meta_var(T.access_ptr(cbuf[at(c_origin, i, 0)], "rw", N))
+                T.evaluate(call(1, ap, cp, scale_row(i), sb))
+                if pack_c:
+                    for j in T.Parallel(N):
+                        cbuf[at(c_origin, i, j)] = c_row[j]
 
-        return _gemm_hvx_blockscaled
+        return _gemm_hvx_blockscaled_rows
