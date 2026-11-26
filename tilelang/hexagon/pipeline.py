@@ -66,6 +66,9 @@ def _check_dma_schedule(mod: IRModule) -> None:
 def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     _check_dma_schedule(mod)
     mod = tirx.transform.BindTarget(target)(mod)
+    # Resolve block-local views before tile operators inspect buffer identity
+    # and before VTCM allocation can treat a matched view as a separate tile.
+    mod = s_tir.transform.LowerMatchBuffer()(mod)
     mod = tilelang.hexagon.transform.LowerKernelLaunch()(mod)
     mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=False, unsupported_annotations=["cluster_dims"])(mod)
     mod = tilelang.hexagon.transform.LowerMath()(mod)

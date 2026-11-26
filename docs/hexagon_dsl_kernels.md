@@ -133,6 +133,11 @@ runs one chain of dependent instructions at a time, about one instruction per pa
 
 `T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).
+To transpose a VTCM tile, call `T.transpose(src, dst)` on distinct shared
+buffers. Regions with shapes `(..., M, N)` and `(..., N, M)` keep their leading
+axes and swap the final two. The operation uses the buffers' logical indices,
+including their region offsets and layouts.
+
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
 reads and writes shared buffers and fragments in place. Reducing the innermost axis is
