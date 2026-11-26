@@ -50,13 +50,11 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import numpy as np
-import torch
-
 from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
+from .tensor import buffer_bytes, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -911,7 +909,7 @@ class DeviceBuffer:
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
         self._live_allocation()
-        raw = _bytes(data)
+        raw = buffer_bytes(data)
         if offset < 0 or offset + len(raw) > self.nbytes:
             raise ValueError(f"{len(raw)} bytes at {offset} overrun a buffer of {self.nbytes}")
         self.session._write(self.id, self.offset + offset, raw)
@@ -932,17 +930,6 @@ class DeviceBuffer:
 
     def free(self) -> None:
         self.session._free(self.id, self._live_allocation())
-
-
-def _bytes(data) -> bytes:
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return bytes(data)
-    if isinstance(data, torch.Tensor):
-        data = data.detach().to("cpu").contiguous()
-        if data.dtype == torch.bfloat16:
-            data = data.view(torch.int16)
-        return data.numpy().tobytes()
-    return np.ascontiguousarray(data).tobytes()
 
 
 class SessionKernel:
@@ -1542,7 +1529,7 @@ class Session:
                 outputs.append((i, out_bytes))
                 out_bytes = _align(out_bytes + plan.nbytes)
             else:
-                raw = _bytes(value)
+                raw = buffer_bytes(value, kernel.params[i], plan.storage_axes)
                 if len(raw) != plan.nbytes:
                     raise ValueError(f"argument {i} of {kernel.name} has {len(raw)} bytes, the kernel takes {plan.nbytes}")
                 args += [_INPUT, len(inputs), 0]
@@ -1563,11 +1550,7 @@ class Session:
             param = kernel.params[i]
             plan = kernel.plans[i]
             chunk = raw[offset : offset + plan.nbytes]
-            dtype = str(param.dtype)
-            if dtype in ("int4", "uint4"):
-                results.append(torch.frombuffer(bytearray(chunk), dtype=torch.uint8))
-                continue
-            results.append(torch.frombuffer(bytearray(chunk), dtype=getattr(torch, dtype)).reshape([int(s) for s in param.shape]))
+            results.append(unpack_buffer(chunk, param))
         if not results:
             return None
         return results[0] if len(results) == 1 else results

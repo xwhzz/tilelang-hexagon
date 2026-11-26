@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 from tvm import DataType
 
+from .tensor import storage_layout
+
 # tilelang/numpy dtype -> the C scalar type the kernel pointer is cast to.
 _CTYPE = {
     "float32": "float",
@@ -43,16 +45,8 @@ def _ctype(dtype) -> str:
     return _CTYPE[name]
 
 
-def _nbytes(param) -> int:
-    """Static byte size of a buffer param (raises on dynamic shapes for now).
-
-    Elements narrower than a byte are packed: a 4-bit param of n elements
-    takes n / 2 bytes, passed as any tensor of those bytes."""
-    n = 1
-    for s in param.shape:
-        if not isinstance(s, int):
-            raise NotImplementedError("Hexagon adapter: dynamic shapes not supported yet")
-        n *= int(s)
+def _nbytes(param, n: int) -> int:
+    """Byte size of the physical span, including packed 4-bit elements."""
     bits = DataType(str(param.dtype)).bits
     if n * bits % 8:
         raise NotImplementedError(f"Hexagon adapter: {param.dtype} param of {n} elements is not whole bytes")
@@ -69,6 +63,7 @@ class BufferPlan:
     is_output: bool
     ctype: str
     nbytes: int  # for buffers
+    storage_axes: tuple[int, ...] | None = ()  # outermost to innermost for dense buffers, None otherwise
 
 
 def _plan(params, result_idx) -> list[BufferPlan]:
@@ -85,7 +80,8 @@ def _plan(params, result_idx) -> list[BufferPlan]:
                 )
             plans.append(BufferPlan(i, f"s{i}", True, False, _ctype(p.dtype), 0))
         else:
-            plans.append(BufferPlan(i, f"p{i}", False, i in out, _ctype(p.dtype), _nbytes(p)))
+            elements, axes = storage_layout(p)
+            plans.append(BufferPlan(i, f"p{i}", False, i in out, _ctype(p.dtype), _nbytes(p, elements), axes))
     return plans
 
 

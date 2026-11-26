@@ -22,6 +22,7 @@ class KernelParam:
     # This avoids information loss when converting from TVM buffer types
     dtype: tvm.DataType  # Data type from buffer.dtype (supports all TVM types)
     shape: list[int | Var]  # List of dimensions, can be integers or TVM variables
+    strides: list[int | PrimExpr] | None = None  # Explicit element strides, when supplied by the buffer
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
@@ -48,7 +49,8 @@ class KernelParam:
                 shape.append(s)
             else:
                 raise ValueError(f"Unsupported dimension type: {type(s)} {s}")
-        return cls(dtype, shape)
+        strides = [s.value if isinstance(s, IntImm) else s for s in buffer.strides]
+        return cls(dtype, shape, strides or None)
 
     @classmethod
     def from_var(cls, var: Var):
@@ -174,7 +176,12 @@ def dump_kernel_params(params: list[KernelParam]) -> str:
     The result contains only IR node data and can be loaded without executing
     any code, unlike a pickle.
     """
-    records = [{"dtype": str(param.dtype), "shape": list(param.shape)} for param in params]
+    records = []
+    for param in params:
+        record = {"dtype": str(param.dtype), "shape": list(param.shape)}
+        if param.strides is not None:
+            record["strides"] = param.strides
+        records.append(record)
     return tvm.ir.save_json(tvm.runtime.convert(records))
 
 
@@ -184,5 +191,6 @@ def load_kernel_params(text: str) -> list[KernelParam]:
     for record in tvm.ir.load_json(text):
         dtype = tvm.DataType(str(record["dtype"]))
         shape = [dim if isinstance(dim, PrimExpr) else int(dim) for dim in record["shape"]]
-        params.append(KernelParam(dtype, shape))
+        strides = list(record["strides"]) if "strides" in record else None
+        params.append(KernelParam(dtype, shape, strides))
     return params
