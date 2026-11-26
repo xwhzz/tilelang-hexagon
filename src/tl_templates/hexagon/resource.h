@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/session_state.h>
 #include <tl_templates/hexagon/vtcm.h>
 
 struct tl_resource_worker {
@@ -35,7 +36,7 @@ struct tl_cooperative_run {
   unsigned served_seq;
   qurt_thread_t owner;
 };
-static tl_cooperative_run tl_resource_state;
+TL_HEXAGON_SESSION_STATE tl_cooperative_run tl_resource_state;
 
 static inline int tl_resource_error(tl_cooperative_run *run) {
   return __atomic_load_n(&run->first_error, __ATOMIC_ACQUIRE);

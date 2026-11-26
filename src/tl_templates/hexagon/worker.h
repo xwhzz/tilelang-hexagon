@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/session_state.h>
 #include <tl_templates/hexagon/vtcm.h>
 #include <type_traits>
 
@@ -41,8 +42,9 @@ typedef int (*tl_worker_fn)(void *ctx, int wid, int nw);
 // creation are serial, so cache once per Session. If either query is
 // unavailable, use only the calling thread; this fallback does not claim a
 // detected HVX unit.
+TL_HEXAGON_SESSION_STATE int tl_worker_capacity;
 static inline int tl_num_workers(void) {
-  static int workers = 0;
+  int &workers = tl_worker_capacity;
   if (workers)
     return workers;
   qurt_sysenv_max_hthreads_t h;
@@ -68,7 +70,7 @@ static inline int tl_num_workers(void) {
 // futex calls (opaque compiler barriers + kernel-side ordering), so the writes
 // happen-before the worker's reads. (Do NOT replace them with an inlined
 // lockless path without an explicit barrier.)
-static struct {
+struct tl_worker_pool {
   qurt_sem_t
       go[TL_MAX_WORKERS]; // dispatcher ups go[w]; worker w blocks on down
   qurt_sem_t done; // worker ups; dispatcher downs once per released worker
@@ -81,7 +83,8 @@ static struct {
   void *blob;                 // one stack blob for the spawned workers
   int status[TL_MAX_WORKERS]; // worker w's return; dispatcher reads it after
                               // the join
-} tl_pool;
+};
+TL_HEXAGON_SESSION_STATE tl_worker_pool tl_pool;
 
 static void tl_pool_worker(void *arg) {
   int wid = (int)(intptr_t)arg; // 1..spawned, fixed for this thread's life
@@ -236,13 +239,14 @@ static inline tl_worker_arenas tl_vtcm_worker_arenas(unsigned int bytes,
 
 // The barrier of the running coresident grid. Launches run one at a time per
 // session, so one instance serves them all.
-static struct {
+struct tl_grid_state {
   int32_t programs;               // programs that meet at each barrier
   int32_t arrived;                // programs waiting at the current barrier
   int32_t completed;              // barriers every program has passed
   int32_t failed;                 // a program stopped with an error
   int32_t passed[TL_MAX_WORKERS]; // barriers program i has reached, its own
-} tl_grid;
+};
+TL_HEXAGON_SESSION_STATE tl_grid_state tl_grid;
 
 // Program `program` of the running coresident grid waits until all its
 // programs reach this call. Memory written before the call, including HVX

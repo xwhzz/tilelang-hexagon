@@ -201,6 +201,48 @@ def test_session_skel_dispatches_by_kernel():
     assert "HAP_mmap_get(fd, &vaddr, &paddr)" in source
 
 
+def _imported_bias(factor, offset):
+    # Even a shared helper's body may depend on its kernel's own macros.
+    source = (
+        "#ifdef TILE_BIAS\n#error unexpected macro from another kernel\n#endif\n"
+        f"#define TILE_BIAS {offset}\n"
+        "static inline float tile_bias(float x) { return x + TILE_BIAS; }"
+    )
+
+    @T.prim_func
+    def apply(a: T.Tensor((2, 32), "float32"), y: T.Tensor((2, 32), "float32")):
+        with T.Kernel(2, num_workers=2) as bx:
+            T.import_source(source)
+            tile = T.alloc_shared((32,), "float32")
+            T.dma_copy(a[bx, :], tile)
+            T.dma_wait()
+            for i in T.serial(32):
+                y[bx, i] = T.call_extern("float32", "tile_bias", tile[i]) * T.float32(factor)
+
+    return apply
+
+
+def test_session_project_keeps_private_imports_and_shares_vtcm(tmp_path):
+    lowered = session.lower_kernels([(_imported_bias(factor, offset), [1]) for factor, offset in ((1, 2), (2, 2), (3, 5))])
+    _, iface = session.write_project(str(tmp_path), [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered])
+    dispatcher = (tmp_path / f"{iface}_dsp.cc").read_text()
+    assert "static inline float tile_bias" not in dispatcher
+    assert "#define TL_HEXAGON_USES_VTCM 1" in dispatcher
+    for i, offset in enumerate((2, 2, 5)):
+        module = (tmp_path / f"{iface}_kernel_{i}.cc").read_text()
+        assert f"#define TILE_BIAS {offset}" in module
+        assert "static inline float tile_bias" in module
+
+
+@DEVICE
+def test_session_runs_kernels_with_private_imports():
+    cases = ((1, 2), (2, 2), (3, 5))
+    x = torch.arange(64, dtype=torch.float32).reshape(2, 32)
+    with session.Session([(_imported_bias(factor, offset), [1]) for factor, offset in cases]) as active:
+        for kernel, (factor, offset) in zip(active.kernels, cases):
+            torch.testing.assert_close(kernel(x), (x + offset) * factor, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("arch", ["v73", "v79"])
 def test_raw_session_skel_compiles_without_kernel_template_includes(tmp_path, arch):
     from tilelang.hexagon.runtime.env import HexagonSDK, HexagonEnvError

@@ -597,6 +597,10 @@ void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
   for (const std::string &header : headers_)
     os << "#include <tl_templates/hexagon/" << header << ">\n";
   os << "\n";
+  // A Session can compile this kernel separately, and include just its
+  // generated resource requirements in the process-wide dispatcher.
+  if (HasImportedSource())
+    os << "// TL_HEXAGON_IMPORTED_SOURCE\n";
 }
 
 void CodeGenTileLangHexagon::PrintFuncPrefix(std::ostream &os) { // NOLINT(*)
