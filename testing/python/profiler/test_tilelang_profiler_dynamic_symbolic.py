@@ -34,21 +34,6 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
     return gemm
 
 
-def test_profiler_supplies_rank_zero_buffers(monkeypatch):
-    from tilelang.engine.param import KernelParam
-    from tilelang.profiler import Profiler, TensorSupplyType
-
-    bias = KernelParam(tilelang.tvm.DataType("float32"), [], is_buffer=True)
-    scalar = KernelParam(bias.dtype, [], is_buffer=False)
-    monkeypatch.setattr("tilelang.utils.device.get_current_device", lambda: torch.device("cpu"))
-    for supply in TensorSupplyType:
-        profiler = Profiler([bias, bias], [1], supply)
-        inputs = profiler._get_inputs(with_output=True, dynamic_symbolic_constraints={"n": 6})
-        assert all(x.shape == () and x.dtype == torch.float32 for x in inputs)
-    with pytest.raises(ValueError, match="by-value scalar"):
-        profiler.supply(scalar)
-
-
 @pytest.mark.parametrize("m_val", SINGLE_SYMBOLIC_M_VALUES, ids=[f"m={m}" for m in SINGLE_SYMBOLIC_M_VALUES])
 def test_profiler_dynamic_symbolic_single(m_val):
     """Test profiler with a single dynamic symbolic variable."""

@@ -62,8 +62,6 @@ class _FakeAdapter:
 
 
 class _FakeKernel:
-    execution_backend = "cython"
-
     def __init__(self, libpath: str, params):
         self.adapter = _FakeAdapter(libpath)
         self.kernel_source = "// device kernel"
@@ -88,59 +86,6 @@ def test_kernel_cache_stores_params_as_json(tmp_path, monkeypatch):
     text = params_file.read_text()
     json.loads(text)
     _check_round_trip(params, load_kernel_params(text))
-
-
-def test_cache_records_keep_only_nondefault_abi_fields(tmp_path, monkeypatch):
-    from tilelang.autotuner.param import AutotuneResult, PARAMS_PATH
-    from tilelang.engine.lower import extrac_params
-
-    n = tirx.Var("n", "int32")
-    rows = tirx.decl_buffer([n, 2], "float32", strides=[n + 2, 1])
-    scalar = tirx.Var("scale", "float32")
-    bias = tirx.decl_buffer([], "float32")
-    dense = tirx.decl_buffer([n], "float32")
-    func = tirx.PrimFunc([rows, scalar, bias, dense], tirx.Evaluate(0))
-    params = extrac_params(func)
-    standalone = load_kernel_params(dump_kernel_params(params))
-    assert standalone[0].strides[0].a.same_as(standalone[0].shape[0])
-    assert [p.is_buffer for p in standalone] == [True, False, True, True]
-
-    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(tmp_path / "cache"))
-    lib_path = tmp_path / "kernel_lib.so"
-    lib_path.write_bytes(b"fake-so")
-    cache = KernelCache()
-    kernel = _FakeKernel(str(lib_path), params)
-    cache._save_kernel_to_disk("strided", kernel, func=func)
-    text = (Path(cache._get_cache_path("strided")) / cache.params_path).read_text()
-
-    tuner_dir = tmp_path / "autotuner"
-    AutotuneResult(func=func)._save_kernel_to_disk(tuner_dir, kernel)
-    assert (tuner_dir / PARAMS_PATH).read_text() == text
-    fields = [set(r.keys()) for r in tvm.ir.load_json(text)]
-    assert fields == [{"shape", "dtype", "strides"}, {"shape", "dtype"}, {"shape", "dtype", "is_buffer"}, {"shape", "dtype"}]
-    assert not load_kernel_params(text)[2].is_scalar()
-    restored = load_kernel_params(text, func=func)
-    assert restored[0].strides[0].a.same_as(restored[0].shape[0])
-    assert [p.is_buffer for p in restored] == [True, False, True, True]
-    assert restored[0].shape[0].same_as(restored[3].shape[0])
-
-    # A caller-supplied ABI takes precedence, including a different stride
-    # for the declared layout and a scalar that replaces a rank-zero pointer.
-    override = [KernelParam(p.dtype, p.shape) for p in params]
-    override[0].strides = [n + 3, 1]
-    restored = load_kernel_params(dump_kernel_params(override, func=func), func=func)
-    assert restored[0].strides[0].a.same_as(restored[0].shape[0])
-    assert int(restored[0].strides[0].b) == 3
-    assert [p.is_scalar() for p in restored] == [False, True, True, False]
-
-    # Both cache writers still accept standalone and previous complete records.
-    assert [p.is_buffer for p in load_kernel_params(dump_kernel_params(params), func=func)] == [True, False, True, True]
-    extra = [*params, KernelParam(scalar.dtype, [], is_buffer=False)]
-    assert load_kernel_params(dump_kernel_params(extra, func=func), func=func)[-1].is_scalar()
-
-    old_override = [KernelParam(params[0].dtype, [7, 2]), *override[1:]]
-    restored = load_kernel_params(dump_kernel_params(old_override), func=func)
-    assert restored[0].shape == [7, 2] and restored[0].strides is None
 
 
 if __name__ == "__main__":

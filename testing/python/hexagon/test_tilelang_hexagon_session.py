@@ -144,15 +144,25 @@ def rank_zero(x: T.Tensor((6,), "float32"), bias: T.Tensor((), "float32"), scale
         out[()] = (x[0] + x[5]) * scale + bias[()]
 
 
-def test_rank_zero_buffer_abi_survives_parameter_serialization():
+def test_rank_zero_buffer_abi_survives_parameter_serialization(monkeypatch):
     from tilelang import tvm
+    from tilelang.autotuner.tuner import _can_reuse_inputs
     from tilelang.engine.param import dump_kernel_params, load_kernel_params
+    from tilelang.profiler import Profiler, TensorSupplyType
 
     ((_, _, params, _),) = session.lower_kernels([(rank_zero, [3])])
     old_records = [{"dtype": str(p.dtype), "shape": p.shape} for p in params]
     old_text = tvm.ir.save_json(tvm.runtime.convert(old_records))
     assert load_kernel_params(old_text)[1].is_scalar()  # Historical shape-only convention.
-    for restored in (params, load_kernel_params(dump_kernel_params(params)), load_kernel_params(old_text, func=rank_zero)):
+    cached = dump_kernel_params(params, func=rank_zero)
+    assert [i for i, record in enumerate(tvm.ir.load_json(cached)) if "is_buffer" in record] == [1, 3]
+    for restored in (
+        params,
+        load_kernel_params(dump_kernel_params(params)),
+        load_kernel_params(cached),
+        load_kernel_params(cached, func=rank_zero),
+        load_kernel_params(old_text, func=rank_zero),
+    ):
         plans = fastrpc._plan(restored, [3])
         assert [(p.is_scalar, p.nbytes, p.is_output) for p in plans] == [
             (False, 24, False),
@@ -162,6 +172,17 @@ def test_rank_zero_buffer_abi_survives_parameter_serialization():
         ]
         idl = fastrpc.gen_idl("rank_zero", plans)
         assert "in sequence<uint8> p1" in idl and "in int32 s2" in idl and "rout sequence<uint8> p3" in idl
+
+    _, bias, scalar, out = restored
+    assert not _can_reuse_inputs([bias], [scalar], [0.5])
+    assert not _can_reuse_inputs([scalar], [bias], [torch.tensor(0.5)])
+    monkeypatch.setattr("tilelang.utils.device.get_current_device", lambda: torch.device("cpu"))
+    for supply in TensorSupplyType:
+        profiler = Profiler([bias, out], [1], supply)
+        inputs = profiler._get_inputs(with_output=True, dynamic_symbolic_constraints={"n": 6})
+        assert all(x.shape == () and x.dtype == torch.float32 for x in inputs)
+    with pytest.raises(ValueError, match="by-value scalar"):
+        profiler.supply(scalar)
 
 
 @DEVICE
