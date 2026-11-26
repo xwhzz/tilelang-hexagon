@@ -87,7 +87,7 @@ def test_cooperative_dispatch_preserves_policy_and_first_error(tmp_path):
     executable = tmp_path / "cooperative_dispatch"
     source.write_text(harness.replace("// GENERATED_RUN_KERNEL", fastrpc.RUN_KERNEL))
     subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(executable)], check=True, timeout=30)
-    for mode in ("ordinary", "cooperative"):
+    for mode in ("ordinary", "cooperative", "resource-free"):
         for failure in ("none", "prepare-error", "body-error", "finish-error", "body-error-finish-error"):
             subprocess.run([str(executable), f"{mode}-{failure}"], check=True, timeout=5)
     subprocess.run([str(executable), "ordinary-take-error"], check=True, timeout=5)

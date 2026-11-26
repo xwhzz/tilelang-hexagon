@@ -440,6 +440,7 @@ class JITKernel(Generic[_P, _T]):
                 compile_flags=compile_flags,
             )
         elif execution_backend == "hexagon":
+            from tilelang.hexagon.codegen import _GeneratedSource
             from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
 
             adapter = create_adapter(
@@ -447,7 +448,7 @@ class JITKernel(Generic[_P, _T]):
                 params=artifact.params,
                 result_idx=out_idx,
                 target=target,
-                kernel_source=artifact.kernel_source,
+                kernel_source=_GeneratedSource(artifact.kernel_source),
                 device_mod=artifact.device_mod,
                 verbose=self.verbose,
             )

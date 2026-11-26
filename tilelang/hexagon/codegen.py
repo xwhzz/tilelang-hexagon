@@ -7,6 +7,10 @@ from tilelang.backend.device_codegen import global_func_device_codegen
 build_hexagon = global_func_device_codegen("target.build.tilelang_hexagon")
 
 
+class _GeneratedSource(str):
+    """Unmodified Hexagon codegen output. String edits produce ordinary text."""
+
+
 def single_device_kernel(device_mod):
     """Return the lowered function whose attributes describe the kernel ABI."""
     if len(device_mod.functions) != 1:

@@ -50,7 +50,7 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from tilelang.hexagon.codegen import single_device_kernel
+from tilelang.hexagon.codegen import _GeneratedSource, single_device_kernel
 
 from . import fastrpc
 from .device import DEVICE_LOCK
@@ -246,11 +246,15 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
+    # An opaque source in this translation unit can redefine a sibling's helpers.
+    managed = all(
+        isinstance(src, _GeneratedSource) and src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels
+    )
     for i, (_, source, plans) in enumerate(kernels):
         args = ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source, managed_session=managed)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -1014,16 +1018,19 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         with contextlib.suppress(OSError, ValueError, KeyError):
             with open(path) as f:
                 entry = json.load(f)
-            return entry["name"], entry["source"]
+            source = entry["source"]
+            if entry.get("source_digest") == hashlib.sha256(source.encode()).hexdigest():
+                source = _GeneratedSource(source)
+            return entry["name"], source
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-    source = str(art.kernel_source)
+    source = _GeneratedSource(art.kernel_source)
     name = str(single_device_kernel(art.device_mod).attrs["global_symbol"])
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": name, "source": source}, f)
+            json.dump({"name": name, "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
     return name, source
 

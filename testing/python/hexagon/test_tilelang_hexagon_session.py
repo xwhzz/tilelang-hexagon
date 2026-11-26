@@ -267,6 +267,35 @@ def test_jit_writes_state_and_keeps_allocated_output_order():
 
 
 @DEVICE
+def test_jit_and_source_only_calls_preserve_output_and_resource_contracts():
+    import tilelang
+    from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
+
+    x = torch.arange(N, dtype=torch.float32)
+    y, supplied = torch.ones_like(x), torch.zeros_like(x)
+    versions = x._version, y._version
+    kernel = tilelang.compile(add.with_attr("global_symbol", "add_into_supplied"), target="hexagon", out_idx=2)
+    adapter = kernel.adapter
+    params, name, source = adapter.params, adapter.kernel_name, adapter.kernel_source
+    plans = fastrpc._plan(params, [])
+    free_dispatch = "return tl_hexagon_run_kernel<false, false>"
+    try:
+        assert free_dispatch in session.gen_dsp("jit", [(name, source, plans)])
+        assert kernel(x, y, supplied) is None
+        torch.testing.assert_close(supplied, x + y)
+        assert (x._version, y._version) == versions
+    finally:
+        adapter.close()
+
+    raw = HexagonKernelAdapter(params, [2], adapter.target, str(source))
+    try:
+        assert free_dispatch not in session.gen_dsp("raw", [(name, raw.kernel_source, plans)])
+        torch.testing.assert_close(raw(x, y), x + y)
+    finally:
+        raw.close()
+
+
+@DEVICE
 def test_eager_and_lazy_jit_write_supplied_state():
     import tilelang
     from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
@@ -399,6 +428,7 @@ def test_imported_helper_preceding_the_kernel_entry(monkeypatch):
     monkeypatch.setattr(session.Session, "of_lowered", classmethod(lambda cls, kernels, **kwargs: captured.extend(kernels) or fake))
     tilelang.compile(add_one, target="hexagon", out_idx=[1])
     assert captured[0][:2] == lowered[:2]
+    assert "tl_hexagon_run_kernel<false, false>" not in session.gen_dsp("jit", [(captured[0][0], captured[0][1], [])])
     # The exported C symbol and the IRModule's lookup key can differ.
     func = add_one.with_attr("global_symbol", name).with_attr("tl.readonly_param_indices", [0])
     mod = tvm.IRModule({"internal": func})
@@ -519,6 +549,69 @@ def test_mixed_session_selects_resource_policy_per_kernel():
     assert fastrpc.run_kernel_entry("// #define TL_HEXAGON_USES_COOPERATIVE 1") == "tl_hexagon_run_kernel"
     oneshot = fastrpc.gen_dsp("single", "cooperative", kernels[1][1], [])
     assert "return tl_hexagon_run_kernel<true>([&]() { return cooperative(); });" in oneshot
+
+
+def test_session_skips_take_and_give_only_for_proven_resource_free_kernels(tmp_path, monkeypatch):
+    import json
+    import tilelang
+    from tilelang.env import env
+
+    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(tmp_path))
+
+    @T.prim_func
+    def imported(a: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            T.import_source("#define PRIVATE_MACRO 3")
+            a[0] = 1
+
+    @T.prim_func
+    def external(a: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a[0] = T.call_extern("float32", "external", a[0])
+
+    def sources(functions):
+        return [(name, source, []) for name, source, _, _ in session.lower_kernels([(f, []) for f in functions])]
+
+    kernels = sources([add, dma_step, hmx_gemm])
+    wrappers = session.gen_dsp("mixed", kernels)
+    assert "tl_hexagon_run_kernel<false, false>([&]() { return tl_session_kernel_0(" in wrappers
+    for i in (1, 2):
+        assert f"tl_hexagon_run_kernel([&]() {{ return tl_session_kernel_{i}(" in wrappers
+    name, source, plans = kernels[0]
+    for opaque in [
+        *sources([imported, external]),
+        ("raw", "int raw() { return 0; }", []),
+        (name, source + "\n// edited after lowering", plans),
+        (name, json.loads(json.dumps(source)), plans),
+    ]:
+        # Source is combined into one TU. An import can affect the other kernels.
+        assert "tl_hexagon_run_kernel<false, false>" not in session.gen_dsp("mixed", [*kernels, opaque])
+
+    from tilelang.hexagon.runtime.adapter import HexagonKernelAdapter
+    from tilelang.hexagon.runtime.env import HexagonSDK
+
+    seen = []
+    fake = SimpleNamespace(kernels=[lambda *args: None], close=lambda: None)
+    monkeypatch.setattr(HexagonSDK, "validate", lambda self: self)
+    monkeypatch.setattr(session.Session, "of_lowered", classmethod(lambda cls, lowered, **kw: seen.extend(lowered) or fake))
+    tilelang.compile(add, target="hexagon", out_idx=2)
+    HexagonKernelAdapter(kernels[0][2], [], None, str(source)).close()
+    generated, supplied = [(n, src, []) for n, src, _, _ in seen]
+    assert "tl_hexagon_run_kernel<false, false>" in session.gen_dsp("jit", [generated])
+    assert "tl_hexagon_run_kernel<false, false>" not in session.gen_dsp("raw", [supplied])
+
+    # Only a cache entry written for these exact source bytes restores the proof.
+    monkeypatch.setattr(tilelang, "lower", lambda *args, **kwargs: pytest.fail("expected a lowering cache hit"))
+    assert session.gen_dsp("mixed", sources([add, dma_step, hmx_gemm])) == wrappers
+    for path in (tmp_path / "hexagon_lowered").glob("*.json"):
+        record = json.loads(path.read_text())
+        if record["source"] == source:
+            del record["source_digest"]  # Historical shape, prior to the proof.
+            path.write_text(json.dumps(record))
+            break
+    else:
+        pytest.fail("missing cached source")
+    assert "tl_hexagon_run_kernel<false, false>" not in session.gen_dsp("mixed", sources([add, dma_step, hmx_gemm]))
 
 
 def test_normal_close_cannot_hide_unsent_shutdown():

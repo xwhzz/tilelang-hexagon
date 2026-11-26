@@ -27,7 +27,7 @@ namespace codegen {
 class CodeGenTileLangHexagon : public CodeGenTileLangCBase {
 public:
   // Imported C and unrecognized text can affect every function in a module.
-  void CheckLoadOnlyDMAModule(const IRModule &module);
+  void CheckManagedCalls(const IRModule &module);
   CodeGenTileLangHexagon();
 
   /*! \brief Emit the preamble (template include) and initialize CodeGenC. */
@@ -99,6 +99,7 @@ private:
   bool dma_load_only_ = false;
   bool in_dma_program_ = false;
   bool dma_load_only_module_ = false;
+  bool has_only_managed_calls_ = true;
   /*!
    * \brief the template headers whose code the module calls, which its
    * preamble includes, and whether it uses HMX and VTCM, which the session
