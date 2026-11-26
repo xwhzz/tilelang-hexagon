@@ -161,6 +161,33 @@ def test_division_matches_torch(dtype, fast):
         kernel.adapter.close()
 
 
+def test_default_float32_division_at_exponent_limits():
+    import torch
+
+    @T.prim_func
+    def divide(a: T.Tensor((32,), "float32"), b: T.Tensor((32,), "float32"), out: T.Tensor((32,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                out[i] = a[i] / b[i]
+
+    kernel = tilelang.compile(divide, out_idx=2, target="hexagon")
+    try:
+        # Cover every normal exponent and both signs, with normal and special
+        # denominators in the same register.
+        denom = torch.tensor([sign * 2.0**e for e in range(-126, 128) for sign in (1, -1)])
+        denom = torch.cat([denom, torch.tensor([torch.finfo(torch.float32).max, -(2.0**127), 2.0**-149, -(2.0**-149)])])
+        for b in denom.split(32):
+            torch.testing.assert_close(kernel(b.abs(), b), b.sign(), rtol=1e-6, atol=0)
+        a = torch.tensor([1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 3.0]).repeat(4)
+        b = torch.tensor([0.0, 0.0, -0.0, float("inf"), -float("inf"), 2.0**127, float("nan"), 2.0]).repeat(4)
+        result = kernel(a, b)
+        expected = a / b
+        torch.testing.assert_close(result, expected, equal_nan=True, rtol=1e-6, atol=0)
+        assert torch.equal(result[expected == 0].signbit(), expected[expected == 0].signbit())
+    finally:
+        kernel.adapter.close()
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float16", "int8"])
 def test_min_and_max_match_torch(dtype):
     import torch

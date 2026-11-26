@@ -725,6 +725,27 @@ TL_DEVICE float tl_hvx_fabs(const half &x) { return __builtin_fabsf((float)x); }
 // codegen prints a / b as tl_hvx_div(a, b): a times the reciprocal of b. fp16
 // divides in fp32, so the quotient is rounded once.
 // ---------------------------------------------------------------------------
+TL_DEVICE HVX_Vector tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
+  using Words = vec_type<uint32_t, 32>::nat_t;
+  using Floats = vec_type<float, 32>::nat_t;
+  Words magnitude = __builtin_bit_cast(Words, y) & 0x7fffffffU;
+  // The reciprocal seed requires a normal denominator whose inverse stays
+  // normal. Include the top two exponent bins, where the bit seed can cross
+  // zero, as well as zeros, subnormals, infinities and NaNs.
+  auto exceptional = (magnitude - 0x00800000U) >= (0x7e800000U - 0x00800000U);
+  HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
+  if (__builtin_expect(__builtin_reduce_or(exceptional) != 0, 0)) {
+    Floats a = __builtin_bit_cast(Floats, x), b = __builtin_bit_cast(Floats, y);
+    Floats result = __builtin_bit_cast(Floats, q);
+    for (int i = 0; i < 32; ++i) {
+      if (exceptional[i])
+        result[i] = a[i] / b[i];
+    }
+    return __builtin_bit_cast(HVX_Vector, result);
+  }
+  return q;
+}
+
 template <int N>
 TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
                                         const vec_type<float, N> &b) {
@@ -735,7 +756,7 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
     HVX_Vector x, y;
     __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
     __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
-    HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
+    HVX_Vector q = tl_hvx_div_vsf(x, y);
     __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
   }
   return out;
