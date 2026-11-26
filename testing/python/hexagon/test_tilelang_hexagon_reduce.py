@@ -409,6 +409,21 @@ def _check(op, shape, dim, src_dtype, dst_dtype, clear=True, scope="shared"):
 
 
 @DEVICE
+@pytest.mark.parametrize("dtype", ["int8", "uint8"])
+def test_byte_rows_sum_into_fp32(dtype):
+    import torch
+
+    # Two full registers and a tail, with signed and unsigned byte extrema.
+    x = torch.arange(4 * 259).to(getattr(torch, dtype)).reshape(4, 259)
+    init = torch.tensor([0.25, -0.5, 0.75, -1.0])
+    kernel = tilelang.compile(_make("sum", (4, 259), 1, dtype, "float32", clear=False), out_idx=2, target="hexagon")
+    try:
+        torch.testing.assert_close(kernel(x, init), x.float().sum(1) + init, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
 @pytest.mark.parametrize("dim", [0, 1])
 @pytest.mark.parametrize("op", _FLOAT_OPS)
 def test_float_reductions_match_torch(op, dim):
