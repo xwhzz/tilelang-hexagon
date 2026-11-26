@@ -309,6 +309,31 @@ def test_mixed_session_selects_resource_policy_per_kernel():
     assert "return tl_hexagon_run_kernel<true>([&]() { return cooperative(); });" in oneshot
 
 
+def test_session_skips_take_and_give_only_for_proven_resource_free_kernels():
+    @T.prim_func
+    def imported(a: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            T.import_source("#define PRIVATE_MACRO 3")
+            a[0] = 1
+
+    @T.prim_func
+    def external(a: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a[0] = T.call_extern("float32", "external", a[0])
+
+    def sources(functions):
+        return [(name, source, []) for name, source, _, _ in session.lower_kernels([(f, []) for f in functions])]
+
+    kernels = sources([add, dma_step, hmx_gemm])
+    wrappers = session.gen_dsp("mixed", kernels)
+    assert "tl_hexagon_run_kernel<false, false>([&]() { return tl_session_kernel_0(" in wrappers
+    for i in (1, 2):
+        assert f"tl_hexagon_run_kernel([&]() {{ return tl_session_kernel_{i}(" in wrappers
+    for opaque in [*sources([imported, external]), ("raw", "int raw() { return 0; }", [])]:
+        # Source is combined into one TU. An import can affect the other kernels.
+        assert "tl_hexagon_run_kernel<false, false>" not in session.gen_dsp("mixed", [*kernels, opaque])
+
+
 def test_normal_close_cannot_hide_unsent_shutdown():
     def fail_send(data):
         raise OSError("connection lost")

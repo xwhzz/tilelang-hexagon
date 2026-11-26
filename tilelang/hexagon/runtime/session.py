@@ -245,11 +245,13 @@ def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
     for i, (name, source, _) in enumerate(kernels):
         parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
+    # An opaque source in this translation unit can redefine a sibling's helpers.
+    managed = all(src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels)
     for i, (_, source, plans) in enumerate(kernels):
         args = ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source, managed_session=managed)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
