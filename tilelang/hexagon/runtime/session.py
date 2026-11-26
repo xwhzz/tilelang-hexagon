@@ -54,7 +54,7 @@ from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
-from .tensor import buffer_bytes, pack_buffer, unpack_buffer
+from .tensor import byte_buffer, pack_buffer, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -909,7 +909,7 @@ class DeviceBuffer:
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
         self._live_allocation()
-        raw = buffer_bytes(data)
+        raw = byte_buffer(data)
         if offset < 0 or offset + len(raw) > self.nbytes:
             raise ValueError(f"{len(raw)} bytes at {offset} overrun a buffer of {self.nbytes}")
         self.session._write(self.id, self.offset + offset, raw)
@@ -1459,10 +1459,16 @@ class Session:
             allocation.alive = False
             del self._allocations[bid]
 
-    def _write(self, bid: int, offset: int, raw: bytes) -> None:
-        wire = bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw
+    def _write(self, bid: int, offset: int, raw: bytes | memoryview) -> None:
+        header = struct.pack("<BiQQ", _OP_WRITE, bid, offset, len(raw))
         with self._exchange():
-            self._sock.sendall(wire)
+            # Send a small request in one socket write for ADB latency. Large
+            # payloads go directly from the caller's storage to the socket.
+            if len(raw) <= 64 * 1024:
+                self._sock.sendall(header + raw)
+            else:
+                self._sock.sendall(header)
+                self._sock.sendall(raw)
             self._status("a buffer write")
 
     def _read(self, bid: int, offset: int, n: int) -> bytes:

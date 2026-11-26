@@ -861,6 +861,36 @@ def _wire_session(sock):
     return instance, session.DeviceBuffer(instance, 0, 128, _allocation=allocation)
 
 
+def test_resident_writes_keep_large_contiguous_storage_and_preserve_byte_order():
+    import numpy as np
+
+    sock = _WireSocket(reply=b"\0" * 8)
+    instance, buffer = _wire_session(sock)
+    data = torch.arange(32769, dtype=torch.int32)
+    size = data.numel() * data.element_size()
+    buffer.nbytes = buffer._allocation.nbytes = size + 128
+    buffer.write(data, 128)
+    head, payload = sock.sent
+    assert struct.unpack("<BiQQ", head) == (session._OP_WRITE, 0, 128, size)
+    assert np.shares_memory(np.frombuffer(payload, dtype=np.int32), data.numpy())
+    assert bytes(payload) == data.numpy().tobytes()
+
+    array = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    for value, expected in [
+        (memoryview(array[:, ::2]), array[:, ::2].tobytes()),
+        (torch.from_numpy(array.T), array.T.tobytes()),
+        (memoryview(array), array.tobytes()),
+        (torch.ones(4, dtype=torch.bfloat16), torch.ones(4, dtype=torch.bfloat16).view(torch.int16).numpy().tobytes()),
+        (b"", b""),
+    ]:
+        sock.sent.clear()
+        buffer.write(value)
+        assert sock.sent == [struct.pack("<BiQQ", session._OP_WRITE, 0, 0, len(expected)) + expected]
+    with pytest.raises(ValueError, match="overrun"):
+        buffer.write(data, 129)
+    instance._closed = True
+
+
 @pytest.mark.parametrize("failure", [TimeoutError, KeyboardInterrupt])
 @pytest.mark.parametrize(
     "operation,phase",
