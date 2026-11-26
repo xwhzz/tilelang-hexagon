@@ -46,7 +46,10 @@ Array<PrimExpr> PanelPosition(const Array<PrimExpr> &shape, int64_t lane) {
 } // namespace
 
 PanelLayoutNode::PanelLayoutNode(Array<PrimExpr> shape, int64_t lane)
-    : LayoutNode(shape, PanelPosition(shape, lane)), lane(lane) {}
+    : lane(lane) {
+  input_size_ = std::move(shape);
+  InitForwardIndex(PanelPosition(input_size_, lane));
+}
 
 int64_t PanelLayoutNode::Rows() const {
   return InputShape()[InputDim() - 2].as<IntImmNode>()->value;
@@ -61,9 +64,11 @@ PanelLayout::PanelLayout(Array<PrimExpr> shape, int64_t lane) {
 }
 
 void PanelLayoutNode::RestoreLegacyIndex() {
-  // Earlier JSON stored the forward expression without its binding Vars.
-  if (placeholder_vars_.empty()) {
-    InitForwardIndex(PanelPosition(input_size_, lane));
+  // The shape and type parameters completely determine this map.
+  InitForwardIndex(PanelPosition(input_size_, lane));
+  if (!placeholder_vars_.empty()) {
+    // Older records can include the ordinary Layout coordinate bindings.
+    placeholder_vars_ = {};
   }
 }
 

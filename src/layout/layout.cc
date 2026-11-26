@@ -788,14 +788,16 @@ DetectInjectiveMapping(const Array<PrimExpr> &forward_indices,
 
 } // namespace
 
+LayoutNode::LayoutNode() : placeholder_vars_(LayoutPlaceholders(0)) {}
+
 LayoutNode::LayoutNode(Array<PrimExpr> input_size,
-                       Array<PrimExpr> forward_index) {
-  input_size_ = input_size;
+                       Array<PrimExpr> forward_index)
+    : placeholder_vars_(LayoutPlaceholders(input_size.size())),
+      input_size_(std::move(input_size)) {
   InitForwardIndex(forward_index);
 }
 
 void LayoutNode::InitForwardIndex(const Array<PrimExpr> &forward_index) {
-  placeholder_vars_ = LayoutPlaceholders(InputDim());
   arith::Analyzer analyzer;
   UpdateAnalyzer(&analyzer);
   forward_index_ = forward_index.Map(
@@ -822,12 +824,15 @@ Layout::Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index) {
 }
 
 void LayoutNode::RestoreIndexVars() {
+  if (placeholder_vars_.empty()) {
+    return;
+  }
   const bool fragment = IsInstance<FragmentNode>();
   const auto &canonical = LayoutPlaceholders(InputDim(), fragment);
   forward_index_ =
       RebindLayoutPlaceholders(forward_index_, placeholder_vars_, canonical);
   // A Fragment also uses these bindings in its subsequent thread field.
-  if (!fragment && !placeholder_vars_.empty()) {
+  if (!fragment) {
     placeholder_vars_ = canonical;
   }
 }

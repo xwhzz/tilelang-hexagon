@@ -46,7 +46,7 @@ class PartialFragment;
 
 class LayoutNode : public ffi::Object {
 public:
-  LayoutNode() = default;
+  LayoutNode();
   LayoutNode(ffi::Array<PrimExpr> input_size,
              ffi::Array<PrimExpr> forward_index);
 

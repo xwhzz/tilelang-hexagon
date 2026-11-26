@@ -54,8 +54,10 @@ Array<PrimExpr> CroutonPosition(const Array<PrimExpr> &shape, bool column_tiles,
 
 CroutonLayoutNode::CroutonLayoutNode(Array<PrimExpr> shape, bool column_tiles,
                                      bool transposed)
-    : LayoutNode(shape, CroutonPosition(shape, column_tiles, transposed)),
-      column_tiles(column_tiles), transposed(transposed) {}
+    : column_tiles(column_tiles), transposed(transposed) {
+  input_size_ = std::move(shape);
+  InitForwardIndex(CroutonPosition(input_size_, column_tiles, transposed));
+}
 
 int CroutonLayoutNode::RowAxis() const {
   int n = static_cast<int>(InputDim());
@@ -81,9 +83,11 @@ CroutonLayout::CroutonLayout(Array<PrimExpr> shape, bool column_tiles,
 }
 
 void CroutonLayoutNode::RestoreLegacyIndex() {
-  // Earlier JSON stored the forward expression without its binding Vars.
-  if (placeholder_vars_.empty()) {
-    InitForwardIndex(CroutonPosition(input_size_, column_tiles, transposed));
+  // The shape and type parameters completely determine this map.
+  InitForwardIndex(CroutonPosition(input_size_, column_tiles, transposed));
+  if (!placeholder_vars_.empty()) {
+    // Older records can include the ordinary Layout coordinate bindings.
+    placeholder_vars_ = {};
   }
 }
 
