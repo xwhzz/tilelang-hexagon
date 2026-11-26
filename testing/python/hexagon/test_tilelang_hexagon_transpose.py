@@ -77,7 +77,7 @@ def test_batched_shared_transpose_writes_only_the_requested_region():
     "case,message",
     [
         ("alias", "distinct shared buffers"),
-        ("matched_alias", "distinct shared buffers"),
+        ("matched_alias", "match_buffer view"),
         ("shape", "region shapes"),
         ("global", "shared source and destination"),
     ],

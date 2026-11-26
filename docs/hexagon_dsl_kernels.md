@@ -136,7 +136,8 @@ row-major in the same arena as its shared buffers (`fragment_scope` on the targe
 To transpose a VTCM tile, call `T.transpose(src, dst)` on distinct shared
 buffers. Regions with shapes `(..., M, N)` and `(..., N, M)` keep their leading
 axes and swap the final two. The operation uses the buffers' logical indices,
-including their region offsets and layouts.
+including their region offsets and layouts. Pass slices of the allocated buffers
+directly when transposing a subregion.
 
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
