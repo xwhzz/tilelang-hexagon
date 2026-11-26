@@ -218,9 +218,11 @@ per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
 group-major scales directly, including a padded row stride. For another physical layout
 they pack the scale rows and columns used by the call into group-major VTCM storage.
 Global scales with explicit noncompact strides accept an identity layout annotation.
-The HVX GEMM is one
-`tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
-fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
+For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
+With interleaved activation or output columns it stages just the affected row, gathering
+the previous output only for accumulation. The sums leave the vrmpy accumulators once per
+group, into fp32 accumulators, and a signed B's offset comes off each group with that
+group's sum of A.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one

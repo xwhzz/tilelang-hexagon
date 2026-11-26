@@ -304,6 +304,116 @@ def test_sfb_layout_reads_offset_and_first_group(hmx, storage):
         kernel.adapter.close()
 
 
+def _strided_blockscaled(sa, sc, signed, clear, transpose_sfb=False):
+    M, N, K = 3, 32, 128
+    ad, bd = ("int16", "int4") if signed else ("uint8", "uint8")
+    x_shape, y_shape = (M + 2, K + 8, sa), (M + 2, N + 4, sc)
+
+    @T.prim_func
+    def gemm(
+        X: T.Tensor(x_shape, ad),
+        W: T.Tensor((N, K), bd),
+        SA: T.Tensor((M + 2, 4), "float32"),
+        SB: T.Tensor((4, N), "float16"),
+        Y0: T.Tensor(y_shape, "float32"),
+        Y: T.Tensor(y_shape, "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.StridedTensor(x_shape[:2], (x_shape[1] * sa, sa), ad, data=X.data)
+            c = T.StridedTensor(y_shape[:2], (y_shape[1] * sc, sc), "float32", data=Y.data)
+            b = T.alloc_shared((N, K), bd)
+            sb = T.alloc_shared((4, N), "float16")
+            T.annotate_layout({W: make_hvx_panel_layout(W)})
+            if transpose_sfb:
+                T.annotate_layout({sb: T.Layout((4, N), lambda g, n: [n, g])})
+            T.copy(W, b)
+            T.copy(SB, sb)
+            T.copy(Y0, Y)
+            T.gemm_blockscaled(
+                a[1 : M + 1, 4 : K + 4],
+                b,
+                c[1 : M + 1, 1 : N + 1],
+                SA[1 : M + 1, 1:4],
+                sb,
+                transpose_B=True,
+                clear_accum=clear,
+                k_start=64,
+                sf_a_granularity_k=64,
+                sf_b_granularity_k=64,
+            )
+
+    return gemm
+
+
+@pytest.mark.parametrize("sa,sc,clear", [(1, 1, True), (2, 1, True), (1, 2, True), (2, 2, False)])
+def test_strided_blockscaled_stages_only_noncontiguous_rows(sa, sc, clear):
+    source = _lower(_strided_blockscaled(sa, sc, False, clear)).kernel_source
+    assert ("a_row" in source) == (sa != 1)
+    assert ("c_row" in source) == (sc != 1)
+    rows = 3 if sa == sc == 1 else 1
+    assert f"tl_hvx_gemm_int_scaled<{rows}, 32, 128," in source
+    before_call = source.split("tl_hvx_gemm_int_scaled<", 1)[0]
+    assert (" = c[" in before_call) == (sc != 1 and not clear)
+
+
+def test_blockscaled_strided_global_identity_keeps_physical_channels():
+    @T.prim_func
+    def gemm(
+        X: T.StridedTensor((3, 132), (264, 2), "uint8"),
+        W: T.Tensor((32, 128), "uint8"),
+        SA: T.Tensor((2, 1), "float32"),
+        SB: T.Tensor((1, 32), "float16"),
+        Y: T.StridedTensor((3, 34), (68, 2), "float32"),
+    ):
+        with T.Kernel(1):
+            b = T.alloc_shared((32, 128), "uint8")
+            T.annotate_layout(
+                {W: make_hvx_panel_layout(W), X: T.Layout((3, 132), lambda i, k: [i, k]), Y: T.Layout((3, 34), lambda i, j: [i, j])}
+            )
+            T.copy(W, b)
+            T.gemm_blockscaled(
+                X[1:3, 2:130],
+                b,
+                Y[1:3, 1:33],
+                SA,
+                SB,
+                transpose_B=True,
+                clear_accum=True,
+                k_start=0,
+                sf_a_granularity_k=128,
+                sf_b_granularity_k=128,
+            )
+
+    source = _lower(gemm).kernel_source
+    assert "a_row" in source and "c_row" in source
+    assert "tl_hvx_gemm_int_scaled<1, 32, 128," in source
+
+
+@DEVICE
+@pytest.mark.parametrize("sa,sc,signed,clear", [(2, 1, False, True), (1, 2, False, True), (1, 2, True, False), (2, 2, True, False)])
+def test_strided_blockscaled_respects_channels_and_accumulation(sa, sc, signed, clear):
+    M, N, K = 3, 32, 128
+    kernel = tilelang.compile(_strided_blockscaled(sa, sc, signed, clear, transpose_sfb=signed), out_idx=[5], target="hexagon")
+    try:
+        x = (torch.arange((M + 2) * (K + 8) * sa).reshape(M + 2, K + 8, sa) % 11).to(torch.int16 if signed else torch.uint8)
+        w = (torch.arange(N * K).reshape(N, K) % 8) - (4 if signed else 0)
+        sfa = (1 + torch.arange((M + 2) * 4).reshape(M + 2, 4) % 5).float()
+        sfb = (1 + torch.arange(4 * N).reshape(4, N) % 7).half()
+        initial = torch.arange((M + 2) * (N + 4) * sc).reshape(M + 2, N + 4, sc).float() - 128
+        y = kernel(x, pack_panel(w, 4 if signed else 8), sfa, sfb, initial)
+        expected = initial.clone()
+        target = expected[1 : M + 1, 1 : N + 1, 0]
+        if clear:
+            target.zero_()
+        for g in range(2):
+            k = slice(g * 64, (g + 1) * 64)
+            sums = x[1 : M + 1, 4 : K + 4, 0][:, k].float() @ w[:, k].float().T
+            target += sums * sfa[1 : M + 1, 2 + g, None] * sfb[1 + g].float()
+        torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_blockscaled_gemm_is_one_fused_call():
     source = _lower(_blockscaled(1, 128, 2048, 64, "int16", "int4", True)).kernel_source
     # Groups of 64 for B, one factor per row of A; SFB rows of 128 factors.
