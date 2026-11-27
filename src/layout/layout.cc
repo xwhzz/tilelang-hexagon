@@ -4,7 +4,9 @@
  */
 
 #include "layout.h"
+#include "reflection.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -312,32 +314,53 @@ Fragment TryReinterpretReshape(const FragmentNode *fragment_node,
   }
 }
 
-} // namespace
+constexpr size_t kMaxPlaceholders = 16;
 
-static constexpr size_t kMaxPlaceholders = 16;
-
-static Var getPlaceholder(const std::string &s) {
-  // Pre-allocate all possible placeholders so the map is immutable after init.
-  // C++11 guarantees thread-safe initialization of function-local statics,
-  // so concurrent reads are safe without a mutex.
-  static const std::unordered_map<std::string, Var> map = []() {
-    std::unordered_map<std::string, Var> m;
-    m.reserve(kMaxPlaceholders + 1);
-    m["_rep"] = Var("_rep");
+// Save the actual Var references with the expressions. When TVM reloads the
+// graph, these identify the bound coordinates even if a captured parameter
+// happens to share a placeholder's name.
+const Array<Var> &LayoutPlaceholders(size_t ndim, bool fragment = false) {
+  struct Coordinates {
+    Array<Var> inputs;
+    Array<Var> replicated;
+  };
+  static const auto by_rank = [] {
+    std::array<Coordinates, kMaxPlaceholders + 1> result;
+    Coordinates vars{{}, {Var("_rep")}};
+    result[0] = vars;
     for (size_t i = 0; i < kMaxPlaceholders; ++i) {
-      std::string key{'_', char('i' + i)};
-      m[key] = Var(key);
+      Var axis(std::string{'_', char('i' + i)});
+      vars.inputs.push_back(axis);
+      vars.replicated.push_back(axis);
+      result[i + 1] = vars;
     }
-    return m;
+    return result;
   }();
-  auto it = map.find(s);
-  ICHECK(it != map.end()) << "Unknown placeholder: " << s;
-  return it->second;
+  ICHECK_LE(ndim, kMaxPlaceholders);
+  return fragment ? by_rank[ndim].replicated : by_rank[ndim].inputs;
 }
 
-Var ReplicationPlaceholder() { return getPlaceholder("_rep"); }
+template <typename T>
+T RebindLayoutPlaceholders(const T &expr, const Array<Var> &vars,
+                           const Array<Var> &canonical) {
+  if (vars.same_as(canonical) || vars.empty()) {
+    return expr;
+  }
+  ICHECK_EQ(vars.size(), canonical.size());
+  Map<Var, PrimExpr> substitution;
+  for (size_t i = 0; i < vars.size(); ++i) {
+    substitution.Set(vars[i], canonical[i]);
+  }
+  return Substitute(expr, substitution);
+}
+
+} // namespace
+
+Var ReplicationPlaceholder() { return LayoutPlaceholders(0, true)[0]; }
+
 Var InputPlaceholder(size_t idx) {
-  return getPlaceholder(std::string{'_', char('i' + idx)});
+  ICHECK_LT(idx, kMaxPlaceholders);
+  return LayoutPlaceholders(kMaxPlaceholders)[idx];
 }
 
 Map<Var, Range> LayoutNode::GetVarMap() const {
@@ -768,6 +791,11 @@ DetectInjectiveMapping(const Array<PrimExpr> &forward_indices,
 LayoutNode::LayoutNode(Array<PrimExpr> input_size,
                        Array<PrimExpr> forward_index) {
   input_size_ = input_size;
+  InitForwardIndex(forward_index);
+}
+
+void LayoutNode::InitForwardIndex(const Array<PrimExpr> &forward_index) {
+  placeholder_vars_ = LayoutPlaceholders(InputDim());
   arith::Analyzer analyzer;
   UpdateAnalyzer(&analyzer);
   forward_index_ = forward_index.Map(
@@ -793,11 +821,36 @@ Layout::Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index) {
   data_ = std::move(n);
 }
 
+void LayoutNode::RestoreIndexVars() {
+  const bool fragment = IsInstance<FragmentNode>();
+  const auto &canonical = LayoutPlaceholders(InputDim(), fragment);
+  forward_index_ =
+      RebindLayoutPlaceholders(forward_index_, placeholder_vars_, canonical);
+  // A Fragment also uses these bindings in its subsequent thread field.
+  if (!fragment && !placeholder_vars_.empty()) {
+    placeholder_vars_ = canonical;
+  }
+}
+
+void FragmentNode::RestoreThreadVars() {
+  const auto &canonical = LayoutPlaceholders(InputDim(), true);
+  forward_thread_ =
+      RebindLayoutPlaceholders(forward_thread_, placeholder_vars_, canonical);
+  if (!placeholder_vars_.empty()) {
+    placeholder_vars_ = canonical;
+  }
+}
+
 void LayoutNode::RegisterReflection() {
   namespace refl = reflection;
   refl::ObjectDef<LayoutNode>()
       .def_ro("input_size", &LayoutNode::input_size_)
-      .def_ro("forward_index", &LayoutNode::forward_index_)
+      .def_ro("placeholder_vars", &LayoutNode::placeholder_vars_,
+              refl::AttachFieldFlag::SEqHashIgnore(), refl::init(false),
+              refl::default_value(Array<Var>()))
+      .def_ro("forward_index", &LayoutNode::forward_index_,
+              RestoreAfterSet<&LayoutNode::forward_index_,
+                              &LayoutNode::RestoreIndexVars>())
       .def("_DebugOutput", &LayoutNode::DebugOutput);
 }
 
@@ -1307,6 +1360,7 @@ FragmentNode::FragmentNode(Array<PrimExpr> input_size,
                            Array<PrimExpr> forward_index,
                            PrimExpr forward_thread, PrimExpr replicate_size) {
   input_size_ = input_size;
+  placeholder_vars_ = LayoutPlaceholders(InputDim(), true);
   replicate_size_ = replicate_size;
   arith::Analyzer analyzer;
   UpdateAnalyzer(&analyzer);
@@ -1763,7 +1817,9 @@ bool FragmentNode::IsEqual(const FragmentNode *other, bool skip_index) const {
 void FragmentNode::RegisterReflection() {
   namespace refl = reflection;
   refl::ObjectDef<FragmentNode>()
-      .def_ro("forward_thread", &FragmentNode::forward_thread_)
+      .def_ro("forward_thread", &FragmentNode::forward_thread_,
+              RestoreAfterSet<&FragmentNode::forward_thread_,
+                              &FragmentNode::RestoreThreadVars>())
       .def_ro("replicate_size", &FragmentNode::replicate_size_)
       .def_ro("thread_range", &FragmentNode::thread_range_)
       .def("_DebugOutput", &FragmentNode::DebugOutput);

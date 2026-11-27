@@ -68,7 +68,7 @@ LOG2E = 1.4426950408889634  # the queries' scale folds it in: 2^(s log2 e) = e^s
 def kinds_table(c: Config, max_pos: int, layers: range | None = None) -> list:
     """Per layer of `layers` (all by default): whether it is attention, its
     index among the stage's layers of its kind, its RoPE table
-    (decode_fp16.kinds), its window (0: none) and, for an attention layer, its
+    index, its window (0: none) and, for an attention layer, its
     first row of the stage's KV cache (decode_fp16.kv_plan) in blocks of KEYS
     rows, which DMA moves whole tiles of."""
     layers = range(c.layers) if layers is None else layers
@@ -135,7 +135,8 @@ def make_prefill(
     FQ = slice_cols(F)  # hidden units of a part of the FFN
     PARTS = F // FQ
     FQW = FQ // NW  # a worker's of a part
-    NK = len(c.rope)
+    layout = decode_fp16.RopeLayout(c)
+    spans = list(layout.spans.values())
     half = HD // 2
     assert R % ROWS == 0 and RW % (2 * RB) == 0 and max_pos % KEYS == 0 and FQW % TILE == 0
     # A chunk's write runs past a ring's end by at most its rows, into the pad
@@ -304,14 +305,15 @@ def make_prefill(
         sums of squares are in hss."""
         for i in T.Parallel(R):
             bf.hss[i] = T.rsqrt(bf.hss[i] * T.float32(1 / HD) + T.float32(eps)) * extra
-        for i, d in T.Parallel(R, HD):
-            d2 = (d + half) % HD
-            sign = T.if_then_else(d < half, T.float32(-1), T.float32(1))
-            v = (
-                bf.hd[i, d] * weight(d) * bf.cos_rows[table, i, d % half]
-                + sign * bf.hd[i, d2] * weight(d2) * bf.sin_rows[table, i, d % half]
-            )
-            bf.rot[i, d] = T.Cast("float16", v * bf.hss[i])
+        for k, span in list(enumerate(spans)):
+            if table == k:
+                for i, d in T.Parallel(R, HD):
+                    d2 = (d + half) % HD
+                    sign = T.if_then_else(d < half, T.float32(-1), T.float32(1))
+                    cv = decode_fp16.rope_coefficient(bf.cos_rows, i, d % half, half, span, layout.width, 1.0)
+                    sv = decode_fp16.rope_coefficient(bf.sin_rows, i, d % half, half, span, layout.width, 0.0)
+                    v = bf.hd[i, d] * weight(d) * cv + sign * bf.hd[i, d2] * weight(d2) * sv
+                    bf.rot[i, d] = T.Cast("float16", v * bf.hss[i])
 
     @T.macro
     def in_proj_block(bf, b, ring, k, ci, valid, parts: int):
@@ -408,10 +410,11 @@ def make_prefill(
         T.dma_copy(bf.kv_v[kvh, at : at + KEYS, :], bf.vblk[slot, :, :])
 
     @T.macro
-    def attention(bf, kv0, base, window):
+    def attention(bf, kv0, base, window, valid):
         """The worker's query heads, ROWS rows at a time: softmax(q K^T) V
         over the cache's positions [base + i - window + 1 (or 0), base + i]
         for row i, gated, into hid, in base 2 (the queries carry log2 e).
+        Round the valid query count up to a whole HMX block.
 
         A head's scores stay in the fp16 tiles HMX stores them in, where the
         mask and the row maxima work; exp2 writes P into another buffer's
@@ -422,63 +425,67 @@ def make_prefill(
             kvh = bf.w * KH + h
             for hq in T.serial(group):
                 for rb in T.serial(R // ROWS):
-                    row0 = base + rb * ROWS
-                    T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
-                    for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = T.float32(0)
-                    for i in T.Parallel(ROWS):
-                        bf.m[i] = T.float32(NEG)
-                        bf.ls[i] = T.float32(0)
-                    # The positions a row sees: its window, or all before it.
-                    span = T.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
-                    first = T.max(row0 - span + 1, 0) // KEYS
-                    last = T.ceildiv(row0 + ROWS, KEYS)
-                    fetch(bf, kv0, window, kvh, first, 0)
-                    for kb in T.serial(first, last):
-                        slot = (kb - first) % 2
-                        if kb + 1 < last:
-                            fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
-                            T.dma_wait(2)
-                        else:
-                            T.dma_wait()
-                        T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
-                        # Causal, and within the window: key kb * KEYS + j is
-                        # visible to row i when row0 + i - span < key <= row0 + i,
-                        # every key of the block to every row away from the
-                        # diagonal and the window's edge.
-                        if kb * KEYS + KEYS - 1 > row0 or kb * KEYS <= row0 + ROWS - 1 - span:
+                    if rb * ROWS < valid:
+                        row0 = base + rb * ROWS
+                        T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
+                        for i, d in T.Parallel(ROWS, HD):
+                            bf.acc_o[i, d] = T.float32(0)
+                        for i in T.Parallel(ROWS):
+                            bf.m[i] = T.float32(NEG)
+                            bf.ls[i] = T.float32(0)
+                        # The positions a row sees: its window, or all before it.
+                        span = T.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
+                        first = T.max(row0 - span + 1, 0) // KEYS
+                        last = T.ceildiv(row0 + ROWS, KEYS)
+                        fetch(bf, kv0, window, kvh, first, 0)
+                        for kb in T.serial(first, last):
+                            slot = (kb - first) % 2
+                            if kb + 1 < last:
+                                fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
+                                T.dma_wait(2)
+                            else:
+                                T.dma_wait()
+                            T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
+                            # Causal, and within the window: key kb * KEYS + j is
+                            # visible to row i when row0 + i - span < key <= row0 + i,
+                            # every key of the block to every row away from the
+                            # diagonal and the window's edge.
+                            if kb * KEYS + KEYS - 1 > row0 or kb * KEYS <= row0 + ROWS - 1 - span:
+                                for i, j in T.Parallel(ROWS, KEYS):
+                                    key = kb * KEYS + j
+                                    causal = T.if_then_else(key <= row0 + i, bf.s[i, j], T.float16(NEG16))
+                                    bf.s[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
+                            T.reduce_max(bf.s, bf.rmax, dim=1)
+                            for i in T.Parallel(ROWS):
+                                bf.rmax[i] = T.max(bf.m[i], bf.rmax[i])
+                                bf.alpha[i] = T.exp2(bf.m[i] - bf.rmax[i])
+                                bf.m[i] = bf.rmax[i]
+                                # The maxima of fp16 scores are fp16.
+                                bf.mh[i] = T.Cast("float16", bf.rmax[i])
                             for i, j in T.Parallel(ROWS, KEYS):
-                                key = kb * KEYS + j
-                                causal = T.if_then_else(key <= row0 + i, bf.s[i, j], T.float16(NEG16))
-                                bf.s[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
-                        T.reduce_max(bf.s, bf.rmax, dim=1)
+                                bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
+                            T.reduce_sum(bf.p, bf.rsum, dim=1)
+                            for i in T.Parallel(ROWS):
+                                bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
+                            for i, d in T.Parallel(ROWS, HD):
+                                bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
+                            T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
+                            if cooperative:
+                                # GEMM has stored its output. On a request, the
+                                # checkpoint drains and preserves the prefetched
+                                # next KV slot along with the online softmax state.
+                                T.sync_grid()
+                        # The loop's last step drained the queue; the wait tells the
+                        # DMA queue's bound (PlanDMAQueue), which cannot prove that
+                        # the loop runs at all and keeps the first fetch in flight.
+                        T.dma_wait()
                         for i in T.Parallel(ROWS):
-                            bf.rmax[i] = T.max(bf.m[i], bf.rmax[i])
-                            bf.alpha[i] = T.exp2(bf.m[i] - bf.rmax[i])
-                            bf.m[i] = bf.rmax[i]
-                            # The maxima of fp16 scores are fp16.
-                            bf.mh[i] = T.Cast("float16", bf.rmax[i])
-                        for i, j in T.Parallel(ROWS, KEYS):
-                            bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
-                        T.reduce_sum(bf.p, bf.rsum, dim=1)
-                        for i in T.Parallel(ROWS):
-                            bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
+                            bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
                         for i, d in T.Parallel(ROWS, HD):
                             bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
-                        T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
-                        if cooperative:
-                            # GEMM has stored its output. On a request, the
-                            # checkpoint drains and preserves the prefetched
-                            # next KV slot along with the online softmax state.
-                            T.sync_grid()
-                    # The loop's last step drained the queue; the wait tells the
-                    # DMA queue's bound (PlanDMAQueue), which cannot prove that
-                    # the loop runs at all and keeps the first fetch in flight.
-                    T.dma_wait()
-                    for i in T.Parallel(ROWS):
-                        bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
-                    for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
+                    else:
+                        # The output projection also reads the inactive rows.
+                        T.clear(bf.acc_o)
                     col = (kvh * group + hq) * HD
                     T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
 
@@ -525,8 +532,8 @@ def make_prefill(
         q_norm: T.Tensor((La1, HD), "float32"),
         k_norm: T.Tensor((La1, HD), "float32"),
         conv_w: T.Tensor((Lc1, taps, D), "float32"),
-        rope_cos: T.Tensor((NK, ROPE, half), "float32"),
-        rope_sin: T.Tensor((NK, ROPE, half), "float32"),
+        rope_cos: T.Tensor(layout.shape(ROPE), "float32"),
+        rope_sin: T.Tensor(layout.shape(ROPE), "float32"),
         kv_k: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         kv_v: T.Tensor((KVH, KV_ROWS, HD), "float16"),
         conv_state: T.Tensor((Lc1, taps - 1, D), "float32"),
@@ -555,8 +562,8 @@ def make_prefill(
             f = T.alloc_global((R, D), "float32", scope="global.vtcm")
             # The workers' parts of f's rows' sums of squares.
             psum = T.alloc_global((NW, R), "float32", scope="global.vtcm")
-            cos_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
-            sin_rows = T.alloc_global((NK, R, half), "float32", scope="global.vtcm")
+            cos_rows = T.alloc_global(layout.shape(R), "float32", scope="global.vtcm")
+            sin_rows = T.alloc_global(layout.shape(R), "float32", scope="global.vtcm")
 
             # A worker's: the outputs of up to two panels, or of a head's;
             # the rows it normalizes or embeds RB at a time.
@@ -626,11 +633,11 @@ def make_prefill(
             valid = T.min(R, n - chunk * R)
             # The chunk's rows of the RoPE tables, into VTCM: worker w's
             # rows. Rows past the tables, the padding's, take their last.
-            if La:
-                for t, i, d in T.Parallel(NK, RW, half):
+            if La and layout.width:
+                for i, d in T.Parallel(RW, layout.width):
                     r = w * RW + i
-                    cos_rows[t, r, d] = rope_cos[t, T.min(base + r, max_pos - 1), d]
-                    sin_rows[t, r, d] = rope_sin[t, T.min(base + r, max_pos - 1), d]
+                    cos_rows[r, d] = rope_cos[T.min(base + r, max_pos - 1), d]
+                    sin_rows[r, d] = rope_sin[T.min(base + r, max_pos - 1), d]
 
             if has_embedding:
                 embed(bf, chunk, n, tokens, embedding, op_norm[0, :])
@@ -644,7 +651,7 @@ def make_prefill(
                 # is provably in its tensor.
                 ci = clamped(kinds[layer, 1], Lc)
                 ai = clamped(kinds[layer, 1], La)
-                table = clamped(kinds[layer, 2], NK)
+                table = clamped(kinds[layer, 2], len(spans))
                 window = attention_window(layer, kinds)
                 kv0 = kinds[layer, 4]
                 # The layer's phases, worker w's blocks of each, in order:
@@ -668,7 +675,7 @@ def make_prefill(
                             bf, b, ring, k, ai, kv0, window, table, base
                         ),
                     )
-                    attention(bf, kv0, base, window)
+                    attention(bf, kv0, base, window, valid)
                 else:
                     if has_last_layer and not c.is_attention(c.layers - 1) and layer == L - 1:
                         # Only B*x history survives the model's final convolution.

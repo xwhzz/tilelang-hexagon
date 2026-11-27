@@ -33,6 +33,9 @@ public:
         .def_ro("dst_range", &TransposeNode::dst_range);
   }
 
+  /// Whether the region extents agree after exchanging the final two axes.
+  bool HasTransposedShape(arith::Analyzer *analyzer) const;
+
   Stmt Lower(const LowerArgs &lower_args,
              arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &layout_args,

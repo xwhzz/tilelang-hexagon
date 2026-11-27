@@ -13,6 +13,7 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon import language as T
 from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remote_dir
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
@@ -24,8 +25,8 @@ import bundle  # noqa: E402
 import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
-from decode import Decoder, make_decode  # noqa: E402
-from model import CONV, FULL, Config, Model, load_hf_weights  # noqa: E402
+from decode import Decoder, add_gumbel, make_decode  # noqa: E402
+from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
 from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
@@ -36,6 +37,23 @@ MULTI_PROCESS = pytest.mark.skipif(
     hlos() == "android" and domain_id() != 3,
     reason="multiple DSP processes on Android require the default cDSP domain",
 )
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_interactive_chat_prefix_reuse_is_opt_in(monkeypatch, opt_in):
+    from io import StringIO
+    from types import SimpleNamespace
+
+    import generate
+
+    calls = []
+    monkeypatch.setattr(generate, "Decoder", lambda *_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(generate, "Text", lambda *_: object())
+    monkeypatch.setattr(generate, "reply", lambda *_, reuse=False: calls.append(reuse) or "answer")
+    monkeypatch.setattr(sys, "stdin", StringIO("one\ntwo\n"))
+    monkeypatch.setattr(sys, "argv", ["generate.py", "host", "device", "checkpoint", "--chat"] + (["--reuse-prefix"] if opt_in else []))
+    generate.main()
+    assert calls == [opt_in, opt_in]
 
 
 @pytest.fixture(scope="module")
@@ -161,6 +179,31 @@ def test_reference_decodes_past_the_window():
     torch.testing.assert_close(torch.stack(got), want[89:119], rtol=0, atol=1e-5 * want.abs().max().item())
 
 
+@pytest.mark.parametrize("fractions", [(1.0, 0.5), (0.125, 0.0), (0.0, 0.0)])
+def test_fp16_rope_tables_match_reference_across_chunks(monkeypatch, fractions):
+    c = Config(head_dim=128, rope={SLIDING: (1e4, fractions[0]), FULL: (1e6, fractions[1])})
+    positions = torch.arange(4099)
+    layout = decode_fp16.RopeLayout(c)
+
+    def chunk_angles(rows, *args, **kwargs):
+        assert len(rows) < len(positions)
+        return rope_angles(rows, *args, **kwargs)
+
+    monkeypatch.setattr(decode_fp16, "rope_angles", chunk_angles)
+    cos, sin = decode_fp16.rope_tables(c, len(positions))
+    assert cos.shape == sin.shape == layout.shape(len(positions))
+    assert cos.numel() * cos.element_size() == layout.nbytes(len(positions))
+    for kind, span in layout.spans.items():
+        reference = rope_angles(positions, c.head_dim, *c.rope[kind])
+        if not layout.width:
+            assert cos.item() == 1 and sin.item() == 0
+            continue
+        for actual, expected in ((cos, reference.cos()), (sin, reference.sin())):
+            assert actual.dtype == torch.float32 and actual.is_contiguous()
+            assert torch.equal(actual[:, span.start : span.stop].view(torch.int32), expected[:, : len(span)].float().view(torch.int32))
+        assert (reference[:, len(span) :] == 0).all()
+
+
 def test_crouton_weight_is_the_hmx_weight_layout():
     from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 
@@ -188,6 +231,44 @@ def test_fp16_bundle_holds_the_weights(tiny_lfm3_bundle):
     head = bundle.read_tensor(path, bundle.read_header(path), "head")
     for token in (0, 1, 31, 32, 1234, c.vocab - 1):
         assert torch.equal(convert.embedding(head, token, c.dim), w["model.embed_tokens.weight"][token].half())
+
+
+def test_fp16_projection_stream_matches_stacked_bundle(tmp_path):
+    c = Config(vocab=32, dim=32, ff=32, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL, CONV))
+    w = random_weights(c)
+    tensors = convert.build_tensors(c, w)
+    tail = tensors["final_norm"]
+    projection = tensors["ffn.w2"]
+    streamed = tmp_path / "streamed.bundle"
+    header = bundle.write(streamed, c.to_dict(), {"ffn.w2": projection, "final_norm": tail}, {})
+
+    packed = convert.crouton_weight(torch.stack([w[f"model.layers.{i}.feed_forward.w2.weight"].half() for i in range(c.layers)]))
+    assert torch.equal(next(projection[0]()), packed[0])
+    stacked = tmp_path / "stacked.bundle"
+    bundle.write(stacked, c.to_dict(), {"ffn.w2": (packed, *projection[1:]), "final_norm": tail}, {})
+    assert header["tensors"]["ffn.w2"]["nbytes"] == 6144
+    assert header["tensors"]["final_norm"]["offset"] == 8192
+    assert streamed.read_bytes() == stacked.read_bytes()
+
+
+def test_fp16_projection_checks_each_layer_shape(tmp_path):
+    c = Config(vocab=32, dim=32, ff=64, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL))
+    w = random_weights(c)
+    key = "model.layers.1.feed_forward.w2.weight"
+    w[key] = w[key].T
+    projection = convert.build_tensors(c, w)["ffn.w2"]
+    with pytest.raises(ValueError, match="ffn.w2 layer 1 has shape"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"ffn.w2": projection}, {})
+
+
+@pytest.mark.parametrize("length", [2, 4])
+def test_bundle_checks_streamed_byte_count(tmp_path, length):
+    def chunks():
+        yield torch.ones(2, dtype=torch.uint8)
+        yield torch.ones(length, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="weights.*5"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"weights": (chunks, "uint8", (5,), "row_major")}, {})
 
 
 @pytest.mark.parametrize("arch", ("v73", "v75", "v79"))
@@ -249,6 +330,121 @@ def test_decode_matches_the_reference(tiny_bundle):
         torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=1e-3, atol=1e-3)
     finally:
         decoder.close()
+
+
+@pytest.mark.parametrize(
+    "rows,capacity,n_prompt,n_new,chunk,fp16",
+    [
+        (None, 32, 1, 32, 32, False),
+        (None, 8, 23, 15, 12, True),
+        (None, 2, 5, 3, 1, False),
+        (8, 11, 29, 18, 16, True),
+        (8, 3, 10, 4, 16, False),
+        (8, 3, 10, 4, 16, True),
+        (None, 16, 4, 6, 16, False),
+    ],
+)
+def test_stream_bounds_token_storage_without_repeating_positions(rows, capacity, n_prompt, n_new, chunk, fp16):
+    class Calls(Decoder):
+        def reset(self):
+            self.consumed = []
+            self.calls = []
+
+        def prefill(self, ids, pos0):
+            assert pos0 == len(self.consumed)
+            assert len(ids) <= capacity
+            assert self.fp16 or pos0 + -(-len(ids) // rows) * rows <= self.max_pos
+            self.consumed.extend(ids)
+            self.calls.append("prefill")
+
+        def run(self, ids, pos0, n, n_forced, temperature, seed):
+            assert pos0 == len(self.consumed) and n + 1 <= capacity
+            assert n_forced == len(ids) and (temperature, seed) == (0.7, 21)
+            out = list(ids)
+            for step in range(n):
+                self.consumed.append(out[step])
+                if step + 1 >= n_forced:
+                    out.append((out[step] + pos0 + step + seed) % 101)
+            self.calls.append("decode")
+            return out, None
+
+    decoder = Calls.__new__(Calls)
+    decoder.prefill_rows, decoder.max_tokens, decoder.max_pos, decoder.fp16 = rows, capacity, n_prompt + n_new - 1, fp16
+    prompt, expected = list(range(n_prompt)), []
+    for pos in range(n_prompt - 1, n_prompt - 1 + n_new):
+        expected.append(((expected[-1] if expected else prompt[-1]) + pos + 21) % 101)
+    parts = list(decoder.stream(prompt, n_new, 0.7, 21, chunk))
+    assert all(1 <= len(part) <= chunk for part in parts)
+    assert [token for part in parts for token in part] == expected
+    assert decoder.consumed == prompt + expected[:-1]
+    if not rows and n_prompt + n_new <= capacity:
+        assert decoder.calls == ["decode"]
+    assert decoder.generate(prompt, n_new, 0.7, 21) == expected
+
+
+def test_generation_rejects_impossible_requests_before_mutating_state():
+    decoder = Decoder.__new__(Decoder)
+    decoder.max_pos, decoder.max_tokens = 4, 4
+    assert decoder.generate([1], 0) == []
+    for prompt, n, chunk in (([], 1, 1), ([1], -1, 1), ([1], 1, 0), ([1, 2], 4, 2)):
+        with pytest.raises(ValueError):
+            list(decoder.stream(prompt, n, chunk=chunk))
+    decoder.max_tokens = 1
+    with pytest.raises(ValueError, match="storage"):
+        decoder.generate([1], 1)
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["quantized", "lfm3"])
+def test_generation_with_short_token_buffer_matches_single_steps(model, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=256, max_tokens=8, prefill_rows=None)
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000, 5, 93, 78]
+    try:
+        for temperature in (0, 0.8):
+            decoder.reset()
+            for pos, token in enumerate(prompt[:-1]):
+                decoder.run([token, prompt[pos + 1]], pos, 1, 2, temperature, 17)
+            expected, token = [], prompt[-1]
+            for pos in range(len(prompt) - 1, len(prompt) - 1 + 15):
+                out, _ = decoder.run([token], pos, 1, 1, temperature, 17)
+                token = out[-1]
+                expected.append(token)
+            assert decoder.generate(prompt, 15, temperature, 17) == expected
+
+        # Stop inside the first chunk, then append a turn longer than scratch.
+        # The saved convolution state precedes prompt[-1]. The reused suffix
+        # and sampled continuation must agree with a seeded full replay.
+        first = next(decoder.stream(prompt, 10, 0.8, 17, chunk=5, reuse=True))
+        second = prompt + [first[0], (first[1] + 1) % decoder.c.vocab] + prompt[:8]
+        timings = []
+        actual = [t for part in decoder.stream(second, 15, 0.8, 17, timings=timings, reuse=True) for t in part]
+        assert sum(steps for _, steps, _ in timings) == len(second) - len(prompt) + 15
+        assert actual == decoder.generate(second, 15, 0.8, 17)
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_sampling_highest_bin():
+    # At seed 26, position 0, the hash of vocabulary index 118408 ends
+    # in the highest bin. Its fp32 midpoint rounds to 1 before clamping.
+    @T.prim_func
+    def sample(scores: T.Tensor((1, 32), "float32")):
+        with T.Kernel(1):
+            hx = T.alloc_shared((1, 32), "uint32")
+            hy = T.alloc_shared((1, 32), "uint32")
+            add_gumbel(scores, T.float32(1), 26, 0, 118400, hx, hy)
+
+    kernel = tilelang.compile(sample, target="hexagon")
+    try:
+        scores = torch.zeros((1, 32))
+        kernel(scores)
+        assert scores.isfinite().all()
+        expected = -torch.log(-torch.log(torch.tensor(1.0 - 2.0**-24)))
+        torch.testing.assert_close(scores[0, 8], expected)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE
@@ -558,6 +754,183 @@ def test_fp16_prefill_matches_the_reference(model, processes, row_major, fp16_bu
         decoder.close()
 
 
+@pytest.mark.parametrize("rows", [None, 128])
+def test_chat_reuses_only_consumed_state(rows):
+    class TrackingDecoder(Decoder):
+        def __init__(self):
+            self.prefill_rows, self.fp16, self.max_pos, self.max_tokens = rows, False, 4096, 5
+            self.calls = []
+            self.reset()
+
+        def reset(self):
+            self._chat_tokens = None
+            self.state = []
+
+        def _copy_chat_conv(self, *, restore):
+            if restore:
+                self.state = self.saved.copy()
+            else:
+                self.saved = self.state.copy()
+
+        def prefill(self, tokens, pos0=0):
+            assert pos0 == len(self.state) and len(tokens) <= self.max_tokens
+            self._chat_tokens = None
+            self.calls.append((pos0, len(tokens)))
+            self.state.extend(tokens)
+
+        def run(self, tokens, pos0, n, n_forced, temperature=0.0, seed=0):
+            assert pos0 == len(self.state) and n + 1 <= self.max_tokens
+            self._chat_tokens = None
+            self.calls.append((pos0, n))
+            result = list(tokens)
+            for i in range(n):
+                self.state.append(result[i])
+                if i + 1 >= n_forced:
+                    result.append((sum(self.state) + len(self.state)) % 101)
+            return result, None
+
+    d = TrackingDecoder()
+    prompt = [2, 5, 7, 11]
+    stream = d.stream(prompt, 16, chunk=4, reuse=True)
+    predicted = next(stream)
+    assert d.state == prompt + predicted[:-1]
+    stream.close()  # The caller can stop in the middle of the first result.
+
+    def turn(tokens, start):
+        d.calls.clear()
+        (actual,) = d.stream(tokens, 1, reuse=True)
+        assert d.calls[0][0] == start
+        assert d.state == tokens
+        reference = TrackingDecoder()
+        (expected,) = reference.stream(tokens, 1, reuse=True)
+        assert actual == expected
+
+    # A chunk's final prediction has not advanced KV or the convolution.
+    more = prompt + predicted + [1, 3]
+    turn(more, len(prompt) + 3)
+    # The template changed the just-consumed final prompt token. The input
+    # before it is exactly the previous prefill checkpoint.
+    changed = more[:-1] + [6, 7]
+    turn(changed, len(more) - 1)
+    # Early EOS discards multiple predictions that the DSP already consumed.
+    chunk = next(d.stream(changed + [9, 10], 16, chunk=4, reuse=True))
+    trimmed = changed + [9, 10, chunk[0], (chunk[1] + 1) % 101, 23]
+    turn(trimmed, len(changed) + 1)
+    turn([99, 87, 33], 0)  # Re-rendering changed even the saved prefix.
+    d.reset()
+    turn([99, 87, 33, 19], 0)
+
+
+def test_chat_checkpoint_cannot_restore_overwritten_sliding_keys():
+    from types import SimpleNamespace
+
+    d = Decoder.__new__(Decoder)
+    d.fp16, d.c = True, SimpleNamespace(window=48)
+    limit = decode_fp16.ring(d.c) - d.c.window
+    saved = 2200
+    called = []
+    d._chat_saved_pos = saved
+    d._copy_chat_conv = lambda *, restore: called.append("restore")
+    d.reset = lambda: called.append("reset")
+    prompt = [2] * saved + [8, 3]
+    for length, result in ((limit, saved), (limit + 1, 0)):
+        d._chat_tokens = [2] * saved + [5] * length
+        assert d._chat_position(prompt) == result
+    assert called == ["restore", "reset"]
+
+
+@DEVICE
+@pytest.mark.parametrize("model,processes", [("quantized", 1), ("lfm2", 1), pytest.param("lfm3", 2, marks=MULTI_PROCESS)])
+def test_chat_continuation_matches_full_replay(model, processes, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=512, max_tokens=256, prefill_rows=128, processes=processes)
+    first = list(range(24, 84))
+    try:
+        predictions = next(decoder.stream(first, 16, chunk=8, reuse=True))
+        # Treat the second returned ID as EOS. The remaining IDs in the
+        # result still advanced the resident state despite the caller's break.
+        second = first + predictions[:1] + [(predictions[1] + 1) % decoder.c.vocab, 53, 77]
+        timings = []
+        (actual,) = decoder.stream(second, 1, reuse=True, timings=timings)
+        logits = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+        assert timings[0][:2] == ("prefill", len(second) - len(first))
+        # At a chunk boundary the whole consumed prefix matches. Only the
+        # prediction and the next user input still need to run.
+        third = second + actual + [55, 79]
+        timings.clear()
+        (third_token,) = decoder.stream(third, 1, reuse=True, timings=timings)
+        third_logits = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+        assert timings[0][:2] == ("prefill", 2)
+        for prompt, token, actual_logits in ((second, actual, logits), (third, third_token, third_logits)):
+            (expected,) = decoder.stream(prompt, 1)
+            reference = torch.frombuffer(bytearray(decoder.logits.read()), dtype=torch.float32)
+            assert token == expected
+            torch.testing.assert_close(actual_logits, reference, rtol=0, atol=0.01 * reference.abs().max().item())
+    finally:
+        decoder.close()
+
+
+@pytest.mark.parametrize(
+    ("pos0", "n", "capacity", "calls"),
+    [
+        (128, 65, 65, [(1, 128, 65, 1)]),
+        (255, 1, 1, [(0, 255, 1, 1)]),
+        (120, 136, 136, [(1, 120, 128, 1), (0, 248, 8, 8)]),
+    ],
+)
+def test_fp16_prefill_only_decodes_chunks_that_cross_the_cache_end(pos0, n, capacity, calls):
+    from types import SimpleNamespace
+
+    decoder = Decoder.__new__(Decoder)
+    decoder.fp16, decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = True, 256, capacity, 128
+    decoder.c = SimpleNamespace(vocab=4096)
+    writes, actual = [], []
+    decoder.tokens = SimpleNamespace(write=lambda ids: writes.extend(ids.tolist()))
+    decoder.stages = [SimpleNamespace(prefill=[], decode=[])]
+    decoder.seconds = 99.0
+
+    def pipeline(first, args, steps):
+        actual.append((first, *args[0], steps))
+        decoder.seconds = 1.0
+
+    decoder._pipeline = pipeline
+    ids = list(range(n))
+    decoder.prefill(ids, pos0)
+    assert writes == ids and actual == calls
+    assert decoder.last_run_seconds() == len(calls)
+    with pytest.raises(AssertionError):
+        decoder.prefill([1], decoder.max_pos)
+    assert writes == ids and actual == calls
+
+
+@DEVICE
+def test_fp16_incremental_prefill_at_context_end(fp16_bundle):
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    seq = torch.randint(c.vocab, (256,), generator=torch.Generator().manual_seed(3))
+    # The suffix ends inside the cache but its last physical 128-row chunk
+    # would extend beyond it. The final decode consumes the last legal slot.
+    with torch.no_grad():
+        want, state = ref.prefill(seq)
+    decoder = Decoder(path, max_pos=256, max_tokens=256, prefill_rows=128, processes=1)
+    try:
+        decoder.prefill(seq[:120].tolist())
+        decoder.prefill(seq[120:-1].tolist(), 120)
+        _, logits = decoder.run(seq[-1:].tolist(), 255, 1, 1)
+
+        def relative(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        errors = _kv_errors(decoder, state, len(seq), relative)
+        states = decoder.conv_states()
+        errors.extend(relative(got, expected) for got, expected in zip(states, state.conv))
+        errors.append(relative(logits, want))
+        assert all(error < 1e-2 for error in errors), errors
+    finally:
+        decoder.close()
+
+
 @DEVICE
 @pytest.mark.parametrize(("model", "processes"), STAGES[:3])
 def test_fp16_prefill_after_decode_steps(model, processes, fp16_bundle):
@@ -847,3 +1220,18 @@ def test_prefill_factory_keeps_staging_for_unqualified_vector_capability(fp16, c
         original = make_prefill(c, shapes, 128, 256, 64)
         candidate = make_prefill(c, shapes, 128, 256, 64, target=target)
     tvm.ir.assert_structural_equal(original, candidate)
+
+
+def test_compact_rope_coefficients_stay_inside_each_row():
+    # A short final kind wraps speculative vector lanes within the row. The
+    # identity still applies to each pair beyond that kind's active span.
+    c = Config(head_dim=128, rope={SLIDING: (1e4, 0.125), FULL: (1e6, 0.34375)})
+    layout = decode_fp16.RopeLayout(c)
+    values = {(0, i): tvm.tirx.FloatImm("float32", i + 2) for i in range(layout.width)}
+    analyzer = tvm.arith.Analyzer()
+    for span in layout.spans.values():
+        for lane in range(c.head_dim // 2):
+            for identity in (0.0, 1.0):
+                coeff = decode_fp16.rope_coefficient(values, 0, lane, c.head_dim // 2, span, layout.width, identity)
+                expected = span.start + lane + 2 if lane < len(span) else identity
+                assert analyzer.simplify(coeff).value == expected

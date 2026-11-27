@@ -6,9 +6,10 @@
 // DCVS vote of its own, which slows HMX kernels by about 13%.
 #include <HAP_power.h>
 #include <string.h>
+#include <tl_templates/hexagon/session_state.h>
 
 // Identifies this session's requests to HAP_power_set.
-static int tl_power_ctx;
+TL_HEXAGON_SESSION_STATE int tl_power_ctx;
 
 static inline __attribute__((unused)) void tl_power_vote(void) {
   HAP_power_request_t req;

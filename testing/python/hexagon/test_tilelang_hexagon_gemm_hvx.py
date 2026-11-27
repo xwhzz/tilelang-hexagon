@@ -65,6 +65,75 @@ def _gemm(M, N, K, BK=None, ab="float16", c_dtype="float32", trans_a=False, tran
     return kernel
 
 
+def _tile_aligned(layouts, extra=0, pitch=64, runtime_rows=False):
+    @T.prim_func
+    def kernel(A: T.Tensor((32, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((32, 64), "float32")):
+        with T.Kernel(1):
+            a = T.sblock_alloc_buffer((32 + extra, 64), "float16", strides=(pitch, 1), scope="shared.dyn")
+            b = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_fragment((32, 64), "float32")
+            if layouts in ("a", "both", "weight"):
+                _row_major(a)
+            if layouts in ("b", "both"):
+                _row_major(b)
+            if layouts in ("weight", "hmx"):
+                T.annotate_layout({b: make_hmx_weight_layout(b)})
+            if pitch == 64:
+                T.copy(A, a[:32, :])
+            else:
+                for i, j in T.grid(32, 64):
+                    a[i, j] = A[i, j]
+            T.copy(B, b)
+            T.gemm(a[:32, :], b, c, clear_accum=True, annotations={"hexagon.rows": 32} if runtime_rows else {})
+            T.copy(c, C)
+
+    return kernel
+
+
+@pytest.mark.parametrize("layouts", ["a", "b", "both", "weight", "hmx", "none"])
+def test_explicit_layout_selects_the_unit_before_inference(layouts):
+    source = _source(_tile_aligned(layouts))
+    if layouts in ("hmx", "none"):
+        assert "tl_hexagon_hmx_gemm<" in source
+    else:
+        helper = "tl_hvx_gemm_weight<" if layouts == "weight" else "tl_hvx_gemm<"
+        call = next(line.strip() for line in source.splitlines() if helper in line)
+        control = _source(_tile_aligned(layouts, extra=1))
+        assert call in control
+
+
+def test_shared_weight_keeps_the_layout_inferred_by_another_gemm():
+    @T.prim_func
+    def kernel(A: T.Tensor((32, 64), "float16"), B: T.Tensor((64, 64), "float16"), C: T.Tensor((32, 64), "float32")):
+        with T.Kernel(1):
+            row = T.alloc_shared((32, 64), "float16")
+            act = T.alloc_shared((32, 64), "float16")
+            weight = T.alloc_shared((64, 64), "float16")
+            c = T.alloc_fragment((32, 64), "float32")
+            _row_major(row)
+            T.copy(A, row)
+            T.copy(A, act)
+            T.copy(B, weight)
+            T.gemm(row, weight, c, clear_accum=True)
+            T.gemm(act, weight, c)
+            T.copy(c, C)
+
+    source = _source(kernel)
+    assert "tl_hvx_gemm_weight<" in source and "tl_hexagon_hmx_gemm<" in source
+
+
+def test_explicit_row_major_keeps_remapped_pitch_and_hmx_row_contract():
+    assert "tl_hvx_gemm<32, 64, 64, false, false, 64, 64, 64," in _source(_tile_aligned("both", pitch=80))
+    with pytest.raises(Exception, match="reads A .* in the HMX activation layout"):
+        _source(_tile_aligned("both", runtime_rows=True))
+
+
+@DEVICE
+@pytest.mark.parametrize("layouts", ["both", "weight"])
+def test_tile_aligned_explicit_row_major_matches_torch(layouts):
+    _check(_tile_aligned(layouts, pitch=80), 32, 64, 64)
+
+
 def _sub_matrices():
     """C[2:5, 1:66] = A[1:4, 3:40] @ B[3:40, 5:70]: regions off register
     boundaries, in larger buffers."""
@@ -189,6 +258,29 @@ def test_a_weight_layout_b_runs_on_hvx():
     # M, N, K, A's and C's row strides, whether A starts on a register
     # boundary, and the elements between B's panels (its matrix's K tiles).
     assert call.startswith("tl_hvx_gemm_weight<16, 64, 64, 64, 64, true, 2048>(")
+
+
+@pytest.mark.parametrize("arch, uses_pairs", [("v73", True), ("v75", False), ("v79", True)])
+@pytest.mark.parametrize("n,k", [(256, 128), (128, 256)])
+def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, uses_pairs, n, k):
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((4, k), "float16"), B: T.Tensor((k, n), "float16"), C: T.Tensor((4, n), "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared((k, n), "float16")
+            T.annotate_layout({B: make_hmx_weight_layout(B), b: make_hmx_weight_layout(b)})
+            T.dma_copy(B, b)
+            T.dma_wait()
+            T.gemm(A, B, C, clear_accum=True)
+            T.gemm(A, b, C)
+
+    source = _source(kernel)
+    generic = _calls(source, "tl_hvx_gemm_weight")
+    paired = _calls(source, "tl_hvx_gemm_weight_row_pairs")
+    assert len(generic) == (1 if uses_pairs else 2)
+    assert len(paired) == int(uses_pairs)
+    assert "(&(B[0]))" in generic[0]
 
 
 def test_operands_in_other_layouts_run_as_scalar_loops(caplog):
@@ -417,3 +509,38 @@ def test_weight_layout_gemms_match_torch(M, N, K, BN, BK, c_dtype, trans_b):
     assert torch.all(out[:, 3:32] == 0)
     rounding = (K // BK) * 2.0**-10 if c_dtype == "float16" else 1e-5
     torch.testing.assert_close(out, ref, atol=rounding * float(ref.abs().max()) + 1e-5, rtol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("N, K", [(256, 128), (128, 256)])
+def test_four_row_weight_gemm_preserves_reduction_order(N, K):
+    import torch
+
+    @T.prim_func
+    def kernel(A: T.Tensor((4, K), "float16"), B: T.Tensor((K, N), "float16"), Out: T.Tensor((2, 2, 4, N), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((4, K), "float16")
+            b = T.alloc_shared((K, N), "float16")
+            c = T.alloc_fragment((4, N), "float32")
+            padded = T.alloc_fragment((4, N + 32), "float32")
+            T.annotate_layout({B: make_hmx_weight_layout(B), b: make_hmx_weight_layout(b)})
+            T.copy(A, a)
+            T.dma_copy(B, b)
+            T.dma_wait()
+            T.fill(c, 3.0)
+            T.fill(padded, 3.0)
+            for i in T.serial(2):
+                T.gemm(a, b, c, clear_accum=(i == 0))
+                T.gemm(a, b, padded[:, :N], clear_accum=(i == 0))
+                T.copy(c, Out[i, 0, :, :])
+                T.copy(padded[:, :N], Out[i, 1, :, :])
+
+    rng = torch.Generator().manual_seed(42)
+    a = torch.randn((4, K), generator=rng).half()
+    b = torch.randn((K, N), generator=rng).half()
+    ref = a.float() @ b.float()
+    # The padded output uses the original one-row schedule for both clear modes.
+    result = _run(kernel, a, _weight_tiles(b))
+    assert torch.equal(result[:, 0].view(torch.int32), result[:, 1].view(torch.int32))
+    for i in range(2):
+        torch.testing.assert_close(result[i, 0], (i + 1) * ref, atol=1e-4, rtol=1e-5)

@@ -46,6 +46,7 @@ public:
   int RowAxis() const;
   int ColAxis() const;
 
+  void RestoreLegacyIndex();
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.hexagon.CroutonLayout",
                                     CroutonLayoutNode, LayoutNode);

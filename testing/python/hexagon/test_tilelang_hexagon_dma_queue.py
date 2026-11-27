@@ -117,6 +117,26 @@ def test_waits_list_the_buffers_they_complete():
     assert re.search(r"tl_hexagon_dma_(?:async|compact)_wait\(tl_dma_async, 0\)\)", source)
 
 
+def test_loop_wait_completes_different_buffers_on_successive_iterations():
+    @T.prim_func
+    def carried(A: T.Tensor((9, 256), "float16"), B: T.Tensor((2, 256), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            t = T.alloc_shared((256,), "float16")
+            T.dma_copy(A[0, :], s)
+            for i in T.serial(8):
+                T.dma_wait()
+                T.dma_copy(A[i + 1, :], t)
+            T.dma_wait()
+            T.copy(s, B[0, :])
+            T.copy(t, B[1, :])
+
+    artifact = _lower(carried)
+    assert _queue(artifact) == (1, 1)
+    waits = [call for call in _dma_calls(artifact) if call.op.name == "tl.hexagon_dma_wait"]
+    assert [[str(arg) for arg in call.args[1:]] for call in waits] == [["s", "t"], ["t"]]
+
+
 def test_queue_bound_covers_both_branches():
     @T.prim_func
     def branches(A: T.Tensor((3, 256), "float16"), flag: T.int32):
@@ -156,3 +176,44 @@ def test_too_many_copies_in_flight_are_rejected():
 
     with pytest.raises(Exception, match="more than 256 DMA transfers in flight"):
         _lower(flood)
+
+
+def test_synchronous_pipeline_does_not_construct_a_dma_queue():
+    @T.prim_func
+    def convert(a: T.Tensor((256, 4, 32), "float16"), b: T.Tensor((256, 4, 16), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((4, 16), "float16")
+            for k in T.Pipelined(256, num_stages=2):
+                T.copy(a[k, :, :16], s)
+                T.copy(s, b[k, :, :])
+
+    artifact = _lower(convert)
+    assert not _ops(artifact)
+    assert "tl_dma_async" not in artifact.kernel_source
+
+
+def test_explicit_wait_without_transfers():
+    @T.prim_func
+    def wait_only(a: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            T.dma_wait(7)
+            a[0] = 9
+
+    assert not _ops(_lower(wait_only))
+
+
+def test_empty_group_keeps_its_place_after_a_real_submission():
+    @T.prim_func
+    def copy(a: T.Tensor((256,), "float16"), b: T.Tensor((256,), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            T.dma_copy(a, s)
+            T.evaluate(T.call_intrin("int32", tvm.ir.Op.get("tl.hexagon_dma_commit")))
+            T.dma_wait(1)
+            T.copy(s, b)
+
+    artifact = _lower(copy)
+    assert _ops(artifact) == ["queue", "submit", "commit", "commit", "wait", "wait"]
+    assert _queue(artifact) == (1, 2)
+    waits = [call for call in _dma_calls(artifact) if call.op.name == "tl.hexagon_dma_wait"]
+    assert [str(arg) for arg in waits[0].args[1:]] == ["s"]

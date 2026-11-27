@@ -81,7 +81,7 @@ static void tl_power_unvote() { calls.push_back("unvote"); }
 // GENERATED_RUN_KERNEL
 
 static int body() {
-  assert(prepared && held);
+  assert(prepared);
   calls.push_back("body");
   return body_error;
 }
@@ -100,8 +100,14 @@ int main(int argc, char **argv) {
     finish_error = TL_ERR_RESOURCE;
   if (mode.find("give-error") != std::string::npos)
     give_error = -1;
-  int result =
-      coop ? tl_hexagon_run_kernel<true>(body) : tl_hexagon_run_kernel(body);
+  bool free = mode.find("resource-free") == 0;
+  auto invoke = [&]() {
+    assert(held == !free);
+    return body();
+  };
+  int result = free   ? tl_hexagon_run_kernel<false, false>(invoke)
+               : coop ? tl_hexagon_run_kernel<true>(invoke)
+                      : tl_hexagon_run_kernel(invoke);
   int expected = prepare_error ? prepare_error
                  : take_error  ? TL_ERR_VTCM
                  : body_error  ? body_error
@@ -111,11 +117,11 @@ int main(int argc, char **argv) {
   std::vector<std::string> order{coop ? "prepare-cooperative"
                                       : "prepare-ordinary"};
   if (!prepare_error) {
-    if (!coop)
+    if (!coop && !free)
       order.push_back("take");
     if (!take_error) {
       order.push_back("body");
-      if (!coop)
+      if (!coop && !free)
         order.push_back("give");
     }
     order.push_back("finish");

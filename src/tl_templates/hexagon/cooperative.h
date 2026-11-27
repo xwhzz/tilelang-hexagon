@@ -4,6 +4,7 @@
 #include <hexagon_types.h>
 #include <tl_templates/hexagon/dma.h>
 #include <tl_templates/hexagon/resource.h>
+#include <tl_templates/hexagon/session_state.h>
 #include <tl_templates/hexagon/worker.h>
 
 enum tl_cooperative_decision { TL_CP_WAIT, TL_CP_COMMITTED, TL_CP_ABORTED };
@@ -18,7 +19,7 @@ struct tl_cooperative_group {
 };
 // Dispatch is serial. This stack-owned group remains live until the persistent
 // pool has joined every worker, including workers returning an error.
-static tl_cooperative_group *tl_cooperative_active;
+TL_HEXAGON_SESSION_STATE tl_cooperative_group *tl_cooperative_active;
 
 static inline void tl_cooperative_pause() { asm volatile("pause(#8)"); }
 static inline bool tl_cooperative_safe(tl_cooperative_run *run) {

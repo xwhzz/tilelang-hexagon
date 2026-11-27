@@ -192,6 +192,8 @@ def add_gumbel(logit, scale, seed, pos, first, hx, hy):
         # 24 bits, through int32: an unsigned conversion to float is not safe
         # on HVX (hexagon-clang 19 selects IEEE instructions v79 does not run).
         u = (T.Cast("float32", T.Cast("int32", hy[i, j] >> T.uint32(8))) + T.float32(0.5)) * T.float32(1.0 / (1 << 24))
+        # The last bin midpoint rounds to 1 in fp32. Keep both logs finite.
+        u = T.min(u, T.float32(1.0 - 2.0**-24))
         logit[i, j] = logit[i, j] * scale + -T.log(-T.log(u))
 
 
@@ -499,7 +501,9 @@ class Decoder:
     once), and the host needs only its header at `bundle_path`; else it is
     written from the host. `prefill_rows` is the prefill's chunk ("auto": 128
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
-    the decode, a token a step).
+    the decode, a token a step). Generation uses as many calls as needed to
+    fit each call in the `max_tokens` scratch slots and the full request in
+    the `max_pos` context positions.
 
     The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
     weights and its cache of max_pos positions fit), each a stage of the
@@ -527,6 +531,7 @@ class Decoder:
             self._open_fp16(bundle_path, device_path, processes)
         else:
             self._open_4bit(bundle_path, device_path)
+        self._chat_backup = None
         self.reset()
 
     def _open_4bit(self, bundle_path: str, device_path: str | None) -> None:
@@ -593,7 +598,8 @@ class Decoder:
         target = determine_target("hexagon", return_object=True)
 
         c, header, max_pos, R = self.c, self.header, self.max_pos, self.prefill_rows
-        D, F, HD, NK = c.dim, c.ff, c.head_dim, len(c.rope)
+        D, F, HD = c.dim, c.ff, c.head_dim
+        rope_layout = decode_fp16.RopeLayout(c)
         ranges = decode_fp16.plan_stages(c, header, max_pos, processes)
         P = len(ranges)
         row_major = self.row_major_embedding = decode_fp16.row_major_embedding(c, header, max_pos, ranges)
@@ -668,7 +674,7 @@ class Decoder:
                 ask((p, "embed"), decode_fp16.TILE * 2, [p])
             if p not in attends:
                 for key in ("cos", "sin"):
-                    ask((p, key), NK * decode_fp16.EMPTY_ROWS * HD // 2 * 4, [p])
+                    ask((p, key), rope_layout.nbytes(decode_fp16.EMPTY_ROWS), [p])
             rows = decode_fp16.kv_plan(c, max_pos, layers)[2] if p in attends else decode_fp16.EMPTY_ROWS
             for key in ("kv_k", "kv_v"):
                 ask((p, key), c.kv_heads * rows * HD * 2, [p])
@@ -752,6 +758,9 @@ class Decoder:
             self.session.pipeline(stages, min(self.CALL_STEPS, steps - s0))
             self.seconds += self.session.last_run_seconds()
 
+    def _fp16_decode_steps(self, pos0: int, n: int, n_forced: int) -> None:
+        self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+
     def last_run_seconds(self) -> float:
         """How long the last run or prefill took on the DSP: its FastRPC
         calls, each timed by the agent on the device, without the host's
@@ -781,9 +790,55 @@ class Decoder:
             parts.append(state.view(-1, self.c.conv_taps - 1, self.c.dim)[:count])
         return torch.cat(parts)
 
+    def _conv_buffers(self):
+        return [st.conv_state for st in self.stages] if self.fp16 else [self.conv_state]
+
+    def _copy_chat_conv(self, *, restore: bool) -> None:
+        from tilelang.hexagon.runtime.session import Copy
+
+        states = self._conv_buffers()
+        if self._chat_backup is None:
+            # The agent copies all stages' convolution states in one request.
+            # Only the backup needs an extra mapping, on one process.
+            self._chat_backup = self.session.buffer(sum(st.nbytes for st in states), processes=[0])
+        operations, offset = [], 0
+        for st in states:
+            if restore:
+                operations.append(Copy(self._chat_backup, st, st.nbytes, src_offset=offset))
+            else:
+                operations.append(Copy(st, self._chat_backup, st.nbytes, dst_offset=offset))
+            offset += st.nbytes
+        self.session.run_sequence(operations)
+
+    def _chat_position(self, prompt: list) -> int:
+        """The number of prompt inputs the retained KV and convolution state represent."""
+        seen = self._chat_tokens
+        self._chat_tokens = None
+        if seen is not None:
+            if len(seen) < len(prompt) and prompt[: len(seen)] == seen:
+                return len(seen)
+            # A decode chunk can consume more than the answer displayed before
+            # EOS. The prompt checkpoint precedes all of that turn's decode
+            # writes. Full attention retains its KV. A ring retains its whole
+            # visible window until enough new positions wrap onto that window.
+            pos = self._chat_saved_pos
+            if 0 < pos < len(prompt) and prompt[:pos] == seen[:pos]:
+                if self.fp16 and self.c.window:
+                    from decode_fp16 import ring
+
+                    retained = len(seen) - pos <= ring(self.c) - self.c.window
+                else:
+                    retained = True
+                if retained:
+                    self._copy_chat_conv(restore=True)
+                    return pos
+        self.reset()
+        return 0
+
     def reset(self) -> None:
         """Forget the context: the conv state starts from zeros."""
-        for state in [st.conv_state for st in self.stages] if self.fp16 else [self.conv_state]:
+        self._chat_tokens = None
+        for state in self._conv_buffers():
             state.write(bytes(state.nbytes))
 
     def run(self, tokens: list, pos0: int, n: int, n_forced: int, temperature: float = 0.0, seed: int = 0) -> tuple:
@@ -793,11 +848,12 @@ class Decoder:
         a sample of their softmax, which `seed` (below 2^24) makes
         reproducible."""
         assert 1 <= n_forced <= n + 1 <= self.max_tokens and pos0 + n <= self.max_pos and 0 <= seed < 1 << 24
+        self._chat_tokens = None
         self.tokens.write(torch.tensor(list(tokens[:n_forced]), dtype=torch.int32))
         self.sampling.write(torch.tensor([1 / temperature if temperature > 0 else 0, seed], dtype=torch.float32))
         if self.fp16:
             # A token a step, through the stages in turn (decode_fp16.make_decode).
-            self._pipeline(0, [[*st.decode, pos0, n_forced] for st in self.stages], n)
+            self._fp16_decode_steps(pos0, n, n_forced)
         else:
             args = [
                 *self.args,
@@ -821,12 +877,29 @@ class Decoder:
         """Positions pos0 .. pos0 + len(tokens) - 1 from `tokens`: their KV cache
         entries and the conv state they leave, in chunks of prefill_rows."""
         n, R = len(tokens), self.prefill_rows
-        assert R and 1 <= n <= self.max_tokens and pos0 + -(-n // R) * R <= self.max_pos
-        self.tokens.write(torch.tensor(list(tokens), dtype=torch.int32))
+        assert R and pos0 >= 0 and 1 <= n <= self.max_tokens and pos0 + n <= self.max_pos
+        chunks = -(-n // R)
+        fits = pos0 + chunks * R <= self.max_pos
+        assert self.fp16 or fits
+        self._chat_tokens = None
+        ids = torch.tensor(list(tokens), dtype=torch.int32)
         if self.fp16:
-            # A chunk a step, through the stages in turn (prefill_fp16.make_prefill).
-            self._pipeline(len(self.stages), [[*st.prefill, pos0, n] for st in self.stages], -(-n // R))
+            # A prefill step accesses R physical KV rows, even for a short last
+            # chunk. Finish a chunk that would cross the cache end one token at
+            # a time, using the resident decode stages and their exact KV stores.
+            batched = n if fits else (chunks - 1) * R
+            if batched:
+                self.tokens.write(ids[:batched])
+                self._pipeline(len(self.stages), [[*st.prefill, pos0, batched] for st in self.stages], -(-batched // R))
+            if batched < n:
+                seconds = self.seconds if batched else 0.0
+                # Match the prefill embedding's token clamp. Forced decode also
+                # uses the next token as an index when computing its score.
+                self.tokens.write(ids[batched:].clamp_(0, self.c.vocab - 1))
+                self._fp16_decode_steps(pos0 + batched, n - batched, n - batched)
+                self.seconds += seconds
         else:
+            self.tokens.write(ids)
             state = (*self.rope, self.kv_k, self.kv_v, self.conv_state, self.kinds)
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
             self.seconds = self.session.last_run_seconds()
@@ -839,34 +912,94 @@ class Decoder:
         self.run(tokens, 0, n, n + 1)
         return torch.frombuffer(bytearray(self.scores.read(n * 4)), dtype=torch.float32).tolist()
 
-    def stream(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0, chunk: int = 16, timings: list | None = None):
-        """The `n_new` tokens after `prompt`, from an empty context, in lists of
+    def stream(
+        self,
+        prompt: list,
+        n_new: int,
+        temperature: float = 0.0,
+        seed: int = 0,
+        chunk: int = 16,
+        timings: list | None = None,
+        *,
+        reuse: bool = False,
+    ):
+        """The `n_new` tokens after `prompt`, in lists of
         up to `chunk`: a decode call each, so that a caller can show them as
         they come. The prefill runs the prompt but its last token, which the
         decode's first step runs and the LM head reads. `timings`, if given,
-        gets (kernel, tokens, seconds on the DSP) for each call."""
+        gets (kernel, tokens, seconds on the DSP) for each call. With `reuse`,
+        a matching prefix from the previous streamed turn is already on the
+        device. By default every prompt starts from an empty context."""
 
         def timed(kernel: str, tokens: int) -> None:
             if timings is not None:
                 timings.append((kernel, tokens, self.last_run_seconds()))
 
-        self.reset()
-        if self.prefill_rows and len(prompt) > 1:
-            self.prefill(prompt[:-1])
-            timed("prefill", len(prompt) - 1)
-            last, pos, done = prompt[-1], len(prompt) - 1, 0
+        if n_new < 0:
+            raise ValueError("the number of new tokens must be nonnegative")
+        if n_new == 0:
+            return
+        if len(prompt) == 0 or chunk < 1 or self.max_tokens < 2:
+            raise ValueError("generation needs a prompt, a positive chunk, and token storage for an input and an output")
+        if len(prompt) - 1 + n_new > self.max_pos:
+            raise ValueError("the prompt and requested decode steps exceed the context")
+
+        if reuse:
+            pos = self._chat_position(prompt)
         else:
-            k = min(chunk, n_new)
-            tokens, _ = self.run(prompt, 0, len(prompt) + k - 1, len(prompt), temperature, seed)
-            timed("decode", len(prompt) + k - 1)
-            yield tokens[len(prompt) :]
-            last, pos, done = tokens[-1], len(prompt) - 1 + k, k
+            self.reset()
+            pos = 0
+        end = len(prompt) - 1
+        rows, capacity = self.prefill_rows, self.max_tokens
+        while rows and pos < end:
+            remaining = end - pos
+            # Use whole prefill tiles between calls when the token buffer fits
+            # them. A single call keeps its original chunk boundaries.
+            n = remaining if remaining <= capacity else (capacity // rows * rows or capacity)
+            if not self.fp16 and pos + -(-n // rows) * rows > self.max_pos:
+                # The quantized prefill stores full physical rows. Finish the
+                # physical tail with the same forced decode path as below.
+                n = (self.max_pos - pos) // rows * rows
+                if not n:
+                    break
+            self.prefill(prompt[pos : pos + n], pos)
+            timed("prefill", n)
+            pos += n
+
+        while len(prompt) - pos >= capacity:
+            # The overlapping token is a forced output of this call and the
+            # first input of the next. Every position advances KV exactly once.
+            n = capacity - 1
+            self.run(prompt[pos : pos + capacity], pos, n, capacity, temperature, seed)
+            timed("decode", n)
+            pos += n
+
+        if reuse:
+            if pos < end:
+                # Finish the forced suffix so the checkpoint is immediately
+                # before the prompt's last token, even with no prefill kernel.
+                self.run(prompt[pos:], pos, end - pos, end - pos + 1, temperature, seed)
+                timed("decode", end - pos)
+            pos = end
+            if pos:
+                self._copy_chat_conv(restore=False)
+            self._chat_saved_pos = pos
+            self._chat_tokens = consumed = prompt[:pos]
+
+        forced, done = prompt[pos:], 0
         while done < n_new:
-            k = min(chunk, n_new - done)
-            tokens, _ = self.run([last], pos, k, 1, temperature, seed)
-            timed("decode", k)
-            yield tokens[1:]
-            last, pos, done = tokens[-1], pos + k, done + k
+            if reuse and self._chat_tokens is not consumed:
+                raise RuntimeError("Decoder state changed between streamed chunks")
+            k = min(chunk, n_new - done, capacity - len(forced))
+            steps = len(forced) - 1 + k
+            tokens, _ = self.run(forced, pos, steps, len(forced), temperature, seed)
+            if reuse:
+                # The returned chunk's final prediction has not advanced state.
+                consumed.extend(tokens[:-1])
+                self._chat_tokens = consumed
+            timed("decode", steps)
+            yield tokens[len(forced) :]
+            forced, pos, done = tokens[-1:], pos + steps, done + k
 
     def generate(self, prompt: list, n_new: int, temperature: float = 0.0, seed: int = 0) -> list:
         """The `n_new` tokens after `prompt`, from an empty context: greedy, or

@@ -40,6 +40,7 @@ public:
   int64_t Rows() const;
   int64_t Cols() const;
 
+  void RestoreLegacyIndex();
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.hexagon.PanelLayout", PanelLayoutNode,
                                     LayoutNode);

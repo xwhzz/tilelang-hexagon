@@ -97,5 +97,30 @@ def test_gemm_f32_tt():
     run_gemm_compile(128, 128, 128, 64, 64, 64, trans_A=True, trans_B=True)
 
 
+def test_scalar_gemm_clears_only_the_selected_matrix_region():
+    @T.prim_func
+    def main(A: T.Tensor((2, 5, 6), "float32"), B: T.Tensor((6, 5), "float32"), C: T.Tensor((2, 2, 5, 6), "float32")):
+        with T.Kernel(1):
+            for block in T.serial(2):
+                k = 1 + block * 2
+                T.gemm(
+                    A[1, k : k + 2, 2:4],
+                    B[2:5, k : k + 2],
+                    C[0, 1, 1:3, 2:5],
+                    transpose_A=True,
+                    transpose_B=True,
+                    clear_accum=(block == 0),
+                )
+
+    a = torch.arange(60, dtype=torch.float32).reshape(2, 5, 6)
+    b = torch.arange(30, dtype=torch.float32).reshape(6, 5)
+    c = torch.arange(120, dtype=torch.float32).reshape(2, 2, 5, 6) + 1
+    expected = c.clone()
+    expected[0, 1, 1:3, 2:5] = a[1, 1:5, 2:4].T @ b[2:5, 1:5].T
+    kernel = tilelang.compile(main, target="c", target_host="c", execution_backend="cython")
+    kernel(a, b, c)
+    torch.testing.assert_close(c, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
