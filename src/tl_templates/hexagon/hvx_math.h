@@ -805,6 +805,23 @@ tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
   HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
 #endif
   auto exceptional = tl_hvx_div_needs_scalar(__builtin_bit_cast(Words, y));
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  // The IEEE reciprocal still rounds before the final multiply. Repair
+  // subnormal inputs and ratios that can round across underflow or overflow.
+  // Keep the magnitude operations in HVX for compound input expressions.
+  HVX_Vector magnitude = Q6_V_vsplat_R(0x7fffffff);
+  HVX_Vector ax = Q6_V_vand_VV(x, magnitude), by = Q6_V_vand_VV(y, magnitude);
+  // For normal operands, one exponent bin in the encoding is a factor of two.
+  HVX_Vector delta =
+      Q6_Vw_vadd_VwVw(Q6_Vw_vsub_VwVw(ax, by), Q6_V_vsplat_R(0x3f000000));
+  HVX_VectorPred extreme =
+      Q6_Q_vcmp_gt_VuwVuw(delta, Q6_V_vsplat_R(0x7e7fffff));
+  HVX_VectorPred subnormal = Q6_Q_vcmp_gt_VuwVuw(Q6_V_vsplat_R(0x00800000), ax);
+  HVX_VectorPred repair = Q6_Q_and_QQn(Q6_Q_or_QQ(extreme, subnormal),
+                                       Q6_Q_vcmp_eq_VwVw(ax, Q6_V_vzero()));
+  exceptional |=
+      __builtin_bit_cast(decltype(exceptional), Q6_V_vand_QR(repair, -1));
+#endif
 #if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75 || __HVX_ARCH__ == 79
   HVX_Vector mask = __builtin_bit_cast(HVX_Vector, exceptional);
   for (int offset = 64; offset >= 4; offset /= 2)
@@ -826,14 +843,24 @@ tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
 }
 
 template <int N>
-TL_HEXAGON_IEEE_ARITHMETIC static inline vec_type<float, N>
-tl_hvx_div(const vec_type<float, N> &a, float b) {
-  // A broadcast has one denominator to classify and one scalar reciprocal.
+TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a, float b) {
+  static_assert(N % TL_HVX_F32_LANES == 0, "tl_hvx_div needs whole registers");
+  // Preserve the vector reciprocal's rounding for ordinary broadcasts. Keep
+  // it outside the exceptional branch so loop-invariant denominators can hoist.
+  HVX_Vector reciprocal = tl_hvx_recip_vsf(tl_hvx_splat_f(b));
+  vec_type<float, N> out;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
+    HVX_Vector x;
+    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
+    HVX_Vector q = tl_hvx_mul_sf(x, reciprocal);
+    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  }
   using Floats = typename vec_type<float, N>::nat_t;
   if (__builtin_expect(tl_hvx_div_needs_scalar(__builtin_bit_cast(uint32_t, b)),
                        0))
     return vec_type<float, N>(a.v / (Floats)b);
-  return vec_type<float, N>(a.v * (Floats)(1.0f / b));
+  return out;
 }
 
 template <int N>
