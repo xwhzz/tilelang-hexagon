@@ -6,7 +6,8 @@ kernel adapter using TVM.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from copy import copy
+from dataclasses import dataclass, replace
 import inspect
 from typing import (
     Any,
@@ -17,8 +18,10 @@ from typing import (
     ParamSpec,
 )
 from collections.abc import Callable
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
+from tilelang import env
+from tilelang.env import _parse_target_config, default_target_cache_key
 from tilelang import tvm as tvm
 from tilelang.language.eager import PrimFunc, prim_func, JITFunc
 from tilelang.language.eager.builder import _make_jit_key
@@ -28,7 +31,7 @@ from contextlib import nullcontext
 from tilelang.jit.kernel import JITKernel
 from tilelang.cache import cached
 from tilelang.utils.device import get_available_cpu_count
-from os import path, makedirs
+from os import fsdecode, path, makedirs
 from logging import getLogger
 from tilelang.jit.param import Kernel
 import concurrent.futures
@@ -43,54 +46,9 @@ _KP = ParamSpec("_KP")
 _T = TypeVar("_T")
 _Ret = TypeVar("_Ret")
 TargetLike = str | dict[str, object] | Target
-_CallFormKey = tuple[tuple[Any, ...], tuple[tuple[str, Any], ...]]
+_CallFormKey = tuple[object, tuple[Any, ...], tuple[tuple[str, Any], ...]]
 _CALL_FORM_CACHE_MISS = object()
-
-
-@dataclass
-class _CallFormCache:
-    """Memoize lazy no-tensor kernel factories by raw Python call form."""
-
-    entries: dict[_CallFormKey, Kernel] = field(default_factory=dict)
-    last_args: tuple[Any, ...] | None = None
-    last_kwargs: dict[str, Any] | None = None
-    last_kernel: Kernel | object = _CALL_FORM_CACHE_MISS
-
-    def clear(self) -> None:
-        self.entries.clear()
-        self.last_args = None
-        self.last_kwargs = None
-        self.last_kernel = _CALL_FORM_CACHE_MISS
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def _matches_last(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
-        if self.last_args is None or self.last_kwargs is None:
-            return False
-        return args == self.last_args and kwargs == self.last_kwargs
-
-    def _remember(self, call_form_key: _CallFormKey, kernel: Kernel) -> None:
-        args, kwargs_items = call_form_key
-        self.last_args = args
-        self.last_kwargs = dict(kwargs_items)
-        self.last_kernel = kernel
-
-    def lookup(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Kernel | object, _CallFormKey | None]:
-        # Validate even on a last-call hit: an unhashable value can compare equal
-        # to a previously cached hashable argument.
-        call_form_key = _make_jit_key((args, tuple(kwargs.items())))
-        if self._matches_last(args, kwargs):
-            return self.last_kernel, None
-
-        kernel = self.entries.get(call_form_key, _CALL_FORM_CACHE_MISS)
-        if kernel is not _CALL_FORM_CACHE_MISS:
-            self._remember(call_form_key, kernel)
-        return kernel, call_form_key
-
-    def store(self, call_form_key: _CallFormKey, kernel: Kernel) -> None:
-        self.entries[call_form_key] = kernel
-        self._remember(call_form_key, kernel)
+_RUNTIME_UNRESOLVED = object()
 
 
 def compile(
@@ -363,8 +321,16 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                 self.debug_root_path = path.join(base_path, self.debug_root_path)
             except NameError:
                 self.debug_root_path = path.abspath(self.debug_root_path)
+        self._initialize_caches()
+
+    def _initialize_caches(self):
         self._kernel_cache: dict[tuple, Kernel] = {}
-        self._call_form_cache: _CallFormCache = _CallFormCache()
+        self._call_form_cache: dict[_CallFormKey, Kernel] = {}
+        self._runtime_policy = _RUNTIME_UNRESOLVED
+        self._bound_factories = {}
+        self._ordinary_factories = {}
+        self._bound_target = None
+        self._compile_scope = None
         self._tuner_cache: dict[tuple, Kernel] = {}
 
     def _get_frontend_target_context(self):
@@ -466,17 +432,28 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         )
 
     def compile(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
-        prim_func = self.get_tir(*args, **kwargs)
-        kernel_result = compile(
-            prim_func,
-            out_idx=self.out_idx,
-            execution_backend=self.execution_backend,
-            target=self.target,
-            target_host=self.target_host,
-            verbose=self.verbose,
-            pass_configs=self.pass_configs,
-            compile_flags=self.compile_flags,
-        )
+        if self._runtime_policy is not None:
+            selector = self.target if self.target is not None else default_target_cache_key()
+            selector, target_key = self._target_choice(selector)
+            bound = self._ordinary_factories.get(target_key) or self._bound_factory(selector, target_key)
+            if bound is not None:
+                factory, scope = bound
+                if scope is None:
+                    return factory.compile(*args, **kwargs)
+                with scope(), factory.target:
+                    return factory.compile(*args, **kwargs)
+        with self._compile_scope() if self._compile_scope is not None else nullcontext():
+            prim_func = self.get_tir(*args, **kwargs)
+            kernel_result = compile(
+                prim_func,
+                out_idx=self.out_idx,
+                execution_backend=self.execution_backend,
+                target=self.target if self._bound_target is None else self._bound_target,
+                target_host=self.target_host,
+                verbose=self.verbose,
+                pass_configs=self.pass_configs,
+                compile_flags=self.compile_flags,
+            )
 
         if self.debug_root_path:
             if isinstance(self.func, PrimFunc):
@@ -513,16 +490,82 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     def is_lazy_mode(self) -> bool:
         return self.mode == "lazy"
 
-    def _can_use_call_form_cache(self, has_tune_params: bool) -> bool:
-        # This cache returns a kernel object directly, so it is only valid for
-        # JIT functions that have no runtime tensor arguments to extract.
-        return not has_tune_params and isinstance(self.func, JITFunc) and not self.func.tensor_args
+    def _target_choice(self, selector):
+        if selector in (b"auto", "auto", None):
+            current = Target.current()
+            selector = "auto" if current is None else current
+            return selector, selector
+        if isinstance(selector, (str, bytes, Target)):
+            return selector, selector
+        # The caller may edit a target mapping in place between calls.
+        snapshot = dict(selector)
+        return snapshot, ("mapping", repr(snapshot))
+
+    def _bind_factory(self, key, target, backend, scope):
+        frontend = replace(self.func) if isinstance(self.func, JITFunc) else self.func
+        factory = replace(self, target=target, execution_backend=backend, func=frontend)
+        factory._runtime_policy = None
+        factory._compile_scope = scope
+        return self._bound_factories.setdefault(key, (factory, scope))
+
+    def _ordinary_factory(self, requested, target_key):
+        # Only the compiler consumes the implicit default. Frontend code still
+        # sees the caller's ambient Target and the original factory settings.
+        factory = copy(self)
+        factory._initialize_caches()
+        factory._runtime_policy = None
+        factory._bound_target = requested
+        if self.target is not None:
+            factory.target = requested
+        factory.func = replace(self.func) if isinstance(self.func, JITFunc) else self.func
+        factory._kernel_cache.update(self._kernel_cache)
+        return self._ordinary_factories.setdefault(target_key, (factory, None))
+
+    def _bound_factory(self, selector, target_key):
+        dispatch = self._runtime_policy
+        if dispatch is None:
+            return None
+        # An ordinary module has no session-owning backend. Only its selected
+        # target can change, and a fixed ordinary target uses this factory itself.
+        backend = self.execution_backend if self.execution_backend is not None else env.get_default_execution_backend()
+        choice = (target_key, backend)
+        if dispatch is _RUNTIME_UNRESOLVED or dispatch[0] != choice:
+            if isinstance(selector, bytes):
+                selector = fsdecode(selector)
+            requested = (_parse_target_config(selector) or selector) if self.target is None and isinstance(selector, str) else selector
+            from tilelang.cache import _resolve_cache_dispatch
+
+            try:
+                _, context, _ = _resolve_cache_dispatch(requested, self.target_host, backend, False)
+            except (ValueError, RuntimeError, AssertionError):
+                # A source-only trace can run without an available auto target.
+                if dispatch is _RUNTIME_UNRESOLVED and requested == "auto":
+                    return None
+                raise
+            policy = context.execution_backend
+            if not any(spec.runtime_cache for spec in context.module.execution_backends):
+                if self.target is not None and self.target != "auto" and not isinstance(self.target, Mapping):
+                    self._runtime_policy = None
+                    return None
+                # Keep the caller's selector. On a compile miss, normalization
+                # can depend on the active device and the execution backend.
+                return self._ordinary_factory(requested, target_key)
+            self._runtime_policy = (choice, requested, policy)
+        else:
+            _, requested, policy = dispatch
+        if policy.runtime_cache is None:
+            return None
+        token, capture = policy.runtime_cache()
+        key = (choice, token)
+        bound = self._bound_factories.get(key)
+        if bound is None:
+            scope = capture()
+            with scope():
+                bound = self._bind_factory(key, determine_target(requested, return_object=True), policy.name, scope)
+        return bound
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
-        # Separate out the tuning parameters from the user's kwargs
-        # Whether to return the compile arguments (out_idx, target, target_host, etc.) for autotuner cache
-        return_compile_arguments = kwargs.pop("__return_compile_arguments", False)
-        if return_compile_arguments:
+        if "__return_compile_arguments" in kwargs and kwargs.pop("__return_compile_arguments"):
             logger.warning("`__return_compile_arguments` is deprecated and will be removed in future versions.")
             compile_args = {
                 "out_idx": self.out_idx,
@@ -535,17 +578,58 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             }
             return compile_args
 
+        # These entries belong only to a fixed factory or an ordinary resolved
+        # target. A live deployment always goes through its backend below.
+        selector = target_key = None
+        if self._runtime_policy is not None:
+            selector = self.target if self.target is not None else default_target_cache_key()
+            if type(selector) is bytes and selector != b"auto":
+                target_key = selector
+            elif selector in (b"auto", "auto", None):
+                current = Target.current()
+                target_key = selector = "auto" if current is None else current
+            else:
+                selector, target_key = self._target_choice(selector)
+        if self._call_form_cache and self.mode == "lazy":
+            try:
+                return self._call_form_cache[target_key, args, tuple(kwargs.items()) if kwargs else ()]
+            except (KeyError, TypeError):
+                # Tuning kwargs and other unhashable arguments use the binder below.
+                pass
+
         has_tune_params = "__tune_params" in kwargs
-        kwargs.update(kwargs.pop("__tune_params", {}))
+        if self._runtime_policy is not None:
+            bound = self._ordinary_factories.get(target_key) or self._bound_factory(selector, target_key)
+            if bound is not None:
+                factory, scope = bound
+                if scope is None or (factory.is_lazy_mode() and isinstance(factory.func, JITFunc) and not factory.func.tensor_args):
+                    result = factory._call_compiled(args, kwargs, has_tune_params)
+                else:
+                    with scope(), factory.target:
+                        result = factory._call_compiled(args, kwargs, has_tune_params)
+                if self.mode == "auto":
+                    self.mode = factory.mode
+                    self.func.set_mode(self.mode)
+                if scope is None and factory._call_form_cache and not has_tune_params:
+                    self._call_form_cache[target_key, args, tuple(kwargs.items())] = result
+                return result
+        return self._call_compiled(args, kwargs, has_tune_params)
+
+    def _call_compiled(self, args, kwargs, has_tune_params):
+        if has_tune_params:
+            kwargs.update(kwargs.pop("__tune_params"))
 
         # infer mode early, before parse_args needs it
         if self.mode == "auto":
             self.mode = self._infer_jit_mode(*args, **kwargs)
             self.func.set_mode(self.mode)
-
         call_form_key = None
-        if self.is_lazy_mode() and self._can_use_call_form_cache(has_tune_params):
-            kernel, call_form_key = self._call_form_cache.lookup(args, kwargs)
+        if self.mode == "lazy" and not has_tune_params and isinstance(self.func, JITFunc) and not self.func.tensor_args:
+            # A source-only auto target can acquire an execution backend later.
+            # Look it up here, after dispatch, until that backend is resolved.
+            owner = None if self._runtime_policy is None else _RUNTIME_UNRESOLVED
+            call_form_key = _make_jit_key((owner, args, tuple(kwargs.items())))
+            kernel = self._call_form_cache.get(call_form_key, _CALL_FORM_CACHE_MISS)
             if kernel is not _CALL_FORM_CACHE_MISS:
                 return kernel
 
@@ -556,7 +640,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             self._kernel_cache[key] = kernel
 
         if call_form_key is not None and self.is_lazy_mode() and not kernel_args:
-            self._call_form_cache.store(call_form_key, kernel)
+            self._call_form_cache[call_form_key] = kernel
 
         # eager mode: execute kernel immediately and return result
         # lazy mode: return kernel object for manual invocation

@@ -340,6 +340,20 @@ def _parse_target_config(value: str) -> TargetConfig | None:
     return dict(parsed)
 
 
+_DEFAULT_TARGET = EnvVar("TILELANG_DEFAULT_TARGET", "auto")
+_process_environment = os.environ
+_get_environ_bytes = os.environb.get if os.supports_bytes_environ else None
+
+
+def default_target_cache_key():
+    """Read the selector without decoding a new string on every factory hit."""
+    if _DEFAULT_TARGET._forced_value is not None:
+        return _DEFAULT_TARGET._forced_value
+    if _get_environ_bytes is not None and os.environ is _process_environment:
+        return _get_environ_bytes(b"TILELANG_DEFAULT_TARGET", b"auto")
+    return os.environ.get(_DEFAULT_TARGET.key, "auto")
+
+
 # Utility function for environment variables with defaults
 # Assuming EnvVar and CacheState are defined elsewhere
 class Environment:
@@ -412,7 +426,7 @@ class Environment:
 
     # Compilation defaults (for jit, autotune, compile)
     # These allow overriding default compilation parameters via environment variables
-    TILELANG_DEFAULT_TARGET = EnvVar("TILELANG_DEFAULT_TARGET", "auto")
+    TILELANG_DEFAULT_TARGET = _DEFAULT_TARGET
     TILELANG_DEFAULT_EXECUTION_BACKEND = EnvVar("TILELANG_EXECUTION_BACKEND", "auto")
     TILELANG_DEFAULT_VERBOSE = EnvVar("TILELANG_VERBOSE", "0")
     TILELANG_LAYOUT_COST_MODEL = EnvVar(

@@ -5,7 +5,6 @@ No target program is run by this module. Android remains the default build path.
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import struct
@@ -30,14 +29,14 @@ def build_linux_host(project_dir, name, sdk, env, verbose=False):
     out = root / "linux_aarch64"
     out.mkdir(exist_ok=True)
     sdk_root = Path(sdk.sdk_root)
-    runtime_dir = os.environ.get("TILELANG_HEXAGON_LINUX_RPC_LIB_DIR")
+    runtime_dir = env.get("TILELANG_HEXAGON_LINUX_RPC_LIB_DIR")
     if not runtime_dir:
         raise RuntimeError("Set TILELANG_HEXAGON_LINUX_RPC_LIB_DIR to the target BSP's captured runtime libraries")
     runtime = Path(runtime_dir).resolve()
     rpc = runtime / "libcdsprpc.so"
     if not rpc.is_file():
         raise RuntimeError(f"Target FastRPC library missing: {rpc}")
-    cc = shutil.which(os.environ.get("TILELANG_HEXAGON_LINUX_CC", "aarch64-linux-gnu-gcc"), path=env["PATH"])
+    cc = shutil.which(env.get("TILELANG_HEXAGON_LINUX_CC", "aarch64-linux-gnu-gcc"), path=env["PATH"])
     if not cc:
         raise RuntimeError("Linux ARM64 compiler not found")
     includes = [out, sdk_root / "incs", sdk_root / "incs/stddef", sdk_root / "utils/examples", sdk_root / "ipc/fastrpc/incs"]

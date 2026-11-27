@@ -23,9 +23,30 @@ import contextlib
 import os
 import shutil
 import subprocess
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
+
+# A live kernel must use the same deployment settings for its cache key,
+# build, connection and subsequent reopen. Standalone SDK/Session callers
+# continue to select their environment at the call site.
+_deployment_environment = ContextVar("hexagon_deployment_environment", default=None)
+
+
+def current_environment():
+    env = _deployment_environment.get()
+    return os.environ if env is None else env
+
+
+@contextlib.contextmanager
+def use_environment(env):
+    token = _deployment_environment.set(env)
+    try:
+        yield
+    finally:
+        _deployment_environment.reset(token)
+
 
 # Default locations on this host.  All overridable via environment variables or
 # explicit constructor args so nothing is hard-wired for production use.
@@ -47,14 +68,14 @@ class HexagonSDK:
     (call :meth:`validate` to fail fast).
     """
 
-    sdk_root: str = field(default_factory=lambda: os.environ.get("HEXAGON_SDK_ROOT", _DEFAULT_SDK_ROOT))
-    ndk_root: str = field(default_factory=lambda: os.environ.get("ANDROID_NDK_ROOT", _DEFAULT_NDK_ROOT))
-    cmake_root: str = field(default_factory=lambda: os.environ.get("CMAKE_ROOT_PATH", _DEFAULT_CMAKE_ROOT))
+    sdk_root: str = field(default_factory=lambda: current_environment().get("HEXAGON_SDK_ROOT", _DEFAULT_SDK_ROOT))
+    ndk_root: str = field(default_factory=lambda: current_environment().get("ANDROID_NDK_ROOT", _DEFAULT_NDK_ROOT))
+    cmake_root: str = field(default_factory=lambda: current_environment().get("CMAKE_ROOT_PATH", _DEFAULT_CMAKE_ROOT))
     # Default to v79: the supported hardware is Snapdragon 8 Elite (SM8750,
     # Hexagon v79).  v79 is a backward-compatible superset of v73, and the HVX
     # fp16<->fp32 conversion ops (vcvt.hf.sf) used by hvx_math.h require it.
     # Override with HEXAGON_DSP_ARCH for older targets.
-    dsp_arch: str = field(default_factory=lambda: os.environ.get("HEXAGON_DSP_ARCH", "v79"))
+    dsp_arch: str = field(default_factory=lambda: current_environment().get("HEXAGON_DSP_ARCH", "v79"))
 
     # ---- core paths -------------------------------------------------------
     @property
@@ -118,7 +139,7 @@ class HexagonSDK:
             "cmake": self.cmake,
             "ninja": self.ninja,
         }
-        if os.environ.get("TILELANG_HEXAGON_HLOS", "android") == "android":
+        if current_environment().get("TILELANG_HEXAGON_HLOS", "android") == "android":
             checks["Android NDK root"] = self.ndk_root
         missing = [f"{name}: {path}" for name, path in checks.items() if not os.path.exists(path)]
         if missing:
@@ -151,6 +172,7 @@ class HexagonSDK:
         try:
             raw = subprocess.run(
                 ["bash", "-c", cmd],
+                env=current_environment(),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -158,7 +180,7 @@ class HexagonSDK:
             ).stdout
             env = dict(kv.split("=", 1) for kv in raw.split("\0") if "=" in kv)
         except Exception:
-            env = dict(os.environ)
+            env = dict(current_environment())
         if not env.get("HEXAGON_SDK_ROOT"):
             env["HEXAGON_SDK_ROOT"] = self.sdk_root
 
@@ -168,7 +190,7 @@ class HexagonSDK:
         env["ANDROID_NDK_ROOT"] = self.ndk_root
         cmake_bin = os.path.join(self.cmake_root, "bin")
         local_bin = str(Path.home() / ".local" / "bin")
-        env["PATH"] = os.pathsep.join([cmake_bin, local_bin, env.get("PATH", os.environ.get("PATH", ""))])
+        env["PATH"] = os.pathsep.join([cmake_bin, local_bin, env.get("PATH", current_environment().get("PATH", ""))])
 
         # Strip toolchain flags injected by a conda/host build env: they target
         # x86 (e.g. ``-march=nocona``, ``-isystem $CONDA_PREFIX/include``) and

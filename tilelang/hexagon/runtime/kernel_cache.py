@@ -11,12 +11,11 @@ intended behavior, since the device state doesn't outlive the process either.
 
 from __future__ import annotations
 
-import json
 from hashlib import sha256
 
 from tilelang.cache.kernel_cache import KernelCache
 
-from .config import cache_identity
+from .config import deployment_cache_key, deployment_scope
 
 
 class HexagonKernelCache(KernelCache):
@@ -24,9 +23,14 @@ class HexagonKernelCache(KernelCache):
     # ``_resolve_cache_dispatch``; this just documents the dispatch key.
     execution_backend = "hexagon"
 
+    def cached(self, *args, **kwargs):
+        scope = deployment_scope()
+        with scope():
+            return super().cached(*args, **kwargs)
+
     def _generate_key(self, *args, **kwargs):
         source_key = super()._generate_key(*args, **kwargs)
-        identity = json.dumps(cache_identity(), sort_keys=True)
+        identity = deployment_cache_key()
         return sha256((source_key + identity).encode()).hexdigest()
 
     def _save_kernel_to_disk(self, key, kernel, func=None, verbose=False):
