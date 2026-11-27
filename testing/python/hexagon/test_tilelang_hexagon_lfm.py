@@ -1354,6 +1354,7 @@ def test_w8a8_w13_tiny_model_state_and_logits(tiny_bundle, record_property):
 
     reference_fp16, reference_int = reference(False), reference(True)
     device_fp16, device_int = device(False), device(True)
+    delta_errors = {}
     for name, host_a, host_b, dsp_a, dsp_b in zip(
         ("prefill_state", "continuation_logits"), reference_fp16, reference_int, device_fp16, device_int, strict=True
     ):
@@ -1368,7 +1369,8 @@ def test_w8a8_w13_tiny_model_state_and_logits(tiny_bundle, record_property):
         record_property(f"{name}_w8a8_delta_relative_l2", delta_error)
         record_property(f"{name}_w4a16_relative_l2", baseline_error)
         record_property(f"{name}_w8a8_relative_l2", integer_error)
-        assert delta_error < 0.5, (name, delta_error, baseline_error, integer_error)
+        delta_errors[name] = delta_error
+    assert all(error < 0.5 for error in delta_errors.values()), delta_errors
 
 
 @DEVICE
