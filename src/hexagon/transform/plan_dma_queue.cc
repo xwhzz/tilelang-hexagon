@@ -191,8 +191,13 @@ private:
       return;
     const auto *extent = op->extent.as<IntImmNode>();
     if (extent && extent->value <= kMaxSimulatedTrips) {
-      for (int64_t i = 0; i < extent->value; ++i)
+      for (int64_t i = 0; i < extent->value; ++i) {
+        bool was_drained = Drained();
         VisitStmt(op->body);
+        // Starting empty again repeats the same peaks and wait completions.
+        if (was_drained && Drained())
+          break;
+      }
       return;
     }
     Iterate(op->body, /*known_trips=*/extent != nullptr);

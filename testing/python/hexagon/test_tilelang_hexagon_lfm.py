@@ -13,6 +13,7 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon import language as T
 from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remote_dir
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
@@ -24,8 +25,8 @@ import bundle  # noqa: E402
 import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
-from decode import Decoder, make_decode  # noqa: E402
-from model import CONV, FULL, Config, Model, load_hf_weights  # noqa: E402
+from decode import Decoder, add_gumbel, make_decode  # noqa: E402
+from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
 from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
@@ -161,6 +162,23 @@ def test_reference_decodes_past_the_window():
     torch.testing.assert_close(torch.stack(got), want[89:119], rtol=0, atol=1e-5 * want.abs().max().item())
 
 
+def test_fp16_rope_tables_match_reference_across_chunks(monkeypatch):
+    c = Config(head_dim=128, rope={SLIDING: (1e4, 1.0), FULL: (1e6, 0.5)})
+    positions = torch.arange(4099)
+    angles = torch.stack([rope_angles(positions, c.head_dim, *params) for params in c.rope.values()])
+
+    def chunk_angles(rows, *args):
+        assert len(rows) < len(positions)
+        return rope_angles(rows, *args)
+
+    monkeypatch.setattr(decode_fp16, "rope_angles", chunk_angles)
+    cos, sin = decode_fp16.rope_tables(c, len(positions))
+    for actual, expected in ((cos, angles.cos()), (sin, angles.sin())):
+        assert actual.dtype == torch.float32 and actual.is_contiguous()
+        assert torch.equal(actual.view(torch.int32), expected.float().view(torch.int32))
+    assert (cos[1, :, 32:] == 1).all() and (sin[1, :, 32:] == 0).all()
+
+
 def test_crouton_weight_is_the_hmx_weight_layout():
     from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 
@@ -188,6 +206,44 @@ def test_fp16_bundle_holds_the_weights(tiny_lfm3_bundle):
     head = bundle.read_tensor(path, bundle.read_header(path), "head")
     for token in (0, 1, 31, 32, 1234, c.vocab - 1):
         assert torch.equal(convert.embedding(head, token, c.dim), w["model.embed_tokens.weight"][token].half())
+
+
+def test_fp16_projection_stream_matches_stacked_bundle(tmp_path):
+    c = Config(vocab=32, dim=32, ff=32, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL, CONV))
+    w = random_weights(c)
+    tensors = convert.build_tensors(c, w)
+    tail = tensors["final_norm"]
+    projection = tensors["ffn.w2"]
+    streamed = tmp_path / "streamed.bundle"
+    header = bundle.write(streamed, c.to_dict(), {"ffn.w2": projection, "final_norm": tail}, {})
+
+    packed = convert.crouton_weight(torch.stack([w[f"model.layers.{i}.feed_forward.w2.weight"].half() for i in range(c.layers)]))
+    assert torch.equal(next(projection[0]()), packed[0])
+    stacked = tmp_path / "stacked.bundle"
+    bundle.write(stacked, c.to_dict(), {"ffn.w2": (packed, *projection[1:]), "final_norm": tail}, {})
+    assert header["tensors"]["ffn.w2"]["nbytes"] == 6144
+    assert header["tensors"]["final_norm"]["offset"] == 8192
+    assert streamed.read_bytes() == stacked.read_bytes()
+
+
+def test_fp16_projection_checks_each_layer_shape(tmp_path):
+    c = Config(vocab=32, dim=32, ff=64, heads=1, kv_heads=1, head_dim=32, layer_types=(CONV, FULL))
+    w = random_weights(c)
+    key = "model.layers.1.feed_forward.w2.weight"
+    w[key] = w[key].T
+    projection = convert.build_tensors(c, w)["ffn.w2"]
+    with pytest.raises(ValueError, match="ffn.w2 layer 1 has shape"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"ffn.w2": projection}, {})
+
+
+@pytest.mark.parametrize("length", [2, 4])
+def test_bundle_checks_streamed_byte_count(tmp_path, length):
+    def chunks():
+        yield torch.ones(2, dtype=torch.uint8)
+        yield torch.ones(length, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="weights.*5"):
+        bundle.write(tmp_path / "invalid.bundle", {}, {"weights": (chunks, "uint8", (5,), "row_major")}, {})
 
 
 @pytest.mark.parametrize("arch", ("v73", "v75", "v79"))
@@ -249,6 +305,111 @@ def test_decode_matches_the_reference(tiny_bundle):
         torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=1e-3, atol=1e-3)
     finally:
         decoder.close()
+
+
+@pytest.mark.parametrize(
+    "rows,capacity,n_prompt,n_new,chunk,fp16",
+    [
+        (None, 32, 1, 32, 32, False),
+        (None, 8, 23, 15, 12, True),
+        (None, 2, 5, 3, 1, False),
+        (8, 11, 29, 18, 16, True),
+        (8, 3, 10, 4, 16, False),
+        (8, 3, 10, 4, 16, True),
+        (None, 16, 4, 6, 16, False),
+    ],
+)
+def test_stream_bounds_token_storage_without_repeating_positions(rows, capacity, n_prompt, n_new, chunk, fp16):
+    class Calls(Decoder):
+        def reset(self):
+            self.consumed = []
+            self.calls = []
+
+        def prefill(self, ids, pos0):
+            assert pos0 == len(self.consumed)
+            assert len(ids) <= capacity
+            assert self.fp16 or pos0 + -(-len(ids) // rows) * rows <= self.max_pos
+            self.consumed.extend(ids)
+            self.calls.append("prefill")
+
+        def run(self, ids, pos0, n, n_forced, temperature, seed):
+            assert pos0 == len(self.consumed) and n + 1 <= capacity
+            assert n_forced == len(ids) and (temperature, seed) == (0.7, 21)
+            out = list(ids)
+            for step in range(n):
+                self.consumed.append(out[step])
+                if step + 1 >= n_forced:
+                    out.append((out[step] + pos0 + step + seed) % 101)
+            self.calls.append("decode")
+            return out, None
+
+    decoder = Calls.__new__(Calls)
+    decoder.prefill_rows, decoder.max_tokens, decoder.max_pos, decoder.fp16 = rows, capacity, n_prompt + n_new - 1, fp16
+    prompt, expected = list(range(n_prompt)), []
+    for pos in range(n_prompt - 1, n_prompt - 1 + n_new):
+        expected.append(((expected[-1] if expected else prompt[-1]) + pos + 21) % 101)
+    parts = list(decoder.stream(prompt, n_new, 0.7, 21, chunk))
+    assert all(1 <= len(part) <= chunk for part in parts)
+    assert [token for part in parts for token in part] == expected
+    assert decoder.consumed == prompt + expected[:-1]
+    if not rows and n_prompt + n_new <= capacity:
+        assert decoder.calls == ["decode"]
+    assert decoder.generate(prompt, n_new, 0.7, 21) == expected
+
+
+def test_generation_rejects_impossible_requests_before_mutating_state():
+    decoder = Decoder.__new__(Decoder)
+    decoder.max_pos, decoder.max_tokens = 4, 4
+    assert decoder.generate([1], 0) == []
+    for prompt, n, chunk in (([], 1, 1), ([1], -1, 1), ([1], 1, 0), ([1, 2], 4, 2)):
+        with pytest.raises(ValueError):
+            list(decoder.stream(prompt, n, chunk=chunk))
+    decoder.max_tokens = 1
+    with pytest.raises(ValueError, match="storage"):
+        decoder.generate([1], 1)
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["quantized", "lfm3"])
+def test_generation_with_short_token_buffer_matches_single_steps(model, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=256, max_tokens=8, prefill_rows=None)
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000, 5, 93, 78]
+    try:
+        for temperature in (0, 0.8):
+            decoder.reset()
+            for pos, token in enumerate(prompt[:-1]):
+                decoder.run([token, prompt[pos + 1]], pos, 1, 2, temperature, 17)
+            expected, token = [], prompt[-1]
+            for pos in range(len(prompt) - 1, len(prompt) - 1 + 15):
+                out, _ = decoder.run([token], pos, 1, 1, temperature, 17)
+                token = out[-1]
+                expected.append(token)
+            assert decoder.generate(prompt, 15, temperature, 17) == expected
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_sampling_highest_bin():
+    # At seed 26, position 0, the hash of vocabulary index 118408 ends
+    # in the highest bin. Its fp32 midpoint rounds to 1 before clamping.
+    @T.prim_func
+    def sample(scores: T.Tensor((1, 32), "float32")):
+        with T.Kernel(1):
+            hx = T.alloc_shared((1, 32), "uint32")
+            hy = T.alloc_shared((1, 32), "uint32")
+            add_gumbel(scores, T.float32(1), 26, 0, 118400, hx, hy)
+
+    kernel = tilelang.compile(sample, target="hexagon")
+    try:
+        scores = torch.zeros((1, 32))
+        kernel(scores)
+        assert scores.isfinite().all()
+        expected = -torch.log(-torch.log(torch.tensor(1.0 - 2.0**-24)))
+        torch.testing.assert_close(scores[0, 8], expected)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE
@@ -553,6 +714,67 @@ def test_fp16_prefill_matches_the_reference(model, processes, row_major, fp16_bu
         with torch.no_grad():
             want = ref.generate(prompt, 8)
         assert decoder.generate(prompt.tolist(), 8) == want
+    finally:
+        decoder.close()
+
+
+@pytest.mark.parametrize(
+    ("pos0", "n", "capacity", "calls"),
+    [
+        (128, 65, 65, [(1, 128, 65, 1)]),
+        (255, 1, 1, [(0, 255, 1, 1)]),
+        (120, 136, 136, [(1, 120, 128, 1), (0, 248, 8, 8)]),
+    ],
+)
+def test_fp16_prefill_only_decodes_chunks_that_cross_the_cache_end(pos0, n, capacity, calls):
+    from types import SimpleNamespace
+
+    decoder = Decoder.__new__(Decoder)
+    decoder.fp16, decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = True, 256, capacity, 128
+    decoder.c = SimpleNamespace(vocab=4096)
+    writes, actual = [], []
+    decoder.tokens = SimpleNamespace(write=lambda ids: writes.extend(ids.tolist()))
+    decoder.stages = [SimpleNamespace(prefill=[], decode=[])]
+    decoder.seconds = 99.0
+
+    def pipeline(first, args, steps):
+        actual.append((first, *args[0], steps))
+        decoder.seconds = 1.0
+
+    decoder._pipeline = pipeline
+    ids = list(range(n))
+    decoder.prefill(ids, pos0)
+    assert writes == ids and actual == calls
+    assert decoder.last_run_seconds() == len(calls)
+    with pytest.raises(AssertionError):
+        decoder.prefill([1], decoder.max_pos)
+    assert writes == ids and actual == calls
+
+
+@DEVICE
+def test_fp16_incremental_prefill_at_context_end(fp16_bundle):
+    path = fp16_bundle("lfm3")
+    c, w = convert.read_weights(path)
+    ref = decode_fp16.DeviceModel(c, w)
+    seq = torch.randint(c.vocab, (256,), generator=torch.Generator().manual_seed(3))
+    # The suffix ends inside the cache but its last physical 128-row chunk
+    # would extend beyond it. The final decode consumes the last legal slot.
+    with torch.no_grad():
+        want, state = ref.prefill(seq)
+    decoder = Decoder(path, max_pos=256, max_tokens=256, prefill_rows=128, processes=1)
+    try:
+        decoder.prefill(seq[:120].tolist())
+        decoder.prefill(seq[120:-1].tolist(), 120)
+        _, logits = decoder.run(seq[-1:].tolist(), 255, 1, 1)
+
+        def relative(a, b):
+            return ((a - b).abs().max() / b.abs().max()).item()
+
+        errors = _kv_errors(decoder, state, len(seq), relative)
+        states = decoder.conv_states()
+        errors.extend(relative(got, expected) for got, expected in zip(states, state.conv))
+        errors.append(relative(logits, want))
+        assert all(error < 1e-2 for error in errors), errors
     finally:
         decoder.close()
 

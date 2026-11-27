@@ -98,6 +98,19 @@ TileOperator TransposeNode::Clone() const {
   return Transpose(op);
 }
 
+bool TransposeNode::HasTransposedShape(arith::Analyzer *analyzer) const {
+  size_t rank = src_range.size();
+  if (rank < 2 || dst_range.size() != rank)
+    return false;
+  for (size_t i = 0; i < rank; ++i) {
+    size_t src_axis = SourceAxisForDestinationAxis(i, rank);
+    if (!analyzer->CanProveEqual(src_range[src_axis]->extent,
+                                 dst_range[i]->extent))
+      return false;
+  }
+  return true;
+}
+
 Array<IterVar> TransposeNode::MakeIterVars() const {
   // Use src_range as the iteration domain (src is the "inner" side).
   Array<IterVar> loop_vars;

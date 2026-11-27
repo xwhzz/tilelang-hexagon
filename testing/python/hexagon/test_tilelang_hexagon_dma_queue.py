@@ -117,6 +117,26 @@ def test_waits_list_the_buffers_they_complete():
     assert re.search(r"tl_hexagon_dma_(?:async|compact)_wait\(tl_dma_async, 0\)\)", source)
 
 
+def test_loop_wait_completes_different_buffers_on_successive_iterations():
+    @T.prim_func
+    def carried(A: T.Tensor((9, 256), "float16"), B: T.Tensor((2, 256), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
+            t = T.alloc_shared((256,), "float16")
+            T.dma_copy(A[0, :], s)
+            for i in T.serial(8):
+                T.dma_wait()
+                T.dma_copy(A[i + 1, :], t)
+            T.dma_wait()
+            T.copy(s, B[0, :])
+            T.copy(t, B[1, :])
+
+    artifact = _lower(carried)
+    assert _queue(artifact) == (1, 1)
+    waits = [call for call in _dma_calls(artifact) if call.op.name == "tl.hexagon_dma_wait"]
+    assert [[str(arg) for arg in call.args[1:]] for call in waits] == [["s", "t"], ["t"]]
+
+
 def test_queue_bound_covers_both_branches():
     @T.prim_func
     def branches(A: T.Tensor((3, 256), "float16"), flag: T.int32):

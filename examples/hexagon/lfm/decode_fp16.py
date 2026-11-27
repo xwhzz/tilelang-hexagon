@@ -45,7 +45,7 @@ from tilelang.hexagon.intrinsics.crouton import make_hmx_weight_layout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import convert  # noqa: E402
 from convert import TILE, qkv_group  # noqa: E402
-from decode import NOISE_KEYS  # noqa: E402
+from decode import add_gumbel  # noqa: E402
 from model import CONV, SLIDING, Config, Model, rope_angles  # noqa: E402
 from stream import Phase, Stream, Weights  # noqa: E402
 
@@ -71,9 +71,18 @@ def kinds(c: Config) -> list:
 def rope_tables(c: Config, max_pos: int) -> tuple:
     """cos and sin [kinds, max_pos, head_dim / 2] of each attention kind's RoPE
     angles, as model.rope_angles computes them."""
-    positions = torch.arange(max_pos)
-    angles = torch.stack([rope_angles(positions, c.head_dim, *c.rope[k]) for k in kinds(c)])
-    return angles.cos().float().contiguous(), angles.sin().float().contiguous()
+    cos = torch.empty((len(c.rope), max_pos, c.head_dim // 2), dtype=torch.float32)
+    sin = torch.empty_like(cos)
+    # At head_dim=128, 2048 positions need 1 MiB of FP64 angles per kind.
+    chunk_rows = 2048
+    for table, kind in enumerate(kinds(c)):
+        for start in range(0, max_pos, chunk_rows):
+            stop = min(start + chunk_rows, max_pos)
+            positions = torch.arange(start, stop)
+            angles = rope_angles(positions, c.head_dim, *c.rope[kind])
+            cos[table, start:stop] = angles.cos()
+            sin[table, start:stop] = angles.sin()
+    return cos, sin
 
 
 def ring(c: Config) -> int:
@@ -404,23 +413,6 @@ def attend(
     T.dma_wait()
     for g, d in T.Parallel(group, HD):
         out[0, out0 + g * HD + d] = T.Cast("float16", o[g, d] / ls[g] * gate(g))
-
-
-@T.macro
-def add_gumbel(logit, scale, seed, pos, first, hx, hy):
-    """logit = logit * scale + Gumbel noise for vocabulary entries first + j at
-    position pos (decode.add_gumbel)."""
-    for i, j in T.Parallel(1, logit.shape[1]):
-        hx[i, j] = T.Cast("uint32", first + j)
-        hy[i, j] = T.Cast("uint32", pos) ^ (T.Cast("uint32", seed) << T.uint32(16))
-    for r in list(range(len(NOISE_KEYS))):
-        for i, j in T.Parallel(1, logit.shape[1]):
-            hx[i, j] = (((hx[i, j] >> T.uint32(8)) | (hx[i, j] << T.uint32(24))) + hy[i, j]) ^ T.uint32(NOISE_KEYS[r])
-        for i, j in T.Parallel(1, logit.shape[1]):
-            hy[i, j] = ((hy[i, j] << T.uint32(3)) | (hy[i, j] >> T.uint32(29))) ^ hx[i, j]
-    for i, j in T.Parallel(1, logit.shape[1]):
-        u = (T.Cast("float32", T.Cast("int32", hy[i, j] >> T.uint32(8))) + T.float32(0.5)) * T.float32(1.0 / (1 << 24))
-        logit[i, j] = logit[i, j] * scale + -T.log(-T.log(u))
 
 
 @T.macro

@@ -6,7 +6,8 @@
  * T.Parallel loop. TVM does not mark every math intrinsic vectorizable
  * (tirx.rsqrt, tirx.erf), and its default lowering has no vector form, so the
  * fp16/fp32 intrinsics become Hexagon builtins that vectorize and print as the
- * hvx_math.h functions. Other dtypes keep the default lowering.
+ * hvx_math.h functions. FP32 intrinsics with only a scalar libm rule expose
+ * that call to the vectorizer so the corresponding map stays scalar.
  *
  * Under tl.enable_fast_math they become the fast variants instead, and a float
  * division becomes hexagon_div_fast, or by a constant a multiply by its
@@ -18,6 +19,8 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/op.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op_attr_types.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -73,6 +76,24 @@ private:
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     if (const Op *math = HexagonMathOp(call.get(), fast_))
       return Call(call->dtype, *math, call->args);
+    const auto *op_node = call->op.as<OpNode>();
+    if (call->dtype != DataType::Float(32) || !op_node)
+      return call;
+    static const auto rules =
+        Op::GetAttrMap<FLowerIntrinsic>("default.FLowerIntrinsic");
+    Op intrinsic = GetRef<Op>(op_node);
+    if (auto lower = rules.get(intrinsic, nullptr); lower != nullptr) {
+      // A target rule takes precedence over the default in LowerIntrin.
+      for (const char *key : {"hexagon.FLowerIntrinsic", "hexagon.FLegalize"}) {
+        if (Op::HasAttrMap(key) &&
+            Op::GetAttrMap<FLowerIntrinsic>(key).count(intrinsic))
+          return call;
+      }
+      PrimExpr lowered = lower(call);
+      if (const auto *libm = lowered.as<CallNode>();
+          libm && libm->op.same_as(builtin::call_pure_extern()))
+        return lowered;
+    }
     return call;
   }
 

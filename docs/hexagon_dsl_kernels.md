@@ -133,6 +133,19 @@ runs one chain of dependent instructions at a time, about one instruction per pa
 
 `T.alloc_fragment` gives the tile program's one hardware thread a tile in VTCM, laid out
 row-major in the same arena as its shared buffers (`fragment_scope` on the target).
+To transpose a VTCM tile, call `T.transpose(src, dst)` on distinct shared
+buffers. Regions with shapes `(..., M, N)` and `(..., N, M)` keep their leading
+axes and swap the final two. The operation uses the buffers' logical indices,
+including their region offsets and layouts. Pass slices of the allocated buffers
+directly when transposing a subregion.
+
+Use `T.cumsum(src, dst, dim=-1)` for an inclusive prefix sum along each row
+of a compact row-major shared tile. Each sum starts with the first element in its slice
+and accumulates in the buffer dtype. Other axes and `reverse=True` use the
+same ordering along the selected axis. Omit `dst` to update the input in
+place. Equal-shaped slices of one buffer can also be scanned into each other
+when the compiler can prove they are disjoint.
+
 `T.copy`, `T.fill` and `T.Parallel` work on fragments as on shared buffers. `T.reduce_*`
 (sum, abssum, max, min, absmax and the bit operations, any axis, clear or accumulate)
 reads and writes shared buffers and fragments in place. Reducing the innermost axis is
@@ -159,8 +172,9 @@ call zeroes A's and B's padding along K before it multiplies, and writes only C'
 columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
 tiles stays row-major. On v79, an M x 512 x 512 GEMM from VTCM takes about 1.3 µs on HMX
 for any M from 2 to 32, against 16 µs (M = 2) to 135 µs (M = 16) on HVX. A GEMV (M = 1)
-stays on HVX, as do the GEMMs whose A or B has a layout of its own (`T.annotate_layout`),
-such as the LFM decode's, whose weights stream by DMA in the HMX weight layout.
+stays on HVX. An explicit row-major layout on A or B also selects HVX for compatible
+operands, including on whole tiles. HVX can read a row-major A together with B in the
+HMX weight layout, as in LFM decode. Matching HMX operand annotations preserve HMX.
 
 Any other GEMM of row-major matrices runs on HVX (`GemmHVX`, `tl.hexagon.GemmHVXRejection`):
 fp16 operands into an fp16 or fp32 C, fp32 operands into an fp32 C, any M, N and K, at most
@@ -208,9 +222,15 @@ read element by element.
 Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
 the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
 A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
-per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). It is one
-`tl_hvx_gemm_int_scaled` call: the sums leave the vrmpy accumulators once per group, into
-fp32 accumulators, and a signed B's offset comes off each group with that group's sum of A.
+per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
+group-major scales directly, including a padded row stride. For another physical layout
+they pack the scale rows and columns used by the call into group-major VTCM storage.
+Global scales with explicit noncompact strides accept an identity layout annotation.
+For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
+With interleaved activation or output columns it stages just the affected row, gathering
+the previous output only for accumulation. The sums leave the vrmpy accumulators once per
+group, into fp32 accumulators, and a signed B's offset comes off each group with that
+group's sum of A.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one
@@ -300,6 +320,11 @@ column-contiguous fp16 matrix (a transposed weight in row-major storage) goes th
 
 HVX code works on Crouton buffers directly, so chained gemms and the maps between them
 (the flash attention softmax on `S`, an FFN gate `silu(h1) * h3`) convert no layouts.
+A `T.copy` between two matching Crouton layouts moves tile-aligned FP16
+regions a register at a time. For stacks, each pair of corresponding matrices
+moves in leading-axis order. Slices may start at different matrices or tiles
+at each endpoint.
+
 A Crouton layout's physical shape is `[tiles, 16 row pairs, 64 lanes]`, and a
 single-thread `T.Parallel` that writes every element of a buffer with a layout iterates
 in that buffer's physical order (`LowerTileOp`): a loop over tiles and their row pairs,

@@ -26,6 +26,7 @@
  * Runs before PipelinePlanning.
  */
 
+#include "hexagon/layout/crouton.h"
 #include "hexagon/op/dma.h"
 #include "hexagon/op/gemm.h"
 #include "hexagon/op/utils.h"
@@ -77,18 +78,41 @@ std::unordered_set<const BufferNode *> HMXOperands(const Stmt &body) {
 // may write (GemmHMX).
 constexpr const char *kPaddedC = "hexagon.padded_c";
 
+// A row-major operand opts out of HMX layout inference. HVX can also read B
+// directly in the matching Crouton weight layout. Leave the HMX diagnostic
+// in place for other layouts and its run-time row-count contract.
+bool UseRowMajorGemm(const GemmNode &op, const Map<Var, Layout> &annotated) {
+  if ((!annotated.count(op.a_->data) && !annotated.count(op.b_->data)) ||
+      op.annotations_.count("hexagon.rows") ||
+      !hexagon::HVXRejection(op).empty())
+    return false;
+  LayoutMap layouts;
+  for (const Buffer &buffer : {op.a_, op.b_, op.c_}) {
+    if (auto layout = annotated.Get(buffer->data))
+      layouts.Set(buffer, layout.value());
+  }
+  if (!hexagon::RowMajor(op.a_, layouts) || !hexagon::RowMajor(op.c_, layouts))
+    return false;
+  if (hexagon::RowMajor(op.b_, layouts))
+    return true;
+  const auto *weight = layouts.at(op.b_).as<CroutonLayoutNode>();
+  return layouts.count(op.a_) && !op.transA_ && weight &&
+         weight->column_tiles && weight->transposed == op.transB_ &&
+         op.n_ % kCroutonTile == 0 && op.k_ % kCroutonTile == 0;
+}
+
 // The operands to pad: the A and B buffers, allocated in `body`, that HMX
 // multiplies once they are padded to whole tiles, and the C buffers of such
-// gemms that they write whole; by their padded buffers. `writers` gets the
-// gemms whose C is padded. A gemm with an operand of a layout of its own
-// (T.annotate_layout) keeps its operands: its unit is the one their layouts
-// chose.
-std::unordered_map<const BufferNode *, Buffer>
-PaddedOperands(const Stmt &body,
-               std::unordered_set<const CallNode *> *writers) {
+// gemms that they write whole; by their padded buffers. Record the
+// instruction-selection and padding decisions on each affected call. A gemm
+// with an operand of a layout of its own (T.annotate_layout) keeps its
+// operands: its unit is the one their layouts chose.
+std::unordered_map<const BufferNode *, Buffer> PaddedOperands(
+    const Stmt &body,
+    std::unordered_map<const CallNode *, const char *> *annotations) {
   std::unordered_set<const BufferNode *> allocated;
   // The data of the buffers with a layout of their own.
-  std::unordered_set<const VarNode *> annotated;
+  Map<Var, Layout> annotated;
   // The gemms off whole tiles that HMX runs once padded.
   std::vector<std::pair<const CallNode *, Gemm>> gemms;
   arith::Analyzer analyzer;
@@ -108,9 +132,9 @@ PaddedOperands(const Stmt &body,
         for (const auto &[key, layout] :
              Downcast<Map<ObjectRef, ObjectRef>>(layouts.value())) {
           if (const auto *var = key.as<VarNode>())
-            annotated.insert(var);
+            annotated.Set(GetRef<Var>(var), Downcast<Layout>(layout));
           else if (const auto *buffer = key.as<BufferNode>())
-            annotated.insert(buffer->data.get());
+            annotated.Set(buffer->data, Downcast<Layout>(layout));
         }
       }
       return;
@@ -136,10 +160,13 @@ PaddedOperands(const Stmt &body,
                buffer->buffer_type);
   };
   auto own = [&](const Buffer &buffer) {
-    return allocated.count(buffer.get()) &&
-           !annotated.count(buffer->data.get());
+    return allocated.count(buffer.get()) && !annotated.count(buffer->data);
   };
   for (const auto &[call, gemm] : gemms) {
+    if (UseRowMajorGemm(*gemm.get(), annotated)) {
+      annotations->emplace(call, hexagon::kRowMajorGemm);
+      continue;
+    }
     if (!own(gemm->a_) || !own(gemm->b_))
       continue;
     for (const Buffer &buffer : {gemm->a_, gemm->b_}) {
@@ -160,7 +187,7 @@ PaddedOperands(const Stmt &body,
     }
     if (all) {
       pad(c.get());
-      writers->insert(call);
+      annotations->emplace(call, kPaddedC);
     }
   }
   return padded;
@@ -169,9 +196,10 @@ PaddedOperands(const Stmt &body,
 // Replaces each buffer of `padded` by its padded buffer, wherever it appears.
 class HMXOperandPadder : public StmtExprMutator {
 public:
-  HMXOperandPadder(std::unordered_map<const BufferNode *, Buffer> padded,
-                   std::unordered_set<const CallNode *> writers)
-      : padded_(std::move(padded)), writers_(std::move(writers)) {}
+  HMXOperandPadder(
+      std::unordered_map<const BufferNode *, Buffer> padded,
+      std::unordered_map<const CallNode *, const char *> annotations)
+      : padded_(std::move(padded)), annotations_(std::move(annotations)) {}
 
 private:
   Buffer Padded(const Buffer &buffer) const {
@@ -188,10 +216,11 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (!writers_.count(op))
+    auto it = annotations_.find(op);
+    if (it == annotations_.end())
       return call;
     Map<String, ObjectRef> annotations = call->annotations;
-    annotations.Set(kPaddedC, Bool(true));
+    annotations.Set(it->second, Bool(true));
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 
@@ -227,7 +256,7 @@ private:
   }
 
   std::unordered_map<const BufferNode *, Buffer> padded_;
-  std::unordered_set<const CallNode *> writers_;
+  std::unordered_map<const CallNode *, const char *> annotations_;
 };
 
 class HMXOperandCopyStager : public StmtExprMutator {
@@ -303,11 +332,11 @@ private:
 tvm::transform::Pass PadHMXOperands() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc f, const IRModule &, const PassContext &) {
-    std::unordered_set<const CallNode *> writers;
-    auto padded = PaddedOperands(f->body, &writers);
-    if (!padded.empty())
+    std::unordered_map<const CallNode *, const char *> annotations;
+    auto padded = PaddedOperands(f->body, &annotations);
+    if (!padded.empty() || !annotations.empty())
       f.CopyOnWrite()->body =
-          HMXOperandPadder(std::move(padded), std::move(writers))(f->body);
+          HMXOperandPadder(std::move(padded), std::move(annotations))(f->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.hexagon.PadHMXOperands", {});

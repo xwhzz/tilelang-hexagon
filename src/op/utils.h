@@ -18,6 +18,9 @@ namespace tl {
 
 using namespace tirx;
 
+// Whether the physical strides describe a compact row-major buffer.
+bool IsBufferContiguous(const Buffer &buffer, arith::Analyzer *analyzer);
+
 /*! \brief Whether a constant has an all-zero bit pattern, excluding -0.0. */
 TVM_DLL bool IsZeroBitPattern(const PrimExpr &expr);
 

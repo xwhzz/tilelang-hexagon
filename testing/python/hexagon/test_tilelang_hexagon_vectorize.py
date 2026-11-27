@@ -30,6 +30,25 @@ def test_maps_use_whole_hvx_registers(dtype, vector):
     assert f"(*({vector}*)(A + " in source
 
 
+def test_noop_keeps_single_store_vector_width():
+    def make(with_noop):
+        @T.prim_func
+        def narrow(A: T.Tensor((128,), "int16"), B: T.Tensor((128,), "int8")):
+            with T.Kernel(1):
+                values = T.alloc_fragment((128,), "int16")
+                T.copy(A, values)
+                for i in T.Parallel(128):
+                    if with_noop:
+                        T.evaluate(0)
+                    B[i] = T.Cast("int8", values[i])
+
+        return narrow
+
+    source = _source(make(False))
+    assert "*(int8_t128*)(B + 0)" in source
+    assert _source(make(True)) == source
+
+
 def test_a_narrow_input_fills_whole_registers():
     @T.prim_func
     def widen(A: T.Tensor((4, 512), "uint8"), B: T.Tensor((4, 512), "float16")):
@@ -85,6 +104,42 @@ def test_vector_min_and_max_are_hvx_instructions(dtype, vector):
     source = _source(clamp)
     assert f"tl_vec_min(tl_vec_max(*({vector}*)(A + " in source
     assert ") < (" in source
+
+
+@pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc", "sin", "cos"])
+def test_scalar_math_fallback_keeps_neighboring_map_vectorized(fn):
+    op = getattr(T, fn)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((64,), "float32"), B: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            for j in T.Parallel(64):
+                B[j] = op(A[j])
+            for j in T.Parallel(64):
+                C[j] = T.erf(A[j])
+
+    source = _source(kernel)
+    assert f"{fn}f(A[" in source
+    assert "tl_hvx_erf(*(float32*)(A + " in source
+
+
+@pytest.mark.parametrize("key", ["hexagon.FLowerIntrinsic", "hexagon.FLegalize"])
+def test_scalar_math_fallback_respects_target_rules(key):
+    @T.prim_func
+    def kernel(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
+        with T.Kernel(1):
+            for j in T.serial(32):
+                B[j] = T.sin(A[j])
+
+    op = tvm.ir.Op.get("tirx.sin")
+    previous = op.get_attr(key) if op.has_attr(key) else None
+    op.set_attr(key, lambda call: tvm.tirx.call_pure_extern(call.dtype, "custom_sin", *call.args), 99)
+    try:
+        assert "custom_sin(A[" in _source(kernel)
+    finally:
+        op.reset_attr(key)
+        if previous is not None:
+            op.set_attr(key, previous)
 
 
 # DSL function: the hvx_math.h function it prints as.
@@ -158,7 +213,7 @@ def test_fast_division_by_a_constant_multiplies():
 
     source = _source(kernel, fast_math=True)
     assert "tl_hvx_div" not in source
-    assert "1.250000e-01f" in source
+    assert "0x1p-3f" in source
 
 
 # ---------------------------------------------------------------------------
