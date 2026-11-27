@@ -820,6 +820,56 @@ TL_DEVICE void tl_gemm_weight_panels(TC *__restrict__ c,
   }
 }
 
+// Four compact rows with weights in VTCM: two rows share each Crouton
+// weight load. Two panels keep eight even/odd qf32 chains live in the same K
+// order as the four-panel, single-row path.
+template <int N, int K>
+TL_GEMM void
+tl_hvx_gemm_weight_row_pairs(float *__restrict__ C, const half *__restrict__ A,
+                             const half *__restrict__ B, bool clear) {
+  using V = tl_gemm_operand<half>;
+  constexpr int G = 2;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < 4; i += 2) {
+#pragma clang loop unroll(disable)
+    for (int p0 = 0; p0 < N / 32; p0 += G) {
+      V::acc acc[2][G];
+#pragma clang loop unroll(full)
+      for (int row = 0; row < 2; ++row)
+#pragma clang loop unroll(full)
+        for (int p = 0; p < G; ++p)
+          acc[row][p] = V::zero();
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < K; k += 64) {
+        alignas(128) int32_t pairs[2][32];
+#pragma clang loop unroll(full)
+        for (int row = 0; row < 2; ++row) {
+          HVX_Vector v = tl_hvx_load<true>(A + (i + row) * K + k);
+          __builtin_memcpy(pairs[row], &v, sizeof(v));
+        }
+#pragma clang loop unroll_count(8)
+        for (int r = 0; r < 32; ++r) {
+          HVX_Vector x0 = Q6_V_vsplat_R(pairs[0][r]);
+          HVX_Vector x1 = Q6_V_vsplat_R(pairs[1][r]);
+#pragma clang loop unroll(full)
+          for (int p = 0; p < G; ++p) {
+            HVX_Vector w =
+                tl_hvx_load<true>(B + (p0 + p) * (K * 32) + k * 32 + r * 64);
+            V::mac(acc[0][p], w, x0);
+            V::mac(acc[1][p], w, x1);
+          }
+        }
+      }
+#pragma clang loop unroll(full)
+      for (int row = 0; row < 2; ++row)
+#pragma clang loop unroll(full)
+        for (int p = 0; p < G; ++p)
+          tl_gemm_store_sums(C + (i + row) * N + (p0 + p) * 32,
+                             V::sums(acc[row][p]), 32, clear);
+    }
+  }
+}
+
 template <int M, int N, int K, int LdA, int LdC, bool AlignA, int PanelStride,
           typename TC>
 TL_GEMM void tl_hvx_gemm_weight(TC *C, const half *A, const half *B,

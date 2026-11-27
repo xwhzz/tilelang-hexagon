@@ -6,7 +6,8 @@ the device, and the reply shows as it comes, a decode call per 16 tokens.
     python generate.py <bundle> <bundle on the device> <checkpoint dir> --chat
 
 Each `--prompt` (it repeats) is answered from a fresh conversation; `--chat`
-holds one conversation from stdin, a turn a line. `--temperature` samples, with
+holds one conversation from stdin, a turn a line. Add `--reuse-prefix` to
+resume a compatible device context between turns. `--temperature` samples, with
 `--seed` (greedy at 0, the default). LFM3's chat template has the reply think
 first, in a <think> section; `--no-think` asks for the answer alone. The
 checkpoint directory needs only the tokenizer's files.
@@ -22,12 +23,12 @@ from decode import Decoder  # noqa: E402
 from text import Detokenizer, Text  # noqa: E402
 
 
-def reply(decoder: Decoder, text: Text, messages: list, args) -> str:
+def reply(decoder: Decoder, text: Text, messages: list, args, *, reuse: bool = False) -> str:
     """The assistant's next message, printed as it comes, then the speeds."""
     prompt = text.chat(messages, **({"enable_thinking": False} if args.no_think else {}))
     shown, ids, timings = Detokenizer(text), [], []
     t0 = time.perf_counter()
-    for part in decoder.stream(prompt, args.max_new, args.temperature, args.seed, timings=timings):
+    for part in decoder.stream(prompt, args.max_new, args.temperature, args.seed, timings=timings, reuse=reuse):
         stop = text.eos in part
         part = part[: part.index(text.eos)] if stop else part
         ids += part
@@ -51,6 +52,7 @@ def main():
     p.add_argument("checkpoint", help="the directory of tokenizer.json and chat_template.jinja")
     p.add_argument("--prompt", action="append", help="a message to answer, from a fresh conversation (repeats)")
     p.add_argument("--chat", action="store_true", help="a conversation from stdin, a turn a line")
+    p.add_argument("--reuse-prefix", action="store_true", help="reuse the device token prefix between interactive chat turns")
     p.add_argument("--system", help="a system message")
     p.add_argument("--max-new", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
@@ -73,7 +75,7 @@ def main():
             if not line.strip():
                 continue
             messages.append({"role": "user", "content": line.strip()})
-            messages.append({"role": "assistant", "content": reply(decoder, text, messages, args)})
+            messages.append({"role": "assistant", "content": reply(decoder, text, messages, args, reuse=args.reuse_prefix)})
     finally:
         decoder.close()
 
