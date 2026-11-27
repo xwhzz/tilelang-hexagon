@@ -7,7 +7,6 @@ import json
 import math
 import os
 import shutil
-import sys
 from functools import lru_cache, partial
 from types import MappingProxyType
 
@@ -156,7 +155,8 @@ _SETTINGS = (
     "ANDROID_ADB_SERVER_PORT",
 )
 _BYTE_SETTINGS = tuple(map(os.fsencode, _SETTINGS))
-_posix_environ = getattr(os.environ, "_data", None) if sys.implementation.name == "cpython" and os.supports_bytes_environ else None
+_process_environment = os.environ
+_get_environ_bytes = os.environb.get if os.supports_bytes_environ else None
 
 
 @lru_cache(maxsize=32)
@@ -171,11 +171,10 @@ def _normalized_deployment(values, selected):
 
 def current_deployment():
     env = current_environment()
-    # CPython's POSIX environment stores bytes. Reading the same mapping
-    # avoids twenty key encodings/decodings on each decorated call. The
-    # public mapping is sufficient for snapshots and other implementations.
-    if env is os.environ and _posix_environ is not None and getattr(env, "_data", None) is _posix_environ:
-        values = tuple(map(_posix_environ.get, _BYTE_SETTINGS))
+    # On POSIX, os.environb mirrors the process environment without decoding
+    # settings on cache hits. Caller-supplied snapshots use their own mapping.
+    if env is _process_environment and _get_environ_bytes is not None:
+        values = tuple(map(_get_environ_bytes, _BYTE_SETTINGS))
     else:
         values = tuple(map(env.get, _SETTINGS))
     device, os_name, host = values[:3]

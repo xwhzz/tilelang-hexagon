@@ -411,7 +411,7 @@ def test_deployment_lookup_tracks_byte_and_string_environment(cache, monkeypatch
     if not os.supports_bytes_environ:
         pytest.skip("byte environment is unavailable")
     if not fast:
-        monkeypatch.setattr(config, "_posix_environ", None)
+        monkeypatch.setattr(config, "_get_environ_bytes", None)
     setting = "TILELANG_HEXAGON_REMOTE_DIR"
     monkeypatch.setenv(setting, "/first")
     first = config.deployment_cache_key()
@@ -466,10 +466,13 @@ def test_decorated_isa_is_bound_from_frontend_to_session(cache, monkeypatch):
     assert factory(32) is first
 
 
-def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch):
+@pytest.mark.parametrize("switch_during_dispatch", [False, True])
+def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch, switch_during_dispatch):
     import tilelang
+    from tilelang import cache as kernel_cache
     from tilelang.hexagon import language as T
     from tilelang.hexagon.runtime.session import Session
+    from tvm.target import Target
 
     monkeypatch.setattr(Session, "of_lowered", classmethod(lambda *a, **kw: SimpleNamespace(kernels=[lambda *_: None], close=lambda: None)))
 
@@ -484,6 +487,19 @@ def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch
         return copy
 
     monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "c")
+    if switch_during_dispatch:
+        resolve = kernel_cache._resolve_cache_dispatch
+        switched = False
+
+        def switch_after_resolution(*args):
+            nonlocal switched
+            result = resolve(*args)
+            if not switched and args[0] == "c":
+                switched = True
+                monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "hexagon")
+            return result
+
+        monkeypatch.setattr(kernel_cache, "_resolve_cache_dispatch", switch_after_resolution)
     cpu = factory(32)
     assert cpu.target.kind.name == "c"
     monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "hexagon")
@@ -494,6 +510,19 @@ def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch
     monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "c")
     assert factory(32) is cpu
     assert factory(64).target.kind.name == "c"
+    monkeypatch.setenv("TILELANG_EXECUTION_BACKEND", "hexagon")
+    assert factory(32) is cpu
+    with pytest.raises(ValueError, match="Invalid execution backend"):
+        factory(96)
+    with pytest.raises(ValueError, match="Invalid execution backend"):
+        factory.compile(128)
+    monkeypatch.setenv("TILELANG_EXECUTION_BACKEND", "auto")
+    monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "auto")
+    with Target("c"):
+        scoped_cpu = factory(32)
+        with Target({"kind": "hexagon", "mcpu": "hexagonv79"}):
+            assert factory(32).target.kind.name == "hexagon"
+        assert factory(32) is scoped_cpu
 
 
 def test_mutable_target_and_default_execution_backend(cache, monkeypatch):
