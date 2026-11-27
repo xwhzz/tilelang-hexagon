@@ -789,40 +789,11 @@ def test_chat_reuses_only_consumed_state(rows):
     turn([99, 87, 33, 19], 0)
 
 
-@pytest.mark.parametrize(
-    ("fp16", "rows", "end", "capacity", "max_pos", "expected"),
-    [
-        (True, 128, 128, 128, 192, 0),  # Both routes run one tile.
-        (True, 128, 129, 256, 256, 64),  # Replay would run two tiles.
-        (True, 128, 64, 128, 256, 64),  # The checkpoint already covers the input.
-        (True, 128, 128, 127, 256, 64),  # Replay would need multiple calls.
-        (True, 128, 128, 128, 191, 64),  # The suffix uses forced decode at the cache end.
-        (True, None, 128, 128, 256, 64),
-        (False, 128, 128, 128, 256, 64),
-    ],
-)
-def test_chat_prefill_tile_at_checkpoint(fp16, rows, end, capacity, max_pos, expected):
-    from types import SimpleNamespace
-
-    d = Decoder.__new__(Decoder)
-    d.fp16, d.prefill_rows, d.max_tokens, d.max_pos = fp16, rows, capacity, max_pos
-    d.c = SimpleNamespace(window=0)
-    d._chat_saved_pos = 64
-    prompt = [2] * (end + 1)
-    calls = []
-    d._copy_chat_conv = lambda *, restore: calls.append(restore)
-    d.reset = lambda: calls.append(False)
-    d._chat_tokens = prompt[:64] + [5] * 8
-    assert d._chat_position(prompt) == expected
-    assert calls == [bool(expected)]
-
-
 def test_chat_checkpoint_cannot_restore_overwritten_sliding_keys():
     from types import SimpleNamespace
 
     d = Decoder.__new__(Decoder)
-    d.fp16, d.prefill_rows, d.c = True, 256, SimpleNamespace(window=48)
-    d.max_pos, d.max_tokens = 4096, 256
+    d.fp16, d.c = True, SimpleNamespace(window=48)
     limit = decode_fp16.ring(d.c) - d.c.window
     saved = 2200
     called = []
@@ -841,7 +812,7 @@ def test_chat_checkpoint_cannot_restore_overwritten_sliding_keys():
 def test_chat_continuation_matches_full_replay(model, processes, tiny_bundle, fp16_bundle):
     path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
     decoder = Decoder(path, max_pos=512, max_tokens=256, prefill_rows=128, processes=processes)
-    first = list(range(24, 152))
+    first = list(range(24, 84))
     try:
         predictions = next(decoder.stream(first, 16, chunk=8, reuse=True))
         # Treat the second returned ID as EOS. The remaining IDs in the

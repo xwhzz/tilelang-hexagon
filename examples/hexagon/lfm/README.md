@@ -178,12 +178,13 @@ Interactive `--chat` prefills the full conversation on each turn. Add
 `--reuse-prefix` to reuse tokens already consumed by the DSP. If EOS interrupted
 a decoded chunk, the decoder can resume at the prior prompt's convolution
 checkpoint. A changed chat template or an overwritten sliding window can
-require full replay. FP16 also replays a short prompt when restoring the
-checkpoint would still run a whole prefill tile. Prefill latency depends on
-the tiles skipped and the KV history read by the suffix. Changing where prefill
-and decode meet can also change rounding and produce a different reply with
-the same sampling seed.
-Each `--prompt` starts fresh.
+require full replay. When both routes run one prefill tile, resuming partway
+through it can take longer on the DSP because the suffix reads earlier keys
+and values. The first token can still arrive sooner because restoring a device
+checkpoint avoids uploading zeroed convolution state. Skipping a whole tile
+can reduce both times. Changing where prefill and decode meet can also change
+rounding and produce a different reply with the same sampling seed. Each
+`--prompt` starts fresh.
 
 Greedy, on v79:
 
