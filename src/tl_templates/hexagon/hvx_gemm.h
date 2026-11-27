@@ -820,10 +820,9 @@ TL_DEVICE void tl_gemm_weight_panels(TC *__restrict__ c,
   }
 }
 
-// Four compact rows on v79, with weights in VTCM: two rows share each Crouton
+// Four compact rows with weights in VTCM: two rows share each Crouton
 // weight load. Two panels keep eight even/odd qf32 chains live in the same K
 // order as the four-panel, single-row path.
-#if __HVX_ARCH__ == 79
 template <int N, int K>
 TL_GEMM void
 tl_hvx_gemm_weight_row_pairs(float *__restrict__ C, const half *__restrict__ A,
@@ -870,7 +869,6 @@ tl_hvx_gemm_weight_row_pairs(float *__restrict__ C, const half *__restrict__ A,
     }
   }
 }
-#endif
 
 template <int M, int N, int K, int LdA, int LdC, bool AlignA, int PanelStride,
           typename TC>

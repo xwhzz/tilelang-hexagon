@@ -237,7 +237,7 @@ class GemmHVX(GemmBase):
         # streaming the same Crouton panels from DDR.
         if (
             (M, N, K) in ((4, 256, 128), (4, 128, 256))
-            and str(target.attrs.get("mcpu", "")) == "hexagonv79"
+            and str(target.attrs.get("mcpu", "")) in ("hexagonv73", "hexagonv79")
             and _in_vtcm(self.B)
             and align_a
             and lda == K

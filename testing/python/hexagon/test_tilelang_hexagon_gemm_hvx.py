@@ -260,9 +260,9 @@ def test_a_weight_layout_b_runs_on_hvx():
     assert call.startswith("tl_hvx_gemm_weight<16, 64, 64, 64, 64, true, 2048>(")
 
 
-@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("arch, uses_pairs", [("v73", True), ("v75", False), ("v79", True)])
 @pytest.mark.parametrize("n,k", [(256, 128), (128, 256)])
-def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, n, k):
+def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, uses_pairs, n, k):
     monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)
 
     @T.prim_func
@@ -278,8 +278,8 @@ def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, n, k):
     source = _source(kernel)
     generic = _calls(source, "tl_hvx_gemm_weight")
     paired = _calls(source, "tl_hvx_gemm_weight_row_pairs")
-    assert len(generic) == (1 if arch == "v79" else 2)
-    assert len(paired) == (1 if arch == "v79" else 0)
+    assert len(generic) == (1 if uses_pairs else 2)
+    assert len(paired) == int(uses_pairs)
     assert "(&(B[0]))" in generic[0]
 
 
