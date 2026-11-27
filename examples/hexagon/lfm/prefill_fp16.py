@@ -409,76 +409,72 @@ def make_prefill(
         tiles, which HMX multiplies by V and whose rows sum in fp32. The
         blocks of keys and values come by DMA, a block ahead, straight into
         HMX's operands: the cache keeps them in its tiles."""
-        query_blocks = T.ceildiv(valid, ROWS)
         for h in T.serial(KH):
             kvh = bf.w * KH + h
             for hq in T.serial(group):
-                for rb in T.serial(query_blocks):
-                    row0 = base + rb * ROWS
-                    T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
-                    for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = T.float32(0)
-                    for i in T.Parallel(ROWS):
-                        bf.m[i] = T.float32(NEG)
-                        bf.ls[i] = T.float32(0)
-                    # The positions a row sees: its window, or all before it.
-                    span = T.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
-                    first = T.max(row0 - span + 1, 0) // KEYS
-                    last = T.ceildiv(row0 + ROWS, KEYS)
-                    fetch(bf, kv0, window, kvh, first, 0)
-                    for kb in T.serial(first, last):
-                        slot = (kb - first) % 2
-                        if kb + 1 < last:
-                            fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
-                            T.dma_wait(2)
-                        else:
-                            T.dma_wait()
-                        T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
-                        # Causal, and within the window: key kb * KEYS + j is
-                        # visible to row i when row0 + i - span < key <= row0 + i,
-                        # every key of the block to every row away from the
-                        # diagonal and the window's edge.
-                        if kb * KEYS + KEYS - 1 > row0 or kb * KEYS <= row0 + ROWS - 1 - span:
+                for rb in T.serial(R // ROWS):
+                    if rb * ROWS < valid:
+                        row0 = base + rb * ROWS
+                        T.dma_copy(bf.qs[kvh, hq, rb * ROWS : (rb + 1) * ROWS, :], bf.qb)
+                        for i, d in T.Parallel(ROWS, HD):
+                            bf.acc_o[i, d] = T.float32(0)
+                        for i in T.Parallel(ROWS):
+                            bf.m[i] = T.float32(NEG)
+                            bf.ls[i] = T.float32(0)
+                        # The positions a row sees: its window, or all before it.
+                        span = T.Select(window > 0, window, max_pos + R) if cooperative else T.if_then_else(window > 0, window, max_pos + R)
+                        first = T.max(row0 - span + 1, 0) // KEYS
+                        last = T.ceildiv(row0 + ROWS, KEYS)
+                        fetch(bf, kv0, window, kvh, first, 0)
+                        for kb in T.serial(first, last):
+                            slot = (kb - first) % 2
+                            if kb + 1 < last:
+                                fetch(bf, kv0, window, kvh, kb + 1, 1 - slot)
+                                T.dma_wait(2)
+                            else:
+                                T.dma_wait()
+                            T.gemm(bf.qb, bf.kblk[slot, :, :], bf.s, transpose_B=True, clear_accum=True)
+                            # Causal, and within the window: key kb * KEYS + j is
+                            # visible to row i when row0 + i - span < key <= row0 + i,
+                            # every key of the block to every row away from the
+                            # diagonal and the window's edge.
+                            if kb * KEYS + KEYS - 1 > row0 or kb * KEYS <= row0 + ROWS - 1 - span:
+                                for i, j in T.Parallel(ROWS, KEYS):
+                                    key = kb * KEYS + j
+                                    causal = T.if_then_else(key <= row0 + i, bf.s[i, j], T.float16(NEG16))
+                                    bf.s[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
+                            T.reduce_max(bf.s, bf.rmax, dim=1)
+                            for i in T.Parallel(ROWS):
+                                bf.rmax[i] = T.max(bf.m[i], bf.rmax[i])
+                                bf.alpha[i] = T.exp2(bf.m[i] - bf.rmax[i])
+                                bf.m[i] = bf.rmax[i]
+                                # The maxima of fp16 scores are fp16.
+                                bf.mh[i] = T.Cast("float16", bf.rmax[i])
                             for i, j in T.Parallel(ROWS, KEYS):
-                                key = kb * KEYS + j
-                                causal = T.if_then_else(key <= row0 + i, bf.s[i, j], T.float16(NEG16))
-                                bf.s[i, j] = T.if_then_else(key > row0 + i - span, causal, T.float16(NEG16))
-                        T.reduce_max(bf.s, bf.rmax, dim=1)
+                                bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
+                            T.reduce_sum(bf.p, bf.rsum, dim=1)
+                            for i in T.Parallel(ROWS):
+                                bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
+                            for i, d in T.Parallel(ROWS, HD):
+                                bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
+                            T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
+                            if cooperative:
+                                # GEMM has stored its output. On a request, the
+                                # checkpoint drains and preserves the prefetched
+                                # next KV slot along with the online softmax state.
+                                T.sync_grid()
+                        # The loop's last step drained the queue; the wait tells the
+                        # DMA queue's bound (PlanDMAQueue), which cannot prove that
+                        # the loop runs at all and keeps the first fetch in flight.
+                        T.dma_wait()
                         for i in T.Parallel(ROWS):
-                            bf.rmax[i] = T.max(bf.m[i], bf.rmax[i])
-                            bf.alpha[i] = T.exp2(bf.m[i] - bf.rmax[i])
-                            bf.m[i] = bf.rmax[i]
-                            # The maxima of fp16 scores are fp16.
-                            bf.mh[i] = T.Cast("float16", bf.rmax[i])
-                        for i, j in T.Parallel(ROWS, KEYS):
-                            bf.p[i, j] = T.exp2(bf.s[i, j] - bf.mh[i])
-                        T.reduce_sum(bf.p, bf.rsum, dim=1)
-                        for i in T.Parallel(ROWS):
-                            bf.ls[i] = bf.ls[i] * bf.alpha[i] + bf.rsum[i]
+                            bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
                         for i, d in T.Parallel(ROWS, HD):
                             bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
-                        T.gemm(bf.p, bf.vblk[slot, :, :], bf.acc_o, clear_accum=False)
-                        if cooperative:
-                            # GEMM has stored its output. On a request, the
-                            # checkpoint drains and preserves the prefetched
-                            # next KV slot along with the online softmax state.
-                            T.sync_grid()
-                    # The loop's last step drained the queue; the wait tells the
-                    # DMA queue's bound (PlanDMAQueue), which cannot prove that
-                    # the loop runs at all and keeps the first fetch in flight.
-                    T.dma_wait()
-                    for i in T.Parallel(ROWS):
-                        bf.alpha[i] = bf.gate(h, rb * ROWS + i, hq) / bf.ls[i]
-                    for i, d in T.Parallel(ROWS, HD):
-                        bf.acc_o[i, d] = bf.acc_o[i, d] * bf.alpha[i]
+                    else:
+                        # The output projection also reads the inactive rows.
+                        T.clear(bf.acc_o)
                     col = (kvh * group + hq) * HD
-                    T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
-        # The output projection reads all R rows, including the padding.
-        if query_blocks < R // ROWS:
-            T.clear(bf.acc_o)
-            for rb in T.serial(query_blocks, R // ROWS):
-                for head in T.serial(KH * group):
-                    col = (bf.w * KH * group + head) * HD
                     T.copy(bf.acc_o, bf.hid[rb * ROWS : (rb + 1) * ROWS, col : col + HD])
 
     @T.macro
