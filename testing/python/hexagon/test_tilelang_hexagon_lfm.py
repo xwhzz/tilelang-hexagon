@@ -726,8 +726,9 @@ def test_fp16_prefill_matches_the_reference(model, processes, row_major, fp16_bu
     c, w = convert.read_weights(path)
     ref = decode_fp16.DeviceModel(c, w)
     torch.manual_seed(1)
-    # A chunk of 128 rows and part of another, past the tiny LFM3's window.
-    n, max_pos = 200, 512
+    # The tiny LFM2 ends in a convolution. A final chunk of one token keeps
+    # one token from its previous state. The LFM3 runs past its sliding window.
+    n, max_pos = (129 if model == "lfm2" else 200), 512
     prompt = torch.randint(0, c.vocab, (n,))
     decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=128, processes=processes)
     assert decoder.row_major_embedding is row_major

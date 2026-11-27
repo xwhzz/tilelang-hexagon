@@ -168,8 +168,9 @@ whole buffer, a sub-matrix of a larger one, or one matrix of a stack. Transposes
 M, N and K need not be multiples of 32: HMX multiplies the tiles that cover them, from
 M = 2 rows. `PadHMXOperands` pads A's and B's buffers to whole tiles, and C's when the
 call writes all of it; the copies into them and every other access keep their regions. The
-call zeroes A's and B's padding along K before it multiplies, and writes only C's rows and
-columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
+call programs HMX to stop at the last group of eight K channels. A partial group uses
+private VTCM to mask A and B, so later calls can reuse their complete inputs. It writes only
+C's rows and columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
 tiles stays row-major. On v79, an M x 512 x 512 GEMM from VTCM takes about 1.3 µs on HMX
 for any M from 2 to 32, against 16 µs (M = 2) to 135 µs (M = 16) on HVX. A GEMV (M = 1)
 stays on HVX. An explicit row-major layout on A or B also selects HVX for compatible
@@ -220,7 +221,7 @@ the lane. 4-bit buffers are addressed by whole registers only: copied and multip
 read element by element.
 
 Group-quantized weights take `T.gemm_blockscaled(A, B, C, SFA, SFB, transpose_B=True, ...)`:
-the integer GEMM above into an fp32 C, each group's int32 sums weighed by an fp32 factor of
+the integer GEMM above into an fp32 C, each group's integer sums weighed by an fp32 factor of
 A per `sf_a_granularity_k` columns (`[M, K / ga]`, or one per row) and an fp16 factor of B
 per `sf_b_granularity_k` columns, group-major (`[K / gb, N]`). HVX and HMX read
 group-major scales directly, including a padded row stride. For another physical layout
@@ -228,9 +229,11 @@ they pack the scale rows and columns used by the call into group-major VTCM stor
 Global scales with explicit noncompact strides accept an identity layout annotation.
 For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
 With interleaved activation or output columns it stages just the affected row, gathering
-the previous output only for accumulation. The sums leave the vrmpy accumulators once per
-group, into fp32 accumulators, and a signed B's offset comes off each group with that
-group's sum of A.
+the previous output only for accumulation. For groups whose operand ranges fit an int32
+dot product, HVX combines the byte planes in registers. For larger groups of up to
+8192 int16 activations, it splits the high and low byte-plane sums into two exact
+parts and rounds their sum once to fp32. Other wide groups accumulate bounded pieces
+in int64. Both paths preserve cancellation across the group, including for signed weights.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one

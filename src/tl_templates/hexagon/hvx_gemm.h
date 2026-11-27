@@ -42,8 +42,10 @@
 #include <hexagon_types.h>
 #include <stdint.h>
 #include <tl_templates/hexagon/common.h>
+#include <tl_templates/hexagon/hvx_convert.h>
 #include <tl_templates/hexagon/hvx_lanes.h>
 
+#include <limits>
 #include <type_traits>
 
 #ifndef TL_DEVICE
@@ -928,10 +930,14 @@ TL_GEMM void tl_hvx_gemm_weight(TC *C, const half *A, const half *B,
 // per byte plane of A (hi then lo for int16), one register of words; with
 // 4-bit B its low half holds the even columns' words, its high half the odd
 // columns'.
-template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
+template <typename TA, int BBits, int KC, bool Planar = false>
+struct tl_gemm_int_row {
   static constexpr int planes = sizeof(TA);
   static constexpr int chunks = (KC + 127) / 128;
-  alignas(128) int32_t words[chunks][planes][32];
+  // A contiguous byte plane lets wide dots walk their scalar words in K order.
+  using Storage = std::conditional_t<Planar, int32_t[planes][chunks * 32],
+                                     int32_t[chunks][planes][32]>;
+  alignas(128) Storage words;
   // The row's sum, for a signed B.
   int32_t sum = 0;
 
@@ -944,7 +950,10 @@ template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
   inline __attribute__((always_inline)) void put(int c, int plane,
                                                  HVX_Vector v) {
     v = deal(v);
-    __builtin_memcpy(words[c][plane], &v, sizeof(v));
+    if constexpr (Planar)
+      __builtin_memcpy(words[plane] + c * 32, &v, sizeof(v));
+    else
+      __builtin_memcpy(words[c][plane], &v, sizeof(v));
   }
 
   // Columns [0, k) of the row at `a`, k <= KC; past k, zeros.
@@ -991,9 +1000,15 @@ template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
   // B) or 8 (4-bit) columns; `odd` picks the odd columns of a 4-bit step.
   inline __attribute__((always_inline)) int32_t word(int plane, int s,
                                                      bool odd) const {
-    if constexpr (BBits == 4)
-      return words[s / 16][plane][(odd ? 16 : 0) + s % 16];
-    return words[s / 32][plane][s % 32];
+    if constexpr (Planar) {
+      const int index =
+          BBits == 4 ? (s / 16) * 32 + (odd ? 16 : 0) + s % 16 : s;
+      return words[plane][index];
+    } else {
+      if constexpr (BBits == 4)
+        return words[s / 16][plane][(odd ? 16 : 0) + s % 16];
+      return words[s / 32][plane][s % 32];
+    }
   }
 };
 
@@ -1115,27 +1130,30 @@ TL_GEMM void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
 //             dot_g(i, j)
 //
 // over the groups g of G = min(GA, GB) columns of K, with dot_g(i, j) the
-// exact int32 sum over group g of A[i, k] B(j, k): B as in tl_hvx_gemm_int,
+// exact integer sum over group g of A[i, k] B(j, k): B as in tl_hvx_gemm_int,
 // the scales fp32 (SFA, one per GA columns) and fp16 (SFB, one per GB columns,
 // group-major). GA and GB divide K, or equal it for one factor per row. Each
-// group's int32 sums leave the vrmpy accumulators once, into fp32 accumulators
-// that weigh them by the group's scales: the scaling costs a few operations
-// per group of 32 outputs, against a vrmpy for every 4 or 8 columns of them.
+// group converts its integer dot to fp32 once, before applying its scales.
 
-// The fp32 values of NB runs of 32 consecutive fp16 from p: two runs per
-// conversion, its pair of even and odd lanes shuffled back in order. Scales
-// are never denormal, so they skip the flush.
-template <int NB>
+// Convert two runs of 32 fp16 scales at a time and restore their lane order.
+// Ordinary groups use the qfloat multiply-by-one conversion. Wide groups
+// preserve subnormal fp16 scales when converting to fp32.
+template <int NB, bool Exact = false>
 TL_DEVICE void tl_gemm_half_rows_sf(HVX_Vector out[NB], const half *p) {
   const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
 #pragma clang loop unroll(full)
   for (int b = 0; b < NB; b += 2) {
     HVX_Vector h = b + 1 < NB ? tl_hvx_load<false>(p + 32 * b)
                               : tl_hvx_load_bytes(p + 32 * b, 64);
-    HVX_VectorPair q = Q6_Wqf32_vmpy_VhfVhf(h, one);
-    HVX_VectorPair ordered =
-        Q6_W_vshuff_VVR(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(q)),
-                        Q6_Vsf_equals_Vqf32(Q6_V_lo_W(q)), -4);
+    HVX_VectorPair ordered;
+    if constexpr (Exact) {
+      HVX_VectorPair f = tl_hvx_convert_hf_to_sf(h);
+      ordered = Q6_W_vshuff_VVR(Q6_V_hi_W(f), Q6_V_lo_W(f), -4);
+    } else {
+      HVX_VectorPair q = Q6_Wqf32_vmpy_VhfVhf(h, one);
+      ordered = Q6_W_vshuff_VVR(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(q)),
+                                Q6_Vsf_equals_Vqf32(Q6_V_lo_W(q)), -4);
+    }
     out[b] = Q6_V_lo_W(ordered);
     if (b + 1 < NB)
       out[b + 1] = Q6_V_hi_W(ordered);
@@ -1187,13 +1205,39 @@ template <int K, int Group> struct tl_gemm_int_group_sums {
   }
 };
 
+// A 16-bit activation contributes 256 * hi + lo. Split the integer dot at
+// the smallest byte boundary that keeps both pieces exactly representable as
+// fp32, including the signed-weight correction. Only the final addition rounds.
+template <int BBits, bool Signed, int Group>
+TL_DEVICE HVX_Vector tl_gemm_wide_planes(HVX_Vector hi, HVX_Vector lo,
+                                         int row_sum) {
+  constexpr int max_b = Signed ? 1 << (BBits - 1) : (1 << BBits) - 1;
+  constexpr int shift =
+      int64_t{Group} * 32768 * max_b <= (int64_t{1} << 32) ? 8 : 16;
+  constexpr int mask = (1 << shift) - 1;
+  HVX_Vector upper = Q6_Vw_vadd_VwVw(Q6_Vw_vasr_VwR(hi, shift - 8),
+                                     Q6_Vuw_vlsr_VuwR(lo, shift));
+  HVX_Vector lower = Q6_V_vand_VV(lo, Q6_V_vsplat_R(mask));
+  if constexpr (shift > 8)
+    lower = Q6_Vw_vadd_VwVw(
+        lower, Q6_V_vand_VV(Q6_Vw_vasl_VwR(hi, 8), Q6_V_vsplat_R(mask)));
+  if constexpr (Signed) {
+    const int64_t correction = int64_t{row_sum} * (1 << (BBits - 1));
+    upper = Q6_Vw_vsub_VwVw(upper, Q6_V_vsplat_R(correction >> shift));
+    lower = Q6_Vw_vsub_VwVw(lower, Q6_V_vsplat_R(correction & mask));
+  }
+  const HVX_Vector unit = Q6_V_vsplat_R((127 + shift) << 23);
+  return Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_equals_Vw(upper), unit),
+                            Q6_Vsf_equals_Vw(lower));
+}
+
 // The groups [g0, g0 + groups) of NB panels, from the staged chunk of A's row
 // that starts at group g0, added to their fp32 sums `total`. sfa and sfb hold
 // the factors of the row of A and of the panels' rows of B, from group 0.
 template <typename TA, int BBits, bool BSigned, int NB, int KC, int Group,
-          bool GroupA>
+          bool GroupA, bool Wide>
 TL_DEVICE void tl_gemm_int_panels_scaled(
-    HVX_Vector *total, const tl_gemm_int_row<TA, BBits, KC> &row,
+    HVX_Vector *total, const tl_gemm_int_row<TA, BBits, KC, Wide> &row,
     const int32_t *sum, const uint8_t *B, int panel_bytes, int g0, int groups,
     const float *sfa, int sfa_per, const half *sfb, int ld_sfb, int sfb_per) {
   constexpr int planes = sizeof(TA);
@@ -1210,8 +1254,7 @@ TL_DEVICE void tl_gemm_int_panels_scaled(
 #pragma clang loop unroll(full)
       for (int b = 0; b < NB; ++b)
         acc[q][b] = Q6_V_vzero();
-// Partly unrolled: a whole group of steps would spill the registers it
-// keeps live onto the stack.
+    // A whole group would spill its live accumulators onto the stack.
 #pragma clang loop unroll_count(2)
     for (int t = 0; t < steps; ++t) {
       int s = g * steps + t;
@@ -1240,7 +1283,7 @@ TL_DEVICE void tl_gemm_int_panels_scaled(
     // chain of products added to one accumulator each. A's factor joins B's
     // here only when A has one per group (GroupA); else at the end.
     HVX_Vector scale[NB];
-    tl_gemm_half_rows_sf<NB>(scale, sfb + ((g0 + g) / sfb_per) * ld_sfb);
+    tl_gemm_half_rows_sf<NB, Wide>(scale, sfb + ((g0 + g) / sfb_per) * ld_sfb);
     if constexpr (GroupA) {
       float a_scale = sfa[(g0 + g) / sfa_per];
       int32_t a_bits;
@@ -1248,20 +1291,29 @@ TL_DEVICE void tl_gemm_int_panels_scaled(
       HVX_Vector va = Q6_V_vsplat_R(a_bits);
 #pragma clang loop unroll(full)
       for (int b = 0; b < NB; ++b)
-        scale[b] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale[b], va));
+        scale[b] =
+            Wide ? Q6_Vsf_vmpy_VsfVsf(scale[b], va)
+                 : Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale[b], va));
     }
     HVX_Vector offset;
-    if constexpr (BSigned)
+    if constexpr (BSigned && !Wide)
       offset = Q6_V_vsplat_R((BBits == 4 ? 8 : 128) * sum[g]);
 #pragma clang loop unroll(full)
     for (int b = 0; b < NB; ++b) {
-      HVX_Vector r = acc[0][b];
-      if constexpr (planes == 2)
-        r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(r, 8), acc[1][b]);
-      if constexpr (BSigned)
-        r = Q6_Vw_vsub_VwVw(r, offset);
-      HVX_Vector p = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(r), scale[b]);
-      total[b] = Q6_Vqf32_vadd_Vqf32Vqf32(total[b], p);
+      if constexpr (Wide) {
+        HVX_Vector dot = tl_gemm_wide_planes<BBits, BSigned, Group>(
+            acc[0][b], acc[1][b], BSigned ? sum[g] : 0);
+        total[b] =
+            Q6_Vsf_vadd_VsfVsf(total[b], Q6_Vsf_vmpy_VsfVsf(dot, scale[b]));
+      } else {
+        HVX_Vector r = acc[0][b];
+        if constexpr (planes == 2)
+          r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(r, 8), acc[1][b]);
+        if constexpr (BSigned)
+          r = Q6_Vw_vsub_VwVw(r, offset);
+        HVX_Vector p = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(r), scale[b]);
+        total[b] = Q6_Vqf32_vadd_Vqf32Vqf32(total[b], p);
+      }
     }
   }
 }
@@ -1275,6 +1327,61 @@ struct tl_gemm_int_no_sums {
 // largest of 3, 2 and 1 that divides the panels.
 constexpr int tl_gemm_int_block(int panels) {
   return panels % 4 == 0 ? 4 : panels % 3 == 0 ? 3 : panels % 2 == 0 ? 2 : 1;
+}
+
+// Accumulate bounded dots exactly in int64 before applying the group's scale.
+// Int16 x uint8 uses chunks of 256. One-byte activations can stage 4 KiB at a
+// time with a worst-case unsigned dot of 4096 * 255 * 255.
+template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
+          int GA, int GB, typename TA>
+TL_DEVICE void tl_gemm_wide_groups(float *C, const TA *A, const uint8_t *B,
+                                   int panel_bytes, const float *sfa,
+                                   int ld_sfa, const half *sfb, int ld_sfb,
+                                   bool clear) {
+  constexpr int Group = tl_gemm_min(GA, GB);
+  constexpr int Lane = 32 / BBits;
+  constexpr int NB = tl_gemm_int_block(N / 32);
+  constexpr int Cols = 32 * NB;
+  constexpr int Chunk = sizeof(TA) == 1 ? 4096 : 256;
+  tl_gemm_int_row<TA, BBits, Chunk> row;
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; n += Cols) {
+      alignas(128) float total[Cols] = {};
+      for (int g = 0; g < K; g += Group) {
+        alignas(128) int64_t sum[Cols] = {};
+        for (int k = 0; k < Group; k += Chunk) {
+          const int count = tl_gemm_min(Group - k, Chunk);
+          row.stage(A + m * LdA + g + k, count, BSigned);
+          alignas(128) int32_t chunk[Cols];
+          tl_gemm_int_panels<TA, BBits, BSigned, NB, Chunk, true>(
+              chunk, row, B + (n / 32) * panel_bytes + ((g + k) / Lane) * 128,
+              panel_bytes, count / Lane, true);
+          for (int j = 0; j < Cols; ++j)
+            sum[j] += chunk[j];
+        }
+        for (int j = 0; j < Cols; ++j) {
+          float scale = sfb[(g / GB) * ld_sfb + n + j];
+          if constexpr (GA < K)
+            scale *= sfa[m * ld_sfa + g / GA];
+          total[j] += static_cast<float>(sum[j]) * scale;
+        }
+      }
+      for (int j = 0; j < Cols; ++j) {
+        float result = total[j];
+        if constexpr (GA == K)
+          result *= sfa[m * ld_sfa];
+        float &dst = C[m * LdC + n + j];
+        dst = clear ? result : dst + result;
+      }
+    }
+  }
+}
+
+// Keep the v73/v75 native IEEE feature on wide panel computations.
+template <typename F, typename Width>
+TL_HEXAGON_IEEE_ARITHMETIC static inline void
+tl_gemm_wide_scaled_block(F &block, int p, Width width) {
+  [[clang::always_inline]] block(p, width);
 }
 
 template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
@@ -1294,65 +1401,109 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
   static_assert(N % 32 == 0 && K % GA == 0 && K % GB == 0 &&
                     Group % lane == 0 && GA % Group == 0 && GB % Group == 0,
                 "HVX block-scaled GEMM: whole panels and whole scale groups");
-  // Columns per staged chunk of A's row, whole groups; panels per block.
-  constexpr int KC = Group >= 512 ? Group : tl_gemm_min(K, 512 / Group * Group);
-  constexpr int Panels = N / 32;
-  constexpr int Divisor = tl_gemm_int_block(Panels);
-  // Keep uniform blocks of two or more panels. For an otherwise single-panel
-  // schedule, share staging across four full panels and handle the remainder.
-  constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
-  constexpr bool RowsC = AlignC && LdC % 32 == 0;
-  tl_gemm_int_row<TA, BBits, KC> row;
+  constexpr int MaxA = std::is_signed_v<TA> ? -std::numeric_limits<TA>::min()
+                                            : std::numeric_limits<TA>::max();
+  constexpr int MaxB = BSigned ? (1 << (BBits - 1)) : (1 << BBits) - 1;
+  constexpr bool Wide = int64_t{Group} * MaxA * MaxB > INT32_MAX;
+  // Keep the staged byte planes within 16 KiB and each plane's dot in int32.
+  if constexpr (Wide && (sizeof(TA) != 2 || Group > 8192)) {
+    tl_gemm_wide_groups<M, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
+        C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear);
+  } else {
+    // Columns per staged chunk of A's row, whole groups; panels per block.
+    // A wide group can stage multiple groups in one pass over its byte planes.
+    constexpr int Capacity = Wide ? 2048 : 512;
+    constexpr int KC =
+        Group >= Capacity ? Group : tl_gemm_min(K, Capacity / Group * Group);
+    constexpr int Panels = N / 32;
+    constexpr int Divisor = tl_gemm_int_block(Panels);
+    // Keep uniform blocks of two or more panels. For an otherwise single-panel
+    // schedule, share staging across four full panels and handle the remainder.
+    constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
+    constexpr bool RowsC = AlignC && LdC % 32 == 0;
+    tl_gemm_int_row<TA, BBits, KC, Wide> row;
 #pragma clang loop unroll(disable)
-  for (int i = 0; i < M; ++i) {
-    const TA *a = A + i * LdA;
-    float *c0 = C + i * LdC;
-    // A signed B subtracts its offset times each group's sum of the row.
-    std::conditional_t<BSigned, tl_gemm_int_group_sums<K, Group>,
-                       tl_gemm_int_no_sums>
-        sums;
-    if constexpr (BSigned)
-      sums.compute(a);
-    const int32_t *sum = sums.sum;
-    auto block = [&](int p, auto width) {
-      constexpr int NB = decltype(width)::value;
-      HVX_Vector total[NB];
+    for (int i = 0; i < M; ++i) {
+      const TA *a = A + i * LdA;
+      float *c0 = C + i * LdC;
+#if __HVX_ARCH__ == 79
+      if constexpr (Wide) {
+        // The v79 Qfloat multiply can retain excess precision in a subnormal
+        // intermediate scale. Use the scalar group path if the smallest fp16
+        // factor (2^-24) could take this row below the fp32 normal range.
+        bool tiny_scale = false;
+        for (int g = 0; g < K / GA; ++g) {
+          float scale = __builtin_fabsf(sfa[i * ld_sfa + g]);
+          tiny_scale |= scale != 0.0f && scale < 0x1p-102f;
+        }
+        if (tiny_scale) {
+          tl_gemm_wide_groups<1, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
+              c0, a, B, panel_bytes, sfa + i * ld_sfa, ld_sfa, sfb, ld_sfb,
+              clear);
+          continue;
+        }
+      }
+#endif
+      // A signed B subtracts its offset times each group's sum of the row.
+      std::conditional_t<BSigned, tl_gemm_int_group_sums<K, Group>,
+                         tl_gemm_int_no_sums>
+          sums;
+      if constexpr (BSigned)
+        sums.compute(a);
+      const int32_t *sum = sums.sum;
+      auto block = [&](int p, auto width) {
+        constexpr int NB = decltype(width)::value;
+        HVX_Vector total[NB];
 #pragma clang loop unroll(full)
-      for (int b = 0; b < NB; ++b)
-        total[b] = Q6_V_vzero();
+        for (int b = 0; b < NB; ++b)
+          total[b] = Q6_V_vzero();
 #pragma clang loop unroll(disable)
-      for (int k0 = 0; k0 < K; k0 += KC) {
-        int k = tl_gemm_min(KC, K - k0);
-        row.stage(a + k0, k, false);
-        tl_gemm_int_panels_scaled<TA, BBits, BSigned, NB, KC, Group, (GA < K)>(
-            total, row, BSigned ? sum + k0 / Group : sum,
-            B + k0 / lane * 128 + p * panel_bytes, panel_bytes, k0 / Group,
-            k / Group, sfa + i * ld_sfa, GA / Group, sfb + 32 * p, ld_sfb,
-            GB / Group);
-      }
-      // A's one factor for the whole row, when it has one.
-      HVX_Vector va = Q6_V_vzero();
-      if constexpr (GA >= K) {
-        float a_scale = sfa[i * ld_sfa];
-        int32_t a_bits;
-        __builtin_memcpy(&a_bits, &a_scale, 4);
-        va = Q6_V_vsplat_R(a_bits);
-      }
+        for (int k0 = 0; k0 < K; k0 += KC) {
+          int k = tl_gemm_min(KC, K - k0);
+          row.stage(a + k0, k, false);
+          tl_gemm_int_panels_scaled<TA, BBits, BSigned, NB, KC, Group, (GA < K),
+                                    Wide>(
+              total, row, BSigned ? sum + k0 / Group : sum,
+              B + k0 / lane * 128 + p * panel_bytes, panel_bytes, k0 / Group,
+              k / Group, sfa + i * ld_sfa, GA / Group, sfb + 32 * p, ld_sfb,
+              GB / Group);
+        }
+        // A's one factor for the whole row, when it has one.
+        HVX_Vector va = Q6_V_vzero();
+        if constexpr (GA >= K) {
+          float a_scale = sfa[i * ld_sfa];
+          int32_t a_bits;
+          __builtin_memcpy(&a_bits, &a_scale, 4);
+          va = Q6_V_vsplat_R(a_bits);
+        }
 #pragma clang loop unroll(full)
-      for (int b = 0; b < NB; ++b) {
-        HVX_Vector r = tl_gemm_result(total[b]);
-        if constexpr (GA >= K)
-          r = tl_gemm_result(Q6_Vqf32_vmpy_VsfVsf(r, va));
-        if (!clear)
-          r = tl_gemm_add_sf(r, tl_hvx_load<RowsC>(c0 + 32 * (p + b)));
-        tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
-      }
-    };
+        for (int b = 0; b < NB; ++b) {
+          HVX_Vector r = Wide ? total[b] : tl_gemm_result(total[b]);
+          if constexpr (GA >= K)
+            r = Wide ? Q6_Vsf_vmpy_VsfVsf(r, va)
+                     : tl_gemm_result(Q6_Vqf32_vmpy_VsfVsf(r, va));
+          if (!clear) {
+            HVX_Vector old = tl_hvx_load<RowsC>(c0 + 32 * (p + b));
+            r = Wide ? Q6_Vsf_vadd_VsfVsf(r, old) : tl_gemm_add_sf(r, old);
+          }
+          tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
+        }
+      };
+      // Wide blocks inherit the IEEE feature of the v73/v75 caller. Leave
+      // ordinary blocks to the original inlining policy.
+      auto apply = [&](int p, auto width) TL_HEXAGON_VECTOR_INLINE {
+        if constexpr (Wide) {
+          tl_gemm_wide_scaled_block(block, p, width);
+        } else {
+          block(p, width);
+        }
+      };
 #pragma clang loop unroll(disable)
-    for (int p = 0; p + Block <= Panels; p += Block)
-      block(p, std::integral_constant<int, Block>{});
-    if constexpr (Panels % Block != 0)
-      block(Panels - Panels % Block,
-            std::integral_constant<int, Panels % Block>{});
+      for (int p = 0; p + Block <= Panels; p += Block)
+        apply(p, std::integral_constant<int, Block>{});
+      if constexpr (Panels % Block != 0)
+        apply(Panels - Panels % Block,
+              std::integral_constant<int, Panels % Block>{});
+    }
   }
 }

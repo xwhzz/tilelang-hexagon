@@ -392,6 +392,67 @@ def test_sub_matrices_match_torch(c_dtype):
 
 
 @DEVICE
+@pytest.mark.parametrize("trans_a, trans_b", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("c_dtype, prefix", [("float32", 33), ("float16", 18), ("float32", 40)])
+def test_partial_k_keeps_both_operands_for_the_next_gemm(trans_a, trans_b, c_dtype, prefix):
+    import torch
+
+    @T.prim_func
+    def reuse(A: T.Tensor((2, 64, 64), "float16"), B: T.Tensor((2, 64, 64), "float16"), O: T.Tensor((2, 64, 64), c_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((2, 64, 64), "float16")
+            b = T.alloc_shared((2, 64, 64), "float16")
+            c = T.alloc_shared((2, 64, 64), c_dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(
+                a[1, :prefix, :] if trans_a else a[1, :, :prefix],
+                b[1, :, :prefix] if trans_b else b[1, :prefix, :],
+                c[0, :, :],
+                transpose_A=trans_a,
+                transpose_B=trans_b,
+                clear_accum=True,
+            )
+            T.gemm(a[1, :, :], b[1, :, :], c[1, :, :], transpose_A=trans_a, transpose_B=trans_b, clear_accum=True)
+            T.copy(c, O)
+
+    # Small integral values keep both reference products exactly representable.
+    gen = torch.Generator().manual_seed(326)
+    a = torch.randint(-2, 3, (2, 64, 64), generator=gen).half()
+    b = torch.randint(-2, 3, (2, 64, 64), generator=gen).half()
+    out = _run(reuse, a.mT.contiguous() if trans_a else a, b.mT.contiguous() if trans_b else b)
+    reference = torch.stack((a[1, :, :prefix].float() @ b[1, :prefix].float(), a[1].float() @ b[1].float()))
+    torch.testing.assert_close(out.float(), reference, rtol=0, atol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("prefix,m,n", [(1025, 32, 32), (1032, 32, 32), (33, 32, 32), (33, 64, 32), (33, 64, 64)])
+def test_partial_k_last_deep_packet(prefix, m, n):
+    import torch
+
+    k = (prefix + 31) // 32 * 32
+
+    @T.prim_func
+    def gemm(A: T.Tensor((m, k), "float16"), B: T.Tensor((k, n), "float16"), C: T.Tensor((m, n), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((m, k), "float16")
+            b = T.alloc_shared((k, n), "float16")
+            c = T.alloc_shared((m, n), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a[:, :prefix], b[:prefix, :], c, clear_accum=True)
+            T.copy(c, C)
+
+    rows = (torch.arange(m) // 32 + 1).float()[:, None]
+    cols = (torch.arange(n) // 32 + 1).float()[None, :]
+    a = rows.expand(m, k).half()
+    b = cols.expand(k, n).half()
+    a[:, prefix:] = float("nan")
+    b[prefix:, :] = float("inf")
+    torch.testing.assert_close(_run(gemm, a, b), rows * cols * prefix, rtol=0, atol=0)
+
+
+@DEVICE
 @pytest.mark.parametrize("kind", ["rows16", "rows32_odd", "columns16", "transposed32"])
 def test_c_layouts_match_torch(kind):
     import torch

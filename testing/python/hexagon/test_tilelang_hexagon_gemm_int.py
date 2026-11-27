@@ -499,6 +499,96 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
         kernel.adapter.close()
 
 
+@DEVICE
+@pytest.mark.parametrize(
+    "dtype,ga,gb,clear,n",
+    [
+        ("uint8", 512, 512, True, 64),
+        ("uint8", 1280, 640, False, 160),
+        ("int8", 576, 1152, True, 224),
+        ("int8", 512, 512, False, 64),
+        ("int4", 8192, 8192, True, 64),
+        ("uint4", 4480, 4480, False, 64),
+        ("int8", 8256, 8256, True, 64),
+    ],
+)
+def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear, n):
+    m, k, group = 5, max(ga, gb), min(ga, gb)
+    a = torch.empty((m, k), dtype=torch.int16)
+    a[0], a[1], a[2] = 20000, -32768, 32767
+    w = torch.empty((n, k), dtype=torch.int64)
+    bits = BITS[dtype]
+    signed = dtype.startswith("int")
+    low = -(1 << (bits - 1)) if signed else 0
+    high = -low - 1 if signed else (1 << bits) - 1
+    extreme = low if signed else high
+    w[:16] = 220 if dtype == "uint8" else extreme
+    w[16:32] = high
+    w[32:] = extreme
+    # Distinguish successive high/low activation bytes and packed weight nibbles.
+    cols = torch.arange(k)
+    a[4] = (cols * 811 + cols // 11) % 65536 - 32768
+    w[0] = ((cols * 7 + cols // 5) % (1 << bits)) + low
+    for start in range(0, k, group):
+        mid = start + group // 2
+        a[3, start:mid], a[3, mid : start + group] = 32767, -32767
+        a[3, mid] += 1
+        w[32:, start], w[32:, mid] = 1, 1
+    sa = torch.ones(m, k // ga)
+    sb = torch.full((k // gb, n), 1 / 256, dtype=torch.float16)
+    sb[:, 32:] = 1
+    sa[:, 1:] *= 2
+    sb[1:] *= 2
+    c0 = (torch.arange(m * n) % 7 - 3).reshape(m, n).float()
+    expected = torch.zeros_like(c0)
+    for start in range(0, k, group):
+        cols = slice(start, start + group)
+        dots = a[:, cols].long() @ w[:, cols].T
+        # The last row's large opposite partials leave exactly one.
+        assert (dots[3, 32:] == 1).all()
+        expected += dots.float() * sa[:, start // ga, None] * sb[start // gb].float()
+    if not clear:
+        expected += c0
+    kernel = tilelang.compile(_blockscaled(m, n, k, gb, "int16", dtype, clear, ga), out_idx=[5], target="hexagon")
+    try:
+        torch.testing.assert_close(kernel(a, sa, pack_panel(w, bits), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_blockscaled_wide_subnormal_group_scale():
+    k, n, ga = 1024, 32, 512
+    a = torch.full((1, k), 20000, dtype=torch.int16)
+    b = torch.full((n, k), 220, dtype=torch.uint8)
+    sa = torch.tensor([[1e-35, 0]], dtype=torch.float32)
+    sb = torch.full((1, n), 2**-24, dtype=torch.float16)
+    c0 = torch.zeros(1, n)
+    kernel = tilelang.compile(_blockscaled(1, n, k, k, "int16", "uint8", True, ga), out_idx=[5], target="hexagon")
+    try:
+        expected = (sa[0, 0] * sb.float()) * float(ga * 20000 * 220)
+        torch.testing.assert_close(kernel(a, sa, pack_panel(b, 8), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_blockscaled_wide_byte_groups():
+    k, n = 33152, 32
+    a = torch.full((1, k), 255, dtype=torch.uint8)
+    b = torch.full((n, k), 255, dtype=torch.uint8)
+    b[::2, -1] = 1
+    sa = torch.ones(1, 1)
+    sb = torch.ones(1, n, dtype=torch.float16)
+    c0 = torch.zeros(1, n)
+    kernel = tilelang.compile(_blockscaled(1, n, k, k, "uint8", "uint8", True, k), out_idx=[5], target="hexagon")
+    try:
+        expected = (a.long() @ b.long().T).float()
+        torch.testing.assert_close(kernel(a, sa, pack_panel(b, 8), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def _blockscaled_hmx(M, N, K, G, b_dtype, c_dtype, clear, workers=1, normal_scales=False):
     """C = C0 + SA * (A @ (B * SB)^T) on HMX, for an fp16 A, a factor per row
     of A and an fp16 one per G columns of each row of B (group-major).
