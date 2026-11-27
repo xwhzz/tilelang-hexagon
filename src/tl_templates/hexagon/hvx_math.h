@@ -782,15 +782,13 @@ TL_DEVICE HVX_Vector tl_hvx_div_recip_vsf(HVX_Vector x) {
 
 // The integer seed needs a normal denominator whose inverse stays normal.
 // In the top two exponent bins the seed can cross zero.
-template <typename UInt> TL_DEVICE auto tl_hvx_div_needs_scalar(UInt bits) {
-  auto magnitude = bits & 0x7fffffffU;
+TL_DEVICE bool tl_hvx_div_needs_scalar(uint32_t bits) {
+  uint32_t magnitude = bits & 0x7fffffffU;
   return (magnitude - 0x00800000U) >= (0x7e800000U - 0x00800000U);
 }
 
 TL_HEXAGON_IEEE_ARITHMETIC static inline HVX_Vector
-tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
-  using Words = vec_type<uint32_t, 32>::nat_t;
-  using Floats = vec_type<float, 32>::nat_t;
+tl_hvx_div_approx(HVX_Vector x, HVX_Vector y) {
 #if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
   HVX_Vector seed = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7ef127ea), y);
   HVX_Vector two = tl_hvx_splat_f(2.0f);
@@ -798,48 +796,52 @@ tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
   for (int i = 0; i < 3; ++i)
     seed = Q6_Vsf_vmpy_VsfVsf(
         seed, Q6_Vsf_vsub_VsfVsf(two, Q6_Vsf_vmpy_VsfVsf(y, seed)));
-  HVX_Vector q = Q6_Vsf_vmpy_VsfVsf(x, seed);
+  return Q6_Vsf_vmpy_VsfVsf(x, seed);
 #elif __HVX_ARCH__ == 79
-  HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_div_recip_vsf(y));
+  return tl_hvx_mul_sf(x, tl_hvx_div_recip_vsf(y));
 #else
-  HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
+  return tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
 #endif
-  auto exceptional = tl_hvx_div_needs_scalar(__builtin_bit_cast(Words, y));
+}
+
+TL_DEVICE HVX_VectorPred tl_hvx_div_exceptional(HVX_Vector x, HVX_Vector y) {
+  HVX_Vector magnitude = Q6_V_vsplat_R(0x7fffffff);
+  HVX_Vector by = Q6_V_vand_VV(y, magnitude);
+  HVX_Vector den_range = Q6_Vw_vsub_VwVw(by, Q6_V_vsplat_R(0x00800000));
+  HVX_VectorPred flags = Q6_Q_vcmp_gt_VuwVuw(
+      den_range, Q6_V_vsplat_R(0x7e800000 - 0x00800000 - 1));
 #if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
   // The IEEE reciprocal still rounds before the final multiply. Repair
   // subnormal inputs and ratios that can round across underflow or overflow.
-  // Keep the magnitude operations in HVX for compound input expressions.
-  HVX_Vector magnitude = Q6_V_vsplat_R(0x7fffffff);
-  HVX_Vector ax = Q6_V_vand_VV(x, magnitude), by = Q6_V_vand_VV(y, magnitude);
   // For normal operands, one exponent bin in the encoding is a factor of two.
+  HVX_Vector ax = Q6_V_vand_VV(x, magnitude);
   HVX_Vector delta =
       Q6_Vw_vadd_VwVw(Q6_Vw_vsub_VwVw(ax, by), Q6_V_vsplat_R(0x3f000000));
   HVX_VectorPred extreme =
       Q6_Q_vcmp_gt_VuwVuw(delta, Q6_V_vsplat_R(0x7e7fffff));
   HVX_VectorPred subnormal = Q6_Q_vcmp_gt_VuwVuw(Q6_V_vsplat_R(0x00800000), ax);
-  HVX_VectorPred repair = Q6_Q_and_QQn(Q6_Q_or_QQ(extreme, subnormal),
-                                       Q6_Q_vcmp_eq_VwVw(ax, Q6_V_vzero()));
-  exceptional |=
-      __builtin_bit_cast(decltype(exceptional), Q6_V_vand_QR(repair, -1));
+  flags = Q6_Q_or_QQ(flags, Q6_Q_and_QQn(Q6_Q_or_QQ(extreme, subnormal),
+                                         Q6_Q_vcmp_eq_VwVw(ax, Q6_V_vzero())));
 #endif
-#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75 || __HVX_ARCH__ == 79
-  HVX_Vector mask = __builtin_bit_cast(HVX_Vector, exceptional);
-  for (int offset = 64; offset >= 4; offset /= 2)
-    mask = Q6_V_vor_VV(mask, Q6_V_vror_VR(mask, offset));
-  bool any = Q6_R_vextract_VR(mask, 0) != 0;
-#else
-  bool any = __builtin_reduce_or(exceptional) != 0;
-#endif
-  if (__builtin_expect(any, 0)) {
-    Floats a = __builtin_bit_cast(Floats, x), b = __builtin_bit_cast(Floats, y);
-    Floats result = __builtin_bit_cast(Floats, q);
-    for (int i = 0; i < 32; ++i) {
-      if (exceptional[i])
-        result[i] = a[i] / b[i];
-    }
-    return __builtin_bit_cast(HVX_Vector, result);
-  }
-  return q;
+  return flags;
+}
+
+TL_DEVICE bool tl_hvx_div_has_exception(HVX_VectorPred flags) {
+  // The final word counts all active predicate bytes in the register.
+  return Q6_R_vextract_VR(Q6_Vw_prefixsum_Q(flags), 124) != 0;
+}
+
+TL_DEVICE HVX_Vector tl_hvx_div_repair(HVX_Vector x, HVX_Vector y, HVX_Vector q,
+                                       HVX_VectorPred flags) {
+  using Words = vec_type<uint32_t, 32>::nat_t;
+  using Floats = vec_type<float, 32>::nat_t;
+  Words exceptional = __builtin_bit_cast(Words, Q6_V_vand_QR(flags, -1));
+  Floats a = __builtin_bit_cast(Floats, x), b = __builtin_bit_cast(Floats, y);
+  Floats result = __builtin_bit_cast(Floats, q);
+  for (int i = 0; i < TL_HVX_F32_LANES; ++i)
+    if (exceptional[i])
+      result[i] = a[i] / b[i];
+  return __builtin_bit_cast(HVX_Vector, result);
 }
 
 template <int N>
@@ -881,16 +883,28 @@ template <int N>
 TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
                                         const vec_type<float, N> &b) {
   static_assert(N % TL_HVX_F32_LANES == 0, "tl_hvx_div needs whole registers");
-  vec_type<float, N> out;
+  constexpr int count = N / TL_HVX_F32_LANES;
+  struct Registers {
+    HVX_Vector v[count];
+  };
+  Registers x = __builtin_bit_cast(Registers, a.v),
+            y = __builtin_bit_cast(Registers, b.v), q;
+  HVX_VectorPred flags[count], combined{};
 #pragma clang loop unroll(full)
-  for (int i = 0; i < N / TL_HVX_F32_LANES; ++i) {
-    HVX_Vector x, y;
-    __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
-    __builtin_memcpy(&y, (const char *)&b.v + 128 * i, 128);
-    HVX_Vector q = tl_hvx_div_vsf(x, y);
-    __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
+  for (int i = 0; i < count; ++i) {
+    q.v[i] = tl_hvx_div_approx(x.v[i], y.v[i]);
+    flags[i] = tl_hvx_div_exceptional(x.v[i], y.v[i]);
+    combined = i == 0 ? flags[i] : Q6_Q_or_QQ(combined, flags[i]);
   }
-  return out;
+  // Independent reciprocals can overlap while a wide vector shares one
+  // branch. A sparse exception still repairs only its own register.
+  if (__builtin_expect(tl_hvx_div_has_exception(combined), 0)) {
+#pragma clang loop unroll(full)
+    for (int i = 0; i < count; ++i)
+      if (count == 1 || tl_hvx_div_has_exception(flags[i]))
+        q.v[i] = tl_hvx_div_repair(x.v[i], y.v[i], q.v[i], flags[i]);
+  }
+  return __builtin_bit_cast(typename vec_type<float, N>::nat_t, q);
 }
 
 template <int N>

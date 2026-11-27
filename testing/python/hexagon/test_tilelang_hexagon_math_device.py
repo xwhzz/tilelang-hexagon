@@ -256,6 +256,28 @@ def test_default_float32_division_at_exponent_limits():
         kernel.adapter.close()
 
 
+def test_wide_float32_division_repairs_each_register():
+    import torch
+
+    lanes = 128
+
+    @T.prim_func
+    def divide(a: T.Tensor((lanes,), "float32"), b: T.Tensor((lanes,), "float32"), out: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            out[T.Ramp(0, 1, lanes)] = a[T.Ramp(0, 1, lanes)] / b[T.Ramp(0, 1, lanes)]
+
+    kernel = tilelang.compile(divide, out_idx=2, target="hexagon")
+    try:
+        for base in range(0, lanes, 32):
+            a = torch.full((lanes,), 6.5)
+            b = torch.full((lanes,), 3.25)
+            a[base], b[base] = 2.0**127, -(2.0**127)
+            a[base + 31], b[base + 31] = 2.0**-149, 2.0**-149
+            torch.testing.assert_close(kernel(a, b), a / b, rtol=1e-6, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
 def test_float32_division_with_broadcast_denominator():
     import torch
 
