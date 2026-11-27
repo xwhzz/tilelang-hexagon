@@ -708,17 +708,18 @@ TL_DEVICE void tl_crouton_copy_columns(half *dst, const half *src, int cols) {
   auto *in = reinterpret_cast<const HVX_Vector *>(src);
   HVX_VectorPred keep = Q6_Q_vsetq2_R(cols * 4);
   for (int q = 0; q < 16; ++q)
-    out[q] = Q6_V_vmux_QVV(keep, in[q], Q6_V_vzero());
+    out[q] = Q6_V_vand_QV(keep, in[q]);
 }
 
-TL_DEVICE void tl_crouton_copy_rows(half *dst, const half *src, int rows) {
+TL_DEVICE void tl_crouton_copy_rows(half *dst, const half *src, int rows,
+                                    int channels) {
   auto *out = reinterpret_cast<HVX_Vector *>(dst);
   auto *in = reinterpret_cast<const HVX_Vector *>(src);
   for (int q = 0; q < rows / 2; ++q)
     out[q] = in[q];
   if (rows & 1)
     out[rows / 2] = Q6_V_vand_VV(in[rows / 2], Q6_V_vsplat_R(0x0000FFFF));
-  for (int q = (rows + 1) / 2; q < 16; ++q)
+  for (int q = (rows + 1) / 2; q < channels / 2; ++q)
     out[q] = Q6_V_vzero();
 }
 

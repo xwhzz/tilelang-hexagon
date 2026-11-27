@@ -155,9 +155,9 @@ whole buffer, a sub-matrix of a larger one, or one matrix of a stack. Transposes
 M, N and K need not be multiples of 32: HMX multiplies the tiles that cover them, from
 M = 2 rows. `PadHMXOperands` pads A's and B's buffers to whole tiles, and C's when the
 call writes all of it; the copies into them and every other access keep their regions. The
-call masks the last partial K tile of A and B in private VTCM so later calls can reuse their
-complete inputs. It writes only C's rows and
-columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
+call programs HMX to stop at the last group of eight K channels. A partial group uses
+private VTCM to mask A and B, so later calls can reuse their complete inputs. It writes only
+C's rows and columns when C is not padded, as for a sub-matrix of a larger C. An fp16 C that is not whole
 tiles stays row-major. On v79, an M x 512 x 512 GEMM from VTCM takes about 1.3 µs on HMX
 for any M from 2 to 32, against 16 µs (M = 2) to 135 µs (M = 16) on HVX. A GEMV (M = 1)
 stays on HVX, as do the GEMMs whose A or B has a layout of its own (`T.annotate_layout`),

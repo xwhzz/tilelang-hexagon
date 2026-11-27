@@ -80,7 +80,6 @@ TL_HMX_INLINE void tl_hmx_unit_release(void) {
 #define TL_HMX_SPATIAL_MASK 0x1cu
 #define TL_HMX_SPATIAL_RT                                                      \
   ((((TL_HMX_SPATIAL_MASK) >> 1) << 7) | (((TL_HMX_SPATIAL_MASK) & 1u) << 1))
-#define TL_HMX_ACTIVATION_RT (TL_HMX_SPATIAL_RT | (31u << 2))
 
 TL_HMX_INLINE void tl_hmx_clear_acc(void) {
   asm volatile("mxclracc.hf" ::: "memory");
@@ -88,11 +87,14 @@ TL_HMX_INLINE void tl_hmx_clear_acc(void) {
 TL_HMX_INLINE void tl_hmx_set_scales(const void *s) {
   asm volatile("bias = mxmem2(%0)" ::"r"(s) : "memory");
 }
-TL_HMX_INLINE void tl_hmx_mac_tiles(const __fp16 *a, const __fp16 *w,
-                                    size_t n) {
-  // Caller guarantees 1 <= n <= 32 and contiguous native tiles.
-  const uint32_t act_rt = TL_HMX_ACTIVATION_RT | ((n - 1) << 11);
-  const uint32_t weight_rt = n * TL_HMX_TILE_BYTES - 1;
+TL_HMX_INLINE void tl_hmx_mac_tiles(const __fp16 *a, const __fp16 *w, size_t n,
+                                    unsigned last_channels = TL_HMX_T) {
+  // Deep activation's channel stop applies to its last tile, in groups of 8.
+  // Each FP16 input channel has 32 weight halves in this packed column.
+  const uint32_t act_rt =
+      TL_HMX_SPATIAL_RT | ((last_channels - 1) << 2) | ((n - 1) << 11);
+  const uint32_t weight_rt =
+      (n - 1) * TL_HMX_TILE_BYTES + last_channels * TL_HMX_T * sizeof(*w) - 1;
   asm volatile("{ activation.hf = mxmem(%0, %1):deep\n"
                "  weight.hf = mxmem(%2, %3) }\n" ::"r"(a),
                "r"(act_rt), "r"(w), "r"(weight_rt)

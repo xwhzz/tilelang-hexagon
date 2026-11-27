@@ -82,8 +82,8 @@ template <bool Signed, bool Normal> struct tl_hmx_panel_weights {
 // an HVX epilogue writes or adds into C. config holds the conversion config.
 //
 // M, N and K need not be multiples of 32 (Tails): HMX multiplies the tiles
-// that cover them. A partial K tile reads private masked copies of A and B;
-// the original buffers can contain live channels past this region. The
+// that cover them. Deep activation can stop at each 8-channel boundary.
+// Other partial K tiles use private masks so live channels are preserved. The
 // last tiles of a row or a column
 // store only C's rows and columns (tl_crouton_tile_store_part). Direct needs
 // M and N whole tiles. Without Tails, the loop has none of this code: its
@@ -126,22 +126,31 @@ TL_HMX_INLINE void tl_hmx_gemm_tiles(int M, int N, int K, D *c, int ldc,
   [[maybe_unused]] const int n_last = N - (NT - 1) * TL_HMX_T;
   constexpr bool can_mask_k = Tails && std::is_same_v<B, tl_hmx_weight_tiles>;
   const int tail = can_mask_k ? K % TL_HMX_T : 0;
-  const int full = KT - (tail != 0);
+  const bool needs_mask = tail % 8 != 0;
+  const int direct_tiles = KT - needs_mask;
   auto multiply = [&](int mt, int nt) TL_HEXAGON_VECTOR_INLINE {
     const half *row = a + mt * a_row_tile;
     const half *col = b.column(nt);
-    for (int k = 0; k < full; k += 32)
-      tl_hmx_mac_tiles(row + k * TL_HMX_TILE_ELMS, col + k * TL_HMX_TILE_ELMS,
-                       full - k < 32 ? full - k : 32);
+    for (int k = 0; k < direct_tiles; k += 32)
+      tl_hmx_mac_tiles(
+          row + k * TL_HMX_TILE_ELMS, col + k * TL_HMX_TILE_ELMS,
+          direct_tiles - k < 32 ? direct_tiles - k : 32,
+          !needs_mask && tail && direct_tiles - k <= 32 ? tail : TL_HMX_T);
     if constexpr (can_mask_k) {
-      if (tail) {
+      if (needs_mask) {
+        const int channels = (tail + 7) & ~7;
         half *a_tail = Direct ? stage : stage + 2 * TL_HMX_TILE_ELMS;
         half *b_tail = a_tail + TL_HMX_TILE_ELMS;
-        tl_crouton_copy_columns(a_tail, row + full * TL_HMX_TILE_ELMS, tail);
-        // Each output column shares its masked weight tile across all rows.
-        if (mt == 0)
-          tl_crouton_copy_rows(b_tail, col + full * TL_HMX_TILE_ELMS, tail);
-        tl_hmx_mac_tiles(a_tail, b_tail, 1);
+        // Masking a column of the activation tile touches every vector.
+        // Reuse that tile across output columns and copy just the live weight
+        // rows.
+        if (nt == 0)
+          tl_crouton_copy_columns(a_tail, row + direct_tiles * TL_HMX_TILE_ELMS,
+                                  tail);
+        if (NT > 1 || mt == 0)
+          tl_crouton_copy_rows(b_tail, col + direct_tiles * TL_HMX_TILE_ELMS,
+                               tail, channels);
+        tl_hmx_mac_tiles(a_tail, b_tail, 1, channels);
       }
     }
   };
@@ -190,8 +199,10 @@ TL_HMX_INLINE void tl_hmx_gemm_tiles(int M, int N, int K, D *c, int ldc,
     // under them, so that the worker's HVX work outside its turn shrinks.
     const bool under = !Direct && KT >= 32;
     int last_mt = -1, last_nt = 0;
-    for (int nt = 0; nt < NT; ++nt)
-      for (int mt = 0; mt < MT; ++mt, slot ^= 1) {
+    for (int outer = 0; outer < (needs_mask ? MT : NT); ++outer)
+      for (int inner = 0; inner < (needs_mask ? NT : MT); ++inner, slot ^= 1) {
+        int mt = needs_mask ? outer : inner;
+        int nt = needs_mask ? inner : outer;
         tl_hmx_unit_acquire();
         tl_hmx_set_scales(config);
         tl_hmx_clear_acc();
@@ -214,8 +225,10 @@ TL_HMX_INLINE void tl_hmx_gemm_tiles(int M, int N, int K, D *c, int ldc,
     tl_hmx_set_scales(config);
     // The previous tile, whose epilogue runs while HMX multiplies.
     int last_mt = -1, last_nt = 0;
-    for (int nt = 0; nt < NT; ++nt)
-      for (int mt = 0; mt < MT; ++mt, slot ^= 1) {
+    for (int outer = 0; outer < (needs_mask ? MT : NT); ++outer)
+      for (int inner = 0; inner < (needs_mask ? NT : MT); ++inner, slot ^= 1) {
+        int mt = needs_mask ? outer : inner;
+        int nt = needs_mask ? inner : outer;
         tl_hmx_clear_acc();
         multiply(mt, nt);
         // HVX slices B and runs the previous tile's epilogue while HMX

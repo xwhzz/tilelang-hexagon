@@ -19,8 +19,8 @@ calls), each output tile is a critical section of its own instead, and its
 epilogue runs outside it, while another worker multiplies.
 
 M, N and K need not be multiples of 32. A and B then fill the tiles that
-cover them, their buffers padded (``PadHMXOperands``); the call masks the
-last partial K tile in private staging before it multiplies. It writes only
+cover them, their buffers padded (``PadHMXOperands``); the call stops HMX at the
+last group of eight channels and masks a partial group in private staging. It writes only
 C's own rows and columns of its last tiles, or
 whole tiles when C is padded too (``hexagon.padded_c``, which
 ``PadHMXOperands`` sets when the call writes all of C). A C of fp16 that is not
@@ -212,9 +212,9 @@ class GemmHMX(GemmBase):
         if self.gemm_node.annotations.get(_ROWS, None) is not None and not _whole(M):
             raise ValueError(f"{name}: run-time rows need M a multiple of {TILE}, not {M}")
 
-        # A partial K needs one masked tile per operand. Direct output leaves
+        # A sub-eight-channel tail needs one masked tile per operand. Direct output leaves
         # the two existing staging slots free for these operands.
-        stage_elems = (2 if _whole(K) or direct else 4) * TILE_ELEMS
+        stage_elems = (2 if K % 8 == 0 or direct else 4) * TILE_ELEMS
 
         def call(c, ldc, rows_major: bool, aligned: bool, clear, stage, config):
             flags = [_flag(rows_major), _flag(aligned), shared, _flag(direct)]
