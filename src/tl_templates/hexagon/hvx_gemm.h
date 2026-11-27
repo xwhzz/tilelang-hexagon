@@ -820,14 +820,14 @@ TL_DEVICE void tl_gemm_weight_panels(TC *__restrict__ c,
   }
 }
 
-// Four compact rows on v79: two rows share each Crouton weight load. Two
-// panels keep eight even/odd qf32 chains live in the same K order as the
-// four-panel, single-row path.
+// Four compact rows on v79, with weights in VTCM: two rows share each Crouton
+// weight load. Two panels keep eight even/odd qf32 chains live in the same K
+// order as the four-panel, single-row path.
 #if __HVX_ARCH__ == 79
 template <int N, int K>
-TL_DEVICE void
-tl_gemm_weight_row_pairs(float *__restrict__ C, const half *__restrict__ A,
-                         const half *__restrict__ B, bool clear) {
+TL_GEMM void
+tl_hvx_gemm_weight_row_pairs(float *__restrict__ C, const half *__restrict__ A,
+                             const half *__restrict__ B, bool clear) {
   using V = tl_gemm_operand<half>;
   constexpr int G = 2;
 #pragma clang loop unroll(disable)
@@ -878,14 +878,6 @@ TL_GEMM void tl_hvx_gemm_weight(TC *C, const half *A, const half *B,
                                 bool clear) {
   static_assert(N % 32 == 0 && K % 32 == 0,
                 "a weight operand covers whole Crouton tiles");
-#if __HVX_ARCH__ == 79
-  if constexpr (M == 4 && AlignA && LdA == K && LdC == N &&
-                PanelStride == K * 32 && std::is_same_v<TC, float> &&
-                ((N == 256 && K == 128) || (N == 128 && K == 256))) {
-    tl_gemm_weight_row_pairs<N, K>(C, A, B, clear);
-    return;
-  }
-#endif
   // Four panels share each broadcast of A: their accumulators, loads and
   // products fit the registers.
   constexpr int P = N / 32;

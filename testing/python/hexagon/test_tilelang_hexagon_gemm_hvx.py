@@ -191,6 +191,29 @@ def test_a_weight_layout_b_runs_on_hvx():
     assert call.startswith("tl_hvx_gemm_weight<16, 64, 64, 64, 64, true, 2048>(")
 
 
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+@pytest.mark.parametrize("n,k", [(256, 128), (128, 256)])
+def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, n, k):
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((4, k), "float16"), B: T.Tensor((k, n), "float16"), C: T.Tensor((4, n), "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared((k, n), "float16")
+            T.annotate_layout({B: make_hmx_weight_layout(B), b: make_hmx_weight_layout(b)})
+            T.dma_copy(B, b)
+            T.dma_wait()
+            T.gemm(A, B, C, clear_accum=True)
+            T.gemm(A, b, C)
+
+    source = _source(kernel)
+    generic = _calls(source, "tl_hvx_gemm_weight")
+    paired = _calls(source, "tl_hvx_gemm_weight_row_pairs")
+    assert len(generic) == (1 if arch == "v79" else 2)
+    assert len(paired) == (1 if arch == "v79" else 0)
+    assert "(&(B[0]))" in generic[0]
+
+
 def test_operands_in_other_layouts_run_as_scalar_loops(caplog):
     with caplog.at_level(logging.WARNING, logger="tilelang.hexagon.op.gemm"):
         source = _source(_laid_out_b(make_hmx_activation_layout))

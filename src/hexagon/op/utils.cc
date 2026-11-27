@@ -101,7 +101,9 @@ PrimExpr RegionArg(const Buffer &buffer, const Array<Range> &ranges,
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.hexagon.RowMajor", hexagon::RowMajor);
+  refl::GlobalDef()
+      .def("tl.hexagon.RowMajor", hexagon::RowMajor)
+      .def("tl.hexagon.IsVTCMBuffer", hexagon::IsVTCMBuffer);
 }
 
 } // namespace tl

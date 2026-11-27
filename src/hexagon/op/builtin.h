@@ -200,6 +200,9 @@ TVM_DLL const Op &hexagon_hvx_gemm();
 // boundary. The seven integers and booleans print as template arguments.
 TVM_DLL const Op &hexagon_hvx_gemm_weight();
 
+// Four compact fp16 rows times VTCM-resident Crouton weights on v79.
+TVM_DLL const Op &hexagon_hvx_gemm_weight_row_pairs();
+
 // tl_hvx_gemm_int<M, N, K, b_bits, b_signed, lda, ldc, align_c>(C, A, B,
 // panel_bytes, clear) (hvx_gemm.h): C = A B^T exactly in int32, or C += A B^T
 // unless clear, on HVX: A int8, uint8 or int16 with rows lda elements apart, B

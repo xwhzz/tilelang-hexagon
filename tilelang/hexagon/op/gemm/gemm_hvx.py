@@ -34,6 +34,7 @@ GEMM_INST_HVX_BLOCK_SCALED = "hexagon.hvx.blockscaled"
 
 logger = logging.getLogger(__name__)
 
+_in_vtcm = tvm_ffi.get_global_func("tl.hexagon.IsVTCMBuffer")
 _row_major = tvm_ffi.get_global_func("tl.hexagon.RowMajor")
 _hmx_rejection = tvm_ffi.get_global_func("tl.hexagon.GemmHMXRejection")
 
@@ -163,7 +164,7 @@ class GemmHVX(GemmBase):
             return f"{self.B.name}'s region is not whole Crouton tiles"
         return ""
 
-    def _lower_weight(self):
+    def _lower_weight(self, target):
         M, N, K = self.M, self.N, self.K
         a, lda, align_a = self._operand(self.ARegion, M, K, "r")
         c, ldc, _ = self._operand(self.CRegion, M, N, "rw")
@@ -173,9 +174,29 @@ class GemmHVX(GemmBase):
         panel_stride = int(self.B.shape[k_axis]) // TILE * TILE_ELEMS
         origin = tuple(r.min for r in self.BRegion.region)
         b = T.access_ptr(self.B[origin], "r", (N // TILE - 1) * panel_stride + K * TILE)
+        clear = self.clear_accum
+        # Pairing rows shares B loads in VTCM, but loses bandwidth when
+        # streaming the same Crouton panels from DDR.
+        if (
+            (M, N, K) in ((4, 256, 128), (4, 128, 256))
+            and str(target.attrs.get("mcpu", "")) == "hexagonv79"
+            and _in_vtcm(self.B)
+            and align_a
+            and lda == K
+            and ldc == N
+            and panel_stride == K * TILE
+            and self.C.dtype == "float32"
+        ):
+            gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_weight_row_pairs")
+
+            @T.prim_func
+            def _gemm_row_pairs() -> None:
+                T.evaluate(tirx.call_intrin("void", gemm, N, K, c, a, b, T.Cast("bool", clear)))
+
+            return _gemm_row_pairs
+
         gemm = tirx.op.Op.get("tl.hexagon_hvx_gemm_weight")
         flags = [lda, ldc, tirx.const(bool(align_a), "bool"), tirx.const(panel_stride, "int32")]
-        clear = self.clear_accum
 
         @T.prim_func
         def _gemm_hvx_weight() -> None:
@@ -196,7 +217,7 @@ class GemmHVX(GemmBase):
             logger.warning("T.gemm(%s, %s, %s) runs as a scalar loop, not on HVX: %s", self.A.name, self.B.name, self.C.name, why)
             return GemmScalar.lower(self, layout_map, target, thread_bounds, thread_var, mbar_phase_expr)
         if isinstance(layout, CroutonLayout):
-            return self._lower_weight()
+            return self._lower_weight(target)
         logger.debug(
             "T.gemm(%s, %s, %s) runs on HVX, not on HMX: %s", self.A.name, self.B.name, self.C.name, _hmx_rejection(self.gemm_node)
         )
