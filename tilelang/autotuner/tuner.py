@@ -103,6 +103,8 @@ def _can_reuse_inputs(params: list[KernelParam], cached_params: list[KernelParam
 
     symbolic_dims: dict[Var, int] = {}
     for param, cached_param, value in zip(params, cached_params, inputs):
+        if param.is_scalar() != cached_param.is_scalar():
+            return False
         if not isinstance(value, torch.Tensor):
             # Python scalars do not retain their kernel dtype. Compare the
             # signatures instead of duplicating backend scalar conversion rules.

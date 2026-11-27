@@ -311,7 +311,7 @@ class AutotuneResult:
         params_path = os.path.join(cache_path, PARAMS_PATH)
         if verbose:
             logger.debug(f"Saving kernel parameters to disk: {params_path}")
-        self._safe_write_file(params_path, "w", lambda f: f.write(dump_kernel_params(kernel.params)))
+        self._safe_write_file(params_path, "w", lambda f: f.write(dump_kernel_params(kernel.params, func=self.func)))
 
     def _load_kernel_from_disk(
         self,
@@ -381,7 +381,7 @@ class AutotuneResult:
             if verbose:
                 logger.debug(f"Loading kernel parameters from file: {params_path}")
             with open(params_path) as f:
-                kernel_params = load_kernel_params(f.read())
+                kernel_params = load_kernel_params(f.read(), func=func)
         except Exception as e:
             logger.error(f"Error loading kernel parameters from disk: {e}")
 

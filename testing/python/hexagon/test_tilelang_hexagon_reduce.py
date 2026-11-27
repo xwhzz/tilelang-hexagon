@@ -71,13 +71,93 @@ def test_rows_of_any_length_use_the_same_call():
     )
 
 
-def test_outer_axes_loop_around_the_call():
+def _strided_row_reduction(op, dtype, column_stride):
+    @T.prim_func
+    def kernel(a: T.Tensor((2, 8), dtype), out: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            storage = T.alloc_shared((2, 8), dtype)
+            T.copy(a, storage)
+            src = T.StridedTensor((2, 4), (8, column_stride), dtype, data=storage.data)
+            dst = T.alloc_shared((2,), "float32")
+            getattr(T, f"reduce_{op}")(src, dst, dim=1)
+            T.copy(dst, out)
+
+    return kernel
+
+
+def test_hvx_row_helper_requires_unit_column_stride():
+    for stride in [1, 2]:
+        src = _source(_strided_row_reduction("sum", "float32", stride))
+        assert ("tl_hvx_reduce_rows<" in src) == (stride == 1)
+
+
+def _compact_identity_reduction(offset):
+    @T.prim_func
+    def kernel(a: T.Tensor((2, 32), "float32"), out: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            src = T.sblock_alloc_buffer((2, 32), "float32", strides=(65, 2), elem_offset=offset, scope="shared.dyn")
+            dst = T.sblock_alloc_buffer((2,), "float32", strides=(3,), scope="shared.dyn")
+            T.annotate_layout({src: T.Layout((2, 32), lambda r, k: [r, k]), dst: T.Layout((2,), lambda r: [r])})
+            for r, k in T.grid(2, 32):
+                src[r, k] = a[r, k]
+            T.reduce_sum(src, dst, dim=1)
+            for r in T.serial(2):
+                out[r] = dst[r]
+
+    return kernel
+
+
+@pytest.mark.parametrize(("offset", "aligned"), [(0, "true"), (1, "false")])
+def test_row_reduction_uses_the_remapped_private_tile_pitch(offset, aligned):
+    source = _source(_compact_identity_reduction(offset))
+    assert f"tl_hvx_reduce_rows<TL_REDUCE_SUM, float, {aligned}>" in source
+    assert ", 2, 32, 32, 1, (bool)1);" in source
+
+
+@DEVICE
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_strided_row_reduction_matches_logical_elements(op, dtype):
+    import torch
+
+    data = torch.tensor([[1, 99, 2, 99, 3, 99, 4, 99], [5, 99, 6, 99, 7, 99, 8, 99]], dtype=getattr(torch, dtype))
+    kernel = tilelang.compile(_strided_row_reduction(op, dtype, 2), out_idx=1, target="hexagon")
+    try:
+        logical = data[:, ::2].float()
+        expected = logical.sum(dim=1) if op == "sum" else logical.amax(dim=1)
+        torch.testing.assert_close(kernel(data), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+def test_contiguous_outer_axes_form_one_row_reduction():
     source = _source(_make("sum", (4, 24, 96), 2, "float32", "float32"))
-    assert "for (int32_t i0 = 0; i0 < 4; ++i0) {" in source
-    assert (
-        "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[(i0 * 24)])), (&(((float*)src)[(i0 * 2304)])), 24, 96, 96, 1, (bool)1);"
-        in source
-    )
+    assert "tl_hvx_reduce_rows<TL_REDUCE_SUM, float, true>((&(((float*)dst)[0])), (&(((float*)src)[0])), 96, 96, 96, 1, (bool)1);" in source
+
+
+def _pitched_head_reduce(q, src_pitch, dst_pitch):
+    @T.prim_func
+    def kernel(
+        a: T.Tensor((3, src_pitch, 16), "float32"), seed: T.Tensor((3, dst_pitch), "float32"), out: T.Tensor((3, dst_pitch), "float32")
+    ):
+        with T.Kernel(1):
+            x = T.alloc_shared((3, src_pitch, 16), "float32")
+            y = T.alloc_shared((3, dst_pitch), "float32")
+            T.copy(a, x)
+            T.copy(seed, y)
+            T.reduce_sum(x[:, :q, 3:11], y[:, :q], dim=2, clear=False)
+            T.copy(y, out)
+
+    return kernel
+
+
+@pytest.mark.parametrize(
+    ("q", "src_pitch", "dst_pitch", "geometry"),
+    [(2, 2, 2, "6, 8, 16, 1"), (2, 3, 2, "2, 8, 16, 1"), (2, 2, 3, "2, 8, 16, 1"), (1, 3, 4, "3, 8, 48, 4")],
+)
+def test_row_coalescing_proves_both_boundary_pitches(q, src_pitch, dst_pitch, geometry):
+    source = _source(_pitched_head_reduce(q, src_pitch, dst_pitch))
+    assert f", {geometry}, (bool)0);" in source
 
 
 def _make_regions(op, clear=True):
@@ -345,6 +425,21 @@ def _check(op, shape, dim, src_dtype, dst_dtype, clear=True, scope="shared"):
             torch.testing.assert_close(out.double(), expected.to(out.dtype).double(), rtol=tol, atol=tol * shape[dim])
         else:
             torch.testing.assert_close(out, expected.to(out.dtype), rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+@pytest.mark.parametrize("dtype", ["int8", "uint8"])
+def test_byte_rows_sum_into_fp32(dtype):
+    import torch
+
+    # Two full registers and a tail, with signed and unsigned byte extrema.
+    x = torch.arange(4 * 259).to(getattr(torch, dtype)).reshape(4, 259)
+    init = torch.tensor([0.25, -0.5, 0.75, -1.0])
+    kernel = tilelang.compile(_make("sum", (4, 259), 1, dtype, "float32", clear=False), out_idx=2, target="hexagon")
+    try:
+        torch.testing.assert_close(kernel(x, init), x.float().sum(1) + init, rtol=0, atol=0)
     finally:
         kernel.adapter.close()
 

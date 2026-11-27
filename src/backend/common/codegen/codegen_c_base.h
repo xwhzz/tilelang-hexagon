@@ -101,6 +101,8 @@ public:
   }
 
 protected:
+  bool HasImportedSource() const { return !import_c_stream_.str().empty(); }
+
   /*! \brief Emit backend headers whose requirements are known after codegen. */
   virtual void EmitPreamble_(std::ostream &) const {}
 

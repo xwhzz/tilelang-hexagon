@@ -13,6 +13,7 @@ import torch
 import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tilelang.hexagon import language as T
 from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remote_dir
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
@@ -24,7 +25,7 @@ import bundle  # noqa: E402
 import convert  # noqa: E402
 import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
-from decode import Decoder, make_decode  # noqa: E402
+from decode import Decoder, add_gumbel, make_decode  # noqa: E402
 from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
 from prefill import make_prefill  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
@@ -304,6 +305,111 @@ def test_decode_matches_the_reference(tiny_bundle):
         torch.testing.assert_close(torch.tensor(scores), torch.tensor(ref_scores), rtol=1e-3, atol=1e-3)
     finally:
         decoder.close()
+
+
+@pytest.mark.parametrize(
+    "rows,capacity,n_prompt,n_new,chunk,fp16",
+    [
+        (None, 32, 1, 32, 32, False),
+        (None, 8, 23, 15, 12, True),
+        (None, 2, 5, 3, 1, False),
+        (8, 11, 29, 18, 16, True),
+        (8, 3, 10, 4, 16, False),
+        (8, 3, 10, 4, 16, True),
+        (None, 16, 4, 6, 16, False),
+    ],
+)
+def test_stream_bounds_token_storage_without_repeating_positions(rows, capacity, n_prompt, n_new, chunk, fp16):
+    class Calls(Decoder):
+        def reset(self):
+            self.consumed = []
+            self.calls = []
+
+        def prefill(self, ids, pos0):
+            assert pos0 == len(self.consumed)
+            assert len(ids) <= capacity
+            assert self.fp16 or pos0 + -(-len(ids) // rows) * rows <= self.max_pos
+            self.consumed.extend(ids)
+            self.calls.append("prefill")
+
+        def run(self, ids, pos0, n, n_forced, temperature, seed):
+            assert pos0 == len(self.consumed) and n + 1 <= capacity
+            assert n_forced == len(ids) and (temperature, seed) == (0.7, 21)
+            out = list(ids)
+            for step in range(n):
+                self.consumed.append(out[step])
+                if step + 1 >= n_forced:
+                    out.append((out[step] + pos0 + step + seed) % 101)
+            self.calls.append("decode")
+            return out, None
+
+    decoder = Calls.__new__(Calls)
+    decoder.prefill_rows, decoder.max_tokens, decoder.max_pos, decoder.fp16 = rows, capacity, n_prompt + n_new - 1, fp16
+    prompt, expected = list(range(n_prompt)), []
+    for pos in range(n_prompt - 1, n_prompt - 1 + n_new):
+        expected.append(((expected[-1] if expected else prompt[-1]) + pos + 21) % 101)
+    parts = list(decoder.stream(prompt, n_new, 0.7, 21, chunk))
+    assert all(1 <= len(part) <= chunk for part in parts)
+    assert [token for part in parts for token in part] == expected
+    assert decoder.consumed == prompt + expected[:-1]
+    if not rows and n_prompt + n_new <= capacity:
+        assert decoder.calls == ["decode"]
+    assert decoder.generate(prompt, n_new, 0.7, 21) == expected
+
+
+def test_generation_rejects_impossible_requests_before_mutating_state():
+    decoder = Decoder.__new__(Decoder)
+    decoder.max_pos, decoder.max_tokens = 4, 4
+    assert decoder.generate([1], 0) == []
+    for prompt, n, chunk in (([], 1, 1), ([1], -1, 1), ([1], 1, 0), ([1, 2], 4, 2)):
+        with pytest.raises(ValueError):
+            list(decoder.stream(prompt, n, chunk=chunk))
+    decoder.max_tokens = 1
+    with pytest.raises(ValueError, match="storage"):
+        decoder.generate([1], 1)
+
+
+@DEVICE
+@pytest.mark.parametrize("model", ["quantized", "lfm3"])
+def test_generation_with_short_token_buffer_matches_single_steps(model, tiny_bundle, fp16_bundle):
+    path = tiny_bundle[-1] if model == "quantized" else fp16_bundle(model)
+    decoder = Decoder(path, max_pos=256, max_tokens=8, prefill_rows=None)
+    prompt = [1, 523, 77, 1999, 3001, 12, 8, 4000, 5, 93, 78]
+    try:
+        for temperature in (0, 0.8):
+            decoder.reset()
+            for pos, token in enumerate(prompt[:-1]):
+                decoder.run([token, prompt[pos + 1]], pos, 1, 2, temperature, 17)
+            expected, token = [], prompt[-1]
+            for pos in range(len(prompt) - 1, len(prompt) - 1 + 15):
+                out, _ = decoder.run([token], pos, 1, 1, temperature, 17)
+                token = out[-1]
+                expected.append(token)
+            assert decoder.generate(prompt, 15, temperature, 17) == expected
+    finally:
+        decoder.close()
+
+
+@DEVICE
+def test_sampling_highest_bin():
+    # At seed 26, position 0, the hash of vocabulary index 118408 ends
+    # in the highest bin. Its fp32 midpoint rounds to 1 before clamping.
+    @T.prim_func
+    def sample(scores: T.Tensor((1, 32), "float32")):
+        with T.Kernel(1):
+            hx = T.alloc_shared((1, 32), "uint32")
+            hy = T.alloc_shared((1, 32), "uint32")
+            add_gumbel(scores, T.float32(1), 26, 0, 118400, hx, hy)
+
+    kernel = tilelang.compile(sample, target="hexagon")
+    try:
+        scores = torch.zeros((1, 32))
+        kernel(scores)
+        assert scores.isfinite().all()
+        expected = -torch.log(-torch.log(torch.tensor(1.0 - 2.0**-24)))
+        torch.testing.assert_close(scores[0, 8], expected)
+    finally:
+        kernel.adapter.close()
 
 
 @DEVICE

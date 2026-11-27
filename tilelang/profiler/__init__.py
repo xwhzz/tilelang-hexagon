@@ -5,7 +5,7 @@ from typing import Any, Literal
 from collections.abc import Callable
 from functools import partial
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tilelang.utils.tensor import (
     get_tensor_supply,
     TensorSupplyType,
@@ -115,7 +115,7 @@ class Profiler:
                     )
             else:
                 new_shape.append(dim)
-        return KernelParam(dtype=param.dtype, shape=new_shape)
+        return replace(param, shape=new_shape)
 
     def _get_params(self, with_output=False):
         params = []

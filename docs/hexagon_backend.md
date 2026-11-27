@@ -440,6 +440,12 @@ barrier and does not release resources or drain DMA. See the
   separately from ARM FastRPC time: the ADB or SSH round trip depends on the
   transport and device. Agent replies combine their header and payload to avoid
   a delayed ACK between small writes.
+- **JIT tensor arguments.** Both eager JIT and `tilelang.compile` copy a supplied
+  writable PyTorch tensor back into its original view after the kernel succeeds.
+  Supply `None` or omit the designated `out_idx` arguments to receive newly
+  allocated outputs. Supplying every output returns `None`. Kernels can read the
+  initial values of supplied outputs. Writable views must have distinct elements
+  and separate address ranges from other inline arguments.
 - **Sessions** (`tilelang.hexagon.runtime.session.Session`) serve models.
   - **Kernels.** Several kernels build into one skel and share one agent and one
     FastRPC session: one persistent worker pool per DSP process. Each lowers under its
@@ -481,6 +487,14 @@ barrier and does not release resources or drain DMA. See the
     inline), or a by-value int32 or float32 scalar. The host converts a Python coefficient
     to FP32 and sends the resulting bits, including signed zero, in one wire word. Pipeline
     stages accept constant coefficients. `Session.STEP` requires an integer parameter.
+  - **Imported C.** By default the Session compiles all kernels in one C++
+    translation unit. Include guards can share static state across kernels.
+    Use `Session(kernels, isolate_imports=True)` when imported private helpers
+    or macros belong to each kernel individually. The Session compiles each
+    generated kernel with C imports in its own translation unit. Static
+    variables become local to that unit. Public symbols follow C++ linkage,
+    and the kernels share the Session's DSP resources. `Session.of_lowered`
+    accepts the same option with sources from `lower_kernels`.
   - **Resident sequences.** `Session.run_sequence` accepts an explicit, finite list
     of `Run(kernel, args)` and `Copy(src, dst, nbytes, src_offset=0, dst_offset=0)`
     descriptors, imported from `tilelang.hexagon.runtime.session`. It sends the list

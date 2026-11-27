@@ -32,6 +32,7 @@
 #include "backend/common/target_utils.h"
 #include "common/int64_promoter.h"
 #include "common/loop_vectorization_utils.h"
+#include "hexagon/target_utils.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 #include <iostream>
@@ -55,8 +56,7 @@ namespace {
 
 // Whether the current target selects lane by lane
 // ("supports_vector_predicate").
-bool TargetHasVectorPredicates() {
-  Target target = Target::Current(false);
+bool TargetHasVectorPredicates(const Target &target = Target::Current(false)) {
   return target.defined() &&
          target->GetAttr<Bool>("supports_vector_predicate", Bool(false))
              .value();
@@ -137,36 +137,6 @@ PrimExpr SimplifyExprForAnalyzer(const PrimExpr &expr, int scale,
                                  arith::Analyzer *analyzer);
 
 } // namespace
-
-/*!
- * \brief Check if buffer strides represent a contiguous (row-major) layout.
- * \param buffer The buffer to check.
- * \param analyzer The analyzer for symbolic comparison.
- * \return True if strides are empty (implicitly contiguous) or match row-major
- * layout.
- */
-bool IsBufferContiguous(const Buffer &buffer, arith::Analyzer *analyzer) {
-  if (buffer->strides.empty()) {
-    return true;
-  }
-  if (buffer->strides.size() != buffer->shape.size()) {
-    return false;
-  }
-  // For row-major layout:
-  // strides[n-1] = 1
-  // strides[i] = strides[i+1] * shape[i+1]
-  int n = buffer->shape.size();
-  PrimExpr expected_stride = make_const(buffer->shape[0].dtype(), 1);
-  for (int i = n - 1; i >= 0; --i) {
-    if (!analyzer->CanProveEqual(buffer->strides[i], expected_stride)) {
-      return false;
-    }
-    if (i > 0) {
-      expected_stride = expected_stride * buffer->shape[i];
-    }
-  }
-  return true;
-}
 
 struct VectorizePlanResult {
   int vector_size;
@@ -1612,7 +1582,10 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 For VectorizeLoop(const For &loop, const arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
   For body = loop;
-  if (TargetHasVectorPredicates() && NeedsPredicateRewrite(loop)) {
+  const Target target = Target::Current(false);
+  // Hexagon skips the analyzer walk for maps without predicates.
+  if (TargetHasVectorPredicates(target) &&
+      (!TargetIsHexagon(target) || NeedsPredicateRewrite(loop))) {
     auto select_analyzer = analyzer->Clone();
     body = Downcast<For>(IfThenElseToSelect(select_analyzer.get())(loop));
   }

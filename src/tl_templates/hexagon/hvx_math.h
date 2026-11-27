@@ -43,25 +43,38 @@ TL_DEVICE HVX_Vector tl_hvx_mul_sf(HVX_Vector a, HVX_Vector b) {
 }
 
 // ---------------------------------------------------------------------------
-// exp2 over 32 fp32 lanes: 2^x = 2^k · 2^f, k = round(x), f ∈ [-0.5, 0.5].
-//   2^f : degree-5 minimax polynomial (Horner, accumulated in qf32)
-//   2^k : construct the fp32 bit pattern (k + 127) << 23  (reinterpret is free)
-// x is clamped to [-126, 126] so the exponent stays representable (very
-// negative inputs flush toward 0, which is what softmax wants).
-// ---------------------------------------------------------------------------
-TL_DEVICE HVX_Vector tl_hvx_exp2_vsf(HVX_Vector x) {
+// Accurate exp/exp2 over 32 fp32 lanes. Reduce the base-two exponent to
+// k + f, k = round(x), f in [-0.5, 0.5], and evaluate 2^f in qf32.
+template <bool Base2, bool Bounded = false>
+TL_HEXAGON_IEEE_ARITHMETIC static inline HVX_Vector
+tl_hvx_exp_impl(HVX_Vector input) {
+  // On v73/v75, qf32 can lose an input ulp near the top of the fp32 range.
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  constexpr bool IEEE = !Bounded;
+#else
+  constexpr bool IEEE = false;
+#endif
+  HVX_Vector x = input;
+  if constexpr (!Base2) {
+    HVX_Vector log2e = tl_hvx_splat_f(1.4426950408889634f);
+    x = IEEE ? Q6_Vsf_vmpy_VsfVsf(x, log2e) : tl_hvx_mul_sf(x, log2e);
+  }
   x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, tl_hvx_splat_f(-126.0f)),
-                         tl_hvx_splat_f(126.0f));
-  // k = round-to-nearest(x), f = x - k ∈ [-0.5, 0.5].  Q6_Vw_equals_Vsf
-  // truncates TOWARD ZERO, so bias by copysign(0.5, x) before the convert —
-  // otherwise f lands in (-1, 1) and the degree-5 minimax poly (fit on [-0.5,
-  // 0.5]) is evaluated outside its domain (~100x worse: 3e-6 -> ~3e-4).
-  HVX_Vector half_signed = Q6_V_vor_VV(
-      Q6_V_vand_VV(x, Q6_V_vsplat_R((int)0x80000000)), tl_hvx_splat_f(0.5f));
-  HVX_Vector ki =
-      Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, half_signed)); // trunc(x ± 0.5)
-  HVX_Vector kf = Q6_Vsf_equals_Vw(ki); // back to float for the residual
-  HVX_Vector f = tl_hvx_sub_sf(x, kf);  // f ∈ [-0.5, 0.5]
+                         tl_hvx_splat_f(Bounded ? 126.0f : 128.0f));
+  HVX_Vector ki, f;
+  if constexpr (Bounded) {
+    HVX_Vector half_signed = Q6_V_vor_VV(
+        Q6_V_vand_VV(x, Q6_V_vsplat_R((int)0x80000000)), tl_hvx_splat_f(0.5f));
+    ki = Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, half_signed));
+    f = tl_hvx_sub_sf(x, Q6_Vsf_equals_Vw(ki));
+  } else {
+    // At this bias the fp32 ULP is one. The rounded exponent is in the
+    // low mantissa bits; only those bits are used when scaling the result.
+    HVX_Vector bias = tl_hvx_splat_f(0x1.8p23f);
+    ki = Q6_Vsf_vadd_VsfVsf(x, bias);
+    HVX_Vector kf = Q6_Vsf_vsub_VsfVsf(ki, bias);
+    f = Q6_Vsf_vsub_VsfVsf(x, kf);
+  }
   // 2^f via Horner in qf32:  ((((C5 f + C4) f + C3) f + C2) f + C1) f + C0
   HVX_Vector fq = Q6_Vqf32_vadd_VsfVsf(f, Q6_V_vzero()); // f as qf32
   HVX_Vector acc =
@@ -74,12 +87,29 @@ TL_DEVICE HVX_Vector tl_hvx_exp2_vsf(HVX_Vector x) {
                                tl_hvx_splat_f(0.2402265069f));
   acc = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq),
                                tl_hvx_splat_f(0.6931471806f));
-  acc = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq),
-                               tl_hvx_splat_f(1.0000000000f));
-  HVX_Vector p = Q6_Vsf_equals_Vqf32(acc); // 2^f
-  // 2^k = reinterpret((k + 127) << 23)
-  HVX_Vector e = Q6_Vw_vasl_VwR(Q6_Vw_vadd_VwVw(ki, Q6_V_vsplat_R(127)), 23);
-  return tl_hvx_mul_sf(p, e);
+  HVX_Vector product = Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq);
+  if constexpr (Bounded) {
+    HVX_Vector p = Q6_Vsf_equals_Vqf32(
+        Q6_Vqf32_vadd_Vqf32Vsf(product, tl_hvx_splat_f(1.0f)));
+    // Reciprocal-based sigmoid/tanh need a finite exponent, including at
+    // their saturated ends.
+    HVX_Vector e = Q6_Vw_vasl_VwR(Q6_Vw_vadd_VwVw(ki, Q6_V_vsplat_R(127)), 23);
+    return tl_hvx_mul_sf(p, e);
+  }
+  // Add the constant in fp32 so an integral exponent has exactly 2^f = 1.
+  HVX_Vector p =
+      Q6_Vsf_vadd_VsfVsf(Q6_Vsf_equals_Vqf32(product), tl_hvx_splat_f(1.0f));
+
+  // Add k directly to the biased exponent. For k == 128 and f < 0 the
+  // scaled polynomial still fits in fp32, although 2^k would overflow.
+  // For exp the first overflowing fp32 input times log2(e) rounds to 128.
+  HVX_Vector r = Q6_Vw_vadd_VwVw(p, Q6_Vw_vasl_VwR(ki, 23));
+  // min/max with a NaN can select the clamp bound. Keep NaNs distinct from
+  // numerical overflow, including when the input was a signaling NaN.
+  HVX_Vector magnitude = Q6_Vw_vasl_VwR(input, 1);
+  return Q6_V_vmux_QVV(
+      Q6_Q_vcmp_gt_VuwVuw(magnitude, Q6_V_vsplat_R(0xff000000)),
+      Q6_V_vsplat_R(0x7fc00000), r);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +167,14 @@ TL_DEVICE HVX_Vector tl_hvx_select(HVX_VectorPred q, HVX_Vector x,
   return Q6_V_vmux_QVV(q, x, y);
 }
 
+TL_DEVICE HVX_Vector tl_hvx_exp2_vsf(HVX_Vector x) {
+  return tl_hvx_exp_impl<true>(x);
+}
 TL_DEVICE HVX_Vector tl_hvx_exp_vsf(HVX_Vector x) {
-  return tl_hvx_exp2_vsf(tl_hvx_mul_sf(x, tl_hvx_splat_f(1.4426950408889634f)));
+  return tl_hvx_exp_impl<false>(x);
+}
+TL_DEVICE HVX_Vector tl_hvx_exp_bounded_vsf(HVX_Vector x) {
+  return tl_hvx_exp_impl<false, true>(x);
 }
 
 // For m in [sqrt(1/2), sqrt(2)), subtract the mantissas exactly before
@@ -256,7 +292,8 @@ TL_DEVICE HVX_Vector tl_hvx_sqrt_vsf(HVX_Vector x) {
 
 // sigmoid(x) = 1/(1 + e^-x); exp2's clamp keeps it finite at both ends.
 TL_DEVICE HVX_Vector tl_hvx_sigmoid_vsf(HVX_Vector x) {
-  HVX_Vector e = tl_hvx_exp_vsf(Q6_V_vxor_VV(x, tl_hvx_bits((int)0x80000000)));
+  HVX_Vector e =
+      tl_hvx_exp_bounded_vsf(Q6_V_vxor_VV(x, tl_hvx_bits((int)0x80000000)));
   return tl_hvx_recip_vsf(tl_hvx_add_sf(tl_hvx_splat_f(1.0f), e));
 }
 
@@ -264,7 +301,7 @@ TL_DEVICE HVX_Vector tl_hvx_sigmoid_vsf(HVX_Vector x) {
 // form loses digits to cancellation, so an odd Taylor polynomial takes over.
 TL_DEVICE HVX_Vector tl_hvx_tanh_vsf(HVX_Vector x) {
   HVX_Vector one = tl_hvx_splat_f(1.0f);
-  HVX_Vector e = tl_hvx_exp_vsf(tl_hvx_add_sf(x, x));
+  HVX_Vector e = tl_hvx_exp_bounded_vsf(tl_hvx_add_sf(x, x));
   HVX_Vector q = tl_hvx_recip_vsf(tl_hvx_add_sf(e, one));
   HVX_Vector large = tl_hvx_sub_sf(one, tl_hvx_add_sf(q, q));
   HVX_Vector x2 = tl_hvx_mul_sf(x, x);
@@ -294,7 +331,7 @@ TL_DEVICE HVX_Vector tl_hvx_erf_vsf(HVX_Vector x) {
   p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(-0.284496736f));
   p = tl_hvx_add_sf(tl_hvx_mul_sf(p, t), tl_hvx_splat_f(0.254829592f));
   p = tl_hvx_mul_sf(p, t);
-  HVX_Vector g = tl_hvx_exp_vsf(
+  HVX_Vector g = tl_hvx_exp_bounded_vsf(
       Q6_V_vxor_VV(tl_hvx_mul_sf(a, a), tl_hvx_bits((int)0x80000000)));
   HVX_Vector y = Q6_V_vor_VV(tl_hvx_sub_sf(one, tl_hvx_mul_sf(p, g)), sign);
   HVX_Vector x2 = tl_hvx_mul_sf(x, x);

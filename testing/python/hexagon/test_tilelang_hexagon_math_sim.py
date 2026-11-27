@@ -41,7 +41,13 @@ def _inputs():
         [0, 0x80000000, 0xBF800000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000, 0x7F800001, 0xFF800001],
         dtype=np.uint32,
     ).view(np.float32)
-    log = np.concatenate([device, near_one, specials])
+    # Mix the high normal range with the adjacent input on either side of
+    # overflow. The vector runner exercises exp and exp2 on the same lanes.
+    exp_edges = []
+    for cutoff in (np.float32(128), np.float32(88.72283935546875)):
+        exp_edges.append(np.linspace(cutoff - 2, cutoff, 257, dtype=np.float32))
+        exp_edges.append(np.array([np.nextafter(cutoff, np.float32(0)), np.nextafter(cutoff, np.float32(np.inf))]))
+    log = np.concatenate([device, near_one, specials, *exp_edges])
     np.random.default_rng(73).shuffle(log)
     log = np.pad(log, (0, (-len(log)) % 32), constant_values=1).astype("<f4")
 
@@ -116,11 +122,11 @@ def test_hvx_math_accuracy_on_simulator(arch, tmp_path):
     data = output_path.read_bytes()
     assert struct.unpack_from("<6I", data) == (0x4856584D, int(arch[1:]), *counts)
     offset = 24
-    results = np.frombuffer(data, dtype="<f4", count=4 * log.size, offset=offset).reshape(-1, 4, 32)
+    results = np.frombuffer(data, dtype="<f4", count=6 * log.size, offset=offset).reshape(-1, 6, 32)
     offset += results.nbytes
-    results = results.transpose(1, 0, 2).reshape(4, -1)
+    results = results.transpose(1, 0, 2).reshape(6, -1)
     for name, actual, reference, fast in zip(
-        ["log", "log2", "log_fast", "log2_fast"], results, [np.log, np.log2, np.log, np.log2], [False, False, True, True]
+        ["log", "log2", "log_fast", "log2_fast"], results[:4], [np.log, np.log2, np.log, np.log2], [False, False, True, True]
     ):
         supported = np.isfinite(log) & (log > 0)
         _check_error(
@@ -138,6 +144,15 @@ def test_hvx_math_accuracy_on_simulator(arch, tmp_path):
             np.testing.assert_array_equal(np.isnan(special), np.isnan(expected))
             np.testing.assert_array_equal(np.isinf(special), np.isinf(expected))
             np.testing.assert_array_equal(np.signbit(special[np.isinf(expected)]), np.signbit(expected[np.isinf(expected)]))
+
+    for actual, reference, cutoff in zip(results[4:], [np.exp2, np.exp], [128.0, 88.72283935546875]):
+        near = np.isfinite(log) & (log >= cutoff - 2) & (log <= cutoff + 1)
+        with np.errstate(over="ignore"):
+            expected = reference(log[near].astype(np.float64)).astype(np.float32)
+        np.testing.assert_allclose(actual[near], expected, rtol=1e-5, atol=0)
+        assert (actual[log == 0] == 1.0).all()
+        assert np.isnan(actual[np.isnan(log)]).all()
+    assert (results[4, log == 127.0] == 2.0**127).all()
 
     for name, values, reference, kind, bound in zip(
         ["exp_fast_hf", "exp2_fast_hf", "sigmoid_fast_hf"],
