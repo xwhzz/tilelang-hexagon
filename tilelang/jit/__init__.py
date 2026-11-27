@@ -434,7 +434,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     def compile(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
         if self._runtime_policy is not None:
             selector = self.target if self.target is not None else default_target_cache_key()
-            bound = self._bound_factory(*self._target_choice(selector))
+            selector, target_key = self._target_choice(selector)
+            bound = self._ordinary_factories.get(target_key) or self._bound_factory(selector, target_key)
             if bound is not None:
                 factory, scope = bound
                 if scope is None:
@@ -526,9 +527,6 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             return None
         # An ordinary module has no session-owning backend. Only its selected
         # target can change, and a fixed ordinary target uses this factory itself.
-        ordinary = self._ordinary_factories.get(target_key)
-        if ordinary is not None:
-            return ordinary
         backend = self.execution_backend if self.execution_backend is not None else env.get_default_execution_backend()
         choice = (target_key, backend)
         if dispatch is _RUNTIME_UNRESOLVED or dispatch[0] != choice:
@@ -567,7 +565,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         return bound
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
-        if kwargs and kwargs.pop("__return_compile_arguments", False):
+        if "__return_compile_arguments" in kwargs and kwargs.pop("__return_compile_arguments"):
             logger.warning("`__return_compile_arguments` is deprecated and will be removed in future versions.")
             compile_args = {
                 "out_idx": self.out_idx,
@@ -587,21 +585,21 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             selector = self.target if self.target is not None else default_target_cache_key()
             if type(selector) is bytes and selector != b"auto":
                 target_key = selector
+            elif selector in (b"auto", "auto", None):
+                current = Target.current()
+                target_key = selector = "auto" if current is None else current
             else:
                 selector, target_key = self._target_choice(selector)
         if self._call_form_cache and self.mode == "lazy":
             try:
-                kernel = self._call_form_cache.get((target_key, args, tuple(kwargs.items()) if kwargs else ()), _CALL_FORM_CACHE_MISS)
-            except TypeError:
-                # Reserved tuning kwargs may contain an unhashable mapping.
+                return self._call_form_cache[target_key, args, tuple(kwargs.items()) if kwargs else ()]
+            except (KeyError, TypeError):
+                # Tuning kwargs and other unhashable arguments use the binder below.
                 pass
-            else:
-                if kernel is not _CALL_FORM_CACHE_MISS:
-                    return kernel
 
         has_tune_params = "__tune_params" in kwargs
         if self._runtime_policy is not None:
-            bound = self._bound_factory(selector, target_key)
+            bound = self._ordinary_factories.get(target_key) or self._bound_factory(selector, target_key)
             if bound is not None:
                 factory, scope = bound
                 if scope is None or (factory.is_lazy_mode() and isinstance(factory.func, JITFunc) and not factory.func.tensor_args):

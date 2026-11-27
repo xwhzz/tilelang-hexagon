@@ -3,7 +3,7 @@ from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass
 import inspect
 import builtins
-from functools import partial
+from functools import cached_property, partial
 
 from tilelang import env
 from tilelang.language.kernel import KernelLaunchFrame
@@ -1326,17 +1326,20 @@ class TirTemplate(Generic[_P, _T]):
         """Create template from lazy-style function that returns PrimFunc directly."""
         return cls(name=name, prim_func=prim_func, is_lazy_style=True)
 
+    @cached_property
+    def _buffers_by_parameter(self):
+        return {param.name: buffer for param, buffer in self.prim_func.buffer_map.items()}
+
     def _parse_phase2_key(self, **kwargs):
-        if self.matcher is None:
+        if not self.matcher:
             return ()
         result = []
-        buffers = {param.name: buffer for param, buffer in self.prim_func.buffer_map.items()}
         for k, ty, i, name in self.matcher.values():
             if name in kwargs:
                 result.append(kwargs.get(name))
             elif k in kwargs:
                 value = kwargs[k]
-                buffer = buffers[k]
+                buffer = self._buffers_by_parameter[k]
                 if ty == "shape":
                     result.append(_logical_shape_value(value, buffer, i))
                 elif ty == "stride":
