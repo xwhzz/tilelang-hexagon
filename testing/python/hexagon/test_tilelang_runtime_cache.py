@@ -494,3 +494,35 @@ def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch
     monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "c")
     assert factory(32) is cpu
     assert factory(64).target.kind.name == "c"
+
+
+def test_mutable_target_and_default_execution_backend(cache, monkeypatch):
+    import tilelang
+    from tilelang.hexagon import language as T
+    from tilelang.hexagon.runtime.session import Session
+
+    monkeypatch.setattr(Session, "of_lowered", classmethod(lambda *a, **kw: SimpleNamespace(kernels=[lambda *_: None], close=lambda: None)))
+    target = {"kind": "hexagon", "mcpu": "hexagonv79"}
+
+    @tilelang.jit(target=target, out_idx=1)
+    def factory(n):
+        @T.prim_func
+        def copy(x: T.Tensor((n,), "int32"), y: T.Tensor((n,), "int32")):
+            with T.Kernel(1):
+                for i in T.Parallel(n):
+                    y[i] = x[i]
+
+        return copy
+
+    v79 = factory(32)
+    target["mcpu"] = "hexagonv73"
+    assert factory(32).adapter.dsp_arch == "v73"
+    target.clear()
+    target["kind"] = "c"
+    assert factory(32).target.kind.name == "c"
+    target.update(kind="hexagon", mcpu="hexagonv79")
+    monkeypatch.setenv("TILELANG_EXECUTION_BACKEND", "cython")
+    with pytest.raises(ValueError, match="Invalid execution backend"):
+        factory(32)
+    monkeypatch.setenv("TILELANG_EXECUTION_BACKEND", "auto")
+    assert factory(32) is v79

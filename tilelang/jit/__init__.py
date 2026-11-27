@@ -17,7 +17,7 @@ from typing import (
     ParamSpec,
 )
 from collections.abc import Callable
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from tilelang import env
 from tilelang import tvm as tvm
@@ -537,12 +537,18 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         selector = self.target if self.target is not None else env.TILELANG_DEFAULT_TARGET
         if selector is None or selector == "auto":
             selector = Target.current(allow_none=True) or "auto"
-        if dispatch is _RUNTIME_UNRESOLVED or dispatch[0] != selector:
+        # A caller may edit a target dict in place between invocations.
+        target_key = repr(dict(selector)) if isinstance(selector, Mapping) else selector
+        backend = self.execution_backend if self.execution_backend is not None else env.get_default_execution_backend()
+        choice = (target_key, backend)
+        if dispatch is _RUNTIME_UNRESOLVED or dispatch[0] != choice:
             requested = env.get_default_target() if self.target is None and not isinstance(selector, Target) else selector
+            if isinstance(requested, Mapping):
+                requested = Target(dict(requested))
             from tilelang.cache import _resolve_cache_dispatch
 
             try:
-                _, context, _ = _resolve_cache_dispatch(requested, self.target_host, self.execution_backend, False)
+                _, context, _ = _resolve_cache_dispatch(requested, self.target_host, backend, False)
             except (ValueError, RuntimeError, AssertionError):
                 # An automatic target may have no runnable backend during
                 # source-only tracing, which does not need live state.
@@ -550,23 +556,24 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                     return None
                 raise
             policy = context.execution_backend
-            if policy.runtime_cache is None and self.target is not None and self.target != "auto":
+            fixed_target = self.target is not None and self.target != "auto" and not isinstance(self.target, Mapping)
+            if fixed_target and not any(spec.runtime_cache for spec in context.module.execution_backends):
                 self._runtime_policy = None
                 return None
-            self._runtime_policy = (selector, requested, policy)
+            self._runtime_policy = (choice, requested, policy)
         else:
             _, requested, policy = dispatch
         if policy.runtime_cache is None:
             return None
         token, capture = policy.runtime_cache()
-        key = (str(requested), token) if self.target is None or self.target == "auto" else token
+        key = (choice, token)
         bound = self._bound_factories.get(key)
         if bound is None:
             scope = capture()
             with scope():
                 target = determine_target(requested, return_object=True)
                 frontend = replace(self.func) if isinstance(self.func, JITFunc) else self.func
-                factory = replace(self, target=target, func=frontend)
+                factory = replace(self, target=target, execution_backend=policy.name, func=frontend)
                 factory._runtime_policy = None
                 factory._compile_scope = scope
                 bound = self._bound_factories.setdefault(key, (factory, scope))
