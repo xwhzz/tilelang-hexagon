@@ -117,3 +117,34 @@ def test_direct_vector_ir_still_requires_the_qualified_target(arch, vector_bits)
 @pytest.mark.parametrize("arch", ["v73", "v79"])
 def test_nonunit_outer_step_is_not_a_complete_contiguous_map(arch):
     _check(_map_ir("nonunit_step", arch=arch), False)
+
+
+@pytest.mark.parametrize("case", ["direct", "volatile_a", "volatile_b", "volatile_c", "volatile_alloc", "shifted", "target_width"])
+def test_grouped_division_keeps_order_and_tracks_its_operands(case):
+    buffers = [tir.decl_buffer((256,), "float32", name=name) for name in ("a", "b", "c")]
+    a, b, c = buffers
+    i = tir.Var("i", "int32")
+    index = tir.Ramp(i * 32, 1, 32)
+    source = tir.Ramp(i * 32 + 32, 1, 32) if case == "shifted" else index
+    store = tir.BufferStore(c, tir.BufferLoad(a, [source]) / tir.BufferLoad(b, [index]), [index])
+    loop = tir.For(i, 0, 4, tir.ForKind.SERIAL, store, annotations={"hexagon.group_div": 1})
+    if case == "volatile_alloc":
+        body = tir.SeqStmt([tir.AllocBuffer(a, annotations={"tirx.volatile": 1}), loop])
+    elif case.startswith("volatile_"):
+        buffer = dict(zip("abc", buffers))[case[-1]]
+        body = tir.AttrStmt(buffer.data, "volatile_scope", 1, loop)
+    else:
+        body = loop
+    bits = 512 if case == "target_width" else 1024
+    target = determine_target({"kind": "hexagon", "min_vector_bits": bits, "max_vector_bits": bits}, return_object=True)
+    func = tir.PrimFunc([buf.data for buf in buffers], body).with_attr("target", target)
+    result = InterleaveMaps()(tvm.IRModule({"main": func}))["main"].body
+    assert ("hexagon_try_div_map" in str(result)) == (case == "direct")
+    if case == "direct":
+        new_a = tir.decl_buffer((256,), "float32", name="new_a")
+        # Buffer uses in both branches refer to the same remappable definition.
+        definition = tir.SeqStmt([tir.DeclBuffer(a), result])
+        renamed = tir.stmt_functor.substitute(definition, {a.data: new_a.data}).seq[-1]
+        assert renamed.condition.a.args[1].args[0].buffer.data.same_as(new_a.data)
+        assert renamed.then_case.body.value.a.buffer.data.same_as(new_a.data)
+        assert int(renamed.then_case.annotations["hexagon.unroll_count"]) == 2

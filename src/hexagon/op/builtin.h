@@ -30,6 +30,10 @@ constexpr const char *kHexagonCooperative = "hexagon.cooperative";
 // loop unroll_count). Set by InterleaveMaps.
 constexpr const char *kHexagonUnrollCount = "hexagon.unroll_count";
 
+// Unconstrained parallel FP32 division is eligible for grouped register
+// scheduling.
+constexpr const char *kHexagonGroupDiv = "hexagon.group_div";
+
 // Disable software pipelining for the narrow v73/v79 half map selected by
 // InterleaveMaps. This does not change its arithmetic or vectorization.
 constexpr const char *kHexagonDisableSoftwarePipelining =
@@ -106,6 +110,8 @@ TVM_DLL const Op &hexagon_tanh_fast();
 TVM_DLL const Op &hexagon_sigmoid_fast();
 TVM_DLL const Op &hexagon_erf_fast();
 TVM_DLL const Op &hexagon_div_fast();
+// Compute a complete four-register-grouped FP32 map when access order allows.
+TVM_DLL const Op &hexagon_try_div_map();
 
 // tl_hvx_reduce_rows<kind, acc, aligned>(dst, src, rows, cols, src_stride,
 // dst_stride, clear) (hvx_reduce.h): reduces `rows` rows of `cols` elements

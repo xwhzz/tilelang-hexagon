@@ -264,7 +264,8 @@ def test_wide_float32_division_repairs_each_register():
     @T.prim_func
     def divide(a: T.Tensor((lanes,), "float32"), b: T.Tensor((lanes,), "float32"), out: T.Tensor((lanes,), "float32")):
         with T.Kernel(1):
-            out[T.Ramp(0, 1, lanes)] = a[T.Ramp(0, 1, lanes)] / b[T.Ramp(0, 1, lanes)]
+            for i in T.Parallel(lanes):
+                out[i] = a[i] / b[i]
 
     kernel = tilelang.compile(divide, out_idx=2, target="hexagon")
     try:

@@ -3,6 +3,7 @@
  * \brief Vectorize the full-register prefix of a pointwise parallel map.
  */
 #include "vectorize_map_tail.h"
+#include "hexagon/op/builtin.h"
 #include "hexagon/target_utils.h"
 #include "transform/loop_partition.h"
 
@@ -30,11 +31,23 @@ ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
       !(type.is_int() || type.is_uint() || type.is_float()))
     return std::nullopt;
   int lanes = MinVectorBits(target) / type.bits();
-  if (lanes < 2 || *extent <= lanes || *extent % lanes == 0 ||
+  const auto *div = store->value.as<DivNode>();
+  bool group_div = type == DataType::Float(32) && div &&
+                   div->a.as<BufferLoadNode>() && div->b.as<BufferLoadNode>() &&
+                   lanes == 32 && *extent >= 128 && *extent % 128 == 0 &&
+                   MaxVectorLoadBits(target, true) == 1024;
+  if (lanes < 2 || *extent <= lanes || (!group_div && *extent % lanes == 0) ||
       tvm::transform::PassContext::Current()
           ->GetConfig<Bool>("tirx.disable_vectorize", Bool(false))
           .value())
     return std::nullopt;
+  // Partitioning erases user scheduling annotations. Carry eligibility from
+  // the unconstrained parallel-map path while preserving its vector width.
+  if (group_div) {
+    For ordinary = PragmaUnrollLoop(VectorizeLoop(loop, analyzer, layouts));
+    ordinary.CopyOnWrite()->annotations.Set(attr::kHexagonGroupDiv, Integer(1));
+    return ordinary;
+  }
 
   // Require the same physical element offset for every access. This also
   // admits in-place maps and excludes shifted reads of the destination.

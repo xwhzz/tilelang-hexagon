@@ -536,3 +536,36 @@ def test_guarded_loads_read_zeros_out_of_bounds():
     out = kernel(table, x, 200)
     ref = x * torch.cat([table, torch.zeros(72, 32)])[200:328].repeat(1, 2)
     torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("case", ["direct", "user_width", "annotated", "scalar", "broadcast", "partial_group", "composite"])
+def test_only_unconstrained_full_fp32_division_maps_group_registers(case):
+    size = 160 if case == "partial_group" else 256
+
+    @T.prim_func
+    def divide(a: T.Tensor((size,), "float32"), b: T.Tensor((size,), "float32"), c: T.Tensor((size,), "float32")):
+        with T.Kernel(1):
+            if case == "scalar":
+                for i in T.serial(size):
+                    c[i] = a[i] / b[i]
+            elif case == "user_width":
+                for i in T.Parallel(size, coalesced_width=T.int32(32)):
+                    c[i] = a[i] / b[i]
+            elif case == "annotated":
+                for i in T.Parallel(size, annotations={"user_hint": T.int32(1)}):
+                    c[i] = a[i] / b[i]
+            else:
+                for i in T.Parallel(size):
+                    if case == "broadcast":
+                        c[i] = a[i] / b[0]
+                    elif case == "composite":
+                        c[i] = (a[i] + b[i]) / b[i]
+                    else:
+                        c[i] = a[i] / b[i]
+
+    source = _source(divide)
+    assert ("tl_hvx_try_div_map(" in source) == (case == "direct")
+    assert "// compute resources: none" in source
+    if case == "direct":
+        assert "#pragma clang loop unroll_count(2)" in source
+        assert "tl_hvx_div(*(float32*)" in source

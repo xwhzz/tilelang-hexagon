@@ -74,6 +74,11 @@ TIR_DEFINE_TL_BUILTIN(hexagon_div_fast)
                                Integer(CallEffectKind::kPure))
     .set_attr<TVectorizable>("TVectorizable", true);
 
+TIR_DEFINE_TL_BUILTIN(hexagon_try_div_map)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(hexagon_reduce_rows)
     .set_num_inputs(10)
     .set_attr<TCallEffectKind>("TCallEffectKind",

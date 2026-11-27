@@ -27,6 +27,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -322,27 +323,82 @@ private:
   Dependencies used_;
 };
 
+// Only group consecutive registers of the three flat kernel arguments. Scratch
+// or volatile allocations, shifted or strided accesses, and composite math keep
+// their exact loop. Checking the lowered ramps also covers layout rewriting.
+Array<PrimExpr>
+GroupedDivOperands(const For &loop,
+                   const std::unordered_set<const VarNode *> &parameters) {
+  const auto *store = loop->body.as<BufferStoreNode>();
+  const auto *div = store ? store->value.as<DivNode>() : nullptr;
+  const auto *a = div ? div->a.as<BufferLoadNode>() : nullptr;
+  const auto *b = div ? div->b.as<BufferLoadNode>() : nullptr;
+  const auto *extent = loop->extent.as<IntImmNode>();
+  if (!a || !b || store->predicate || a->predicate || b->predicate ||
+      div->dtype != DataType::Float(32, 32) || !extent || extent->value < 4 ||
+      extent->value % 4 || extent->value > INT32_MAX / 32 ||
+      !IsInt(loop->min, 0) || !loop->HasTrivialStep() || loop->thread_binding)
+    return {};
+  auto flat = [&](const Buffer &buf, const Array<PrimExpr> &indices) {
+    if (buf->dtype != DataType::Float(32) || buf.scope() != "global" ||
+        buf->shape.size() != 1 || !buf->strides.empty() ||
+        !IsInt(buf->elem_offset, 0) || indices.size() != 1 ||
+        !parameters.count(buf->data.get()))
+      return false;
+    const auto *ramp = indices[0].as<RampNode>();
+    const auto *mul = ramp ? ramp->base.as<MulNode>() : nullptr;
+    return mul && IsInt(ramp->stride, 1) && IsInt(ramp->lanes, 32) &&
+           mul->a.same_as(loop->loop_var) && IsInt(mul->b, 32);
+  };
+  if (flat(store->buffer, store->indices) && flat(a->buffer, a->indices) &&
+      flat(b->buffer, b->indices)) {
+    auto first = [](const Buffer &buffer) {
+      return Call(DataType::Handle(), builtin::address_of(),
+                  {BufferLoad(buffer, {0})});
+    };
+    return {first(store->buffer), first(a->buffer), first(b->buffer),
+            loop->extent};
+  }
+  return {};
+}
+
 class MapInterleaver : public StmtExprMutator {
 public:
   explicit MapInterleaver(const PrimFunc &func) {
     if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
-      simple_maps_ = TargetIsHexagon(target.value()) &&
-                     (HexagonArchVersion(target.value()) == 73 ||
-                      HexagonArchVersion(target.value()) == 79) &&
-                     target.value()
-                             ->GetAttr<Integer>("min_vector_bits", Integer(0))
-                             .value()
-                             ->value == 1024 &&
-                     target.value()
-                             ->GetAttr<Integer>("max_vector_bits", Integer(0))
-                             .value()
-                             ->value == 1024;
+      native_registers_ =
+          TargetIsHexagon(target.value()) &&
+          target.value()->GetAttr<Integer>("min_vector_bits").value_or(0) ==
+              1024 &&
+          target.value()->GetAttr<Integer>("max_vector_bits").value_or(0) ==
+              1024;
+      simple_maps_ =
+          native_registers_ && (HexagonArchVersion(target.value()) == 73 ||
+                                HexagonArchVersion(target.value()) == 79);
+      if (native_registers_)
+        for (const Var &param : func->params)
+          parameters_.insert(param.get());
     }
     if (simple_maps_)
       slices_ = CollectArenaSlices(func->body);
   }
 
 private:
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    // A local declaration can reuse a parameter Var in hand-written TIR.
+    parameters_.erase(op->buffer->data.get());
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    bool outer = in_volatile_scope_;
+    in_volatile_scope_ |= op->attr_key == "volatile_scope" ||
+                          op->attr_key == tirx::attr::kVolatile;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    in_volatile_scope_ = outer;
+    return result;
+  }
+
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
     // The loops over the vectors of a map are serial, or unrolled kind (which
@@ -351,6 +407,12 @@ private:
       return loop;
     if (const auto *n = loop->extent.as<IntImmNode>(); n && n->value < 2)
       return loop;
+    Array<PrimExpr> group;
+    if (loop->annotations.count(attr::kHexagonGroupDiv)) {
+      loop.CopyOnWrite()->annotations.erase(attr::kHexagonGroupDiv);
+      if (native_registers_ && !in_volatile_scope_ && loop->annotations.empty())
+        group = GroupedDivOperands(loop, parameters_);
+    }
     if (IsHeavyMapIteration(loop->body)) {
       loop.CopyOnWrite()->annotations.Set(attr::kHexagonUnrollCount,
                                           Integer(2));
@@ -359,9 +421,15 @@ private:
       loop.CopyOnWrite()->annotations.Set(
           attr::kHexagonDisableSoftwarePipelining, Integer(1));
     }
+    if (!group.empty())
+      return IfThenElse(
+          Not(Call(DataType::Bool(), hexagon_try_div_map(), group)), loop);
     return loop;
   }
 
+  std::unordered_set<const VarNode *> parameters_;
+  bool native_registers_ = false;
+  bool in_volatile_scope_ = false;
   bool simple_maps_ = false;
   ArenaSlices slices_;
 };

@@ -87,6 +87,7 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
       {tl::hexagon_sigmoid_fast(), "tl_hvx_sigmoid_fast", "hvx_math.h", false},
       {tl::hexagon_erf_fast(), "tl_hvx_erf_fast", "hvx_math.h", false},
       {tl::hexagon_div_fast(), "tl_hvx_div_fast", "hvx_math.h", false},
+      {tl::hexagon_try_div_map(), "tl_hvx_try_div_map", "hvx_math.h", false},
       {tl::hexagon_reduce_rows(), "tl_hvx_reduce_rows", "hvx_reduce.h", false,
        false, false, -1, 3},
       {tl::hexagon_crouton_reduce(), "tl_crouton_reduce", "crouton.h", false,
@@ -343,6 +344,18 @@ bool IsLaneTemplate(const PrimExpr &value) {
   return n > 0 && n <= 128;
 }
 
+bool IsScalarBufferAddress(const PrimExpr &expr) {
+  // LowerIntrin turns the planner's access_ptr into address_of of a flat,
+  // scalar BufferLoad before this emitter sees it. No custom pointer call.
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(builtin::address_of()) ||
+      call->args.size() != 1)
+    return false;
+  const auto *load = call->args[0].as<BufferLoadNode>();
+  return load && load->dtype.is_scalar() && load->indices.size() == 1 &&
+         load->indices[0].dtype().is_scalar();
+}
+
 // These backend helpers operate on their typed tensor operands, not the DMA
 // engine or its private completion records. Do not infer this from an Op's
 // effect annotation: even a pure external call could name the C++ context.
@@ -359,6 +372,10 @@ bool IsKnownNonDMAOperation(const CallNode *call) {
   if (call->op.same_as(tl::hexagon_exclusive_pointer()))
     return a.size() == 1 && call->dtype.is_handle() &&
            a[0].dtype().is_handle() && !a[0].as<StringImmNode>();
+  if (call->op.same_as(tl::hexagon_try_div_map()))
+    return a.size() == 4 && call->dtype == DataType::Bool() &&
+           std::all_of(a.begin(), a.begin() + 3, IsScalarBufferAddress) &&
+           a[3].as<IntImmNode>();
   if (call->op.same_as(tl::hexagon_exp()))
     return a.size() == 1 && call->dtype.is_float() &&
            call->dtype == a[0].dtype();
@@ -455,18 +472,6 @@ bool HasOnlyManagedDMACalls(const Stmt &body) {
   return safe;
 }
 
-bool IsDMAEndpoint(const PrimExpr &expr) {
-  // LowerIntrin turns the planner's access_ptr into address_of of a flat,
-  // scalar BufferLoad before this emitter sees it. No custom pointer call.
-  const auto *call = expr.as<CallNode>();
-  if (!call || !call->op.same_as(builtin::address_of()) ||
-      call->args.size() != 1)
-    return false;
-  const auto *load = call->args[0].as<BufferLoadNode>();
-  return load && load->dtype.is_scalar() && load->indices.size() == 1 &&
-         load->indices[0].dtype().is_scalar();
-}
-
 // PlanDMAQueue declares one queue before the tile program's execution. Arena
 // merging can prepend storage declarations and typed pointer bindings.
 bool IsDMAStorageDeclaration(const Stmt &stmt) {
@@ -545,7 +550,8 @@ private:
           const auto *direction = call->args[6].as<IntImmNode>();
           safe_ &= direction &&
                    (direction->value == 0 || direction->value == 3) &&
-                   IsDMAEndpoint(call->args[0]) && IsDMAEndpoint(call->args[1]);
+                   IsScalarBufferAddress(call->args[0]) &&
+                   IsScalarBufferAddress(call->args[1]);
           for (size_t i = 2; i < 6; ++i)
             safe_ &= call->args[i].dtype().is_scalar() &&
                      (call->args[i].dtype().is_int() ||

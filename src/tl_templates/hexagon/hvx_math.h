@@ -909,6 +909,31 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
   return out;
 }
 
+// A forward overlap shorter than four registers needs the original 32-lane
+// store order. Exact aliases, backward overlaps and more distant dependences
+// are safe: each group finishes storing before the next group reads.
+TL_DEVICE bool tl_hvx_try_div_map(float *dst, const float *a, const float *b,
+                                  int registers) {
+  constexpr uintptr_t bytes = 4 * sizeof(HVX_Vector);
+  auto safe = [&](const float *src) {
+    uintptr_t distance =
+        reinterpret_cast<uintptr_t>(dst) - reinterpret_cast<uintptr_t>(src);
+    return distance == 0 || distance >= bytes;
+  };
+  if (registers < 4 || registers > INT32_MAX / 32 || registers % 4 ||
+      !safe(a) || !safe(b))
+    return false;
+  for (int i = 0; i < registers; i += 4) {
+    vec_type<float, 128> x, y;
+    // The runtime guarantees register alignment; float128 itself needs 512 B.
+    __builtin_memcpy(&x.v, __builtin_assume_aligned(a + i * 32, 128), bytes);
+    __builtin_memcpy(&y.v, __builtin_assume_aligned(b + i * 32, 128), bytes);
+    auto q = tl_hvx_div(x, y);
+    __builtin_memcpy(__builtin_assume_aligned(dst + i * 32, 128), &q.v, bytes);
+  }
+  return true;
+}
+
 template <int N>
 TL_DEVICE vec_type<half, N> tl_hvx_div(const vec_type<half, N> &a,
                                        const vec_type<half, N> &b) {
