@@ -268,7 +268,7 @@ def test_float32_division_with_broadcast_denominator():
     kernel = tilelang.compile(divide, out_idx=1, target="hexagon")
     try:
         x = torch.tensor([0.0, -0.0, 1.0, -1.0, 2.0**-149, -(2.0**127), float("inf"), float("nan")]).repeat(4)
-        for b in (3.25, 2.0**-149, -(2.0**127), 0.0, -0.0, float("inf"), float("nan")):
+        for b in (3.25, -3.25, 2.0**-149, -(2.0**127), 0.0, -0.0, float("inf"), float("nan")):
             expected = x / b
             result = kernel(x, b)
             torch.testing.assert_close(result, expected, rtol=1e-6, atol=0, equal_nan=True)

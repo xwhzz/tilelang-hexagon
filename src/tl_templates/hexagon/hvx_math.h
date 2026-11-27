@@ -854,6 +854,20 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a, float b) {
     HVX_Vector x;
     __builtin_memcpy(&x, (const char *)&a.v + 128 * i, 128);
     HVX_Vector q = tl_hvx_mul_sf(x, reciprocal);
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+    // Qfloat does not propagate non-finite numerators through the multiply.
+    // For a normal denominator, preserve infinity's sign and quiet NaNs.
+    HVX_Vector magnitude = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7fffffff));
+    HVX_VectorPred special =
+        Q6_Q_vcmp_gt_VuwVuw(magnitude, Q6_V_vsplat_R(0x7f7fffff));
+    HVX_VectorPred nan =
+        Q6_Q_vcmp_gt_VuwVuw(magnitude, Q6_V_vsplat_R(0x7f800000));
+    HVX_Vector sign =
+        Q6_V_vsplat_R(__builtin_bit_cast(uint32_t, b) & 0x80000000U);
+    HVX_Vector exact =
+        Q6_V_vor_VV(Q6_V_vxor_VV(x, sign), Q6_V_vand_QR(nan, 0x00400000));
+    q = Q6_V_vmux_QVV(special, exact, q);
+#endif
     __builtin_memcpy((char *)&out.v + 128 * i, &q, 128);
   }
   using Floats = typename vec_type<float, N>::nat_t;
