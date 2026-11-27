@@ -228,9 +228,10 @@ Global scales with explicit noncompact strides accept an identity layout annotat
 For contiguous A and C rows, the HVX GEMM is one `tl_hvx_gemm_int_scaled` call.
 With interleaved activation or output columns it stages just the affected row, gathering
 the previous output only for accumulation. For groups whose operand ranges fit an int32
-dot product, HVX combines the byte planes in registers. A larger group uses bounded
-int32 partial dots and accumulates them in int64 before converting to fp32. This
-preserves cancellation across the group, including for signed weights.
+dot product, HVX combines the byte planes in registers. For larger groups of up to
+8192 int16 activations, it splits the high and low byte-plane sums into two exact
+parts and rounds their sum once to fp32. Other wide groups accumulate bounded pieces
+in int64. Both paths preserve cancellation across the group, including for signed weights.
 A signed B takes an int16 A, in groups of whole registers (64 columns). On v79 the w4a16
 GEMV (`example_gemv_w4a16.py`), which also quantizes x to int16 with one dynamic scale,
 computes 30 GB/s of weights on one worker, against 18 (groups of 64) to 23 (128) for one

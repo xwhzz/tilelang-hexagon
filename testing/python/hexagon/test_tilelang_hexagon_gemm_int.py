@@ -506,6 +506,7 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
         ("int8", 512, 512, False),
         ("int4", 8192, 8192, True),
         ("uint4", 4480, 4480, False),
+        ("int8", 8256, 8256, True),
     ],
 )
 def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear):
@@ -544,6 +545,39 @@ def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear):
     kernel = tilelang.compile(_blockscaled(m, n, k, gb, "int16", dtype, clear, ga), out_idx=[5], target="hexagon")
     try:
         torch.testing.assert_close(kernel(a, sa, pack_panel(w, bits), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_blockscaled_wide_subnormal_group_scale():
+    k, n, ga = 1024, 32, 512
+    a = torch.full((1, k), 20000, dtype=torch.int16)
+    b = torch.full((n, k), 220, dtype=torch.uint8)
+    sa = torch.tensor([[1e-35, 0]], dtype=torch.float32)
+    sb = torch.full((1, n), 2**-24, dtype=torch.float16)
+    c0 = torch.zeros(1, n)
+    kernel = tilelang.compile(_blockscaled(1, n, k, k, "int16", "uint8", True, ga), out_idx=[5], target="hexagon")
+    try:
+        expected = (sa[0, 0] * sb.float()) * float(ga * 20000 * 220)
+        torch.testing.assert_close(kernel(a, sa, pack_panel(b, 8), sb, c0), expected, rtol=0, atol=0)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_blockscaled_wide_byte_groups():
+    k, n = 33152, 32
+    a = torch.full((1, k), 255, dtype=torch.uint8)
+    b = torch.full((n, k), 255, dtype=torch.uint8)
+    b[::2, -1] = 1
+    sa = torch.ones(1, 1)
+    sb = torch.ones(1, n, dtype=torch.float16)
+    c0 = torch.zeros(1, n)
+    kernel = tilelang.compile(_blockscaled(1, n, k, k, "uint8", "uint8", True, k), out_idx=[5], target="hexagon")
+    try:
+        expected = (a.long() @ b.long().T).float()
+        torch.testing.assert_close(kernel(a, sa, pack_panel(b, 8), sb, c0), expected, rtol=0, atol=0)
     finally:
         kernel.adapter.close()
 
