@@ -12,7 +12,7 @@ namespace tvm::tl::hexagon {
 ffi::Optional<tirx::Stmt> VectorizeMapTail(const tirx::For &loop,
                                            const arith::Analyzer *analyzer,
                                            const LayoutMap &layouts,
-                                           int register_bits);
+                                           const Target &target);
 
 } // namespace tvm::tl::hexagon
 #endif // TVM_TL_HEXAGON_TRANSFORM_VECTORIZE_MAP_TAIL_H_

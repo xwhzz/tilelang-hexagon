@@ -3,6 +3,7 @@
  * \brief Vectorize the full-register prefix of a pointwise parallel map.
  */
 #include "vectorize_map_tail.h"
+#include "hexagon/target_utils.h"
 #include "transform/loop_partition.h"
 
 #include <tvm/arith/pattern.h>
@@ -17,7 +18,7 @@ using namespace tirx;
 ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
                                      const arith::Analyzer *analyzer,
                                      const LayoutMap &layouts,
-                                     int register_bits) {
+                                     const Target &target) {
   const auto *store = loop->body.as<BufferStoreNode>();
   const auto *extent = as_const_int(loop->extent);
   if (!store || store->predicate || !extent || !loop->HasTrivialStep() ||
@@ -28,7 +29,7 @@ ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
   if (!type.is_scalar() || type.bits() < 8 || type.bits() > 32 ||
       !(type.is_int() || type.is_uint() || type.is_float()))
     return std::nullopt;
-  int lanes = register_bits / type.bits();
+  int lanes = MinVectorBits(target) / type.bits();
   if (lanes < 2 || *extent <= lanes || *extent % lanes == 0 ||
       tvm::transform::PassContext::Current()
           ->GetConfig<Bool>("tirx.disable_vectorize", Bool(false))
@@ -59,6 +60,7 @@ ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
   static const auto vectorizable =
       Op::GetAttrMap<TVectorizable>("TVectorizable");
   bool legal = true;
+  bool uses_vector_intrinsic = false;
   PreOrderVisit(store->value, [&](const ffi::ObjectRef &node) {
     if (!legal)
       return false;
@@ -77,6 +79,7 @@ ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
           op && op.value()->name.find("tl.hexagon_") == 0 &&
           vectorizable.get(op.value(), false) && effects.count(op.value()) &&
           effects[op.value()]->value == static_cast<int>(CallEffectKind::kPure);
+      uses_vector_intrinsic = true;
     } else {
       legal = node.as<FloatImmNode>() || node.as<IntImmNode>() ||
               (node.as<VarNode>() && !node.same_as(loop->loop_var)) ||
@@ -86,6 +89,13 @@ ffi::Optional<Stmt> VectorizeMapTail(const For &loop,
     return legal;
   });
   if (!legal)
+    return std::nullopt;
+
+  // Short arithmetic maps can run faster as scalar loops on v73. Vector
+  // math intrinsics benefit from splitting even a single full register.
+  constexpr int kMinV73ArithmeticElements = 256;
+  if (!uses_vector_intrinsic && *extent < kMinV73ArithmeticElements &&
+      HexagonArchVersion(target) == 73)
     return std::nullopt;
 
   For prefix = loop;

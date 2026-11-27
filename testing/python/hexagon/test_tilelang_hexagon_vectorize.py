@@ -10,8 +10,8 @@ from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
 
 
-def _source(func, fast_math=False):
-    target = determine_target("hexagon", return_object=True)
+def _source(func, fast_math=False, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config={"tl.enable_fast_math": fast_math}):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
@@ -64,14 +64,14 @@ def test_nondivisible_sigmoid_uses_a_whole_vector_prefix(n, vector, tail):
 
 def test_vector_prefix_honors_an_unaligned_subregion_in_place():
     @T.prim_func
-    def increment(x: T.Tensor((72,), "float32")):
+    def increment(x: T.Tensor((264,), "float32")):
         with T.Kernel(1):
-            for i in T.Parallel(65):
+            for i in T.Parallel(257):
                 x[i + 3] = x[i + 3] + T.float32(1)
 
     source = _source(increment)
     assert "tl_hvx_vec_loadu<float32>" in source and "tl_hvx_vec_storeu(" in source
-    assert "x[67] =" in source
+    assert "x[259] =" in source
 
 
 @pytest.mark.parametrize("case", ["shifted", "reversed", "predicate", "scalar_math"])
@@ -94,17 +94,29 @@ def test_vector_prefix_keeps_other_odd_maps_scalar(case):
     assert "float32*" not in source and "tl_hvx_vec_" not in source
 
 
-@pytest.mark.parametrize("dtype,lanes,vector", [("float16", 64, "half64"), ("int8", 128, "int8_t128")])
-def test_vector_prefix_uses_the_element_width(dtype, lanes, vector):
+@pytest.mark.parametrize("dtype,vector", [("float16", "half64"), ("int8", "int8_t128")])
+def test_vector_prefix_uses_the_element_width(dtype, vector):
     @T.prim_func
-    def add(x: T.Tensor((lanes + 1,), dtype), y: T.Tensor((lanes + 1,), dtype)):
+    def add(x: T.Tensor((257,), dtype), y: T.Tensor((257,), dtype)):
         with T.Kernel(1):
-            for i in T.Parallel(lanes + 1):
+            for i in T.Parallel(257):
                 y[i] = x[i] + T.cast(1, dtype)
 
     source = _source(add)
-    assert f"*({vector}*)(y + 0)" in source
-    assert f"y[{lanes}] =" in source
+    assert f"*({vector}*)(y +" in source
+    assert "y[256] =" in source
+
+
+@pytest.mark.parametrize("arch,n,vector", [(73, 255, False), (73, 257, True), (79, 33, True)])
+def test_small_arithmetic_prefix_cost(arch, n, vector):
+    @T.prim_func
+    def add(x: T.Tensor((n,), "int32"), y: T.Tensor((n,), "int32")):
+        with T.Kernel(1):
+            for i in T.Parallel(n):
+                y[i] = x[i] + 1
+
+    source = _source(add, target={"kind": "hexagon", "mcpu": f"hexagonv{arch}"})
+    assert ("*(int32_t32*)" in source) == vector
 
 
 @pytest.mark.parametrize("width", [1, 4])

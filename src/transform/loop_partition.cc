@@ -364,9 +364,9 @@ Stmt LowerParallelLoop(For loop, const Fragment &loop_layout,
       !has_loop_constraints && target.defined() && TargetIsHexagon(target) &&
       loop->kind == ForKind::kParallel && loop->HasTrivialStep() &&
       loop->body.as<BufferStoreNode>()) {
-    vectorized = hexagon::VectorizeMapTail(result_loop, analyzer, layout_map,
-                                           MinVectorBits(target))
-                     .value_or(Stmt());
+    vectorized =
+        hexagon::VectorizeMapTail(result_loop, analyzer, layout_map, target)
+            .value_or(Stmt());
   }
   if (!vectorized.defined()) {
     vectorized =
