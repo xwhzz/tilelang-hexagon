@@ -426,7 +426,7 @@ def test_partial_k_keeps_both_operands_for_the_next_gemm(trans_a, trans_b, c_dty
 
 
 @DEVICE
-@pytest.mark.parametrize("prefix,m,n", [(1025, 32, 32), (1032, 32, 32), (33, 64, 32), (33, 64, 64)])
+@pytest.mark.parametrize("prefix,m,n", [(1025, 32, 32), (1032, 32, 32), (33, 32, 32), (33, 64, 32), (33, 64, 64)])
 def test_partial_k_last_deep_packet(prefix, m, n):
     import torch
 

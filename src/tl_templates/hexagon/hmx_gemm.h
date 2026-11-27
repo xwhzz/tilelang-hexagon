@@ -269,7 +269,14 @@ TL_HMX_INLINE void tl_hmx_gemm(int M, int N, int K, D *c, int ldc,
                                const half *a, int a_row_tile, const B &b,
                                const float *sfa, int ld_sfa, bool clear,
                                half *stage, uint32_t *config) {
-  if ((M | N | K) % TL_HMX_T)
+  // For a single full output tile, inlining folds the loops and private K
+  // masks. A run-time row count keeps the shared out-of-line tail loop.
+  const bool single_masked_tile = std::is_same_v<B, tl_hmx_weight_tiles> &&
+                                  M == TL_HMX_T && N == TL_HMX_T && K % 8;
+  if (__builtin_constant_p(single_masked_tile) && single_masked_tile)
+    tl_hmx_gemm_tiles<Rows, Aligned, Scaled, Shared, Direct, true>(
+        M, N, K, c, ldc, a, a_row_tile, b, sfa, ld_sfa, clear, stage, config);
+  else if ((M | N | K) % TL_HMX_T)
     tl_hmx_gemm_tails<Rows, Aligned, Scaled, Shared, Direct>(
         M, N, K, c, ldc, a, a_row_tile, b, sfa, ld_sfa, clear, stage, config);
   else
