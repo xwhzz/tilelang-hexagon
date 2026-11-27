@@ -1072,9 +1072,9 @@ TL_GEMM void tl_hvx_gemm_int(int32_t *C, const TA *A, const void *B_,
 // group-major). GA and GB divide K, or equal it for one factor per row. Each
 // group converts its integer dot to fp32 once, before applying its scales.
 
-// The fp32 values of NB runs of 32 consecutive fp16 from p: two runs per
-// conversion, its pair of even and odd lanes shuffled back in order. Scales
-// are never denormal, so they skip the flush.
+// Convert two runs of 32 fp16 scales at a time and restore their lane order.
+// Ordinary groups use the qfloat multiply-by-one conversion. Wide groups
+// preserve subnormal fp16 scales when converting to fp32.
 template <int NB, bool Exact = false>
 TL_DEVICE void tl_gemm_half_rows_sf(HVX_Vector out[NB], const half *p) {
   const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
