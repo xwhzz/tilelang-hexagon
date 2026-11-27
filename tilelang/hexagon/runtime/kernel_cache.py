@@ -15,13 +15,18 @@ from hashlib import sha256
 
 from tilelang.cache.kernel_cache import KernelCache
 
-from .config import deployment_cache_key
+from .config import deployment_cache_key, deployment_scope
 
 
 class HexagonKernelCache(KernelCache):
     # Cosmetic: the base always receives the backend explicitly from
     # ``_resolve_cache_dispatch``; this just documents the dispatch key.
     execution_backend = "hexagon"
+
+    def cached(self, *args, **kwargs):
+        scope = deployment_scope()
+        with scope():
+            return super().cached(*args, **kwargs)
 
     def _generate_key(self, *args, **kwargs):
         source_key = super()._generate_key(*args, **kwargs)

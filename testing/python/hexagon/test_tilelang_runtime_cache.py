@@ -292,11 +292,12 @@ def test_decorated_jit_uses_current_deployment(mode, monkeypatch):
     opened = []
 
     def open_session(cls, *args, **kwargs):
+        if not opened:
+            # Another caller changes deployment after key capture but before
+            # this Session reads its connection settings.
+            monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "second")
         parent = remote_dir(hlos())
         opened.append(parent)
-        if len(opened) == 1:
-            # Simulate a configuration change after the first session opens.
-            monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "second")
         return SimpleNamespace(kernels=[lambda x: parent], close=lambda: None)
 
     monkeypatch.setenv("TILELANG_HEXAGON_DEVICE", "phone")
@@ -330,3 +331,102 @@ def test_decorated_jit_uses_current_deployment(mode, monkeypatch):
         result = lazy(32)(x) if mode == "lazy" else eager(x)
         assert result == parent
     assert opened == ["first", "second"]
+    if mode == "lazy":
+        first = lazy(32)
+        first.adapter.close()
+        monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "second")
+        assert first(x) == "first"  # reopening the handle retains its identity
+        assert lazy(32)(x) == "second"
+        first.adapter.close()
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_deployment_lookup_tracks_byte_and_string_environment(cache, monkeypatch, fast):
+    from tilelang.hexagon.runtime import config
+
+    if not os.supports_bytes_environ:
+        pytest.skip("byte environment is unavailable")
+    if not fast:
+        monkeypatch.setattr(config, "_posix_environ", None)
+    setting = "TILELANG_HEXAGON_REMOTE_DIR"
+    monkeypatch.setenv(setting, "/first")
+    first = config.deployment_cache_key()
+    monkeypatch.setitem(os.environb, os.fsencode(setting), b"/second")
+    assert config.deployment_cache_key() != first
+    monkeypatch.setenv(setting, "/first")
+    assert config.deployment_cache_key() == first
+
+
+def test_decorated_isa_is_bound_from_frontend_to_session(cache, monkeypatch):
+    import tilelang
+    from tvm.target import Target
+    from tilelang.hexagon import language as T
+    from tilelang.hexagon.runtime.session import Session
+    from tilelang.hexagon.target import hexagon_arch
+
+    def make_factory(target):
+        @tilelang.jit(target=target, out_idx=1)
+        def factory(n):
+            arch = int(hexagon_arch(Target.current())[1:])
+
+            @T.prim_func
+            def add(x: T.Tensor((n,), "int32"), y: T.Tensor((n,), "int32")):
+                with T.Kernel(1):
+                    for i in T.Parallel(n):
+                        y[i] = x[i] + arch
+
+            return add
+
+        return factory
+
+    monkeypatch.setattr(Session, "of_lowered", classmethod(lambda *a, **kw: SimpleNamespace(kernels=[lambda *_: None], close=lambda: None)))
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", "v79")
+    original = HexagonKernelCache.cached
+
+    def change_after_target_resolution(self, *args, **kwargs):
+        monkeypatch.setenv("HEXAGON_DSP_ARCH", "v73")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(HexagonKernelCache, "cached", change_after_target_resolution)
+    factory = make_factory("hexagon")
+    first = factory(32)
+    monkeypatch.setattr(HexagonKernelCache, "cached", original)
+    second = factory(32)
+    assert (first.adapter.dsp_arch, second.adapter.dsp_arch) == ("v79", "v73")
+    assert second.get_kernel_source() == make_factory("hexagon")(32).get_kernel_source()
+    assert first.get_kernel_source() != second.get_kernel_source()
+    # An explicit target keeps its ISA when the default changes.
+    explicit = make_factory({"kind": "hexagon", "mcpu": "hexagonv79"})(32)
+    assert explicit.get_kernel_source() == first.get_kernel_source()
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", "v79")
+    assert factory(32) is first
+
+
+def test_implicit_target_can_enter_and_leave_live_deployments(cache, monkeypatch):
+    import tilelang
+    from tilelang.hexagon import language as T
+    from tilelang.hexagon.runtime.session import Session
+
+    monkeypatch.setattr(Session, "of_lowered", classmethod(lambda *a, **kw: SimpleNamespace(kernels=[lambda *_: None], close=lambda: None)))
+
+    @tilelang.jit(out_idx=1)
+    def factory(n):
+        @T.prim_func
+        def copy(x: T.Tensor((n,), "int32"), y: T.Tensor((n,), "int32")):
+            with T.Kernel(1):
+                for i in T.Parallel(n):
+                    y[i] = x[i]
+
+        return copy
+
+    monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "c")
+    cpu = factory(32)
+    assert cpu.target.kind.name == "c"
+    monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "hexagon")
+    first = factory(32)
+    assert first.target.kind.name == "hexagon"
+    monkeypatch.setenv("TILELANG_HEXAGON_REMOTE_DIR", "/two")
+    assert factory(32) is not first
+    monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "c")
+    assert factory(32) is cpu
+    assert factory(64).target.kind.name == "c"

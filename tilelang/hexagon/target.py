@@ -23,12 +23,13 @@ else from the ``HEXAGON_DSP_ARCH`` environment variable, else v79.
 
 from __future__ import annotations
 
-import os
 import re
 
 from tvm.target import Target
 
 from tilelang.backend.target import TargetLike, register_target_normalizer
+
+from .runtime.env import current_environment
 
 SUPPORTED_ARCHS = ("v73", "v75", "v79", "v81")
 DEFAULT_ARCH = "v79"
@@ -85,7 +86,7 @@ def normalize_hexagon_target(target: TargetLike) -> Target | None:
         return None
 
     config = dict(parsed.export())
-    requested = config.get("mcpu") or os.environ.get("HEXAGON_DSP_ARCH") or DEFAULT_ARCH
+    requested = config.get("mcpu") or current_environment().get("HEXAGON_DSP_ARCH") or DEFAULT_ARCH
     arch = _canonical_arch(requested)
     if arch not in SUPPORTED_ARCHS:
         raise ValueError(

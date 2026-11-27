@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from .env import current_environment
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
 from .config import device_serial, domain_id, remote_dir, ssh_host, ssh_transfer_timeout
 
@@ -30,7 +31,7 @@ def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
     from . import build, linux_build
 
     env = sdk.environ
-    legacy = "ON" if os.environ.get("TILELANG_HEXAGON_LEGACY_COMPUTE_RES") == "1" else "OFF"
+    legacy = "ON" if current_environment().get("TILELANG_HEXAGON_LEGACY_COMPUTE_RES") == "1" else "OFF"
     build._run(
         [sdk.build_cmake, "hexagon", f"DSP_ARCH={dsp_arch}", f"TL_HEXAGON_LEGACY_COMPUTE_RES={legacy}"],
         cwd=project_dir,
@@ -46,7 +47,7 @@ def build_linux_fastrpc(project_dir, name, sdk, dsp_arch, verbose):
     if not skel:
         raise build.HexagonBuildError(f"DSP skel lib{name}_skel.so not found after build in {project_dir}")
     linux_build.validate_dsp_artifact(skel, dsp_arch)
-    if os.environ.get("TILELANG_HEXAGON_ELF_CRC") == "1":
+    if current_environment().get("TILELANG_HEXAGON_ELF_CRC") == "1":
         from .elf_crc import add_load_crc
 
         add_load_crc(skel)
@@ -70,7 +71,7 @@ class LinuxConnection(AdbConnection):
 
     workdir: str = field(default_factory=lambda: "/tmp/tilelang_hexagon/" + uuid.uuid4().hex)
     ssh_host: str | None = field(default_factory=ssh_host)
-    known_hosts: str | None = field(default_factory=lambda: os.environ.get("TILELANG_HEXAGON_SSH_KNOWN_HOSTS"))
+    known_hosts: str | None = field(default_factory=lambda: current_environment().get("TILELANG_HEXAGON_SSH_KNOWN_HOSTS"))
     transfer_timeout: float | None = None
 
     def __post_init__(self):

@@ -35,8 +35,9 @@ class ExecutionBackendSpec:
     # the adapter. None preserves the original execution callable.
     wrap_callable: CallableWrapper | None = None
 
-    # Live deployments can depend on runtime settings beyond the compiled target.
-    runtime_cache_key: Callable[[], Hashable] | None = None
+    # The optional live deployment key and a factory for its captured context.
+    # Both come from one lookup so changes during compilation cannot mix them.
+    runtime_cache: Callable[[], tuple[Hashable, Callable]] | None = None
 
     def matches(self, target: Target) -> bool:
         return True if self.supports_target is None else self.supports_target(target)

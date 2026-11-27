@@ -25,7 +25,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 
 from . import config
-from .env import HexagonSDK
+from .env import HexagonSDK, current_environment
 
 
 class HexagonBuildError(RuntimeError):
@@ -115,7 +115,7 @@ def _cache_entry(project_dir: str, name: str, sdk: HexagonSDK, dsp_arch: str, hl
         # Build switches and the Linux HLOS toolchain (linux_build.py), not
         # the device a build runs on. Like the paths above, they identify
         # tools; replacing a tool in place needs a cleared cache.
-        "env": {k: v for k, v in os.environ.items() if k.startswith("TILELANG_HEXAGON_") and k not in _RUNTIME_ONLY},
+        "env": {k: v for k, v in current_environment().items() if k.startswith("TILELANG_HEXAGON_") and k not in _RUNTIME_ONLY},
     }
     digest.update(json.dumps(toolchain, sort_keys=True).encode())
     return os.path.join(env.TILELANG_CACHE_DIR, "hexagon_builds", digest.hexdigest())

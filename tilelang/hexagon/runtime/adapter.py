@@ -20,7 +20,7 @@ import weakref
 from tilelang.hexagon.target import hexagon_arch
 from tilelang.jit.adapter.base import BaseKernelAdapter
 
-from .env import HexagonSDK
+from .env import HexagonSDK, current_environment, use_environment
 
 # The kernel entry is the generated function that returns its int32 status;
 # static helpers such as `<name>_worker` are not.
@@ -58,6 +58,7 @@ class HexagonKernelAdapter(BaseKernelAdapter):
         # The target names the DSP architecture; HEXAGON_DSP_ARCH only seeds
         # its default during target normalization.
         dsp_arch = dsp_arch or hexagon_arch(target)
+        self._environment = current_environment()
         self.sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self.dsp_arch = dsp_arch or self.sdk.dsp_arch
         self._param_list = list(params)
@@ -79,7 +80,8 @@ class HexagonKernelAdapter(BaseKernelAdapter):
             from .session import Session
 
             lowered = [(self.kernel_name, self.kernel_source, self._param_list, self._result_idx)]
-            self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
+            with use_environment(self._environment):
+                self._device = Session.of_lowered(lowered, sdk=self.sdk, dsp_arch=self.dsp_arch, verbose=self.verbose)
             self._run = self._device.kernels[0]
         return self._run
 

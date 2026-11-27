@@ -16,6 +16,8 @@ import subprocess
 import threading
 from dataclasses import dataclass
 
+from .env import current_environment
+
 
 class HexagonConnectionError(RuntimeError):
     pass
@@ -136,8 +138,10 @@ class AdbConnection(HexagonConnection):
     adb: str = "adb"
 
     def __post_init__(self) -> None:
-        self._base = [shutil.which(self.adb) or self.adb] + (["-s", self.serial] if self.serial else [])
-        self._transport_env = dict(os.environ)
+        self._base = [shutil.which(self.adb, path=current_environment().get("PATH", os.defpath)) or self.adb] + (
+            ["-s", self.serial] if self.serial else []
+        )
+        self._transport_env = dict(current_environment())
         self._ensured = False
         self._workdir_attempted = False
         self._forwards = set()
@@ -169,7 +173,7 @@ class AdbConnection(HexagonConnection):
     def list_devices(cls, adb: str = "adb") -> list[str]:
         """Return serials of authorized, attached devices; none without adb."""
         try:
-            proc = subprocess.run([adb, "devices"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            proc = subprocess.run([adb, "devices"], env=current_environment(), capture_output=True, text=True, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
             return []
         out = []
