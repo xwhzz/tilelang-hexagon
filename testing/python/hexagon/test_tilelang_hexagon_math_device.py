@@ -184,6 +184,11 @@ def test_default_float32_division_at_exponent_limits():
         expected = a / b
         torch.testing.assert_close(result, expected, equal_nan=True, rtol=1e-6, atol=0)
         assert torch.equal(result[expected == 0].signbit(), expected[expected == 0].signbit())
+        # Keeping the Newton steps in qf32 changes this normal-denominator
+        # quotient on v73, where qf32 has different range and precision.
+        a = torch.tensor([0x005AE722], dtype=torch.int32).view(torch.float32).expand(32).contiguous()
+        b = torch.tensor([0x00EBC153], dtype=torch.int32).view(torch.float32).expand(32).contiguous()
+        torch.testing.assert_close(kernel(a, b), a / b, rtol=1e-6, atol=0)
     finally:
         kernel.adapter.close()
 

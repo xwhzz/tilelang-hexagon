@@ -725,6 +725,32 @@ TL_DEVICE float tl_hvx_fabs(const half &x) { return __builtin_fabsf((float)x); }
 // codegen prints a / b as tl_hvx_div(a, b): a times the reciprocal of b. fp16
 // divides in fp32, so the quotient is rounded once.
 // ---------------------------------------------------------------------------
+#if __HVX_ARCH__ == 79
+// Keep the Newton products in qf32 until the reciprocal is rounded. This
+// shortens the common dependency chain before checking exceptional lanes.
+TL_DEVICE HVX_Vector tl_hvx_div_recip_vsf(HVX_Vector x) {
+  HVX_Vector seed = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7ef127ea), x);
+  HVX_Vector neg_x = Q6_V_vxor_VV(x, Q6_V_vsplat_R((int)0x80000000));
+  HVX_Vector two = tl_hvx_splat_f(2.0f);
+  HVX_Vector neg_q = tl_hvx_qf(neg_x);
+  HVX_Vector y = Q6_Vqf32_vmpy_Vqf32Vqf32(
+      tl_hvx_qf(seed),
+      Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(neg_x, seed), two));
+  for (int i = 0; i < 2; ++i)
+    y = Q6_Vqf32_vmpy_Vqf32Vqf32(
+        y, Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(neg_q, y), two));
+  return Q6_Vsf_equals_Vqf32(y);
+}
+
+TL_DEVICE bool tl_hvx_div_has_exception(HVX_Vector mask) {
+  // Reduce word masks on HVX; only the final word crosses to the scalar core.
+  for (int offset = 64; offset >= 4; offset /= 2)
+    mask = Q6_V_vor_VV(mask, Q6_V_vror_VR(mask, offset));
+  return Q6_R_vextract_VR(mask, 0) != 0;
+}
+
+#endif
+
 TL_DEVICE HVX_Vector tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
   using Words = vec_type<uint32_t, 32>::nat_t;
   using Floats = vec_type<float, 32>::nat_t;
@@ -733,8 +759,15 @@ TL_DEVICE HVX_Vector tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
   // normal. Include the top two exponent bins, where the bit seed can cross
   // zero, as well as zeros, subnormals, infinities and NaNs.
   auto exceptional = (magnitude - 0x00800000U) >= (0x7e800000U - 0x00800000U);
+#if __HVX_ARCH__ == 79
+  HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_div_recip_vsf(y));
+  bool any =
+      tl_hvx_div_has_exception(__builtin_bit_cast(HVX_Vector, exceptional));
+#else
   HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
-  if (__builtin_expect(__builtin_reduce_or(exceptional) != 0, 0)) {
+  bool any = __builtin_reduce_or(exceptional) != 0;
+#endif
+  if (__builtin_expect(any, 0)) {
     Floats a = __builtin_bit_cast(Floats, x), b = __builtin_bit_cast(Floats, y);
     Floats result = __builtin_bit_cast(Floats, q);
     for (int i = 0; i < 32; ++i) {
