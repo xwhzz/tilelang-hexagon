@@ -38,6 +38,23 @@ MULTI_PROCESS = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_interactive_chat_prefix_reuse_is_opt_in(monkeypatch, opt_in):
+    from io import StringIO
+    from types import SimpleNamespace
+
+    import generate
+
+    calls = []
+    monkeypatch.setattr(generate, "Decoder", lambda *_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(generate, "Text", lambda *_: object())
+    monkeypatch.setattr(generate, "reply", lambda *_, reuse=False: calls.append(reuse) or "answer")
+    monkeypatch.setattr(sys, "stdin", StringIO("one\ntwo\n"))
+    monkeypatch.setattr(sys, "argv", ["generate.py", "host", "device", "checkpoint", "--chat"] + (["--reuse-prefix"] if opt_in else []))
+    generate.main()
+    assert calls == [opt_in, opt_in]
+
+
 @pytest.fixture(scope="module")
 def tiny_bundle(tmp_path_factory):
     c, w, q = tiny()

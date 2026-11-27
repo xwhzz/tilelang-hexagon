@@ -174,11 +174,14 @@ the header: a copy of the file's first `data_offset` bytes
 `generate.py` renders the checkpoint's chat template and tokenizes on the
 host (it needs `tokenizers` and `jinja2`), prefills the prompt and streams the
 reply, a decode call per 16 tokens; `--temperature` and `--seed` sample.
-Interactive `--chat` reuses the token prefix already consumed by the DSP.
-A checkpoint of the convolution state also lets the next turn reuse its prior
-prompt when EOS interrupted a decoded chunk. A changed chat template or an
-overwritten sliding window can require replaying the prompt. Each `--prompt`
-starts from an empty context.
+Interactive `--chat` prefills the full conversation on each turn. Add
+`--reuse-prefix` to reuse tokens already consumed by the DSP. If EOS interrupted
+a decoded chunk, the decoder can resume at the prior prompt's convolution
+checkpoint. A changed chat template or an overwritten sliding window can
+require full replay. Prefill latency depends on the tiles skipped and the KV
+history read by the suffix. Changing where prefill and decode meet can also
+change rounding and produce a different reply with the same sampling seed.
+Each `--prompt` starts fresh.
 
 Greedy, on v79:
 
