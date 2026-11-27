@@ -930,10 +930,14 @@ TL_GEMM void tl_hvx_gemm_weight(TC *C, const half *A, const half *B,
 // per byte plane of A (hi then lo for int16), one register of words; with
 // 4-bit B its low half holds the even columns' words, its high half the odd
 // columns'.
-template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
+template <typename TA, int BBits, int KC, bool Planar = false>
+struct tl_gemm_int_row {
   static constexpr int planes = sizeof(TA);
   static constexpr int chunks = (KC + 127) / 128;
-  alignas(128) int32_t words[chunks][planes][32];
+  // A contiguous byte plane lets wide dots walk their scalar words in K order.
+  using Storage = std::conditional_t<Planar, int32_t[planes][chunks * 32],
+                                     int32_t[chunks][planes][32]>;
+  alignas(128) Storage words;
   // The row's sum, for a signed B.
   int32_t sum = 0;
 
@@ -946,7 +950,10 @@ template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
   inline __attribute__((always_inline)) void put(int c, int plane,
                                                  HVX_Vector v) {
     v = deal(v);
-    __builtin_memcpy(words[c][plane], &v, sizeof(v));
+    if constexpr (Planar)
+      __builtin_memcpy(words[plane] + c * 32, &v, sizeof(v));
+    else
+      __builtin_memcpy(words[c][plane], &v, sizeof(v));
   }
 
   // Columns [0, k) of the row at `a`, k <= KC; past k, zeros.
@@ -993,9 +1000,15 @@ template <typename TA, int BBits, int KC> struct tl_gemm_int_row {
   // B) or 8 (4-bit) columns; `odd` picks the odd columns of a 4-bit step.
   inline __attribute__((always_inline)) int32_t word(int plane, int s,
                                                      bool odd) const {
-    if constexpr (BBits == 4)
-      return words[s / 16][plane][(odd ? 16 : 0) + s % 16];
-    return words[s / 32][plane][s % 32];
+    if constexpr (Planar) {
+      const int index =
+          BBits == 4 ? (s / 16) * 32 + (odd ? 16 : 0) + s % 16 : s;
+      return words[plane][index];
+    } else {
+      if constexpr (BBits == 4)
+        return words[s / 16][plane][(odd ? 16 : 0) + s % 16];
+      return words[s / 32][plane][s % 32];
+    }
   }
 };
 
@@ -1224,7 +1237,7 @@ TL_DEVICE HVX_Vector tl_gemm_wide_planes(HVX_Vector hi, HVX_Vector lo,
 template <typename TA, int BBits, bool BSigned, int NB, int KC, int Group,
           bool GroupA, bool Wide>
 TL_DEVICE void tl_gemm_int_panels_scaled(
-    HVX_Vector *total, const tl_gemm_int_row<TA, BBits, KC> &row,
+    HVX_Vector *total, const tl_gemm_int_row<TA, BBits, KC, Wide> &row,
     const int32_t *sum, const uint8_t *B, int panel_bytes, int g0, int groups,
     const float *sfa, int sfa_per, const half *sfb, int ld_sfb, int sfb_per) {
   constexpr int planes = sizeof(TA);
@@ -1241,8 +1254,7 @@ TL_DEVICE void tl_gemm_int_panels_scaled(
 #pragma clang loop unroll(full)
       for (int b = 0; b < NB; ++b)
         acc[q][b] = Q6_V_vzero();
-// Partly unrolled: a whole group of steps would spill the registers it
-// keeps live onto the stack.
+    // A whole group would spill its live accumulators onto the stack.
 #pragma clang loop unroll_count(2)
     for (int t = 0; t < steps; ++t) {
       int s = g * steps + t;
@@ -1409,7 +1421,7 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
     // schedule, share staging across four full panels and handle the remainder.
     constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
     constexpr bool RowsC = AlignC && LdC % 32 == 0;
-    tl_gemm_int_row<TA, BBits, KC> row;
+    tl_gemm_int_row<TA, BBits, KC, Wide> row;
 #pragma clang loop unroll(disable)
     for (int i = 0; i < M; ++i) {
       const TA *a = A + i * LdA;

@@ -513,7 +513,7 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
     ],
 )
 def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear, n):
-    m, k, group = 4, max(ga, gb), min(ga, gb)
+    m, k, group = 5, max(ga, gb), min(ga, gb)
     a = torch.empty((m, k), dtype=torch.int16)
     a[0], a[1], a[2] = 20000, -32768, 32767
     w = torch.empty((n, k), dtype=torch.int64)
@@ -525,6 +525,10 @@ def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear, n):
     w[:16] = 220 if dtype == "uint8" else extreme
     w[16:32] = high
     w[32:] = extreme
+    # Distinguish successive high/low activation bytes and packed weight nibbles.
+    cols = torch.arange(k)
+    a[4] = (cols * 811 + cols // 11) % 65536 - 32768
+    w[0] = ((cols * 7 + cols // 5) % (1 << bits)) + low
     for start in range(0, k, group):
         mid = start + group // 2
         a[3, start:mid], a[3, mid : start + group] = 32767, -32767
