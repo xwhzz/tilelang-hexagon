@@ -278,7 +278,9 @@ for one.
 all of them in one FastRPC call (`Session.pipeline`). The bundle's fp16 tiles
 are HMX's weight operand as they are: each worker streams the decode's share
 of every projection, a panel of 32 channels a block, and multiplies it by the
-whole chunk on HMX, with nothing to dequantize.
+whole chunk on HMX, with nothing to dequantize. When an incremental prefill
+ends near the context limit, a final chunk whose padded rows would exceed
+the KV cache runs its real tokens through the resident decode stages.
 
 - **VTCM.** A chunk's activations stay in VTCM the workers share:
   - the normalized input and the hidden units, which HMX reads;

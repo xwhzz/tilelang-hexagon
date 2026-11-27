@@ -27,30 +27,30 @@ class GemmScalar(GemmBase):
         M, N, K = self.M, self.N, self.K
         A_buf = self.ARegion.buffer
         B_buf = self.BRegion.buffer
-        C_buf = self.CRegion.buffer
+        C_region = self.CRegion
+        C_buf = C_region.buffer
         trans_A = self.trans_A
         trans_B = self.trans_B
         clear_accum = self.clear_accum
         accum_dtype = self.accum_dtype
 
-        # Region offsets for strided gemm (e.g. T.gemm(A[0:64, :], B, C))
-        a0 = self.ARegion.region[0].min
-        a1 = self.ARegion.region[1].min
-        b0 = self.BRegion.region[0].min
-        b1 = self.BRegion.region[1].min
-        c0 = self.CRegion.region[0].min
-        c1 = self.CRegion.region[1].min
+        a_origin = tuple(r.min for r in self.ARegion.region)
+        b_origin = tuple(r.min for r in self.BRegion.region)
+        c_origin = tuple(r.min for r in C_region.region)
+
+        def at(origin, row, col):
+            return origin[:-2] + (origin[-2] + row, origin[-1] + col)
 
         @T.prim_func
         def _gemm_scalar() -> None:
             if clear_accum:
-                T.clear(C_buf)
+                T.clear(C_region)
             for i, j, k in T.grid(M, N, K):
-                C_buf[c0 + i, c1 + j] += T.cast(
-                    A_buf[a0 + (k if trans_A else i), a1 + (i if trans_A else k)],
+                C_buf[at(c_origin, i, j)] += T.cast(
+                    A_buf[at(a_origin, k if trans_A else i, i if trans_A else k)],
                     accum_dtype,
                 ) * T.cast(
-                    B_buf[b0 + (j if trans_B else k), b1 + (k if trans_B else j)],
+                    B_buf[at(b_origin, j if trans_B else k, k if trans_B else j)],
                     accum_dtype,
                 )
 

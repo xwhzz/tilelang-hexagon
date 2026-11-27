@@ -1298,7 +1298,11 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
                 "HVX block-scaled GEMM: whole panels and whole scale groups");
   // Columns per staged chunk of A's row, whole groups; panels per block.
   constexpr int KC = Group >= 512 ? Group : tl_gemm_min(K, 512 / Group * Group);
-  constexpr int NB = tl_gemm_int_block(N / 32);
+  constexpr int Panels = N / 32;
+  constexpr int Divisor = tl_gemm_int_block(Panels);
+  // Keep uniform blocks of two or more panels. For an otherwise single-panel
+  // schedule, share staging across four full panels and handle the remainder.
+  constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
   constexpr bool RowsC = AlignC && LdC % 32 == 0;
   tl_gemm_int_row<TA, BBits, KC> row;
 #pragma clang loop unroll(disable)
@@ -1312,8 +1316,8 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
     if constexpr (BSigned)
       sums.compute(a);
     const int32_t *sum = sums.sum;
-#pragma clang loop unroll(disable)
-    for (int p = 0; p < N / 32; p += NB) {
+    auto block = [&](int p, auto width) {
+      constexpr int NB = decltype(width)::value;
       HVX_Vector total[NB];
 #pragma clang loop unroll(full)
       for (int b = 0; b < NB; ++b)
@@ -1345,6 +1349,12 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
           r = tl_gemm_add_sf(r, tl_hvx_load<RowsC>(c0 + 32 * (p + b)));
         tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
       }
-    }
+    };
+#pragma clang loop unroll(disable)
+    for (int p = 0; p + Block <= Panels; p += Block)
+      block(p, std::integral_constant<int, Block>{});
+    if constexpr (Panels % Block != 0)
+      block(Panels - Panels % Block,
+            std::integral_constant<int, Panels % Block>{});
   }
 }

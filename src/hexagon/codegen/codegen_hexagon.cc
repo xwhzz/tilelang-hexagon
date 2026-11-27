@@ -3,6 +3,7 @@
  */
 #include "codegen_hexagon.h"
 #include "arith/pattern_match.h"
+#include "backend/common/codegen/codegen_utils.h"
 #include "hexagon/op/builtin.h"
 #include "hexagon/op/utils.h" // kGridVTCMScope
 #include "op/builtin.h"
@@ -18,6 +19,8 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -566,19 +569,19 @@ private:
 
 CodeGenTileLangHexagon::CodeGenTileLangHexagon() {}
 
-void CodeGenTileLangHexagon::CheckLoadOnlyDMAModule(const IRModule &module) {
+void CodeGenTileLangHexagon::CheckManagedCalls(const IRModule &module) {
+  for (const auto &[gvar, base] : module->functions) {
+    const auto *func = base.as<PrimFuncNode>();
+    if (!func || !HasOnlyManagedDMACalls(func->body)) {
+      has_only_managed_calls_ = false;
+      break;
+    }
+  }
   dma_load_only_module_ =
+      has_only_managed_calls_ &&
       !tvm::transform::PassContext::Current()
            ->GetConfig<Bool>("tl.hexagon_disable_dma_load_only", Bool(false))
            .value();
-  for (const auto &[gvar, base] : module->functions) {
-    const auto *func = base.as<PrimFuncNode>();
-    if (!func) {
-      dma_load_only_module_ = false;
-      continue;
-    }
-    dma_load_only_module_ &= HasOnlyManagedDMACalls(func->body);
-  }
 }
 
 void CodeGenTileLangHexagon::Init(bool output_ssa) {
@@ -590,6 +593,13 @@ void CodeGenTileLangHexagon::Init(bool output_ssa) {
 void CodeGenTileLangHexagon::EmitPreamble_(std::ostream &os) const {
   // What the session that runs the kernel acquires for it (the skel's open,
   // runtime/fastrpc.py): HMX, or the VTCM alone.
+  if (has_only_managed_calls_) {
+    // The Session can trust the per-module resource declarations only when
+    // none of the combined sources introduce opaque C or external calls.
+    os << "// compute resources: "
+       << (uses_hmx_ || uses_vtcm_ || uses_cooperative_ ? "managed" : "none")
+       << "\n";
+  }
   if (uses_hmx_)
     os << "#define TL_HEXAGON_USES_HMX 1\n";
   if (uses_vtcm_)
@@ -964,6 +974,22 @@ void CodeGenTileLangHexagon::VisitStmt_(const BindNode *op) {
     // otherwise-exclusive slice so LLVM retains accesses across that call.
     PrintIndent();
     stream << "tl_escape(" << GetVarID(op->var.get()) << ");\n";
+  }
+}
+
+void CodeGenTileLangHexagon::VisitExpr_(const FloatImmNode *op,
+                                        std::ostream &os) { // NOLINT(*)
+  if (op->dtype == DataType::Float(32) && std::isfinite(op->value)) {
+    // Deserialized FloatImm nodes can bypass the constructor's range check.
+    TVM_FFI_CHECK_LE(std::abs(op->value), std::numeric_limits<float>::max(),
+                     ValueError)
+        << "Literal value " << op->value << " exceeds the float32 range";
+    std::string literal =
+        FlexibleHexFormat(static_cast<float>(op->value)) + "f";
+    MarkConst(literal);
+    os << literal;
+  } else {
+    CodeGenTileLangCBase::VisitExpr_(op, os);
   }
 }
 

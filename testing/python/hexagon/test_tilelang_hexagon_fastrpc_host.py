@@ -71,6 +71,13 @@ def test_one_shot_propagates_close_failure(driver, monkeypatch):
     assert "close failed: 0x1005" in result.stderr
 
 
+@pytest.mark.parametrize(("value", "word"), [(0.375, 0x3EC00000), (-0.5, -1090519040), (-0.0, -(1 << 31)), (2**-149, 1)])
+def test_one_shot_driver_transports_float32_bits(driver, value, word):
+    (plan,) = fastrpc._plan([KernelParam("float32", [])], [])
+    result = subprocess.run([str(driver), "3", str(plan.scalar_word(value))], capture_output=True, text=True, check=True, timeout=5)
+    assert result.stdout == f"domain=3 value={word}\n"
+
+
 def test_cooperative_dispatch_preserves_policy_and_first_error(tmp_path):
     compiler = shutil.which("c++")
     if compiler is None:
@@ -80,7 +87,7 @@ def test_cooperative_dispatch_preserves_policy_and_first_error(tmp_path):
     executable = tmp_path / "cooperative_dispatch"
     source.write_text(harness.replace("// GENERATED_RUN_KERNEL", fastrpc.RUN_KERNEL))
     subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(executable)], check=True, timeout=30)
-    for mode in ("ordinary", "cooperative"):
+    for mode in ("ordinary", "cooperative", "resource-free"):
         for failure in ("none", "prepare-error", "body-error", "finish-error", "body-error-finish-error"):
             subprocess.run([str(executable), f"{mode}-{failure}"], check=True, timeout=5)
     subprocess.run([str(executable), "ordinary-take-error"], check=True, timeout=5)

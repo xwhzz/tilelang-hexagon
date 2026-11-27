@@ -2,10 +2,39 @@
 
 import tilelang
 import tilelang.testing
+from tilelang import tvm
 from tilelang.layout import Layout
 from tilelang.layout.fragment import Fragment
 
 tilelang.testing.set_random_seed()
+
+
+def test_serialized_layout_preserves_captured_var_identity():
+    # A captured shape parameter may share the name of the first layout axis.
+    outer = tvm.tirx.Var("_i", "int32")
+    layout = Layout([8], lambda i: i + outer)
+    restored, captured = tvm.ir.load_json(tvm.ir.save_json([layout, outer]))
+    tvm.ir.assert_structural_equal(restored.forward_index, restored.get_forward_index())
+    (mapped,) = restored.map_forward_index([3])
+    tvm.ir.assert_structural_equal(mapped, captured + 3)
+
+
+def test_independently_restored_layouts_compose_in_one_graph():
+    layouts = [Layout([8], lambda i: i + 2), Layout([8], lambda i: i * 2)]
+    restored = [tvm.ir.load_json(tvm.ir.save_json(layout)) for layout in layouts]
+    for graph in ([layouts[0], restored[1]], restored):
+        tvm.ir.assert_structural_equal(layouts, graph)
+        assert tvm.ir.structural_hash(layouts) == tvm.ir.structural_hash(graph)
+
+
+def test_serialized_fragment_preserves_replication_and_storage_maps():
+    fragment = Fragment([8], forward_thread_fn=lambda i, rep: i % 4 + 4 * rep, forward_index_fn=lambda i: i // 4, replicate=2)
+    restored = tvm.ir.load_json(tvm.ir.save_json(fragment))
+    tvm.ir.assert_structural_equal(fragment, restored)
+    tvm.ir.assert_structural_equal(restored.forward_thread, restored.thread)
+    assert restored.is_equal(fragment)
+    assert [int(x) for x in restored.map_forward_thread([1, 6])] == [6]
+    assert [int(x) for x in restored.map_forward_index([1, 6])] == [1]
 
 
 class TestLayoutEqual:

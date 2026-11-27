@@ -197,7 +197,15 @@ tl_reduce_step_value(const HVX_Vector (&src)[tl_reduce_step_regs<A, S>]) {
     // Any other pair: a lane-wise conversion of E lanes.
     tl_hvx_vec<S, E> x;
     __builtin_memcpy(&x, src, sizeof(x));
-    tl_hvx_vec<A, E> y = __builtin_convertvector(x, tl_hvx_vec<A, E>);
+    tl_hvx_vec<A, E> y;
+    if constexpr (sizeof(S) == 1 && std::is_same_v<A, float>) {
+      // Widen bytes to words and convert one HVX register at a time. A
+      // 128-lane byte-to-float cast is costly for Hexagon instruction
+      // selection.
+      y = vec_type<A, E>(vec_type<S, E>(x)).v;
+    } else {
+      y = __builtin_convertvector(x, tl_hvx_vec<A, E>);
+    }
     tl_hvx_reg<A> acc;
     __builtin_memcpy(&acc, &y, 128);
     acc = tl_reduce_operand<K, A>(acc);

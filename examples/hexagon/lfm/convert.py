@@ -124,13 +124,13 @@ def build_tensors(c: Config, w: dict) -> dict:
     def projection(name, layers, N, K, rows):
         """Stack, over `layers`, the rows [N, K] (rows(i)) of each layer i."""
 
-        def make():
-            out = torch.empty(len(layers), N // TILE, K // TILE, TILE * TILE, dtype=torch.float16)
-            for j, i in enumerate(layers):
-                out[j] = crouton_weight(rows(i).half())
-            return out
+        def pack(i):
+            weight = rows(i).half()
+            if weight.shape != (N, K):
+                raise ValueError(f"{name} layer {i} has shape {tuple(weight.shape)}, expected {(N, K)}")
+            return crouton_weight(weight)
 
-        tensors[name] = (make, "float16", (len(layers), K, N), "hmx_weight")
+        tensors[name] = (lambda: map(pack, layers), "float16", (len(layers), K, N), "hmx_weight")
 
     def qkv(i):
         q, k, v = lw(i, "self_attn.q_proj"), lw(i, "self_attn.k_proj"), lw(i, "self_attn.v_proj")

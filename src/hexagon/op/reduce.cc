@@ -74,16 +74,6 @@ DataType AccType(const ReduceOpNode &op) {
   return DataType::Float(32);
 }
 
-// The stride of `axis` in a compact row-major buffer, in elements.
-PrimExpr Stride(const Buffer &buffer, int axis) {
-  if (!buffer->strides.empty())
-    return buffer->strides[axis];
-  PrimExpr stride = make_const(DataType::Int(32), 1);
-  for (size_t d = axis + 1; d < buffer->shape.size(); ++d)
-    stride = stride * buffer->shape[d];
-  return stride;
-}
-
 Stmt Loop(const Var &var, PrimExpr extent, ForKind kind, Stmt body) {
   return For(var, make_zero(DataType::Int(32)), cast(DataType::Int(32), extent),
              kind, std::move(body));
@@ -133,15 +123,18 @@ public:
     res_ = decl_buffer({1}, acc_t_, "res", "local");
   }
 
-  Stmt Lower() {
+  Stmt Lower(arith::Analyzer *analyzer) {
     for (int d = 0; d < ndim_; ++d)
       vars_.emplace_back("i" + std::to_string(d), DataType::Int(32));
     if (auto crouton = CroutonReduce())
       return *crouton;
-    if (Innermost())
-      return RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_)
-                 ? RowReduce()
-                 : ScalarRowReduce();
+    if (Innermost()) {
+      // The row helper accepts a row pitch but indexes adjacent columns.
+      if (RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_) &&
+          analyzer->CanProveEqual(Stride(op_.src, op_.dim), 1))
+        return RowReduce();
+      return ScalarRowReduce();
+    }
     // Loops over the outputs: every axis but the reduced one and the innermost
     // one, which ColumnReduce walks itself.
     Stmt body = ColumnReduce();
@@ -153,6 +146,17 @@ public:
   }
 
 private:
+  // A row-major layout remaps a private tile into compact physical storage.
+  // An unannotated view keeps its declared strides.
+  PrimExpr Stride(const Buffer &buffer, int axis) const {
+    if (!buffer->strides.empty() && !layout_map_.count(buffer))
+      return buffer->strides[axis];
+    PrimExpr stride = make_const(DataType::Int(32), 1);
+    for (size_t d = axis + 1; d < buffer->shape.size(); ++d)
+      stride = stride * buffer->shape[d];
+    return stride;
+  }
+
   bool Innermost() const { return op_.dim == ndim_ - 1; }
   PrimExpr Extent(int d) const { return op_.srcRegion_->region[d]->extent; }
 
@@ -227,7 +231,7 @@ private:
   // buffers start on one: VTCM arena buffers and stack arrays are 128-byte
   // aligned.
   bool RowsAligned(const BufferLoad &first, const PrimExpr &row_stride) const {
-    PrimExpr offset = make_zero(DataType::Int(64));
+    PrimExpr offset = cast(DataType::Int(64), op_.src->elem_offset);
     for (size_t d = 0; d < first->indices.size(); ++d)
       offset = offset + cast(DataType::Int(64), first->indices[d]) *
                             cast(DataType::Int(64), Stride(op_.src, d));
@@ -438,7 +442,6 @@ private:
 struct Reduce {
   static Stmt Lower(const ReduceOpNode &op, const LowerArgs &lower_args,
                     arith::Analyzer *analyzer) {
-    (void)analyzer;
     if (!InPlace(op.src) || !InPlace(op.dst)) {
       LOG(FATAL) << "Hexagon reduce reads and writes shared, fragment or "
                     "local buffers, got `"
@@ -453,7 +456,8 @@ struct Reduce {
       LOG(FATAL) << "Hexagon reduce does not propagate NaN: HVX max and min "
                     "return the other operand";
     }
-    return ReduceLowering(op, lower_args.layout_map, lower_args.target).Lower();
+    return ReduceLowering(op, lower_args.layout_map, lower_args.target)
+        .Lower(analyzer);
   }
 };
 
