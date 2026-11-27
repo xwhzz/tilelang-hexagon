@@ -9,7 +9,7 @@
  * widening once to combine with an fp32 destination value.
  *
  * Reducing the innermost axis is one tl_hvx_reduce_rows call (hvx_reduce.h)
- * per position of the outer axes: it reduces blocks of rows with HVX transpose
+ * per consecutive run of rows: it reduces blocks of rows with HVX transpose
  * trees and stores whole blocks of results. Along any other axis the outputs
  * are contiguous instead: a block of them accumulates in registers while the
  * loop walks the reduced axis. A whole Crouton matrix reduces along its rows
@@ -34,6 +34,7 @@
 #include <tvm/tirx/stmt.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -132,7 +133,7 @@ public:
       // The row helper accepts a row pitch but indexes adjacent columns.
       if (RowMajor(op_.src, layout_map_) && RowMajor(op_.dst, layout_map_) &&
           analyzer->CanProveEqual(Stride(op_.src, op_.dim), 1))
-        return RowReduce();
+        return RowReduce(analyzer);
       return ScalarRowReduce();
     }
     // Loops over the outputs: every axis but the reduced one and the innermost
@@ -160,21 +161,47 @@ private:
   bool Innermost() const { return op_.dim == ndim_ - 1; }
   PrimExpr Extent(int d) const { return op_.srcRegion_->region[d]->extent; }
 
-  // Reduces the innermost axis with one tl_hvx_reduce_rows call per position
-  // of the axes before the rows, the next-to-innermost axis.
-  Stmt RowReduce() {
+  // Merge adjacent axes while both buffers advance by a constant pitch from
+  // each logical row to the next, including across an outer-axis boundary.
+  Stmt RowReduce(arith::Analyzer *analyzer) {
     int rows_axis = ndim_ - 2;
-    std::vector<std::pair<int, PrimExpr>> first_row;
-    if (rows_axis >= 0)
-      first_row.emplace_back(rows_axis, make_zero(DataType::Int(32)));
-    Array<PrimExpr> dst_indices = Output(first_row);
     PrimExpr one = make_const(DataType::Int(32), 1);
     PrimExpr rows = rows_axis >= 0 ? Extent(rows_axis) : one;
     PrimExpr cols = Extent(op_.dim);
-    // The rows axis keeps its position in the destination, with or without
-    // keepdim, since the reduced axis is the innermost one.
+    // Reducing the innermost axis preserves the row axes with or without
+    // keepdim.
     PrimExpr src_stride = rows_axis >= 0 ? Stride(op_.src, rows_axis) : cols;
     PrimExpr dst_stride = rows_axis >= 0 ? Stride(op_.dst, rows_axis) : one;
+    int first_axis = std::max(rows_axis, 0);
+    while (first_axis > 0 && !op_.src->data.same_as(op_.dst->data)) {
+      int d = first_axis - 1;
+      PrimExpr extent = Extent(d);
+      if (!analyzer->CanProveEqual(extent, 1)) {
+        // Keep the helper's signed 32-bit row count in range.
+        PrimExpr count =
+            cast(DataType::Int(64), rows) * cast(DataType::Int(64), extent);
+        if (!analyzer->CanProve(rows > 0) || !analyzer->CanProve(extent > 0) ||
+            !analyzer->CanProve(count <= std::numeric_limits<int32_t>::max()))
+          break;
+        if (analyzer->CanProveEqual(rows, 1)) {
+          src_stride = Stride(op_.src, d);
+          dst_stride = Stride(op_.dst, d);
+        } else if (!analyzer->CanProveEqual(Stride(op_.src, d),
+                                            rows * src_stride) ||
+                   !analyzer->CanProveEqual(Stride(op_.dst, d),
+                                            rows * dst_stride)) {
+          break;
+        }
+        if (!analyzer->CanProve(dst_stride > 0))
+          break;
+        rows = cast(DataType::Int(32), count);
+      }
+      first_axis = d;
+    }
+    std::vector<std::pair<int, PrimExpr>> first_row;
+    for (int d = first_axis; d <= rows_axis; ++d)
+      first_row.emplace_back(d, make_zero(DataType::Int(32)));
+    Array<PrimExpr> dst_indices = Output(first_row);
     BufferLoad first =
         Downcast<BufferLoad>(Source(make_zero(DataType::Int(32)), first_row));
     Stmt body = Evaluate(
@@ -187,7 +214,7 @@ private:
               cast(DataType::Int(32), rows), cast(DataType::Int(32), cols),
               cast(DataType::Int(32), src_stride),
               cast(DataType::Int(32), dst_stride), Bool(op_.clear)}));
-    for (int d = rows_axis - 1; d >= 0; --d)
+    for (int d = first_axis - 1; d >= 0; --d)
       body = Loop(vars_[d], Extent(d), ForKind::kSerial, body);
     return body;
   }

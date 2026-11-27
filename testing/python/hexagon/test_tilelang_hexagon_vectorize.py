@@ -10,8 +10,8 @@ from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
 
 
-def _source(func, fast_math=False):
-    target = determine_target("hexagon", return_object=True)
+def _source(func, fast_math=False, target="hexagon"):
+    target = determine_target(target, return_object=True)
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config={"tl.enable_fast_math": fast_math}):
         return str(tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source)
 
@@ -47,6 +47,101 @@ def test_noop_keeps_single_store_vector_width():
     source = _source(make(False))
     assert "*(int8_t128*)(B + 0)" in source
     assert _source(make(True)) == source
+
+
+@pytest.mark.parametrize("n,vector,tail", [(31, False, False), (32, True, False), (33, True, True), (1000, True, True)])
+def test_nondivisible_sigmoid_uses_a_whole_vector_prefix(n, vector, tail):
+    @T.prim_func
+    def activate(x: T.Tensor((n,), "float32"), y: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(n):
+                y[i] = T.sigmoid(x[i])
+
+    source = _source(activate)
+    assert ("tl_hvx_sigmoid(*(float32*)" in source) == vector
+    assert ("tl_hvx_sigmoid(x[" in source) == (tail or not vector)
+
+
+def test_vector_prefix_honors_an_unaligned_subregion_in_place():
+    @T.prim_func
+    def increment(x: T.Tensor((264,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(257):
+                x[i + 3] = x[i + 3] + T.float32(1)
+
+    source = _source(increment)
+    assert "tl_hvx_vec_loadu<float32>" in source and "tl_hvx_vec_storeu(" in source
+    assert "x[259] =" in source
+
+
+@pytest.mark.parametrize("case", ["shifted", "reversed", "predicate", "scalar_math"])
+def test_vector_prefix_keeps_other_odd_maps_scalar(case):
+    @T.prim_func
+    def update(x: T.Tensor((66,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(65):
+                if case == "shifted":
+                    x[i + 1] = x[i] + T.float32(1)
+                elif case == "reversed":
+                    x[i] = x[64 - i]
+                elif case == "predicate":
+                    if x[i] > T.float32(1):
+                        x[i] = T.float32(0)
+                else:
+                    x[i] = T.floor(x[i])
+
+    source = _source(update)
+    assert "float32*" not in source and "tl_hvx_vec_" not in source
+
+
+@pytest.mark.parametrize("dtype,vector", [("float16", "half64"), ("int8", "int8_t128")])
+def test_vector_prefix_uses_the_element_width(dtype, vector):
+    @T.prim_func
+    def add(x: T.Tensor((257,), dtype), y: T.Tensor((257,), dtype)):
+        with T.Kernel(1):
+            for i in T.Parallel(257):
+                y[i] = x[i] + T.cast(1, dtype)
+
+    source = _source(add)
+    assert f"*({vector}*)(y +" in source
+    assert "y[256] =" in source
+
+
+@pytest.mark.parametrize("arch,n,vector", [(73, 255, False), (73, 257, True), (79, 33, True)])
+def test_small_arithmetic_prefix_cost(arch, n, vector):
+    @T.prim_func
+    def add(x: T.Tensor((n,), "int32"), y: T.Tensor((n,), "int32")):
+        with T.Kernel(1):
+            for i in T.Parallel(n):
+                y[i] = x[i] + 1
+
+    source = _source(add, target={"kind": "hexagon", "mcpu": f"hexagonv{arch}"})
+    assert ("*(int32_t32*)" in source) == vector
+
+
+@pytest.mark.parametrize("width", [1, 4])
+def test_vector_prefix_respects_explicit_coalesced_width(width):
+    @T.prim_func
+    def activate(x: T.Tensor((65,), "float32"), y: T.Tensor((65,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(65, coalesced_width=tvm.tirx.IntImm("int32", width)):
+                y[i] = T.sigmoid(x[i])
+
+    source = _source(activate)
+    assert "i < 65" in source and "float32*" not in source
+
+
+def test_vector_prefix_honors_disabled_vectorization():
+    @T.prim_func
+    def activate(x: T.Tensor((65,), "float32"), y: T.Tensor((65,), "float32")):
+        with T.Kernel(1):
+            for i in T.Parallel(65):
+                y[i] = T.sigmoid(x[i])
+
+    target = determine_target("hexagon", return_object=True)
+    with target, tvm.transform.PassContext(config={"tirx.disable_vectorize": True}):
+        source = tilelang.lower(activate, target=target, enable_host_codegen=False, enable_device_compile=False).kernel_source
+    assert "i < 65" in source and "float32*" not in source
 
 
 def test_a_narrow_input_fills_whole_registers():

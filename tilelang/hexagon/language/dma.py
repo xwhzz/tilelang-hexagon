@@ -15,7 +15,8 @@ __all__ = ["annotate_dma_only", "annotate_write_through", "dma_copy", "dma_wait"
 def dma_copy(src: BufferLikeType, dst: BufferLikeType) -> tirx.PrimExpr:
     """Submit one asynchronous Hexagon DDR <-> VTCM DMA transfer.
 
-    Supports in-bounds 1D/2D row-major regions with identical scalar dtypes.
+    Supports matching, in-bounds row-major regions with identical scalar dtypes.
+    Multi-plane regions must cover contiguous elements on both sides.
     Strided regions use 16-bit descriptor fields before v75, 24-bit fields
     thereafter. Wider strides use one 1D descriptor per row or tiled run.
     The program may keep at most 256 descriptors in flight across its groups.

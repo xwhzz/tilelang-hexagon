@@ -351,7 +351,9 @@ in one assembly block, keeping Qfloat state out of register spills while preserv
 each accumulator's addition order.
 
 DMA is a separate row-major DDR↔VTCM operation and does not perform the Crouton
-permutation. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,
+permutation. A row-major region that spans several planes transfers as one contiguous
+block when the physical strides of both regions match their extents. A gap between
+planes prevents this lowering. Between two buffers of one Crouton layout, `T.dma_copy` moves whole tiles,
 which follow each other in the tile order (a weight's K, an activation's columns): each run
 of a region's tiles is a row of one 2D descriptor, or the runs are one 1D transfer when they
 follow each other on both sides, as one panel of weights does.
@@ -452,7 +454,8 @@ wait (`async_copy_commit`, `async_copy_wait`), so the shared pipeline injector
 commits a stage's copies as one group of the tile program's DMA queue and waits for
 them before their consumers. A pipelined `T.copy` from DDR becomes the descriptors
 of a DMA transfer, when DMA moves it faster than HVX loads: one contiguous block,
-or rows of at least 512 bytes (`DMAOutpacesHVX`). Other copies run at once in
+or rows of at least 512 bytes (`DMAOutpacesHVX`). A contiguous block spanning
+multiple planes uses DMA from 2 KiB up. Other copies run at once in
 their stage. Into an HMX operand, which DMA cannot fill in Crouton order, the copy
 goes to a row-major staging buffer that the pipeline multi-buffers, and an HVX pack
 in the gemm's stage fills the operand (`StageHMXOperandCopies`).

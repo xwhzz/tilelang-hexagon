@@ -38,6 +38,8 @@ def cooperative_host(tmp_path_factory):
             "-fno-sanitize-recover=all",
             "-I",
             str(out),
+            "-I",
+            str(root / "src"),
             str(Path(__file__).with_name("cooperative_host.cc")),
             "-o",
             str(binary),

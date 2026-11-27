@@ -155,6 +155,11 @@ TIR_DEFINE_TL_BUILTIN(hexagon_hvx_gemm_weight)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(hexagon_hvx_gemm_weight_row_pairs)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(hexagon_hvx_gemm_int)
     .set_num_inputs(13)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -29,7 +29,7 @@ def resource_host(tmp_path_factory):
     # Compile the exact resource-facing HMX functions. The matrix instruction
     # helpers are not part of this host ownership test.
     enable = hmx[hmx.index("TL_HMX_INLINE int tl_hmx_enable") : hmx.index("TL_HMX_INLINE void tl_hmx_unit_acquire")]
-    lifecycle = hmx[hmx.index("static int tl_hmx_inited;") :]
+    lifecycle = hmx[hmx.index("TL_HEXAGON_SESSION_STATE int tl_hmx_inited;") :]
     (headers / "hmx_lifecycle.h").write_text("#define TL_HMX_INLINE static inline\n" + enable + lifecycle)
     binary = directory / "resource-host"
     subprocess.run(

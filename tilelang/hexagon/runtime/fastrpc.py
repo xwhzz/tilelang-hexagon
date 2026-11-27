@@ -375,7 +375,7 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
     )
 
 
-def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
+def gen_cmake(iface: str, template_dir: str, agent: bool, kernel_files=()) -> str:
     # The DSP skel (skel + impl, compiled with HVX/HMX enabled) and, for a
     # session, its HLOS agent (stub + agent). ``template_dir`` is the parent
     # of ``tl_templates`` so the kernel's <tl_templates/hexagon/...> include
@@ -384,6 +384,7 @@ def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
     # Kernels clean up by scope (DMA queues, worker HMX scopes) and never throw;
     # -fno-exceptions keeps those destructors from importing the C++ unwinder,
     # which the DSP does not have.
+    dsp_sources = "\n        ".join(f"${{CMAKE_CURRENT_SOURCE_DIR}}/{name}" for name in (f"{iface}_dsp.cc", *kernel_files))
     agent_block = (
         """
     add_executable(IFACE_agent
@@ -427,7 +428,7 @@ if(${{OS_TYPE}} MATCHES "HLOS"){agent_block}
 else()
     add_library({iface}_skel SHARED
         ${{CMAKE_CURRENT_BINARY_DIR}}/{iface}_skel.c
-        ${{CMAKE_CURRENT_SOURCE_DIR}}/{iface}_dsp.cc
+        {dsp_sources}
     )
     build_idl({iface}.idl {iface}_skel)
     if(TL_HEXAGON_LEGACY_COMPUTE_RES)

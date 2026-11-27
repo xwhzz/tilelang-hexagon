@@ -260,6 +260,29 @@ def test_a_weight_layout_b_runs_on_hvx():
     assert call.startswith("tl_hvx_gemm_weight<16, 64, 64, 64, 64, true, 2048>(")
 
 
+@pytest.mark.parametrize("arch, uses_pairs", [("v73", True), ("v75", False), ("v79", True)])
+@pytest.mark.parametrize("n,k", [(256, 128), (128, 256)])
+def test_four_row_weight_schedule_requires_vtcm(monkeypatch, arch, uses_pairs, n, k):
+    monkeypatch.setenv("HEXAGON_DSP_ARCH", arch)
+
+    @T.prim_func
+    def kernel(A: T.Tensor((4, k), "float16"), B: T.Tensor((k, n), "float16"), C: T.Tensor((4, n), "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared((k, n), "float16")
+            T.annotate_layout({B: make_hmx_weight_layout(B), b: make_hmx_weight_layout(b)})
+            T.dma_copy(B, b)
+            T.dma_wait()
+            T.gemm(A, B, C, clear_accum=True)
+            T.gemm(A, b, C)
+
+    source = _source(kernel)
+    generic = _calls(source, "tl_hvx_gemm_weight")
+    paired = _calls(source, "tl_hvx_gemm_weight_row_pairs")
+    assert len(generic) == (1 if uses_pairs else 2)
+    assert len(paired) == int(uses_pairs)
+    assert "(&(B[0]))" in generic[0]
+
+
 def test_operands_in_other_layouts_run_as_scalar_loops(caplog):
     with caplog.at_level(logging.WARNING, logger="tilelang.hexagon.op.gemm"):
         source = _source(_laid_out_b(make_hmx_activation_layout))
@@ -486,3 +509,38 @@ def test_weight_layout_gemms_match_torch(M, N, K, BN, BK, c_dtype, trans_b):
     assert torch.all(out[:, 3:32] == 0)
     rounding = (K // BK) * 2.0**-10 if c_dtype == "float16" else 1e-5
     torch.testing.assert_close(out, ref, atol=rounding * float(ref.abs().max()) + 1e-5, rtol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize("N, K", [(256, 128), (128, 256)])
+def test_four_row_weight_gemm_preserves_reduction_order(N, K):
+    import torch
+
+    @T.prim_func
+    def kernel(A: T.Tensor((4, K), "float16"), B: T.Tensor((K, N), "float16"), Out: T.Tensor((2, 2, 4, N), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((4, K), "float16")
+            b = T.alloc_shared((K, N), "float16")
+            c = T.alloc_fragment((4, N), "float32")
+            padded = T.alloc_fragment((4, N + 32), "float32")
+            T.annotate_layout({B: make_hmx_weight_layout(B), b: make_hmx_weight_layout(b)})
+            T.copy(A, a)
+            T.dma_copy(B, b)
+            T.dma_wait()
+            T.fill(c, 3.0)
+            T.fill(padded, 3.0)
+            for i in T.serial(2):
+                T.gemm(a, b, c, clear_accum=(i == 0))
+                T.gemm(a, b, padded[:, :N], clear_accum=(i == 0))
+                T.copy(c, Out[i, 0, :, :])
+                T.copy(padded[:, :N], Out[i, 1, :, :])
+
+    rng = torch.Generator().manual_seed(42)
+    a = torch.randn((4, K), generator=rng).half()
+    b = torch.randn((K, N), generator=rng).half()
+    ref = a.float() @ b.float()
+    # The padded output uses the original one-row schedule for both clear modes.
+    result = _run(kernel, a, _weight_tiles(b))
+    assert torch.equal(result[:, 0].view(torch.int32), result[:, 1].view(torch.int32))
+    for i in range(2):
+        torch.testing.assert_close(result[i, 0], (i + 1) * ref, atol=1e-4, rtol=1e-5)
