@@ -1347,101 +1347,101 @@ TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
   if constexpr (Wide && (sizeof(TA) != 2 || Group > 8192)) {
     tl_gemm_wide_groups<M, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
         C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear);
-    return;
-  }
-  // Columns per staged chunk of A's row, whole groups; panels per block.
-  // A wide group can stage multiple groups in one pass over its byte planes.
-  constexpr int Capacity = Wide ? 2048 : 512;
-  constexpr int KC =
-      Group >= Capacity ? Group : tl_gemm_min(K, Capacity / Group * Group);
-  constexpr int Panels = N / 32;
-  constexpr int Divisor = tl_gemm_int_block(Panels);
-  // Keep uniform blocks of two or more panels. For an otherwise single-panel
-  // schedule, share staging across four full panels and handle the remainder.
-  constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
-  constexpr bool RowsC = AlignC && LdC % 32 == 0;
-  tl_gemm_int_row<TA, BBits, KC> row;
+  } else {
+    // Columns per staged chunk of A's row, whole groups; panels per block.
+    // A wide group can stage multiple groups in one pass over its byte planes.
+    constexpr int Capacity = Wide ? 2048 : 512;
+    constexpr int KC =
+        Group >= Capacity ? Group : tl_gemm_min(K, Capacity / Group * Group);
+    constexpr int Panels = N / 32;
+    constexpr int Divisor = tl_gemm_int_block(Panels);
+    // Keep uniform blocks of two or more panels. For an otherwise single-panel
+    // schedule, share staging across four full panels and handle the remainder.
+    constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
+    constexpr bool RowsC = AlignC && LdC % 32 == 0;
+    tl_gemm_int_row<TA, BBits, KC> row;
 #pragma clang loop unroll(disable)
-  for (int i = 0; i < M; ++i) {
-    const TA *a = A + i * LdA;
-    float *c0 = C + i * LdC;
+    for (int i = 0; i < M; ++i) {
+      const TA *a = A + i * LdA;
+      float *c0 = C + i * LdC;
 #if __HVX_ARCH__ == 79
-    if constexpr (Wide) {
-      // The v79 Qfloat multiply can retain excess precision in a subnormal
-      // intermediate scale. Use the scalar group path if the smallest fp16
-      // factor (2^-24) could take this row below the fp32 normal range.
-      bool tiny_scale = false;
-      for (int g = 0; g < K / GA; ++g) {
-        float scale = __builtin_fabsf(sfa[i * ld_sfa + g]);
-        tiny_scale |= scale != 0.0f && scale < 0x1p-102f;
-      }
-      if (tiny_scale) {
-        tl_gemm_wide_groups<1, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
-            c0, a, B, panel_bytes, sfa + i * ld_sfa, ld_sfa, sfb, ld_sfb,
-            clear);
-        continue;
-      }
-    }
-#endif
-    // A signed B subtracts its offset times each group's sum of the row.
-    std::conditional_t<BSigned, tl_gemm_int_group_sums<K, Group>,
-                       tl_gemm_int_no_sums>
-        sums;
-    if constexpr (BSigned)
-      sums.compute(a);
-    const int32_t *sum = sums.sum;
-    auto block = [&](int p, auto width) {
-      constexpr int NB = decltype(width)::value;
-      HVX_Vector total[NB];
-#pragma clang loop unroll(full)
-      for (int b = 0; b < NB; ++b)
-        total[b] = Q6_V_vzero();
-#pragma clang loop unroll(disable)
-      for (int k0 = 0; k0 < K; k0 += KC) {
-        int k = tl_gemm_min(KC, K - k0);
-        row.stage(a + k0, k, false);
-        tl_gemm_int_panels_scaled<TA, BBits, BSigned, NB, KC, Group, (GA < K),
-                                  Wide>(
-            total, row, BSigned ? sum + k0 / Group : sum,
-            B + k0 / lane * 128 + p * panel_bytes, panel_bytes, k0 / Group,
-            k / Group, sfa + i * ld_sfa, GA / Group, sfb + 32 * p, ld_sfb,
-            GB / Group);
-      }
-      // A's one factor for the whole row, when it has one.
-      HVX_Vector va = Q6_V_vzero();
-      if constexpr (GA >= K) {
-        float a_scale = sfa[i * ld_sfa];
-        int32_t a_bits;
-        __builtin_memcpy(&a_bits, &a_scale, 4);
-        va = Q6_V_vsplat_R(a_bits);
-      }
-#pragma clang loop unroll(full)
-      for (int b = 0; b < NB; ++b) {
-        HVX_Vector r = Wide ? total[b] : tl_gemm_result(total[b]);
-        if constexpr (GA >= K)
-          r = Wide ? Q6_Vsf_vmpy_VsfVsf(r, va)
-                   : tl_gemm_result(Q6_Vqf32_vmpy_VsfVsf(r, va));
-        if (!clear) {
-          HVX_Vector old = tl_hvx_load<RowsC>(c0 + 32 * (p + b));
-          r = Wide ? Q6_Vsf_vadd_VsfVsf(r, old) : tl_gemm_add_sf(r, old);
-        }
-        tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
-      }
-    };
-    // Wide blocks inherit the IEEE feature of the v73/v75 caller. Leave
-    // ordinary blocks to the original inlining policy.
-    auto apply = [&](int p, auto width) TL_HEXAGON_VECTOR_INLINE {
       if constexpr (Wide) {
-        tl_gemm_wide_scaled_block(block, p, width);
-      } else {
-        block(p, width);
+        // The v79 Qfloat multiply can retain excess precision in a subnormal
+        // intermediate scale. Use the scalar group path if the smallest fp16
+        // factor (2^-24) could take this row below the fp32 normal range.
+        bool tiny_scale = false;
+        for (int g = 0; g < K / GA; ++g) {
+          float scale = __builtin_fabsf(sfa[i * ld_sfa + g]);
+          tiny_scale |= scale != 0.0f && scale < 0x1p-102f;
+        }
+        if (tiny_scale) {
+          tl_gemm_wide_groups<1, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
+              c0, a, B, panel_bytes, sfa + i * ld_sfa, ld_sfa, sfb, ld_sfb,
+              clear);
+          continue;
+        }
       }
-    };
+#endif
+      // A signed B subtracts its offset times each group's sum of the row.
+      std::conditional_t<BSigned, tl_gemm_int_group_sums<K, Group>,
+                         tl_gemm_int_no_sums>
+          sums;
+      if constexpr (BSigned)
+        sums.compute(a);
+      const int32_t *sum = sums.sum;
+      auto block = [&](int p, auto width) {
+        constexpr int NB = decltype(width)::value;
+        HVX_Vector total[NB];
+#pragma clang loop unroll(full)
+        for (int b = 0; b < NB; ++b)
+          total[b] = Q6_V_vzero();
 #pragma clang loop unroll(disable)
-    for (int p = 0; p + Block <= Panels; p += Block)
-      apply(p, std::integral_constant<int, Block>{});
-    if constexpr (Panels % Block != 0)
-      apply(Panels - Panels % Block,
-            std::integral_constant<int, Panels % Block>{});
+        for (int k0 = 0; k0 < K; k0 += KC) {
+          int k = tl_gemm_min(KC, K - k0);
+          row.stage(a + k0, k, false);
+          tl_gemm_int_panels_scaled<TA, BBits, BSigned, NB, KC, Group, (GA < K),
+                                    Wide>(
+              total, row, BSigned ? sum + k0 / Group : sum,
+              B + k0 / lane * 128 + p * panel_bytes, panel_bytes, k0 / Group,
+              k / Group, sfa + i * ld_sfa, GA / Group, sfb + 32 * p, ld_sfb,
+              GB / Group);
+        }
+        // A's one factor for the whole row, when it has one.
+        HVX_Vector va = Q6_V_vzero();
+        if constexpr (GA >= K) {
+          float a_scale = sfa[i * ld_sfa];
+          int32_t a_bits;
+          __builtin_memcpy(&a_bits, &a_scale, 4);
+          va = Q6_V_vsplat_R(a_bits);
+        }
+#pragma clang loop unroll(full)
+        for (int b = 0; b < NB; ++b) {
+          HVX_Vector r = Wide ? total[b] : tl_gemm_result(total[b]);
+          if constexpr (GA >= K)
+            r = Wide ? Q6_Vsf_vmpy_VsfVsf(r, va)
+                     : tl_gemm_result(Q6_Vqf32_vmpy_VsfVsf(r, va));
+          if (!clear) {
+            HVX_Vector old = tl_hvx_load<RowsC>(c0 + 32 * (p + b));
+            r = Wide ? Q6_Vsf_vadd_VsfVsf(r, old) : tl_gemm_add_sf(r, old);
+          }
+          tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
+        }
+      };
+      // Wide blocks inherit the IEEE feature of the v73/v75 caller. Leave
+      // ordinary blocks to the original inlining policy.
+      auto apply = [&](int p, auto width) TL_HEXAGON_VECTOR_INLINE {
+        if constexpr (Wide) {
+          tl_gemm_wide_scaled_block(block, p, width);
+        } else {
+          block(p, width);
+        }
+      };
+#pragma clang loop unroll(disable)
+      for (int p = 0; p + Block <= Panels; p += Block)
+        apply(p, std::integral_constant<int, Block>{});
+      if constexpr (Panels % Block != 0)
+        apply(Panels - Panels % Block,
+              std::integral_constant<int, Panels % Block>{});
+    }
   }
 }
