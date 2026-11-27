@@ -669,11 +669,12 @@ def make_prefill(
                         ),
                     )
                     attention(bf, kv0, base, window)
-                elif has_last_layer and not c.is_attention(c.layers - 1) and layer == L - 1:
-                    # Only B*x history survives the model's final convolution.
-                    run_conv(bf, ci, valid, p_in, rings, 2)
                 else:
-                    run_conv(bf, ci, valid, p_in, rings, 3)
+                    if has_last_layer and not c.is_attention(c.layers - 1) and layer == L - 1:
+                        # Only B*x history survives the model's final convolution.
+                        run_conv(bf, ci, valid, p_in, rings, 2)
+                    else:
+                        run_conv(bf, ci, valid, p_in, rings, 3)
                 T.sync_grid()
                 # The model's last layer's output projection and FFN feed
                 # nothing the prefill leaves: the decode runs the prompt's
