@@ -538,13 +538,18 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         if selector is None or selector == "auto":
             selector = Target.current(allow_none=True) or "auto"
         # A caller may edit a target dict in place between invocations.
-        target_key = repr(dict(selector)) if isinstance(selector, Mapping) else selector
+        target_key = selector
+        if not isinstance(selector, str) and isinstance(selector, Mapping):
+            target_key = repr(dict(selector))
+        # An ordinary module has no session-owning execution backend.
+        if dispatch is not _RUNTIME_UNRESOLVED and dispatch[2] is None and dispatch[0][0] == target_key:
+            return None
         backend = self.execution_backend if self.execution_backend is not None else env.get_default_execution_backend()
         choice = (target_key, backend)
         if dispatch is _RUNTIME_UNRESOLVED or dispatch[0] != choice:
             requested = env.get_default_target() if self.target is None and not isinstance(selector, Target) else selector
             if isinstance(requested, Mapping):
-                requested = Target(dict(requested))
+                requested = dict(requested)
             from tilelang.cache import _resolve_cache_dispatch
 
             try:
@@ -557,8 +562,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                 raise
             policy = context.execution_backend
             fixed_target = self.target is not None and self.target != "auto" and not isinstance(self.target, Mapping)
-            if fixed_target and not any(spec.runtime_cache for spec in context.module.execution_backends):
-                self._runtime_policy = None
+            if not any(spec.runtime_cache for spec in context.module.execution_backends):
+                self._runtime_policy = None if fixed_target else (choice, requested, None)
                 return None
             self._runtime_policy = (choice, requested, policy)
         else:
