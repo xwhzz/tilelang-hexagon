@@ -826,7 +826,12 @@ class Decoder:
                     retained = len(seen) - pos <= ring(self.c) - self.c.window
                 else:
                     retained = True
-                if retained:
+                # An FP16 prefill starting inside the first tile also reads the
+                # preceding KV. Replaying that tile avoids both that work and
+                # the checkpoint restore when either route needs one tile.
+                end, rows = len(prompt) - 1, self.prefill_rows
+                replay_tile = self.fp16 and rows and pos < end <= min(rows, self.max_tokens) and pos + rows <= self.max_pos
+                if retained and not replay_tile:
                     self._copy_chat_conv(restore=True)
                     return pos
         self.reset()
