@@ -13,6 +13,8 @@
 #include "hexagon/op/gemm.h"
 
 #include "hexagon/op/utils.h" // GetBufferStrides, IsVTCMBuffer
+#include "hexagon/target_utils.h"
+#include "op/builtin.h"
 #include "op/gemm.h"
 #include "op/gemm_blockscaled.h"
 #include "support/check.h"
@@ -22,6 +24,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -52,6 +55,57 @@ std::string TypeName(DataType dtype) {
 }
 
 } // namespace
+
+void ValidateHMXGemmU8I8(const CallNode &op, const Target &target,
+                         const LayoutMap &layouts, arith::Analyzer *analyzer) {
+  const int arch = HexagonArchVersion(target);
+  ICHECK(TargetIsHexagon(target) &&
+         (arch == 73 || arch == 75 || arch == 79 || arch == 81))
+      << "T.hmx_gemm_u8i8 requires a Hexagon v73, v75, v79 or v81 target";
+  for (size_t i = 1; i <= 3; ++i) {
+    const auto *ptr = op.args[i].as<CallNode>();
+    ICHECK(ptr && ptr->op.same_as(tl::access_ptr()));
+    BufferLoad start = Downcast<BufferLoad>(ptr->args[0]);
+    const Buffer &buffer = start->buffer;
+    ICHECK(RowMajor(buffer, layouts))
+        << "T.hmx_gemm_u8i8 requires dense row-major layout for "
+        << buffer->name;
+    // Check the original extents before 32-bit flattening can wrap their
+    // product to an apparently small VTCM allocation.
+    int64_t remaining =
+        std::numeric_limits<int32_t>::max() / buffer->dtype.bytes();
+    for (const PrimExpr &dim : buffer->shape) {
+      PrimExpr simplified = analyzer->Simplify(dim);
+      const auto *extent = simplified.as<IntImmNode>();
+      ICHECK(extent && extent->value > 0 && extent->value <= remaining)
+          << "T.hmx_gemm_u8i8 requires a constant-size VTCM buffer that "
+             "fits signed 32-bit byte offsets; "
+          << buffer->name << " has shape " << buffer->shape;
+      remaining /= extent->value;
+    }
+    // The Python contract checks the inner tile axes. Check the leading
+    // indices and the span of K even when they fit in a different batch.
+    bool has_k_tiles = i != 3;
+    size_t tile_rank = i == 2 ? 3 : 2;
+    ICHECK_GE(buffer->shape.size(), tile_rank + has_k_tiles);
+    size_t checked_axes = buffer->shape.size() - tile_rank;
+    for (size_t d = 0; d < checked_axes; ++d) {
+      PrimExpr begin = start->indices[d];
+      PrimExpr count = has_k_tiles && d + 1 == checked_axes
+                           ? op.args[0]
+                           : make_const(begin.dtype(), 1);
+      const PrimExpr &dim = buffer->shape[d];
+      // This order avoids overflow in begin + count and underflow in
+      // dim - count.
+      ICHECK(analyzer->CanProve(begin >= 0) && analyzer->CanProve(count >= 0) &&
+             analyzer->CanProve(count <= dim) &&
+             analyzer->CanProve(begin <= dim - count))
+          << "T.hmx_gemm_u8i8 requires provably in-bounds regions; "
+          << buffer->name << " axis " << d << " starts at " << begin
+          << " with extent " << count << " and shape " << dim;
+    }
+  }
+}
 
 std::string HMXRejection(const GemmNode &op, bool pad) {
   if (op.annotations_.count(kRowMajorGemm))

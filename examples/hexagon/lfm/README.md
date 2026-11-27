@@ -105,7 +105,7 @@ shares of every projection, and a chunk's activations stay in VTCM that the
 workers share (`global.vtcm`): its residual, the normalized input of a layer's
 GEMMs, and their output or a part of the FFN's hidden units.
 
-- **GEMMs.** Each block a worker streams, 128 rows of a projection, is one
+- **GEMMs.** By default, each block a worker streams, 128 rows of a projection, is one
   `T.gemm_blockscaled` by the whole chunk: HVX dequantizes the block's 4-bit
   weights once for all 128 rows, and the workers take turns at HMX, each
   dequantizing and running its epilogues while another multiplies.
@@ -137,11 +137,43 @@ The prefill's keys and values match the decode's, a token a step, to 4.3e-3
 at most (the last attention layer's keys), and the tokens generated after it
 match the decode's.
 
+### Integer HMX gate/up projection
+
+`Decoder(..., w8a8_w13=True)` enables online W8A8 for the `ffn.w13` projection
+of a Q4 LFM2 prefill. `bench.py` and `generate.py` expose it as `--w8a8-w13`.
+The prefill factory accepts Hexagon v73 and v79 with 1024-bit HVX, chunk sizes of
+32, 64 or 128 rows, and a single K slice up to 2048 channels. At 128 rows, the
+workers share one FFN hidden slot and synchronize before reusing it.
+
+Each worker quantizes its normalized fp16 activation rows once per layer. The
+workers share those packed rows across gate/up blocks. Each Q4 weight panel
+expands through the ordinary fp16 dequantizer and is then requantized once
+and reused across the chunk's row tiles. The normalized activations and
+expanded weights must be finite fp16 values. Quantization uses signed
+symmetric 8-bit levels with ties to even and an fp32 scale per activation
+row and output channel. The integer HMX dot corrects the activation's unsigned
+bias before applying the scales and passing the results to SwiGLU.
+
+This option is experimental and defaults to off. Device projection checks
+with K = 2048 and 32 or 128 rows pass on v73 and v79.
+
+The default W4A16 path was faster in both measurements on the v79 phone
+using LFM2-1.2B RTN, 128-row chunks and one cDSP session.
+
+| Test | Default W4A16 | Online W8A8 `ffn.w13` |
+| --- | ---: | ---: |
+| PP1024 median FastRPC time, eight timed runs per mode | 180.55 ms | 637.91 ms |
+| Isolated layer-0 gate/up projection, median with output written to DDR | 0.908 ms | 4.613 ms |
+
+Both timings include DMA and the work to prepare the operands. On 16 held-out
+WikiText-2 windows with 128-token prefills and 512 scored suffix targets in
+total, perplexity was 22.901 for W4A16 and 22.844 for W8A8.
+
 ### Numerical checks
 
 For the Q4 bundle, `BundleModel` rounds projection inputs to int16 with one
-scale per row and evaluates the dequantized weights in fp32. The HMX prefill
-rounds its activation and weight operands to fp16 and also uses fp16
+scale per row and evaluates the dequantized weights in fp32. The default HMX
+prefill rounds its activation and weight operands to fp16 and also uses fp16
 intermediates for softmax and SwiGLU. Rounding differences between these
 arithmetic paths can accumulate across layers and affect their logits.
 
@@ -155,7 +187,10 @@ The tiny-model Q4 regression tests use separate references and comparisons.
   `max(abs(actual - reference)) / max(abs(reference)) < 5e-3`, then checks
   continuation tokens against `BundleModel`.
 - The WikiText-2 comparison above scores forced tokens through decode.
-  `ppl.py` constructs its decoder with `prefill_rows=None`.
+  `ppl.py` uses decode by default. Add `--prefill-prefix 512` to prefill the
+  first 512 tokens of each window, including BOS, and score the targets
+  following the first suffix token. With `--w8a8-w13`, this measures suffix
+  perplexity conditioned on the integer prefill.
 
 ## On the device
 

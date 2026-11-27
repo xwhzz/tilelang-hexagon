@@ -112,6 +112,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        false, -1, 4},
       {tl::hexagon_hmx_gemm_blockscaled(), "tl_hexagon_hmx_gemm_blockscaled",
        "hmx_gemm.h", true, false, false, -1, 6},
+      {tl::hexagon_hmx_gemm_u8i8(), "tl_hexagon_hmx_gemm_u8i8",
+       "hmx_gemm_int.h", true},
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", "hvx_gemm.h", false, false, false,
        -1, 11},
       {tl::hexagon_hvx_gemm_weight(), "tl_hvx_gemm_weight", "hvx_gemm.h", false,
@@ -236,6 +238,7 @@ private:
         tl::hexagon_crouton_tile_store(),
         tl::hexagon_hmx_gemm(),
         tl::hexagon_hmx_gemm_blockscaled(),
+        tl::hexagon_hmx_gemm_u8i8(),
         tl::sync_grid()};
     for (const auto &safe : without_arithmetic) {
       if (op->op.same_as(safe)) {
@@ -1035,6 +1038,14 @@ void CodeGenTileLangHexagon::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangHexagon::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
+  // These packing helpers have ordinary typed extern operands. Include their
+  // definitions without an opaque source import that can affect other kernels.
+  if (op->op.same_as(builtin::call_extern()) && !op->args.empty()) {
+    const auto *name = op->args[0].as<StringImmNode>();
+    if (name && (name->value == "tl_hexagon_quantize_crouton_u8" ||
+                 name->value == "tl_hexagon_requantize_panel_s4_s8"))
+      headers_.insert("w8a8.h");
+  }
   if (op->op.same_as(builtin::address_of())) {
     const auto *load = op->args[0].as<BufferLoadNode>();
     if (load && load->buffer->dtype.bits() == 4) {

@@ -30,6 +30,8 @@
 #include "cuda/op/builtin.h"
 #include "cuda/target_utils.h"
 #include "cuda/transform/ptx_async_copy_injector.h"
+#include "hexagon/op/builtin.h"
+#include "hexagon/op/gemm.h"
 
 #include "../op/reducer.h"
 #include "arith/ir_mutator_with_analyzer.h"
@@ -871,6 +873,8 @@ private:
   }
 
   PrimExpr VisitExpr_(const tirx::CallNode *op) final {
+    if (op->op.same_as(tl::hexagon_hmx_gemm_u8i8()))
+      hexagon::ValidateHMXGemmU8I8(*op, target_, layout_map_, analyzer_);
     if (op->op.same_as(tl::tma_load()) ||
         op->op.same_as(tl::tma_load_im2col()) ||
         op->op.same_as(tl::tma_load_multicast()) ||

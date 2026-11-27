@@ -57,12 +57,13 @@ def main():
     p.add_argument("--max-new", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--w8a8-w13", action="store_true", help="use online W8A8 for the 4-bit LFM2 prefill gate/up projection")
     p.add_argument("--no-think", action="store_true", help="LFM3: answer without the <think> section its template asks for")
     args = p.parse_args()
     assert args.prompt or args.chat, "--prompt or --chat"
     text = Text(args.checkpoint)
     t0 = time.time()
-    decoder = Decoder(args.bundle, args.device_bundle)
+    decoder = Decoder(args.bundle, args.device_bundle, w8a8_w13=args.w8a8_w13)
     print(f"[session ready in {time.time() - t0:.0f} s]", file=sys.stderr)
     messages = [{"role": "system", "content": args.system}] if args.system else []
     try:

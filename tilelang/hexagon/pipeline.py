@@ -44,7 +44,9 @@ def _check_tile_ops(mod: IRModule) -> None:
                 if name == "tl.tileop.dma_copy":
                     calls.append(node)
                 elif name in ("tl.tileop.transpose", "tl.tileop.cumsum"):
-                    view_sensitive_ops.append(node)
+                    view_sensitive_ops.append((name.rsplit(".", 1)[-1], node.args[:2]))
+                elif name == "tl.hexagon_hmx_gemm_u8i8":
+                    view_sensitive_ops.append(("hmx_gemm_u8i8", node.args[1:4]))
             elif isinstance(node, tirx.For):
                 loops.append(node)
             elif isinstance(node, tirx.SBlock):
@@ -52,9 +54,8 @@ def _check_tile_ops(mod: IRModule) -> None:
 
         tirx.stmt_functor.post_order_visit(func.body, collect)
         if matched_data:
-            for call in view_sensitive_ops:
-                if any(region.args[0].buffer.data in matched_data for region in call.args[:2]):
-                    op = call.op.name.rsplit(".", 1)[-1]
+            for op, operands in view_sensitive_ops:
+                if any(operand.args[0].buffer.data in matched_data for operand in operands):
                     raise ValueError(f"Hexagon T.{op} on a match_buffer view requires passing its source buffer region directly")
         if calls:
             for loop in loops:

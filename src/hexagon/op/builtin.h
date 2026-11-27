@@ -191,6 +191,11 @@ TVM_DLL const Op &hexagon_hmx_gemm();
 // as template arguments; normal promises finite normal B scales.
 TVM_DLL const Op &hexagon_hmx_gemm_blockscaled();
 
+// tl_hexagon_hmx_gemm_u8i8(kt, a, b, c, planes, config) (hmx_gemm_int.h):
+// overwrite a row-major 64x32 int32 tile with the product of kt packed
+// 64x32 uint8 activation and 32x32 int8 weight tile pairs in VTCM.
+TVM_DLL const Op &hexagon_hmx_gemm_u8i8();
+
 // tl_hvx_gemm<M, N, K, trans_A, trans_B, lda, ldb, ldc, align_a, align_b,
 // align_c>(C, A, B, clear) (hvx_gemm.h): C = A B, or C += A B unless clear,
 // on HVX for the M x N x K GEMM whose operands start at C, A and B, their rows

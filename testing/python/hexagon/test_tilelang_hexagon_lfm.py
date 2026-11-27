@@ -4,6 +4,7 @@ with the real ones' structures (tiny.py)."""
 
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +15,8 @@ import tilelang
 from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tilelang.hexagon import language as T
+from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.intrinsics.panel import make_hvx_panel_layout, pack_panel
 from tilelang.hexagon.runtime.config import device_serial, domain_id, hlos, remote_dir
 from tilelang.hexagon.runtime.device import AdbConnection
 from tilelang.hexagon.runtime.linux_runtime import LinuxConnection
@@ -27,11 +30,12 @@ import decode_fp16  # noqa: E402
 import prefill_fp16  # noqa: E402
 from decode import Decoder, add_gumbel, make_decode  # noqa: E402
 from model import CONV, FULL, SLIDING, Config, Model, load_hf_weights, rope_angles  # noqa: E402
-from prefill import make_prefill  # noqa: E402
+from prefill import make_prefill, pack_w8a8_activations, project_w8a8  # noqa: E402
 from quantize import BundleModel, build_tensors  # noqa: E402
 from tiny import random_weights, rtn, tiny, tiny_lfm3  # noqa: E402
 
 DEVICE = pytest.mark.skipif(os.environ.get("TL_HEXAGON_DEVICE_TEST") != "1", reason="requires an authorized Hexagon device and SDK")
+SIMULATOR = pytest.mark.skipif(os.environ.get("TL_HEXAGON_SIMULATOR_TEST") != "1", reason="requires the Hexagon SDK simulator")
 FP16_SOURCE_TARGET = {"kind": "hexagon", "mcpu": "hexagonv79"}
 MULTI_PROCESS = pytest.mark.skipif(
     hlos() == "android" and domain_id() != 3,
@@ -47,7 +51,7 @@ def test_interactive_chat_prefix_reuse_is_opt_in(monkeypatch, opt_in):
     import generate
 
     calls = []
-    monkeypatch.setattr(generate, "Decoder", lambda *_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(generate, "Decoder", lambda *_, **__: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(generate, "Text", lambda *_: object())
     monkeypatch.setattr(generate, "reply", lambda *_, reuse=False: calls.append(reuse) or "answer")
     monkeypatch.setattr(sys, "stdin", StringIO("one\ntwo\n"))
@@ -64,6 +68,45 @@ def tiny_bundle(tmp_path_factory):
     config = c.to_dict()
     bundle.write(path, config, tensors, quant)
     return c, w, q, path
+
+
+@pytest.mark.parametrize(
+    ("tensor", "field", "value"),
+    [
+        ("ffn.w13", "dtype", "int8"),
+        ("ffn.w13.scale", "dtype", "float32"),
+        ("ffn.w13.scale", "layout", "panel"),
+        ("ffn.w13.scale", "shape", [1, 1, 1, 1, 128]),
+    ],
+)
+def test_decoder_rejects_incompatible_w8a8_bundle(tiny_bundle, monkeypatch, tensor, field, value):
+    *_, path = tiny_bundle
+    header = bundle.read_header(path)
+    header["tensors"][tensor][field] = value
+    monkeypatch.setattr(bundle, "read_header", lambda _: header)
+    with pytest.raises(ValueError, match="requires signed Q4 panels and row-major FP16 scales"):
+        Decoder(path, w8a8_w13=True)
+
+
+@pytest.mark.parametrize("prefix", [0, 2])
+def test_decoder_scores_the_targets_after_the_forced_suffix_input(monkeypatch, prefix):
+    from types import SimpleNamespace
+
+    decoder = Decoder.__new__(Decoder)
+    decoder.prefill_rows = 64 if prefix else None
+    pending = []
+    monkeypatch.setattr(decoder, "reset", lambda: pending.append("reset"))
+    monkeypatch.setattr(decoder, "prefill", lambda tokens: pending.append(("prefill", tokens)))
+    monkeypatch.setattr(decoder, "run", lambda *args: pending.append(("run", *args)))
+    decoder.scores = SimpleNamespace(read=lambda size: bytes(size))
+    tokens = [101, 11, 22, 33, 44]
+    result = decoder.score(tokens, prefill_prefix=prefix)
+    if prefix:
+        assert pending == ["reset", ("prefill", [101, 11]), ("run", [22, 33, 44], 2, 2, 3)]
+        assert len(result) == 2  # scores targets 33 and 44
+    else:
+        assert pending == ["reset", ("run", tokens, 0, 4, 5)]
+        assert len(result) == 4
 
 
 @pytest.mark.parametrize("scale", [0x0000, 0x8000, 0x0001, 0x8001, 0x7C00, 0xFC00, 0x7E01, 0x3C00, 0xBC00])
@@ -1086,6 +1129,248 @@ def test_prefill_is_one_loop_over_the_layers(tiny_bundle, arch, cooperative):
     _assert_prefill_norm_path(source)
 
 
+@pytest.mark.parametrize("arch", ("v73", "v79"))
+def test_w8a8_w13_prefill_lowering(arch):
+    c = Config(vocab=4096, dim=2048, ff=8192, heads=32, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
+    shapes = {
+        "conv.in_proj": (2, 1, 6144, 2048),
+        "attn.qkv": (1, 1, 3072, 2048),
+        "out_proj": (3, 1, 2048, 2048),
+        "ffn.w13": (3, 1, 16384, 2048),
+        "ffn.w2": (3, 4, 2048, 2048),
+    }
+    target = determine_target({"kind": "hexagon", "mcpu": f"hexagon{arch}"}, return_object=True)
+    ordinary = make_prefill(c, shapes, 128, 256, 64, target=target)
+    integer = make_prefill(c, shapes, 128, 256, 64, target=target, w8a8_w13=True)
+    (_, baseline, _, _), (_, source, _, _) = lower_kernels([(ordinary, []), (integer, [])], target=target)
+    assert "#include <tl_templates/hexagon/w8a8.h>" not in baseline and "tl_hexagon_hmx_gemm_u8i8" not in baseline
+    assert "#include <tl_templates/hexagon/w8a8.h>" in source
+    assert source.count("tl_hexagon_quantize_crouton_u8(") == 1  # one call inside the layer loop
+    assert "tl_hexagon_requantize_panel_s4_s8(" in source and "tl_hexagon_hmx_gemm_u8i8(" in source
+    assert "tl_hexagon_hmx_gemm_blockscaled<" in source  # the other projections
+    assert source.count("tl_hexagon_dma_async_submit(") == baseline.count("tl_hexagon_dma_async_submit(")
+
+
+def _w8a8_w13_projection(R, K, normal_scales):
+    @T.prim_func
+    def projection(
+        A: T.Tensor((R, K), "float16"),
+        W: T.Tensor((2, 128, K), "int4"),
+        S: T.Tensor((2, K // 64, 128), "float16"),
+        Out: T.Tensor((1, R, 128), "float32"),
+        PackedA: T.Tensor(((R + 63) // 64, K // 32, 64, 32), "uint8"),
+    ):
+        with T.Kernel(4, num_workers=4) as worker:
+            a = T.alloc_global((R, K), "float16", scope="global.vtcm")
+            aq = T.alloc_global(((R + 63) // 64, K // 32, 64, 32), "uint8", scope="global.vtcm")
+            sa = T.alloc_global((R,), "float32", scope="global.vtcm")
+            w = T.alloc_shared((2, 128, K), "int4")
+            s = T.alloc_shared((2, K // 64, 128), "float16")
+            tmp = T.alloc_shared((64 * 32,), "float16")
+            wq = T.alloc_shared((K // 32, 8, 32, 4), "int8")
+            sw = T.alloc_shared((32,), "float32")
+            correction = T.alloc_shared((32,), "int32")
+            dots = T.alloc_shared((64, 32), "int32")
+            result = T.alloc_shared((1, R, 128), "float32")
+            T.annotate_layout({a: make_hmx_activation_layout(a), W: make_hvx_panel_layout(W), w: make_hvx_panel_layout(w)})
+
+            first = worker * (R // 4)
+            T.copy(A[first : first + R // 4, :], a[first : first + R // 4, :])
+            pack_w8a8_activations(a, aq, sa, R, K, first, R // 4)
+            T.sync_grid()
+            if worker == 0:
+                # Use a nonzero ring slot and all four Q4 panels in the block.
+                T.dma_copy(W[1, :, :], w[1, :, :])
+                T.dma_copy(S[1, :, :], s[1, :, :])
+                T.dma_wait()
+                project_w8a8(aq, sa, w, s, 1, tmp, wq, sw, correction, dots, result, 0, R, K, normal_scales)
+                T.copy(result, Out)
+                T.copy(aq, PackedA)
+
+    return projection
+
+
+def _symmetric_q8_from_fp16(x):
+    values = x.to(torch.float64)
+    amax = values.abs().amax(-1, keepdim=True)
+    safe = torch.where(amax == 0, 1.0, amax)
+    return (values * 127 / safe).round().to(torch.int32), (amax / 127).to(torch.float32)
+
+
+def _w8a8_w13_inputs(R, K, normal_scales):
+    rng = torch.Generator().manual_seed(30)
+    a = torch.randn((R, K), generator=rng).half()
+    a[0].zero_()
+    a[1, 0] = 254
+    a[1, 1:255] = torch.arange(-127, 127, dtype=torch.float16)  # half-integer ties in both directions
+    a[2] *= 2**-20
+    w = torch.randint(-8, 8, (2, 128, K), generator=rng, dtype=torch.int8)
+    w[1, 0].zero_()
+    w[1, 1, :64] = 0
+    w[1, 1, 0] = 1
+    scales = (0.005 + torch.rand((2, K // 64, 128), generator=rng) * 0.025).half()
+    scales[1, :, 1] = 1
+    scales[1, 0, 1] = 254
+    scales[1, 1::2, 4].neg_()
+    if not normal_scales:
+        scales[1, :, 2] = 0
+        scales[1, ::2, 3] = 2**-24
+        scales[1, :, 5:7] = 2**-24
+        w[1, 5].clamp_(-1, 1)
+        w[1, 6].clamp_(-2, 2)
+    return a, w, scales
+
+
+@SIMULATOR
+@pytest.mark.parametrize("arch", ["v73", "v79"])
+def test_w8a8_w13_packing_on_simulator(arch, tmp_path):
+    sdk = Path(os.environ["HEXAGON_TOOLS_ROOT"]) / "Tools/bin"
+    repo = LFM.parents[2]
+    fixture = Path(__file__).with_name("hvx_w8a8_lfm_sim.cc")
+    executable = tmp_path / "pack"
+    compile_command = [
+        sdk / "hexagon-clang++", f"-m{arch}", "-mhvx", "-mhvx-length=128B", "-std=c++17", "-O2",
+        "-mllvm", "--disable-handle-qfp", "-mllvm", "-hexagon-insert=false", "-I", repo / "src", fixture, "-o", executable,
+    ]  # fmt: skip
+    compiled = subprocess.run(compile_command, capture_output=True, text=True, timeout=180)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    K = 2048
+    for R, normal_scales in [(32, False), (128, True)]:
+        a, w, scales = _w8a8_w13_inputs(R, K, normal_scales)
+        crouton = a.reshape(R // 32, 16, 2, K // 32, 32).permute(0, 3, 1, 4, 2).contiguous()
+        src, dst = tmp_path / "input.bin", tmp_path / "output.bin"
+        src.write_bytes(crouton.numpy().tobytes() + pack_panel(w[1], 4).numpy().tobytes() + scales[1].numpy().tobytes())
+        simulated = subprocess.run(
+            [sdk / "hexagon-sim", f"-m{arch}", "--simulated_returnval", executable, "--", src, dst, str(R), str(int(normal_scales))],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert simulated.returncode == 0, simulated.stdout + simulated.stderr
+        assert "LFM_W8A8_PACK_OK" in simulated.stdout
+
+        a_bytes = max(64, R) * K
+        w_bytes = 128 * K
+        data = bytearray(dst.read_bytes())
+        packed_a = torch.frombuffer(data, dtype=torch.uint8, count=a_bytes).reshape(-1, K // 32, 64, 32)
+        packed_w = torch.frombuffer(data, dtype=torch.int8, count=w_bytes, offset=a_bytes).reshape(4, K // 4, 32, 4)
+        sa = torch.frombuffer(data, dtype=torch.float32, count=R, offset=a_bytes + w_bytes)
+        sw = torch.frombuffer(data, dtype=torch.float32, count=128, offset=a_bytes + w_bytes + R * 4)
+        correction = torch.frombuffer(data, dtype=torch.int32, count=128, offset=a_bytes + w_bytes + (R + 128) * 4)
+        logical_a = packed_a.permute(0, 2, 1, 3).reshape(-1, K)
+        logical_w = packed_w.permute(0, 2, 1, 3).reshape(128, K)
+
+        aq, sa_ref = _symmetric_q8_from_fp16(a)
+        w16 = (w[1].float() * scales[1].T.repeat_interleave(64, -1).float()).half()
+        wq, sw_ref = _symmetric_q8_from_fp16(w16)
+        assert torch.equal(logical_a[:R], (aq + 128).to(torch.uint8))
+        assert (logical_a[R:] == 128).all()
+        assert torch.equal(logical_w, wq.to(torch.int8))
+        assert torch.equal(correction, 128 * wq.sum(-1).to(torch.int32))
+        torch.testing.assert_close(sa, sa_ref[:, 0], rtol=2e-7, atol=0)
+        torch.testing.assert_close(sw, sw_ref[:, 0], rtol=2e-7, atol=0)
+
+
+@DEVICE
+@pytest.mark.parametrize(("R", "normal_scales"), [(32, False), (128, True)])
+def test_w8a8_w13_projection_matches_reference(R, normal_scales):
+    K = 2048
+    a, w, scales = _w8a8_w13_inputs(R, K, normal_scales)
+
+    aw, sa = _symmetric_q8_from_fp16(a)
+    w16 = (w[1].float() * scales[1].T.repeat_interleave(64, -1).float()).half()
+    ww, sw = _symmetric_q8_from_fp16(w16)
+    # Signed logical dot uses no centering identity, making an independent
+    # check of the native unsigned activation and zero-point correction.
+    want = (aw.to(torch.int64) @ ww.to(torch.int64).T).float() * sa * sw.T
+    target = determine_target("hexagon", return_object=True)
+    kernel = tilelang.compile(_w8a8_w13_projection(R, K, normal_scales), out_idx=[3, 4], target=target)
+    try:
+        actual, packed = kernel(a, pack_panel(w, 4), scales)
+        rows = packed.permute(0, 2, 1, 3).reshape(-1, K)
+        assert torch.equal(rows[:R], (aw + 128).to(torch.uint8))
+        assert (rows[R:] == 128).all()
+        torch.testing.assert_close(actual[0], want, rtol=1e-6, atol=1e-7)
+    finally:
+        kernel.adapter.close()
+
+
+@DEVICE
+def test_w8a8_w13_tiny_model_state_and_logits(tiny_bundle, record_property):
+    c, _, _, path = tiny_bundle
+    decode_ref = BundleModel(path)
+
+    class PrefillReference(Model):
+        def __init__(self, integer_w13):
+            super().__init__(c, decode_ref.w)
+            self.integer_w13 = integer_w13
+
+        def linear(self, name, x):
+            a, w = x.half(), self.w[name].half()
+            if self.integer_w13 and name.endswith((".feed_forward.w1.weight", ".feed_forward.w3.weight")):
+                aq, sa = _symmetric_q8_from_fp16(a)
+                wq, sw = _symmetric_q8_from_fp16(w)
+                # For the tiny model's K=1024, every integer partial sum fits exactly in FP32.
+                return (aq.float() @ wq.float().T) * sa * sw.T
+            return a.float() @ w.float().T
+
+        def _ffn(self, layer, x):
+            name = f"model.layers.{layer}.feed_forward."
+            gate = self.linear(name + "w1.weight", x).half()
+            up = self.linear(name + "w3.weight", x).half()
+            return self.linear(name + "w2.weight", gate * gate.sigmoid() * up)
+
+    prefix_len, max_pos = 66, 256  # two R=32 chunks followed by a short chunk
+    tokens = torch.randint(c.vocab, (prefix_len + 1,), generator=torch.Generator().manual_seed(30))
+
+    def flatten_state(conv, keys, values):
+        return torch.cat([x.reshape(-1) for x in (conv, keys, values)])
+
+    @torch.no_grad()
+    def reference(integer):
+        model = PrefillReference(integer)
+        state = model.new_state()
+        model.run(tokens[:-1], state)
+        rows = flatten_state(torch.stack(state.conv), torch.stack(state.k), torch.stack(state.v))
+        hidden = decode_ref.run(tokens[-1:], state)
+        return rows, decode_ref.logits(hidden)[0]
+
+    def device(integer):
+        decoder = Decoder(path, max_pos=max_pos, max_tokens=max_pos, prefill_rows=32, w8a8_w13=integer)
+        try:
+            decoder.prefill(tokens[:-1].tolist())
+            conv = torch.frombuffer(bytearray(decoder.conv_state.read()), dtype=torch.float32)
+            kv_shape = (len(c.attention_layers), c.kv_heads, max_pos, c.head_dim)
+            keys, values = (
+                torch.frombuffer(bytearray(buf.read()), dtype=torch.float32).view(kv_shape)[:, :, :prefix_len]
+                for buf in (decoder.kv_k, decoder.kv_v)
+            )
+            rows = flatten_state(conv, keys, values)
+            _, logits = decoder.run(tokens[-1:].tolist(), prefix_len, 1, 1)
+            return rows, logits
+        finally:
+            decoder.close()
+
+    reference_fp16, reference_int = reference(False), reference(True)
+    device_fp16, device_int = device(False), device(True)
+    for name, host_a, host_b, dsp_a, dsp_b in zip(
+        ("prefill_state", "continuation_logits"), reference_fp16, reference_int, device_fp16, device_int, strict=True
+    ):
+        # Compare the incremental effect of changing w13. The FP16 control
+        # accounts for common discrepancies from DSP attention and epilogues.
+        # Leaving w13 on the ordinary route produces a relative delta error of 1.
+        expected = host_b - host_a
+        actual = dsp_b - dsp_a
+        delta_error = ((actual - expected).norm() / expected.norm()).item()
+        baseline_error = ((dsp_a - host_a).norm() / host_a.norm()).item()
+        integer_error = ((dsp_b - host_b).norm() / host_b.norm()).item()
+        record_property(f"{name}_w8a8_delta_relative_l2", delta_error)
+        record_property(f"{name}_w4a16_relative_l2", baseline_error)
+        record_property(f"{name}_w8a8_relative_l2", integer_error)
+        assert delta_error < 0.5, (name, delta_error, baseline_error, integer_error)
+
+
 @DEVICE
 def test_prefill_matches_the_reference(tiny_bundle):
     c, _, _, path = tiny_bundle
@@ -1180,6 +1465,7 @@ def test_decoder_passes_one_resolved_target_to_factory_and_session(fp16, arch, m
     decoder.c = Config(vocab=4096, dim=2048, ff=2048, heads=32, kv_heads=8, head_dim=64, layer_types=(CONV, FULL, CONV))
     decoder.header = {"tensors": {}}
     decoder.max_pos, decoder.max_tokens, decoder.prefill_rows = 256, 64, 128
+    decoder.w8a8_w13 = False
     if fp16:
         monkeypatch.setattr(decode_fp16, "plan_stages", lambda *args: [range(3)])
         monkeypatch.setattr(decode_fp16, "row_major_embedding", lambda *args: True)

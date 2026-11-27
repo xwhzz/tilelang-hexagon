@@ -16,7 +16,7 @@ must match that Config, as Decoder constructs them. Ordinary mode reads the
 layer kind from the table. Each worker multiplies the decode's share of every
 projection's output channels, its blocks streamed by DMA through one ring
 (``Stream``): a layer's operator (the short conv or attention), then its
-output projection and its FFN. Each block is one ``T.gemm_blockscaled`` on HMX
+output projection and its FFN. By default each block is one ``T.gemm_blockscaled`` on HMX
 by the whole chunk: HVX dequantizes the 4-bit weights once for all R rows, and
 the workers take turns at HMX, each dequantizing and running its epilogues
 while another multiplies. The epilogues fuse the rest:
@@ -48,6 +48,7 @@ from types import SimpleNamespace
 
 from tilelang.hexagon import language as T
 from tilelang.hexagon.intrinsics.crouton import make_hmx_activation_layout
+from tilelang.hexagon.language.hmx import _alloc_hmx_u8i8_scratch, _hmx_gemm_u8i8
 from tilelang.hexagon.target import hexagon_arch
 from tvm.target import Target
 
@@ -82,6 +83,56 @@ def gemm(A, K: int, rw, rs, k, C, ones, clear, normal_scales: bool):
     )
 
 
+@T.macro
+def pack_w8a8_activations(a, packed, scales, R: int, K: int, first, count):
+    """Pack the worker's finished Crouton rows before the existing grid barrier."""
+    T.evaluate(
+        T.call_extern(
+            "void",
+            "tl_hexagon_quantize_crouton_u8",
+            T.access_ptr(a, "r"),
+            T.access_ptr(packed, "w"),
+            T.access_ptr(scales, "w"),
+            K,
+            R,
+            first,
+            count,
+        )
+    )
+
+
+@T.macro
+def project_w8a8(
+    a, a_scales, w, scales, k, tmp, packed, w_scales, correction, dots, C, slot, R: int, K: int, normal_scales: bool, scratch=None
+):
+    """Requantize each Q4 ring panel into the integer HMX layout once per chunk."""
+    for plane in T.serial(BLOCK // 32):
+        T.evaluate(
+            T.call_extern(
+                "void",
+                "tl_hexagon_requantize_panel_s4_s8",
+                T.access_ptr(w[k, plane * 32, 0], "r", 32 * K),
+                T.access_ptr(scales[k, 0, plane * 32], "r", K // 64 * BLOCK - plane * 32),
+                T.access_ptr(tmp, "w"),
+                T.access_ptr(packed, "w"),
+                T.access_ptr(w_scales, "w"),
+                T.access_ptr(correction, "w"),
+                K,
+                BLOCK,
+                normal_scales,
+            )
+        )
+        for tile in T.serial((R + 63) // 64):
+            if scratch is None:
+                T.hmx_gemm_u8i8(a[tile, :, :, :], packed, dots)
+            else:
+                _hmx_gemm_u8i8(a[tile, :, :, :], packed, dots, scratch[0], scratch[1])
+            for i, j in T.Parallel(min(R, 64), 32):
+                C[slot, tile * 64 + i, plane * 32 + j] = (
+                    T.Cast("float32", dots[i, j] - correction[j]) * a_scales[tile * 64 + i] * w_scales[j]
+                )
+
+
 def make_prefill(
     c: Config,
     shapes: dict,
@@ -92,6 +143,7 @@ def make_prefill(
     *,
     target=None,
     cooperative: bool = True,
+    w8a8_w13: bool = False,
 ):
     """The prefill kernel for config c, the bundle's tensor `shapes`, and
     chunks of R rows. Without an explicit target, normalization keeps the
@@ -100,10 +152,18 @@ def make_prefill(
     resource checkpoints preserve VTCM while letting other DSP clients run
     during a long prefill. In cooperative mode, `kinds[layer]` must contain
     `[int(c.is_attention(layer)), index_within_that_kind]`; layer selection is
-    specialized to c, and Decoder builds this matching table."""
+    specialized to c, and Decoder builds this matching table. `w8a8_w13`
+    uses online integer HMX packing only for the FFN gate/up projection."""
     assert is_lfm2(c), "the 4-bit kernels run LFM2"
     D, F, HD = c.dim, c.ff, c.head_dim
     target = target if target is None or isinstance(target, Target) else Target(target)
+    if w8a8_w13:
+        if hexagon_arch(target) not in {"v73", "v79"} or any(
+            int(target.attrs.get(attr, 0)) != 1024 for attr in ("min_vector_bits", "max_vector_bits")
+        ):
+            raise ValueError("W8A8 w13 prefill requires an explicit Hexagon v73 or v79 target with 1024-bit HVX")
+        if R not in {32, 64, 128} or D <= 0 or D > 2048 or D % 64:
+            raise ValueError("W8A8 w13 prefill requires R=32/64/128 and K a positive multiple of 64 up to 2048")
     direct_norm = (
         D >= 2048
         and hexagon_arch(target) == "v79"
@@ -119,6 +179,8 @@ def make_prefill(
     DW = D // NW  # a worker's channels of the residual
     QW, KW = H // NW * HD, KVH // NW * HD  # its query and key rows
     s_in, s_qkv, s_out, s_13, s_2 = (shapes[n] for n in ("conv.in_proj", "attn.qkv", "out_proj", "ffn.w13", "ffn.w2"))
+    if w8a8_w13 and tuple(s_13) != (L, 1, 2 * F, D):
+        raise ValueError("W8A8 w13 prefill requires a single K slice of the full gate/up projection")
     # The FFN's parts: w2's slices.
     PARTS, FQ = s_2[1], s_2[3]  # parts, hidden units of a part
     FQW = FQ // NW  # a worker's of a part
@@ -127,8 +189,10 @@ def make_prefill(
     assert D % (NW * BLOCK) == 0 and FQ % (NW * BLOCK) == 0 and (KVH // NW * HD) % BLOCK == 0
     assert PARTS * FQ == F
     eps = c.eps
-    # Two slots of the FFN's hidden units; the operators' outputs use the first.
-    HID = max(D, 2 * FQ)
+    # The operators' outputs use the first FFN hidden slot. Free the second
+    # at R=128 for the integer activation/weight tiles and accumulator scratch.
+    single_hid = w8a8_w13 and R == 128
+    HID = max(D, FQ if single_hid else 2 * FQ)
 
     def clamped(index, count: int):
         return T.max(T.min(index, max(count, 1) - 1), 0)
@@ -308,7 +372,28 @@ def make_prefill(
     def glu_block(bf, b, rw, rs, k, slot):
         """w1 (even b) or w3 of hidden block b // 2 of the worker's part;
         after w3, silu(w1 a) * (w3 a) into hid's slot."""
-        gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True, normal_scales)
+        if w8a8_w13:
+            iq = bf.integer
+            project_w8a8(
+                iq.a8,
+                iq.a8_scale,
+                rw,
+                rs,
+                k,
+                iq.w8_tmp,
+                iq.w8,
+                iq.w8_scale,
+                iq.w8_correction,
+                iq.w8_dots,
+                bf.cc,
+                b % 2,
+                R,
+                D,
+                normal_scales,
+                iq.scratch,
+            )
+        else:
+            gemm(bf.a, D, rw, rs, k, bf.cc[b % 2, :, :], bf.ones, True, normal_scales)
         if b % 2 == 1:
             # In fp16, which hid holds: the sigmoid then takes 64 lanes a
             # register.
@@ -403,6 +488,22 @@ def make_prefill(
             mh = T.alloc_shared((R,), "float16")
             rsum = T.alloc_shared((R,), "float32")
             alpha = T.alloc_shared((R,), "float32")
+            if w8a8_w13:
+                a8 = T.alloc_global(((R + 63) // 64, D // 32, 64, 32), "uint8", scope="global.vtcm")
+                a8_scale = T.alloc_global((R,), "float32", scope="global.vtcm")
+                w8_tmp = T.alloc_shared((64 * 32,), "float16")
+                w8 = T.alloc_shared((D // 32, 8, 32, 4), "int8")
+                w8_scale = T.alloc_shared((32,), "float32")
+                w8_correction = T.alloc_shared((32,), "int32")
+                w8_dots = T.alloc_shared((64, 32), "int32")
+                # Sequential panels and row tiles share one HMX accumulator store per worker.
+                scratch = _alloc_hmx_u8i8_scratch()
+                integer = SimpleNamespace(
+                    a8=a8, a8_scale=a8_scale, w8_tmp=w8_tmp, w8=w8, w8_scale=w8_scale, w8_correction=w8_correction, w8_dots=w8_dots,
+                    scratch=scratch,
+                )  # fmt: skip
+            else:
+                integer = None
 
             for i in T.Parallel(R):
                 ones[i, 0] = T.float32(1)
@@ -411,7 +512,7 @@ def make_prefill(
                 w=w, x=x, a=a, hid=hid, ones=ones, cc=cc, rows=rows, sq=sq, ss=ss, nw=nw, head=head, hsq=hsq, hss=hss,
                 q=q, kblk=kblk, vblk=vblk, kst=kst, vst=vst, s=s, p=p, acc_o=acc_o, m=m, ls=ls, rmax=rmax, mh=mh, rsum=rsum, alpha=alpha, gl=gl,
                 cos_rows=cos_rows, sin_rows=sin_rows, conv_state=conv_state, conv_w=conv_w, q_norm=q_norm, k_norm=k_norm,
-                kv_k=kv_k, kv_v=kv_v,
+                kv_k=kv_k, kv_v=kv_v, integer=integer,
             )  # fmt: skip
 
             # Every projection streams blocks of one shape through one ring.
@@ -420,6 +521,8 @@ def make_prefill(
             layouts = Stream([Phase(p, 0, 1, lambda b: 0) for p in projections], DEPTH, rings=rings).layouts()
             # The scores: HMX's output tiles.
             layouts[s] = make_hmx_activation_layout(s)
+            if w8a8_w13:
+                layouts[a] = make_hmx_activation_layout(a)
             T.annotate_layout(layouts)
 
             for chunk in T.serial(T.ceildiv(n, R)):
@@ -487,13 +590,20 @@ def make_prefill(
                     st_rest.run(0, lambda b, rw, rs, k: residual_block(bf, b, rw, rs, k, 0, D))
                     T.sync_grid()
                     normalize(bf, ffn_norm[layer, :])
+                    if w8a8_w13:
+                        pack_w8a8_activations(bf.a, bf.integer.a8, bf.integer.a8_scale, R, D, w * RW, RW)
                     T.sync_grid()
                     st_rest.run(1, lambda b, rw, rs, k: glu_block(bf, b, rw, rs, k, 0))
                     T.sync_grid()
                     for part in list(range(PARTS)):
-                        st_rest.run(2 + 2 * part, lambda b, rw, rs, k, part=part: residual_block(bf, b, rw, rs, k, part % 2 * FQ, FQ))
+                        at = 0 if single_hid else part % 2 * FQ
+                        st_rest.run(2 + 2 * part, lambda b, rw, rs, k, at=at: residual_block(bf, b, rw, rs, k, at, FQ))
                         if part + 1 < PARTS:
-                            st_rest.run(3 + 2 * part, lambda b, rw, rs, k, part=part: glu_block(bf, b, rw, rs, k, (part + 1) % 2))
+                            if single_hid:
+                                # Every worker must finish reading this slot before any worker overwrites it.
+                                T.sync_grid()
+                            next_slot = 0 if single_hid else (part + 1) % 2
+                            st_rest.run(3 + 2 * part, lambda b, rw, rs, k, next_slot=next_slot: glu_block(bf, b, rw, rs, k, next_slot))
                         T.sync_grid()
 
     return prefill

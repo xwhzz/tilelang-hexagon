@@ -503,7 +503,8 @@ class Decoder:
     rows for the 4-bit bundle, 256 for the fp16 one; None: prompts run through
     the decode, a token a step). Generation uses as many calls as needed to
     fit each call in the `max_tokens` scratch slots and the full request in
-    the `max_pos` context positions.
+    the `max_pos` context positions. `w8a8_w13` enables online W8A8 for the
+    gate/up projection of the 4-bit LFM2 bundle during prefill.
 
     The fp16 bundle runs on `processes` DSP processes ("auto": the fewest its
     weights and its cache of max_pos positions fit), each a stage of the
@@ -519,6 +520,8 @@ class Decoder:
         max_tokens: int = 4096,
         prefill_rows: int | str | None = "auto",
         processes: int | str = "auto",
+        *,
+        w8a8_w13: bool = False,
     ):
         header = bundle.read_header(bundle_path)
         c = Config.from_dict(header["config"])
@@ -526,6 +529,21 @@ class Decoder:
         # The fp16 bundle has no quantized tensors.
         self.fp16 = fp16 = not header["quant"]
         self.prefill_rows = (256 if fp16 else 128) if prefill_rows == "auto" else prefill_rows
+        self.w8a8_w13 = w8a8_w13
+        if w8a8_w13:
+            if fp16 or not is_lfm2(c) or not self.prefill_rows:
+                raise ValueError("W8A8 w13 requires a 4-bit LFM2 bundle and an enabled prefill kernel")
+            quant = header["quant"].get("ffn.w13", {})
+            meta = header["tensors"].get("ffn.w13", {})
+            scales = header["tensors"].get("ffn.w13.scale", {})
+            if (
+                (quant.get("bits"), quant.get("group"), quant.get("block")) != (4, 64, BLOCK)
+                or (meta.get("dtype"), meta.get("layout"), tuple(meta.get("shape", ())))
+                != ("int4", "panel", (c.layers, 1, 2 * c.ff, c.dim))
+                or (scales.get("dtype"), scales.get("layout"), tuple(scales.get("shape", ())))
+                != ("float16", "row_major", (c.layers, 1, 2 * c.ff // BLOCK, c.dim // 64, BLOCK))
+            ):
+                raise ValueError("W8A8 w13 requires signed Q4 panels and row-major FP16 scales with group 64 and block 128")
         assert max_pos % POS_BLOCK == 0
         if fp16:
             self._open_fp16(bundle_path, device_path, processes)
@@ -549,7 +567,14 @@ class Decoder:
             kernels.append(
                 (
                     make_prefill(
-                        c, shapes, self.prefill_rows, max_pos, max_tokens, bundle.has_normal_scales(bundle_path, header), target=target
+                        c,
+                        shapes,
+                        self.prefill_rows,
+                        max_pos,
+                        max_tokens,
+                        bundle.has_normal_scales(bundle_path, header),
+                        target=target,
+                        w8a8_w13=self.w8a8_w13,
                     ),
                     [],
                 )
@@ -904,12 +929,18 @@ class Decoder:
             self.session.kernels[1](*self.prefill_args, *state, self.tokens, pos0, n)
             self.seconds = self.session.last_run_seconds()
 
-    def score(self, tokens: list) -> list:
+    def score(self, tokens: list, *, prefill_prefix: int = 0) -> list:
         """From an empty context, log p(tokens[i + 1] | tokens[: i + 1]) for
-        each i: the decode, every token forced."""
+        each i from prefill_prefix onward, every token forced. A positive
+        prefill_prefix processes that many tokens through the prefill first."""
+        if prefill_prefix < 0 or prefill_prefix and (not self.prefill_rows or prefill_prefix >= len(tokens) - 1):
+            raise ValueError("scoring with a prefill prefix requires an enabled prefill and at least two suffix tokens")
         self.reset()
+        if prefill_prefix:
+            self.prefill(tokens[:prefill_prefix])
+            tokens = tokens[prefill_prefix:]
         n = len(tokens) - 1
-        self.run(tokens, 0, n, n + 1)
+        self.run(tokens, prefill_prefix, n, n + 1)
         return torch.frombuffer(bytearray(self.scores.read(n * 4)), dtype=torch.float32).tolist()
 
     def stream(

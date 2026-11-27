@@ -150,6 +150,13 @@ TIR_DEFINE_TL_BUILTIN(hexagon_hmx_gemm_blockscaled)
                                         0, 0, 0, 2048, 0, 0,    0,    0,
                                         0, 0, 0, 0,    0, 2048, 2048, 256});
 
+TIR_DEFINE_TL_BUILTIN(hexagon_hmx_gemm_u8i8)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<TSharedOperandAlignment>(kSharedOperandAlignment,
+                                       {0, 2048, 128, 128, 2048, 256});
+
 TIR_DEFINE_TL_BUILTIN(hexagon_hvx_gemm)
     .set_num_inputs(15)
     .set_attr<TCallEffectKind>("TCallEffectKind",

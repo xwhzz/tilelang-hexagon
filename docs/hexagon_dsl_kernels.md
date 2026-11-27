@@ -507,6 +507,68 @@ remain. Later iterations retain their original copy lowering. This option has
 no ISA, shape, or model-specific selection rule; measure it for the workload and
 input cache state before enabling it.
 
+### Packed byte GEMM on integer HMX
+
+`T.hmx_gemm_u8i8(A, B, C)` in `tilelang.hexagon.language` overwrites one
+64-row, 32-column tile with exact int32 dot products. Use compact VTCM buffers
+in the following physical order. A can reside in `global.vtcm` so several
+workers can reuse it after a grid barrier. B and C are program-local.
+The compiler supplies the base alignments.
+
+| Buffer | Shape and dtype | Location of a logical element | Alignment |
+| --- | --- | --- | --- |
+| A | `[K // 32, 64, 32]` uint8 | `A[k // 32, m, k % 32]` | 2048 bytes |
+| B | `[K // 32, 8, 32, 4]` int8 | `B[k // 32, (k % 32) // 4, n, k % 4]` | 128 bytes |
+| C | `[64, 32]` int32 | `C[m, n]` | 128 bytes |
+
+K is a positive, compile-time multiple of 32. The limit of 2,056 K tiles keeps
+even a dot product of 255 by −128 within int32. Select a single matrix from
+any leading batch axes, and the same number of consecutive K tiles from A and
+B. Pad partial tiles when packing. Zero weight padding removes unused K
+channels from the dot product. Consume only the valid output rows and columns.
+
+The kernel clears the integer accumulator, then processes up to 32 consecutive
+K tiles per packet with `activation.ub = mxmem(...):deep:cm` and
+`weight.b = mxmem(...)`. It retains the accumulator across four unsigned-byte
+reads. Each read uses a 1 KiB bank with zero bias and a scale word of
+`0x6000`, `0x4000`, `0x2000`, or `0`, in increasing byte order.
+HVX interleaves the four row-major planes into int32 words. The
+planes occupy 8 KiB and the control banks 4 KiB of worker-local VTCM. Qualcomm's
+HexKL example `hexkl_micro_hmx_mm_u8i8_i32` exercises this readout with
+Hexagon SDK 6.6 and Tools 19.0.07.
+
+**LFM2 prefill gate and up projections.** Pass `--w8a8-w13` to the LFM
+`bench.py` or `generate.py` for a 4-bit bundle on v73 or v79 with 128-byte
+HVX. The gate and up matrices share each token's packed activations. The model
+path takes one full input-channel group, K = 2048 on LFM2-1.2B. It accepts
+one full K slice of up to 2048 channels in multiples of 64 and chunks of 32,
+64 or 128 rows, subject to the model kernel's shape and VTCM constraints.
+At 128 rows, one FFN hidden slot is reused after a worker barrier.
+For each output channel, it expands the bundle's signed Q4 weights with the
+fp16 scale per 64 K elements and rounds the products to fp16. For weights
+per output channel and activations per token, it uses the group's maximum
+absolute value divided by 127 as the scale and rounds to the nearest signed
+byte code in [−127, 127], with ties to even. An all-zero group has zero codes
+and a zero scale.
+Pack each activation code plus 128 into A and the signed weight code into B.
+The group's fp32 contribution is
+`(C[m,n] - 128 * sum_k(B[n,k])) * activation_scale[m] * weight_scale[n]`,
+where the sum uses the logical signed weight codes. Apply the integer correction
+before converting to fp32. Callers own the group scales, row sums and any
+accumulation across groups. [llama.cpp's W8A8 implementation](https://github.com/ggml-org/llama.cpp/blob/e0f884d4058d7acc117eb768a0a1c5290d0a8b94/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled-int.h)
+
+| HMX mode | Targets and DSL mapping |
+| --- | --- |
+| Unsigned byte × signed byte | The explicit integer primitive accepts v73, v75, v79 and v81. Integer `T.gemm` uses the HVX contracts described above. |
+| Unsigned byte × packed 4-bit weight | SDK v73 and later expose `weight.n = mxmem(...):2x`. A native W4A8 path still needs a packed-weight and accumulator conversion contract. Current fp16 `T.gemm_blockscaled` expands Q4 panels to fp16. |
+| FP8 operands and result conversion | SDK v79 and later accept FP8 × FP8 and fp16 × FP8 instruction sequences with fp16 conversion. FP8 result conversion and storage appear on v81. These are candidate modes for a future lowering. |
+
+On v73 and v79, the SDK simulators and device tests checked the integer
+readout against reference int32 dot products. The W8A8 projection tests on
+both devices checked K = 2048 with 32 and 128 rows, including the FP16
+expansion, centering correction and FP32 rescale. Whole-model LFM2
+comparisons use the v79 phone.
+
 ## 3. Measuring
 
 - **Measure compute, not one call's wall clock.** A standalone kernel's call is dominated

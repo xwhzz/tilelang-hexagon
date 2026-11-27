@@ -7,7 +7,7 @@ import tilelang.language.common as T_comm
 from tilelang.backend import create_backend_context, get_backend
 from tilelang.hexagon import language as T
 
-HEXAGON_ONLY_NAMES = {"annotate_dma_only", "annotate_write_through", "dma_copy", "dma_wait"}
+HEXAGON_ONLY_NAMES = {"annotate_dma_only", "annotate_write_through", "dma_copy", "dma_wait", "hmx_gemm_u8i8"}
 
 
 def test_hexagon_language_composes_common_and_hexagon_symbols():
