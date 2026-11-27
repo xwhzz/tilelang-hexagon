@@ -1187,7 +1187,11 @@ void CodeGenTileLangHexagon::VisitExpr_(const DivNode *op,
                                         std::ostream &os) { // NOLINT(*)
   if (op->dtype.is_float() && op->dtype.lanes() > 1) {
     headers_.insert("hvx_math.h");
-    os << "tl_hvx_div(" << PrintExpr(op->a) << ", " << PrintExpr(op->b) << ")";
+    const auto *broadcast = op->b.as<BroadcastNode>();
+    const auto &denominator =
+        broadcast && op->dtype.bits() == 32 ? broadcast->value : op->b;
+    os << "tl_hvx_div(" << PrintExpr(op->a) << ", " << PrintExpr(denominator)
+       << ")";
     return;
   }
   CodeGenC::VisitExpr_(op, os);

@@ -186,6 +186,17 @@ def test_vector_division_uses_the_hvx_reciprocal(dtype, vector):
     assert "(A[(bx * 256)] / B[((bx * 256) + 1)])" in source
 
 
+def test_fp32_vector_division_keeps_the_broadcast_divisor_scalar():
+    @T.prim_func
+    def divide(A: T.Tensor((64,), "float32"), B: T.Tensor((64,), "float32"), scale: T.float32):
+        with T.Kernel(1):
+            for j in T.Parallel(64):
+                B[j] = A[j] / scale
+
+    source = _source(divide)
+    assert re.search(r"tl_hvx_div\(.*?, scale\)", source)
+
+
 @pytest.mark.parametrize("dtype,vector", [("float32", "float32"), ("float16", "half64"), ("int8", "int8_t128")])
 def test_vector_min_and_max_are_hvx_instructions(dtype, vector):
     @T.prim_func

@@ -778,30 +778,39 @@ TL_DEVICE HVX_Vector tl_hvx_div_recip_vsf(HVX_Vector x) {
         y, Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(neg_q, y), two));
   return Q6_Vsf_equals_Vqf32(y);
 }
-
-TL_DEVICE bool tl_hvx_div_has_exception(HVX_Vector mask) {
-  // Reduce word masks on HVX; only the final word crosses to the scalar core.
-  for (int offset = 64; offset >= 4; offset /= 2)
-    mask = Q6_V_vor_VV(mask, Q6_V_vror_VR(mask, offset));
-  return Q6_R_vextract_VR(mask, 0) != 0;
-}
-
 #endif
 
-TL_DEVICE HVX_Vector tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
+// The integer seed needs a normal denominator whose inverse stays normal.
+// In the top two exponent bins the seed can cross zero.
+template <typename UInt> TL_DEVICE auto tl_hvx_div_needs_scalar(UInt bits) {
+  auto magnitude = bits & 0x7fffffffU;
+  return (magnitude - 0x00800000U) >= (0x7e800000U - 0x00800000U);
+}
+
+TL_HEXAGON_IEEE_ARITHMETIC static inline HVX_Vector
+tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
   using Words = vec_type<uint32_t, 32>::nat_t;
   using Floats = vec_type<float, 32>::nat_t;
-  Words magnitude = __builtin_bit_cast(Words, y) & 0x7fffffffU;
-  // The reciprocal seed requires a normal denominator whose inverse stays
-  // normal. Include the top two exponent bins, where the bit seed can cross
-  // zero, as well as zeros, subnormals, infinities and NaNs.
-  auto exceptional = (magnitude - 0x00800000U) >= (0x7e800000U - 0x00800000U);
-#if __HVX_ARCH__ == 79
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75
+  HVX_Vector seed = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7ef127ea), y);
+  HVX_Vector two = tl_hvx_splat_f(2.0f);
+  // IEEE products keep the range of ordinary quotients, including subnormals.
+  for (int i = 0; i < 3; ++i)
+    seed = Q6_Vsf_vmpy_VsfVsf(
+        seed, Q6_Vsf_vsub_VsfVsf(two, Q6_Vsf_vmpy_VsfVsf(y, seed)));
+  HVX_Vector q = Q6_Vsf_vmpy_VsfVsf(x, seed);
+#elif __HVX_ARCH__ == 79
   HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_div_recip_vsf(y));
-  bool any =
-      tl_hvx_div_has_exception(__builtin_bit_cast(HVX_Vector, exceptional));
 #else
   HVX_Vector q = tl_hvx_mul_sf(x, tl_hvx_recip_vsf(y));
+#endif
+  auto exceptional = tl_hvx_div_needs_scalar(__builtin_bit_cast(Words, y));
+#if __HVX_ARCH__ == 73 || __HVX_ARCH__ == 75 || __HVX_ARCH__ == 79
+  HVX_Vector mask = __builtin_bit_cast(HVX_Vector, exceptional);
+  for (int offset = 64; offset >= 4; offset /= 2)
+    mask = Q6_V_vor_VV(mask, Q6_V_vror_VR(mask, offset));
+  bool any = Q6_R_vextract_VR(mask, 0) != 0;
+#else
   bool any = __builtin_reduce_or(exceptional) != 0;
 #endif
   if (__builtin_expect(any, 0)) {
@@ -814,6 +823,17 @@ TL_DEVICE HVX_Vector tl_hvx_div_vsf(HVX_Vector x, HVX_Vector y) {
     return __builtin_bit_cast(HVX_Vector, result);
   }
   return q;
+}
+
+template <int N>
+TL_HEXAGON_IEEE_ARITHMETIC static inline vec_type<float, N>
+tl_hvx_div(const vec_type<float, N> &a, float b) {
+  // A broadcast has one denominator to classify and one scalar reciprocal.
+  using Floats = typename vec_type<float, N>::nat_t;
+  if (__builtin_expect(tl_hvx_div_needs_scalar(__builtin_bit_cast(uint32_t, b)),
+                       0))
+    return vec_type<float, N>(a.v / (Floats)b);
+  return vec_type<float, N>(a.v * (Floats)(1.0f / b));
 }
 
 template <int N>

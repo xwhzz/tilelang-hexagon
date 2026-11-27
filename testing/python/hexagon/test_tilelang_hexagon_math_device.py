@@ -232,6 +232,27 @@ def test_default_float32_division_at_exponent_limits():
         kernel.adapter.close()
 
 
+def test_float32_division_with_broadcast_denominator():
+    import torch
+
+    @T.prim_func
+    def divide(a: T.Tensor((32,), "float32"), out: T.Tensor((32,), "float32"), b: T.float32):
+        with T.Kernel(1):
+            for i in T.Parallel(32):
+                out[i] = a[i] / b
+
+    kernel = tilelang.compile(divide, out_idx=1, target="hexagon")
+    try:
+        x = torch.tensor([0.0, -0.0, 1.0, -1.0, 2.0**-149, -(2.0**127), float("inf"), float("nan")]).repeat(4)
+        for b in (3.25, 2.0**-149, -(2.0**127), 0.0, -0.0, float("inf"), float("nan")):
+            expected = x / b
+            result = kernel(x, b)
+            torch.testing.assert_close(result, expected, rtol=1e-6, atol=0, equal_nan=True)
+            assert torch.equal(result[expected == 0].signbit(), expected[expected == 0].signbit())
+    finally:
+        kernel.adapter.close()
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float16", "int8"])
 def test_min_and_max_match_torch(dtype):
     import torch
