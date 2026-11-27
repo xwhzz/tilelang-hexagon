@@ -46,9 +46,9 @@ def _pad(n: int) -> int:
 
 
 def write(path: str, config: dict, tensors: dict, quant: dict) -> dict:
-    """Write `tensors` (name -> (data, dtype, shape, layout)): data is a tensor
-    of the bytes (its own dtype or uint8), or a function that makes one when
-    it is written, so that a large bundle need not be in memory at once."""
+    """Write `tensors` (name -> (data, dtype, shape, layout)). Data is a tensor
+    or a function returning a tensor or an iterable of consecutive tensor
+    chunks. Each chunk supplies its bytes in contiguous order."""
     header = {"config": config, "quant": quant, "tensors": {}}
     offset = 0
     for name, (_, dtype, shape, layout) in tensors.items():
@@ -61,10 +61,19 @@ def write(path: str, config: dict, tensors: dict, quant: dict) -> dict:
         f.write(MAGIC + struct.pack("<Q", len(head)) + head)
         for name, (data, *_) in tensors.items():
             t = header["tensors"][name]
-            raw = (data() if callable(data) else data).contiguous().view(torch.uint8).reshape(-1)
-            assert raw.numel() == t["nbytes"], (name, raw.numel(), t["nbytes"])
             f.seek(start + t["offset"])
-            f.write(memoryview(raw.numpy()))
+            data = data() if callable(data) else data
+            if isinstance(data, torch.Tensor):
+                data = (data,)
+            written = 0
+            for chunk in data:
+                written += chunk.nbytes
+                if written > t["nbytes"]:
+                    raise ValueError(f"{name} exceeds its declared size of {t['nbytes']} bytes")
+                f.write(memoryview(chunk.contiguous().view(torch.uint8).reshape(-1).numpy()))
+                del chunk  # Release this layer before the producer packs the next one.
+            if written != t["nbytes"]:
+                raise ValueError(f"{name} supplied {written} bytes, expected {t['nbytes']}")
         f.truncate(start + offset)
     header["data_offset"] = start
     return header

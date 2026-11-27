@@ -18,7 +18,7 @@ OP_SEQUENCE = 10  # 9 is the upstream DSP pipeline operation.
 
 @dataclass(frozen=True)
 class Run:
-    """One kernel invocation on process 0, with all arguments resident or int32."""
+    """One kernel invocation on process 0, with resident buffers and by-value scalars."""
 
     kernel: SessionKernel
     args: tuple
@@ -110,9 +110,12 @@ def encode(session, operations):
             payload += struct.pack("<III", 0, kernel.index, len(op.args))
             for i, (plan, value) in enumerate(zip(kernel.plans, op.args)):
                 if plan.is_scalar:
-                    scalar = _integer(value, "a Run scalar")
-                    if plan.ctype != "int32_t" or not -(1 << 31) <= scalar < 1 << 31:
-                        raise ValueError("Run supports int32 scalar parameters only")
+                    if plan.ctype == "float":
+                        scalar = plan.scalar_word(value)
+                    else:
+                        scalar = _integer(value, "a Run scalar")
+                        if plan.ctype != "int32_t" or not -(1 << 31) <= scalar < 1 << 31:
+                            raise ValueError("Run integer scalar must fit in int32")
                     payload += struct.pack("<IIQQ", 3, scalar & 0xFFFFFFFF, 0, 0)
                 else:
                     allocation = buffer(value)

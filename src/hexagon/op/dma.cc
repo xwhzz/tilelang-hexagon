@@ -15,8 +15,11 @@
 #include <tvm/tirx/builtin.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "hexagon/layout/crouton.h"
 #include "hexagon/layout/panel.h"
@@ -36,43 +39,84 @@ namespace hexagon {
 
 namespace {
 
-// A region of a buffer as a matrix of `rows` x `cols` elements whose rows are
-// `stride` elements apart: the last dimension, or the last two.
+int64_t PositiveConstant(const PrimExpr &e, arith::Analyzer *analyzer) {
+  PrimExpr value = analyzer->Simplify(e);
+  const auto *v = value.as<IntImmNode>();
+  return v && v->value > 0 ? v->value : 0;
+}
+
+bool HasMultiplePlanes(const Array<Range> &region, arith::Analyzer *analyzer) {
+  for (size_t i = 0; i + 2 < region.size(); ++i)
+    if (!analyzer->CanProveEqual(region[i]->extent, 1))
+      return true;
+  return false;
+}
+
+// Descriptor dimensions in elements. Keep the original strides for computing
+// the base address, including offsets on axes with extent one.
 struct Matrix {
-  PrimExpr rows, cols, stride;
+  int64_t rows, cols, stride;
   Array<PrimExpr> strides;
+  std::vector<int64_t> shape;
 };
 
 std::optional<Matrix> MatrixOf(const Buffer &buf, const Array<Range> &region,
-                               arith::Analyzer *analyzer, std::string *why) {
+                               bool flatten, arith::Analyzer *analyzer,
+                               std::string *why) {
   size_t rank = buf->shape.size();
   ICHECK(rank > 0 && region.size() == rank);
-  Array<PrimExpr> strides = GetBufferStrides(buf);
-  if (!analyzer->CanProveEqual(strides.back(), 1)) {
-    *why = "Hexagon T.dma_copy requires unit innermost stride";
-    return std::nullopt;
-  }
-  for (size_t i = 0; i < rank; ++i) {
-    if (i + 2 < rank && !analyzer->CanProveEqual(region[i]->extent, 1)) {
-      *why = "Hexagon T.dma_copy supports only 1D/2D regions";
+  Matrix m{1, 1, 1, GetBufferStrides(buf), {}};
+  if (flatten) {
+    // Each varying axis must advance by exactly the inner region's span.
+    // Keep its extents to distinguish different shapes of the same size.
+    int64_t max_elements =
+        std::numeric_limits<int64_t>::max() / buf->dtype.bytes();
+    for (size_t i = rank; i-- > 0;) {
+      int64_t extent = PositiveConstant(region[i]->extent, analyzer);
+      if (extent == 1)
+        continue;
+      if (!extent || m.cols > max_elements / extent ||
+          !analyzer->CanProveEqual(m.strides[i],
+                                   IntImm(DataType::Int(64), m.cols))) {
+        *why = "Hexagon T.dma_copy requires contiguous multi-plane regions "
+               "with positive static extents";
+        return std::nullopt;
+      }
+      m.shape.push_back(extent);
+      m.cols *= extent;
+    }
+    m.stride = m.cols;
+  } else {
+    if (!analyzer->CanProveEqual(m.strides.back(), 1)) {
+      *why = "Hexagon T.dma_copy requires unit innermost stride";
       return std::nullopt;
     }
-    if (!analyzer->CanProve(region[i]->min >= 0) ||
-        !analyzer->CanProve(region[i]->min + region[i]->extent <=
-                            buf->shape[i])) {
-      *why = "Hexagon T.dma_copy requires provably in-bounds regions";
-      return std::nullopt;
-    }
+    m.cols = PositiveConstant(region.back()->extent, analyzer);
+    m.rows =
+        rank == 1 ? 1 : PositiveConstant(region[rank - 2]->extent, analyzer);
+    m.stride =
+        rank == 1 ? m.cols : PositiveConstant(m.strides[rank - 2], analyzer);
   }
-  PrimExpr cols = region.back()->extent;
-  PrimExpr rows = rank == 1 ? PrimExpr(1) : region[rank - 2]->extent;
-  PrimExpr stride = rank == 1 ? cols : strides[rank - 2];
-  return Matrix{rows, cols, stride, strides};
+  return m;
 }
 
-int64_t PositiveConstant(const PrimExpr &e, arith::Analyzer *analyzer) {
-  const auto *v = analyzer->Simplify(e).as<IntImmNode>();
-  return v && v->value > 0 ? v->value : 0;
+using MatrixPair = std::pair<Matrix, Matrix>;
+std::optional<MatrixPair>
+MatricesOf(const CopyNode &op, arith::Analyzer *analyzer, std::string *why) {
+  bool flatten = HasMultiplePlanes(op.src_range, analyzer) ||
+                 HasMultiplePlanes(op.dst_range, analyzer);
+  auto src = MatrixOf(op.src, op.src_range, flatten, analyzer, why);
+  if (!src)
+    return std::nullopt;
+  auto dst = MatrixOf(op.dst, op.dst_range, flatten, analyzer, why);
+  if (!dst)
+    return std::nullopt;
+  if (src->shape != dst->shape || src->rows != dst->rows ||
+      src->cols != dst->cols) {
+    *why = "Hexagon T.dma_copy requires matching region shapes";
+    return std::nullopt;
+  }
+  return MatrixPair{std::move(*src), std::move(*dst)};
 }
 
 // Descriptor fields are 24 bits wide, and a 2D descriptor has at most 65535
@@ -370,18 +414,22 @@ std::string DMARejection(const CopyNode &op, const LowerArgs &T,
   if (op.annotations.count("parallel_loop_layout") ||
       op.annotations.count("coalesced_width"))
     return "Hexagon T.dma_copy does not support SIMT copy hints";
+  auto in_bounds = [&](const Buffer &buf, const Array<Range> &region) {
+    for (size_t i = 0; i < region.size(); ++i)
+      if (!analyzer->CanProve(region[i]->min >= 0) ||
+          !analyzer->CanProve(region[i]->min + region[i]->extent <=
+                              buf->shape[i]))
+        return false;
+    return true;
+  };
+  if (!in_bounds(op.src, op.src_range) || !in_bounds(op.dst, op.dst_range))
+    return "Hexagon T.dma_copy requires provably in-bounds regions";
   std::string why;
-  auto src = MatrixOf(op.src, op.src_range, analyzer, &why);
-  auto dst = src ? MatrixOf(op.dst, op.dst_range, analyzer, &why) : src;
-  if (!src || !dst)
+  auto matrices = MatricesOf(op, analyzer, &why);
+  if (!matrices)
     return why;
-  if (!analyzer->CanProveEqual(src->rows, dst->rows) ||
-      !analyzer->CanProveEqual(src->cols, dst->cols))
-    return "Hexagon T.dma_copy requires matching region shapes";
-  int64_t rows = PositiveConstant(src->rows, analyzer);
-  int64_t cols = PositiveConstant(src->cols, analyzer);
-  int64_t ss = PositiveConstant(src->stride, analyzer);
-  int64_t ds = PositiveConstant(dst->stride, analyzer);
+  const auto &[src, dst] = *matrices;
+  int64_t rows = src.rows, cols = src.cols, ss = src.stride, ds = dst.stride;
   if (!rows || !cols || !ss || !ds)
     return "Hexagon T.dma_copy requires positive static extents and strides";
   if (ss < cols || ds < cols)
@@ -397,6 +445,15 @@ std::string DMARejection(const CopyNode &op, const LowerArgs &T,
 
 bool DMAOutpacesHVX(const CopyNode &op, arith::Analyzer *analyzer) {
   constexpr int64_t kMinRowBytes = 512;
+  if (HasMultiplePlanes(op.src_range, analyzer) ||
+      HasMultiplePlanes(op.dst_range, analyzer)) {
+    std::string why;
+    auto matrices = MatricesOf(op, analyzer, &why);
+    // v79: pipelining a 1 KiB multi-plane copy breaks even with HVX.
+    constexpr int64_t kMinMultiPlaneBytes = 2048;
+    return matrices &&
+           matrices->first.cols * op.src->dtype.bytes() >= kMinMultiPlaneBytes;
+  }
   // The row length, and whether the rows of a buffer's region follow each
   // other in memory.
   const Array<Range> &region = op.src_range;
@@ -427,12 +484,8 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
     return LowerCroutonTransfer(op, T, analyzer, commit);
   const bool load = IsGlobalBuffer(op.src);
   std::string unused;
-  Matrix src = *MatrixOf(op.src, op.src_range, analyzer, &unused);
-  Matrix dst = *MatrixOf(op.dst, op.dst_range, analyzer, &unused);
-  int64_t rows = PositiveConstant(src.rows, analyzer);
-  int64_t cols = PositiveConstant(src.cols, analyzer);
-  int64_t ss = PositiveConstant(src.stride, analyzer);
-  int64_t ds = PositiveConstant(dst.stride, analyzer);
+  auto [src, dst] = MatricesOf(op, analyzer, &unused).value();
+  int64_t rows = src.rows, cols = src.cols, ss = src.stride, ds = dst.stride;
   int64_t bytes = op.src->dtype.bytes();
   auto u32 = [](int64_t n) { return IntImm(DataType::UInt(32), n); };
   PrimExpr direction = IntImm(DataType::Int(32), load ? 0 : 1);

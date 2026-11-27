@@ -21,6 +21,7 @@
 #include <HAP_compute_res.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <tl_templates/hexagon/session_state.h>
 
 // Some BSP loaders reject the SDK's optional weak v2 import. Opt in only for
 // firmware known to need the legacy API (validated on SA8650/v73). ISA version
@@ -46,23 +47,27 @@ compute_resource_attr_init_v2(compute_res_attr_t *attr, unsigned int size,
 
 #define TL_VTCM_INLINE static inline __attribute__((unused))
 
-static uint8_t *tl_vtcm_base_ptr;  // base of the region the current run holds
-static unsigned int tl_vtcm_total; // its bytes (capacity guard)
-static int tl_vtcm_ctx;            // the process's HAP_compute_res context
-static void *tl_vtcm_region;       // the context's region, as HAP gives it
-static unsigned int tl_vtcm_region_bytes;
+TL_HEXAGON_SESSION_STATE uint8_t
+    *tl_vtcm_base_ptr; // base of the region the current run holds
+TL_HEXAGON_SESSION_STATE unsigned int
+    tl_vtcm_total; // its bytes (capacity guard)
+TL_HEXAGON_SESSION_STATE int
+    tl_vtcm_ctx; // the process's HAP_compute_res context
+TL_HEXAGON_SESSION_STATE void
+    *tl_vtcm_region; // the context's region, as HAP gives it
+TL_HEXAGON_SESSION_STATE unsigned int tl_vtcm_region_bytes;
 // An unsuccessful release does not prove that the resource was relinquished.
 // Keep ownership poisoned until the process exits; never pretend cleanup ran.
-static int tl_vtcm_held;
-static int tl_vtcm_poisoned;
-static int tl_vtcm_hmx_requested;
-static int tl_vtcm_cooperative;
+TL_HEXAGON_SESSION_STATE int tl_vtcm_held;
+TL_HEXAGON_SESSION_STATE int tl_vtcm_poisoned;
+TL_HEXAGON_SESSION_STATE int tl_vtcm_hmx_requested;
+TL_HEXAGON_SESSION_STATE int tl_vtcm_cooperative;
 
 // The VTCM arena of the current serial kernel, in bytes from
 // tl_vtcm_base_ptr. Codegen publishes this for embedding/export capacity
 // checks. Worker loops size their per-worker arenas at run time instead and do
 // not write it.
-static unsigned int tl_vtcm_shared_high_water;
+TL_HEXAGON_SESSION_STATE unsigned int tl_vtcm_shared_high_water;
 
 // HMX mxmem addresses are Crouton-tile addresses: the low 11 bits are not a
 // byte offset.  Align the arena itself, not only each compiler-assigned offset.

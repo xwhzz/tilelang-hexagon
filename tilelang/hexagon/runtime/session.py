@@ -9,8 +9,8 @@ cache maintenance FastRPC does for the buffers of every call. Weights, KV
 caches and recurrent state stay on the device across calls and kernels.
 
 A kernel parameter takes, per call, a :class:`DeviceBuffer` (resident: no
-copy), a tensor (copied in, as with a standalone kernel), or for an int32
-scalar a Python int. Its ``out_idx`` parameters come back as tensors unless a
+copy), a tensor (copied in, as with a standalone kernel), or a Python number for an
+int32 or float32 scalar. Its ``out_idx`` parameters come back as tensors unless a
 :class:`DeviceBuffer` is passed for them too.
 
 The host writes a buffer's bytes with :meth:`DeviceBuffer.write`, or has the
@@ -50,13 +50,13 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import numpy as np
-import torch
+from tilelang.hexagon.codegen import _GeneratedSource, single_device_kernel
 
 from . import fastrpc
 from .device import DEVICE_LOCK
 from . import sequence
 from .sequence import Copy, Run, SequenceError, SequenceResult, SequenceTiming  # noqa: F401
+from .tensor import byte_buffer, check_writeback, pack_buffer, unpack_buffer
 
 # Seconds one call to the agent may take, its transfers included.
 CALL_TIMEOUT = 600.0
@@ -82,6 +82,7 @@ _INPUT = 1  # (byte offset into the inputs, 0)
 _OUTPUT = 2  # (byte offset into the outputs, 0)
 _SCALAR = 3  # (value, 0)
 _STEP = 4  # a pipeline stage's step index plus `first`, filled in at each step: (first, 0)
+_INOUT = 5  # (shared byte offset in the inline input and output blocks, size)
 
 # Agent operations.
 _OP_CLOSE, _OP_RUN, _OP_SHUTDOWN, _OP_ALLOC, _OP_FREE, _OP_WRITE, _OP_READ, _OP_LOAD, _OP_TIMING, _OP_PIPELINE = range(10)
@@ -93,8 +94,6 @@ _TURN_GAVE_UP = fastrpc.KERNEL_STATUS_BASE + 0xFF
 # Inline arguments start on register boundaries, as kernels assume.
 _ALIGN = 128
 _MAX_BUFFERS = 256
-
-_KERNEL_RE = re.compile(r"^\s*(?:void|int|int32_t)\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def _align(n: int) -> int:
@@ -235,23 +234,45 @@ static AEEResult tl_session_dispatch_close() {{
 """
 
 
-def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]]) -> str:
-    """The skel of `kernels`, (name, source, plans) each: one translation unit,
-    every kernel's entry renamed to its index."""
+def _kernel_args(plans) -> str:
+    return ", ".join(pl.scalar_expr(f"(intptr_t)a[{j}]") if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
+
+
+def _skel_headers(iface: str) -> str:
+    return (
+        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\n#include <type_traits>\n"
+        f'#include "{iface}.h"\n\n' + fastrpc.SKEL_INCLUDES
+    )
+
+
+def gen_dsp(iface: str, kernels: Sequence[tuple[str, str, list]], external: dict[int, str] | None = None) -> str:
+    """The session dispatcher, with indexed kernel entries. For separate kernel
+    units, `external` supplies the generated resource preamble by index."""
     parts = [
         "// Auto-generated FastRPC skel of a tilelang Hexagon session.\n",
-        "#include <AEEStdErr.h>\n#include <HAP_mem.h>\n#include <qurt.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <type_traits>\n",
-        f'#include "{iface}.h"\n\n',
-        fastrpc.SKEL_INCLUDES,
+        _skel_headers(iface),
     ]
+    if external:
+        parts.insert(0, "#define TL_HEXAGON_SEPARATE_KERNELS 1\n")
     for i, (name, source, _) in enumerate(kernels):
-        parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
+        if external and i in external:
+            parts += [external[i], f'extern "C" int tl_session_external_{i}(void**);\n']
+        else:
+            parts.append(f"\n// ---- kernel {i}: {name} ----\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n")
     parts.append("\n" + fastrpc.RUN_KERNEL)
+    # An opaque source in this translation unit can redefine a sibling's helpers.
+    managed = all(
+        isinstance(src, _GeneratedSource) and src.startswith((fastrpc.NO_RESOURCES, fastrpc.MANAGED_RESOURCES)) for _, src, _ in kernels
+    )
     for i, (_, source, plans) in enumerate(kernels):
-        args = ", ".join(f"({pl.ctype})(intptr_t)a[{j}]" if pl.is_scalar else f"({pl.ctype}*)a[{j}]" for j, pl in enumerate(plans))
+        if external and i in external:
+            source = external[i]
+            call = f"tl_session_external_{i}(a)"
+        else:
+            call = f"tl_session_kernel_{i}({_kernel_args(plans)})"
         parts.append(
             f"static AEEResult tl_session_call_{i}(void** a) {{\n"
-            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source)}([&]() {{ return tl_session_kernel_{i}({args}); }});\n}}\n"
+            f"  (void)a;\n  return {fastrpc.run_kernel_entry(source, managed_session=managed)}([&]() {{ return {call}; }});\n}}\n"
         )
     calls = "".join(f"  case {i}: return tl_session_call_{i}(a);\n" for i in range(len(kernels)))
     max_params = max([len(plans) for _, _, plans in kernels] + [1])
@@ -344,7 +365,7 @@ AEEResult {iface}_sync(remote_handle64 h, int32 fd, uint32 offset, uint32 size, 
 }}
 
 AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int argsLen, const uint8* inputs, int inputsLen, uint8* outputs, int outputsLen) {{
-  (void)h; (void)inputsLen; (void)outputsLen;
+  (void)h;
   void* a[{max_params}];
   int n = argsLen / 3;
   if (n > {max_params}) return AEE_EBADPARM;
@@ -358,6 +379,15 @@ AEEResult {iface}_run(remote_handle64 h, int32 kernel, const int32* args, int ar
       a[i] = (void*)(inputs + v);
     }} else if (kind == {_OUTPUT}) {{
       a[i] = (void*)(outputs + v);
+    }} else if (kind == {_INOUT}) {{
+      if (v < 0 || o < 0 || v > inputsLen || o > inputsLen - v ||
+          v > outputsLen || o > outputsLen - v) return AEE_EBADPARM;
+      a[i] = (void*)(outputs + v);
+      if (o) {{
+        memcpy(a[i], inputs + v, o);
+        // The kernel may read or overwrite this memory exclusively by DMA.
+        if (qurt_mem_cache_clean((qurt_addr_t)a[i], o, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE) != QURT_EOK) return AEE_EFAILED;
+      }}
     }} else {{
       a[i] = (void*)(intptr_t)v;
     }}
@@ -825,18 +855,41 @@ int main(int argc, char** argv) {{
 """
 
 
-def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]]) -> tuple[str, str]:
+def write_project(workdir: str, kernels: Sequence[tuple[str, str, list]], *, isolate_imports: bool = False) -> tuple[str, str]:
     """Write the session's FastRPC project; returns (project_dir, iface)."""
     from tilelang.env import TILELANG_TEMPLATE_PATH
 
-    digest = hashlib.sha256("\0".join(source for _, source, _ in kernels).encode()).hexdigest()[:10]
-    iface = f"tl_session_{digest}"
+    digest = hashlib.sha256("\0".join(source for _, source, _ in kernels).encode())
+    if isolate_imports:
+        digest.update(b"\0isolated imports")
+    iface = f"tl_session_{digest.hexdigest()[:10]}"
     os.makedirs(workdir, exist_ok=True)
+    external = {}
+    units = {}
+    if isolate_imports and len(kernels) > 1:
+        for i, (name, source, plans) in enumerate(kernels):
+            preamble, imported, _ = source.partition("\n// TL_HEXAGON_IMPORTED_SOURCE\n")
+            if imported:
+                # The dispatcher's open/close still sees the union of the generated
+                # resource declarations. Each compiler invocation owns its C imports.
+                external[i] = preamble + "\n"
+                # An included header could redefine the backend's resource flags.
+                # Let the preprocessor catch a mismatch with the dispatcher's policy.
+                flags = ("TL_HEXAGON_USES_VTCM", "TL_HEXAGON_USES_HMX", "TL_HEXAGON_USES_COOPERATIVE")
+                declarations = preamble.splitlines()
+                changed = " || ".join(f"!defined({flag})" if f"#define {flag} 1" in declarations else f"defined({flag})" for flag in flags)
+                units[f"{iface}_kernel_{i}.cc"] = (
+                    f"#define TL_HEXAGON_SEPARATE_KERNELS 1\n{_skel_headers(iface)}\n#define {name} tl_session_kernel_{i}\n{source}\n#undef {name}\n"
+                    f'#if {changed}\n#error "Imported source changed the generated Hexagon resource requirements"\n#endif\n'
+                    f'extern "C" __attribute__((visibility("hidden"))) int tl_session_external_{i}(void** a) {{\n'
+                    f"  (void)a; return tl_session_kernel_{i}({_kernel_args(plans)});\n}}\n"
+                )
     files = {
         f"{iface}.idl": gen_idl(iface),
-        f"{iface}_dsp.cc": gen_dsp(iface, kernels),
+        f"{iface}_dsp.cc": gen_dsp(iface, kernels, external),
         f"{iface}_agent.c": gen_agent(iface, kernels),
-        "CMakeLists.txt": fastrpc.gen_cmake(iface, TILELANG_TEMPLATE_PATH, agent=True),
+        "CMakeLists.txt": fastrpc.gen_cmake(iface, TILELANG_TEMPLATE_PATH, agent=True, kernel_files=units),
+        **units,
     }
     for fn, content in files.items():
         with open(os.path.join(workdir, fn), "w") as f:
@@ -911,7 +964,7 @@ class DeviceBuffer:
     def write(self, data, offset: int = 0) -> None:
         """Write a tensor's (or a byte string's) bytes at ``offset``."""
         self._live_allocation()
-        raw = _bytes(data)
+        raw = byte_buffer(data)
         if offset < 0 or offset + len(raw) > self.nbytes:
             raise ValueError(f"{len(raw)} bytes at {offset} overrun a buffer of {self.nbytes}")
         self.session._write(self.id, self.offset + offset, raw)
@@ -934,17 +987,6 @@ class DeviceBuffer:
         self.session._free(self.id, self._live_allocation())
 
 
-def _bytes(data) -> bytes:
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return bytes(data)
-    if isinstance(data, torch.Tensor):
-        data = data.detach().to("cpu").contiguous()
-        if data.dtype == torch.bfloat16:
-            data = data.view(torch.int16)
-        return data.numpy().tobytes()
-    return np.ascontiguousarray(data).tobytes()
-
-
 class SessionKernel:
     """A kernel of a :class:`Session`, called like a compiled kernel."""
 
@@ -955,6 +997,7 @@ class SessionKernel:
         self.params = list(params)
         n = len(self.params)
         self.out_idx = [i if i >= 0 else n + i for i in out_idx]
+        self._writable = ()  # Set by JIT adapters with lowered parameter access metadata.
         self.plans = fastrpc._plan(self.params, [])
 
     def __call__(self, *args, process: int = 0):
@@ -1016,20 +1059,21 @@ def _lower(func, target, configs: dict) -> tuple[str, str]:
         with contextlib.suppress(OSError, ValueError, KeyError):
             with open(path) as f:
                 entry = json.load(f)
-            return entry["name"], entry["source"]
+            source = entry["source"]
+            if entry.get("source_digest") == hashlib.sha256(source.encode()).hexdigest():
+                source = _GeneratedSource(source)
+            return entry["name"], source
     with tvm.target.Target(target), tvm.transform.PassContext(opt_level=3, config=configs):
         art = tilelang.lower(func, target=target, enable_host_codegen=False, enable_device_compile=False)
-    source = str(art.kernel_source)
-    match = _KERNEL_RE.search(source)
-    if not match:
-        raise RuntimeError("could not find the kernel function in the generated source")
+    source = _GeneratedSource(art.kernel_source)
+    name = str(single_device_kernel(art.device_mod).attrs["global_symbol"])
     if path is not None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"name": match.group(1), "source": source}, f)
+            json.dump({"name": name, "source": source, "source_digest": hashlib.sha256(source.encode()).hexdigest()}, f)
         os.replace(tmp, path)
-    return match.group(1), source
+    return name, source
 
 
 def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]]:
@@ -1041,9 +1085,9 @@ def lower_kernels(kernels, target="hexagon") -> list[tuple[str, str, list, list]
     from tilelang.backend.target import determine_target
     from tilelang.engine.lower import extrac_params
 
-    # Each PrimFunc lowers separately, but gen_dsp joins their C++ into one TU.
-    # Imported C may define macros affecting a later kernel's private queue.
-    # Carry a conservative opt-out through PassContext and its normal cache key.
+    # Callers can embed these sources together in one translation unit. Keep
+    # the conservative queue policy when any import can change another kernel's
+    # private queue macros, including in older unmarked sources.
     kernels = list(kernels)
     imports_c = False
 
@@ -1111,6 +1155,7 @@ class Session:
         ready_timeout: float = 30.0,
         processes: int = 1,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ):
         """``kernels``: (prim_func, out_idx) pairs, compiled into one skel for
         the DSP the target names, which ``processes`` DSP processes load.
@@ -1120,7 +1165,9 @@ class Session:
         from tilelang.hexagon.target import hexagon_arch
 
         target = determine_target(target, return_object=True)
-        self._open(lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes, domain)
+        self._open(
+            lower_kernels(kernels, target), None, hexagon_arch(target), serial, verbose, ready_timeout, processes, domain, isolate_imports
+        )
 
     @classmethod
     def of_lowered(
@@ -1134,12 +1181,13 @@ class Session:
         ready_timeout: float = 30.0,
         processes: int = 1,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ) -> Session:
         """A session of kernels lowered already, (name, source, params,
         out_idx) each as :func:`lower_kernels` gives them: a compiled kernel
         (tilelang.compile) is a session of one."""
         session = cls.__new__(cls)
-        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain)
+        session._open(lowered, sdk, dsp_arch, serial, verbose, ready_timeout, processes, domain, isolate_imports)
         return session
 
     def _open(
@@ -1152,6 +1200,7 @@ class Session:
         ready_timeout: float,
         processes: int,
         domain: int | None = None,
+        isolate_imports: bool = False,
     ) -> None:
         from .build import build_cmake_fastrpc
         from .config import check_domain, device_serial, domain_id, hlos, remote_dir
@@ -1176,7 +1225,11 @@ class Session:
         # The session's FastRPC project and build tree, removed with it.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_session_")
         weakref.finalize(self, shutil.rmtree, self._workdir, True)
-        project, iface = write_project(self._workdir, [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered])
+        project, iface = write_project(
+            self._workdir,
+            [(name, source, fastrpc._plan(params, [])) for name, source, params, _ in lowered],
+            isolate_imports=isolate_imports,
+        )
         sdk = (sdk or (HexagonSDK(dsp_arch=dsp_arch) if dsp_arch else HexagonSDK())).validate()
         self._artifacts = build_cmake_fastrpc(project, iface, sdk=sdk, dsp_arch=dsp_arch, verbose=verbose)
         self.kernels = [SessionKernel(self, i, name, params, out) for i, (name, _, params, out) in enumerate(lowered)]
@@ -1410,9 +1463,11 @@ class Session:
                 if isinstance(value, _Step):
                     if not plan.is_scalar:
                         raise ValueError(f"argument {i} of {kernel.name} is a buffer; Session.STEP stands for a scalar")
+                    if plan.ctype == "float":
+                        raise ValueError("Session.STEP requires an integer scalar parameter")
                     words += [_STEP, value.first, 0]
                 elif plan.is_scalar:
-                    words += [_SCALAR, int(value), 0]
+                    words += [_SCALAR, plan.scalar_word(value), 0]
                 elif isinstance(value, DeviceBuffer):
                     self._check_resident(kernel, i, value, process)
                     words += [_RESIDENT, value.id, value.offset]
@@ -1472,10 +1527,16 @@ class Session:
             allocation.alive = False
             del self._allocations[bid]
 
-    def _write(self, bid: int, offset: int, raw: bytes) -> None:
-        wire = bytes([_OP_WRITE]) + struct.pack("<iQQ", bid, offset, len(raw)) + raw
+    def _write(self, bid: int, offset: int, raw: bytes | memoryview) -> None:
+        header = struct.pack("<BiQQ", _OP_WRITE, bid, offset, len(raw))
         with self._exchange():
-            self._sock.sendall(wire)
+            # Send a small request in one socket write for ADB latency. Large
+            # payloads go directly from the caller's storage to the socket.
+            if len(raw) <= 64 * 1024:
+                self._sock.sendall(header + raw)
+            else:
+                self._sock.sendall(header)
+                self._sock.sendall(raw)
             self._status("a buffer write")
 
     def _read(self, bid: int, offset: int, n: int) -> bytes:
@@ -1529,11 +1590,26 @@ class Session:
 
     def _run(self, kernel: SessionKernel, given: list, process: int):
         args, inputs, outputs = [], bytearray(), []
-        out_bytes = 0
+        # Inline read/write parameters occupy a common prefix in both wire
+        # blocks. Their initial values and updates travel in the same RUN.
+        writebacks = {}
+        for i in kernel._writable:
+            value = given[i]
+            if value is None or isinstance(value, DeviceBuffer):
+                continue
+            plan = kernel.plans[i]
+            check_writeback(kernel.params, kernel.plans, given, i)
+            raw = pack_buffer(value, kernel.params[i], plan, kernel.name)
+            writebacks[i] = len(inputs)
+            outputs.append((i, len(inputs)))
+            inputs += raw + bytes(_align(len(raw)) - len(raw))
+        out_bytes = len(inputs)
         for i, plan in enumerate(kernel.plans):
             value = given[i]
-            if plan.is_scalar:
-                args += [_SCALAR, int(value), 0]
+            if i in writebacks:
+                args += [_INOUT, writebacks[i], plan.nbytes]
+            elif plan.is_scalar:
+                args += [_SCALAR, plan.scalar_word(value), 0]
             elif isinstance(value, DeviceBuffer):
                 self._check_resident(kernel, i, value, process)
                 args += [_RESIDENT, value.id, value.offset]
@@ -1542,9 +1618,7 @@ class Session:
                 outputs.append((i, out_bytes))
                 out_bytes = _align(out_bytes + plan.nbytes)
             else:
-                raw = _bytes(value)
-                if len(raw) != plan.nbytes:
-                    raise ValueError(f"argument {i} of {kernel.name} has {len(raw)} bytes, the kernel takes {plan.nbytes}")
+                raw = pack_buffer(value, kernel.params[i], plan, kernel.name)
                 args += [_INPUT, len(inputs), 0]
                 inputs += raw + bytes(_align(len(raw)) - len(raw))
         # The outputs come back in out_idx order, as a compiled kernel's do;
@@ -1563,11 +1637,11 @@ class Session:
             param = kernel.params[i]
             plan = kernel.plans[i]
             chunk = raw[offset : offset + plan.nbytes]
-            dtype = str(param.dtype)
-            if dtype in ("int4", "uint4"):
-                results.append(torch.frombuffer(bytearray(chunk), dtype=torch.uint8))
-                continue
-            results.append(torch.frombuffer(bytearray(chunk), dtype=getattr(torch, dtype)).reshape([int(s) for s in param.shape]))
+            result = unpack_buffer(chunk, param)
+            if i in writebacks:
+                given[i].detach().copy_(result.reshape(given[i].shape))
+            else:
+                results.append(result)
         if not results:
             return None
         return results[0] if len(results) == 1 else results

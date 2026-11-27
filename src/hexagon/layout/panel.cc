@@ -3,7 +3,7 @@
  */
 #include "hexagon/layout/panel.h"
 
-#include <tvm/ffi/reflection/registry.h>
+#include "layout/reflection.h"
 #include <tvm/tirx/op.h>
 
 namespace tvm {
@@ -60,9 +60,19 @@ PanelLayout::PanelLayout(Array<PrimExpr> shape, int64_t lane) {
   data_ = make_object<PanelLayoutNode>(shape, lane);
 }
 
+void PanelLayoutNode::RestoreLegacyIndex() {
+  // Earlier JSON stored the forward expression without its binding Vars.
+  if (placeholder_vars_.empty()) {
+    InitForwardIndex(PanelPosition(input_size_, lane));
+  }
+}
+
 void PanelLayoutNode::RegisterReflection() {
   namespace refl = reflection;
-  refl::ObjectDef<PanelLayoutNode>().def_ro("lane", &PanelLayoutNode::lane);
+  refl::ObjectDef<PanelLayoutNode>().def_ro(
+      "lane", &PanelLayoutNode::lane,
+      RestoreAfterSet<&PanelLayoutNode::lane,
+                      &PanelLayoutNode::RestoreLegacyIndex>());
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

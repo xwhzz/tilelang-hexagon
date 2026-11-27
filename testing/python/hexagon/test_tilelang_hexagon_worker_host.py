@@ -27,7 +27,7 @@ def worker_host(tmp_path_factory):
     binary = directory / "worker-host"
     source = Path(__file__).with_name("worker_host.cc")
     subprocess.run(
-        [compiler, "-std=c++17", "-O2", "-pthread", "-I", str(directory), str(source), "-o", str(binary)],
+        [compiler, "-std=c++17", "-O2", "-pthread", "-I", str(directory), "-I", str(root / "src"), str(source), "-o", str(binary)],
         check=True,
         timeout=30,
     )
@@ -69,5 +69,5 @@ def worker_host(tmp_path_factory):
     ],
 )
 def test_worker_runtime_on_host(worker_host, case):
-    # Every case has a fresh process, including the real function-local cache.
+    # Every case has a fresh process, including the worker capacity cache.
     subprocess.run([str(worker_host), case], check=True, timeout=10)

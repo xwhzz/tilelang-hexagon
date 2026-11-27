@@ -18,8 +18,7 @@ import uuid
 import weakref
 from dataclasses import dataclass, field
 
-import numpy as np
-import torch
+from .tensor import pack_buffer, unpack_buffer
 
 from .env import current_environment
 from .device import DEVICE_LOCK, AdbConnection, HexagonConnectionError, _DEFAULT_ADSP_DIRS
@@ -268,6 +267,7 @@ class OneShotKernel:
         from .build import build_cmake_fastrpc
 
         self.params, self.result_idx = list(params), list(result_idx)
+        self._plans = fastrpc._plan(self.params, self.result_idx)
         self._domain = domain_id()
         # The kernel's FastRPC project, build tree and argument files.
         self._workdir = tempfile.mkdtemp(prefix="tl_hexagon_")
@@ -292,35 +292,29 @@ class OneShotKernel:
         params, outputs = self.params, set(self.result_idx)
         # Arguments in parameter order: a buffer is a pushed file, a scalar
         # (a number, or a 0-d tensor) its value.
-        values, it = [None] * len(params), iter(ins)
-        for i, p in enumerate(params):
-            if i in outputs:
-                values[i] = torch.empty(tuple(int(s) for s in p.shape), dtype=p.torch_dtype(), device="cpu")
-            else:
-                t = next(it)
-                values[i] = t if p.is_scalar() else t.detach().to("cpu").contiguous()
+        it = iter(ins)
+        values = [None if i in outputs else next(it) for i in range(len(params))]
         argv, pulls = [str(self._domain)], []
         for i, p in enumerate(params):
             if p.is_scalar():
-                argv.append(str(int(values[i])))
+                argv.append(str(self._plans[i].scalar_word(values[i])))
                 continue
             fname = f"{self._iface}_p{i}.bin"
             local = os.path.join(self._workdir, fname)
             if i in outputs:
-                pulls.append((local, fname, values[i]))
+                pulls.append((local, fname, i))
             else:
                 with open(local, "wb") as f:
-                    f.write(values[i].numpy().tobytes())
+                    f.write(pack_buffer(values[i], p, self._plans[i], self._iface))
                 self._conn.push(local, fname)
             argv.append(fname)
         rc, out = self._conn.run_host_binary(self._exe, argv, timeout=120)
         if rc != 0:
             raise RuntimeError(f"Hexagon device run failed (rc={rc}):\n{out}")
-        for local, fname, tensor in pulls:
+        for local, fname, i in pulls:
             self._conn.pull(os.path.join(self._conn.workdir, fname), local)
             with open(local, "rb") as f:
-                arr = np.frombuffer(f.read(), dtype=np.dtype(str(tensor.dtype).replace("torch.", ""))).reshape(tensor.shape)
-            tensor.copy_(torch.from_numpy(arr.copy()))
+                values[i] = unpack_buffer(f.read(), params[i])
         results = [values[i] for i in self.result_idx]
         if not results:
             return None
