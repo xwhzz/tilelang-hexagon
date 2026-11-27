@@ -467,6 +467,9 @@ def test_blockscaled_gemm_splits_k_by_its_start():
     "M,N,K,G,GA,split",
     [
         (1, 128, 2048, 64, None, 1),
+        # Four-panel blocks with one or three panels left in the tail.
+        (1, 160, 2048, 64, None, 1),
+        (2, 224, 1024, 128, 64, 2),
         (2, 96, 512, 128, None, 1),
         (1, 64, 8192, 64, None, 1),
         # A's factors per group, finer than B's and coarser, over two calls.
@@ -498,19 +501,19 @@ def test_blockscaled_gemms_match_torch(b_dtype, M, N, K, G, GA, split):
 
 @DEVICE
 @pytest.mark.parametrize(
-    "dtype,ga,gb,clear",
+    "dtype,ga,gb,clear,n",
     [
-        ("uint8", 512, 512, True),
-        ("uint8", 1280, 640, False),
-        ("int8", 576, 1152, True),
-        ("int8", 512, 512, False),
-        ("int4", 8192, 8192, True),
-        ("uint4", 4480, 4480, False),
-        ("int8", 8256, 8256, True),
+        ("uint8", 512, 512, True, 64),
+        ("uint8", 1280, 640, False, 160),
+        ("int8", 576, 1152, True, 224),
+        ("int8", 512, 512, False, 64),
+        ("int4", 8192, 8192, True, 64),
+        ("uint4", 4480, 4480, False, 64),
+        ("int8", 8256, 8256, True, 64),
     ],
 )
-def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear):
-    m, n, k, group = 4, 64, max(ga, gb), min(ga, gb)
+def test_blockscaled_wide_groups_preserve_integer_dots(dtype, ga, gb, clear, n):
+    m, k, group = 4, max(ga, gb), min(ga, gb)
     a = torch.empty((m, k), dtype=torch.int16)
     a[0], a[1], a[2] = 20000, -32768, 32767
     w = torch.empty((n, k), dtype=torch.int64)

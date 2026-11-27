@@ -166,20 +166,33 @@ class CompiledArtifact:
     target_host: tvm.target.Target | None = None  # Normalized host target used for host codegen/export
 
 
-def dump_kernel_params(params: list[KernelParam]) -> str:
+def _declares_buffer(func: PrimFunc, index: int) -> bool:
+    params = func.params
+    return index < len(params) and params[index] in func.buffer_map
+
+
+def dump_kernel_params(params: list[KernelParam], *, func: PrimFunc | None = None) -> str:
     """Serialize kernel parameters to JSON text.
 
     Uses TVM's JSON reflection (``tvm.ir.save_json``) so symbolic shape
     expressions round-trip, including shared ``Var`` identity across params.
     The result contains only IR node data and can be loaded without executing
-    any code, unlike a pickle.
+    any code, unlike a pickle. When a disk cache supplies its PrimFunc,
+    omit buffer-kind flags that the legacy shape convention already represents.
     """
     records = []
-    for param in params:
+    for index, param in enumerate(params):
         record = {"dtype": str(param.dtype), "shape": list(param.shape)}
         if param.strides is not None:
             record["strides"] = param.strides
-        if param.is_buffer is not None:
+        if isinstance(func, PrimFunc):
+            is_buffer = not param.is_scalar()
+            # Empty shapes also occur in old cache records. A reader with the
+            # PrimFunc resolves those using its buffer map, so an explicit
+            # by-value override of a declared pointer needs a false flag.
+            if is_buffer != bool(param.shape) or (not param.shape and _declares_buffer(func, index)):
+                record["is_buffer"] = is_buffer
+        elif param.is_buffer is not None:
             record["is_buffer"] = param.is_buffer
         records.append(record)
     return tvm.ir.save_json(tvm.runtime.convert(records))
@@ -193,8 +206,8 @@ def load_kernel_params(text: str, *, func: PrimFunc | None = None) -> list[Kerne
         shape = [dim if isinstance(dim, PrimExpr) else int(dim) for dim in record["shape"]]
         strides = list(record["strides"]) if "strides" in record else None
         is_buffer = bool(record["is_buffer"]) if "is_buffer" in record else None
-        if is_buffer is None and not shape and isinstance(func, PrimFunc):
+        if is_buffer is None and isinstance(func, PrimFunc):
             # Old records described rank-zero buffers and by-value scalars identically.
-            is_buffer = func.params[index] in func.buffer_map
+            is_buffer = bool(shape) or _declares_buffer(func, index)
         params.append(KernelParam(dtype, shape, strides, is_buffer))
     return params

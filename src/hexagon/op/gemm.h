@@ -14,6 +14,9 @@ namespace tvm {
 namespace tl {
 namespace hexagon {
 
+// An explicit row-major A or B chose the HVX layout before pipeline staging.
+constexpr const char *kRowMajorGemm = "hexagon.row_major_gemm";
+
 /*!
  * \brief Why HMX cannot run `op`, or an empty string when it can: A and B
  * fp16 and C fp16 or fp32, all in VTCM (shared buffers or fragments, which are

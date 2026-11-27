@@ -1238,23 +1238,18 @@ TL_DEVICE void tl_gemm_int_panels_scaled(
       offset = Q6_V_vsplat_R((BBits == 4 ? 8 : 128) * sum[g]);
 #pragma clang loop unroll(full)
     for (int b = 0; b < NB; ++b) {
-      HVX_Vector dot;
       if constexpr (Wide) {
-        dot = tl_gemm_wide_planes<BBits, BSigned, Group>(acc[0][b], acc[1][b],
-                                                         BSigned ? sum[g] : 0);
+        HVX_Vector dot = tl_gemm_wide_planes<BBits, BSigned, Group>(
+            acc[0][b], acc[1][b], BSigned ? sum[g] : 0);
+        total[b] =
+            Q6_Vsf_vadd_VsfVsf(total[b], Q6_Vsf_vmpy_VsfVsf(dot, scale[b]));
       } else {
         HVX_Vector r = acc[0][b];
         if constexpr (planes == 2)
           r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(r, 8), acc[1][b]);
         if constexpr (BSigned)
           r = Q6_Vw_vsub_VwVw(r, offset);
-        dot = Q6_Vsf_equals_Vw(r);
-      }
-      if constexpr (Wide) {
-        total[b] =
-            Q6_Vsf_vadd_VsfVsf(total[b], Q6_Vsf_vmpy_VsfVsf(dot, scale[b]));
-      } else {
-        HVX_Vector p = Q6_Vqf32_vmpy_VsfVsf(dot, scale[b]);
+        HVX_Vector p = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(r), scale[b]);
         total[b] = Q6_Vqf32_vadd_Vqf32Vqf32(total[b], p);
       }
     }
@@ -1320,21 +1315,50 @@ TL_DEVICE void tl_gemm_wide_groups(float *C, const TA *A, const uint8_t *B,
   }
 }
 
+// Keep the v73/v75 native IEEE feature on wide panel computations.
+template <typename F, typename Width>
+TL_HEXAGON_IEEE_ARITHMETIC static inline void
+tl_gemm_wide_scaled_block(F &block, int p, Width width) {
+  [[clang::always_inline]] block(p, width);
+}
+
 template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
-          int GA, int GB, bool AlignC, bool Wide, typename TA>
-TL_DEVICE void tl_gemm_scaled_rows(float *C, const TA *A, const void *B_,
-                                   int panel_bytes, const float *sfa,
-                                   int ld_sfa, const half *sfb, int ld_sfb,
-                                   bool clear) {
-  const auto *B = static_cast<const uint8_t *>(B_);
+          int GA, int GB, bool AlignC, typename TA>
+TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
+                                    int panel_bytes, const float *sfa,
+                                    int ld_sfa, const half *sfb, int ld_sfb,
+                                    bool clear) {
+  const uint8_t *B = static_cast<const uint8_t *>(B_);
+  static_assert(std::is_same_v<TA, int8_t> || std::is_same_v<TA, uint8_t> ||
+                    std::is_same_v<TA, int16_t>,
+                "HVX block-scaled GEMM: A is int8, uint8 or int16");
+  static_assert(!BSigned || std::is_same_v<TA, int16_t>,
+                "HVX block-scaled GEMM: a signed B takes an int16 A");
   constexpr int lane = 32 / BBits;
-  constexpr int Group = tl_gemm_min(GA, GB);
+  constexpr int Group = GA < GB ? GA : GB;
+  static_assert(N % 32 == 0 && K % GA == 0 && K % GB == 0 &&
+                    Group % lane == 0 && GA % Group == 0 && GB % Group == 0,
+                "HVX block-scaled GEMM: whole panels and whole scale groups");
+  constexpr int MaxA = std::is_signed_v<TA> ? -std::numeric_limits<TA>::min()
+                                            : std::numeric_limits<TA>::max();
+  constexpr int MaxB = BSigned ? (1 << (BBits - 1)) : (1 << BBits) - 1;
+  constexpr bool Wide = int64_t{Group} * MaxA * MaxB > INT32_MAX;
+  // Keep the staged byte planes within 16 KiB and each plane's dot in int32.
+  if constexpr (Wide && (sizeof(TA) != 2 || Group > 8192)) {
+    tl_gemm_wide_groups<M, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
+        C, A, B, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear);
+    return;
+  }
   // Columns per staged chunk of A's row, whole groups; panels per block.
   // A wide group can stage multiple groups in one pass over its byte planes.
   constexpr int Capacity = Wide ? 2048 : 512;
   constexpr int KC =
       Group >= Capacity ? Group : tl_gemm_min(K, Capacity / Group * Group);
-  constexpr int NB = tl_gemm_int_block(N / 32);
+  constexpr int Panels = N / 32;
+  constexpr int Divisor = tl_gemm_int_block(Panels);
+  // Keep uniform blocks of two or more panels. For an otherwise single-panel
+  // schedule, share staging across four full panels and handle the remainder.
+  constexpr int Block = Divisor == 1 ? tl_gemm_min(4, Panels) : Divisor;
   constexpr bool RowsC = AlignC && LdC % 32 == 0;
   tl_gemm_int_row<TA, BBits, KC> row;
 #pragma clang loop unroll(disable)
@@ -1366,8 +1390,8 @@ TL_DEVICE void tl_gemm_scaled_rows(float *C, const TA *A, const void *B_,
     if constexpr (BSigned)
       sums.compute(a);
     const int32_t *sum = sums.sum;
-#pragma clang loop unroll(disable)
-    for (int p = 0; p < N / 32; p += NB) {
+    auto block = [&](int p, auto width) {
+      constexpr int NB = decltype(width)::value;
       HVX_Vector total[NB];
 #pragma clang loop unroll(full)
       for (int b = 0; b < NB; ++b)
@@ -1403,50 +1427,21 @@ TL_DEVICE void tl_gemm_scaled_rows(float *C, const TA *A, const void *B_,
         }
         tl_hvx_store<RowsC>(c0 + 32 * (p + b), r);
       }
-    }
-  }
-}
-
-// Run the same panel loop with native IEEE scaling for wide integer dots on
-// v73/v75. Narrow groups keep the original Qfloat arithmetic and code shape.
-template <auto Rows, typename... Args>
-TL_HEXAGON_IEEE_ARITHMETIC static inline void
-tl_gemm_wide_scaled(Args... args) {
-  Rows(args...);
-}
-
-template <int M, int N, int K, int BBits, bool BSigned, int LdA, int LdC,
-          int GA, int GB, bool AlignC, typename TA>
-TL_GEMM void tl_hvx_gemm_int_scaled(float *C, const TA *A, const void *B_,
-                                    int panel_bytes, const float *sfa,
-                                    int ld_sfa, const half *sfb, int ld_sfb,
-                                    bool clear) {
-  static_assert(std::is_same_v<TA, int8_t> || std::is_same_v<TA, uint8_t> ||
-                    std::is_same_v<TA, int16_t>,
-                "HVX block-scaled GEMM: A is int8, uint8 or int16");
-  static_assert(!BSigned || std::is_same_v<TA, int16_t>,
-                "HVX block-scaled GEMM: a signed B takes an int16 A");
-  constexpr int lane = 32 / BBits;
-  constexpr int Group = GA < GB ? GA : GB;
-  static_assert(N % 32 == 0 && K % GA == 0 && K % GB == 0 &&
-                    Group % lane == 0 && GA % Group == 0 && GB % Group == 0,
-                "HVX block-scaled GEMM: whole panels and whole scale groups");
-  constexpr int MaxA = std::is_signed_v<TA> ? -std::numeric_limits<TA>::min()
-                                            : std::numeric_limits<TA>::max();
-  constexpr int MaxB = BSigned ? (1 << (BBits - 1)) : (1 << BBits) - 1;
-  constexpr bool Wide = int64_t{Group} * MaxA * MaxB > INT32_MAX;
-  // Keep the staged byte planes within 16 KiB and each plane's dot in int32.
-  if constexpr (Wide && (sizeof(TA) != 2 || Group > 8192)) {
-    tl_gemm_wide_groups<M, N, K, BBits, BSigned, LdA, LdC, GA, GB>(
-        C, A, static_cast<const uint8_t *>(B_), panel_bytes, sfa, ld_sfa, sfb,
-        ld_sfb, clear);
-  } else {
-    constexpr auto rows = tl_gemm_scaled_rows<M, N, K, BBits, BSigned, LdA, LdC,
-                                              GA, GB, AlignC, Wide, TA>;
-    if constexpr (Wide)
-      tl_gemm_wide_scaled<rows>(C, A, B_, panel_bytes, sfa, ld_sfa, sfb, ld_sfb,
-                                clear);
-    else
-      rows(C, A, B_, panel_bytes, sfa, ld_sfa, sfb, ld_sfb, clear);
+    };
+    // Wide blocks inherit the IEEE feature of the v73/v75 caller. Leave
+    // ordinary blocks to the original inlining policy.
+    auto apply = [&](int p, auto width) TL_HEXAGON_VECTOR_INLINE {
+      if constexpr (Wide) {
+        tl_gemm_wide_scaled_block(block, p, width);
+      } else {
+        block(p, width);
+      }
+    };
+#pragma clang loop unroll(disable)
+    for (int p = 0; p + Block <= Panels; p += Block)
+      apply(p, std::integral_constant<int, Block>{});
+    if constexpr (Panels % Block != 0)
+      apply(Panels - Panels % Block,
+            std::integral_constant<int, Panels % Block>{});
   }
 }
