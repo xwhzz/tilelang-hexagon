@@ -61,17 +61,20 @@ tl_hvx_exp_impl(HVX_Vector input) {
   }
   x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, tl_hvx_splat_f(-126.0f)),
                          tl_hvx_splat_f(Bounded ? 126.0f : 128.0f));
-  // k = round-to-nearest(x), f = x - k ∈ [-0.5, 0.5].  Q6_Vw_equals_Vsf
-  // truncates TOWARD ZERO, so bias by copysign(0.5, x) before the convert —
-  // otherwise f lands in (-1, 1) and the degree-5 minimax poly (fit on [-0.5,
-  // 0.5]) is evaluated outside its domain (~100x worse: 3e-6 -> ~3e-4).
-  HVX_Vector half_signed = Q6_V_vor_VV(
-      Q6_V_vand_VV(x, Q6_V_vsplat_R((int)0x80000000)), tl_hvx_splat_f(0.5f));
-  HVX_Vector ki =
-      Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, half_signed)); // trunc(x ± 0.5)
-  HVX_Vector kf = Q6_Vsf_equals_Vw(ki); // back to float for the residual
-  HVX_Vector f = IEEE ? Q6_Vsf_vsub_VsfVsf(x, kf)
-                      : tl_hvx_sub_sf(x, kf); // f ∈ [-0.5, 0.5]
+  HVX_Vector ki, f;
+  if constexpr (Bounded) {
+    HVX_Vector half_signed = Q6_V_vor_VV(
+        Q6_V_vand_VV(x, Q6_V_vsplat_R((int)0x80000000)), tl_hvx_splat_f(0.5f));
+    ki = Q6_Vw_equals_Vsf(tl_hvx_add_sf(x, half_signed));
+    f = tl_hvx_sub_sf(x, Q6_Vsf_equals_Vw(ki));
+  } else {
+    // At this bias the fp32 ULP is one. The rounded exponent is in the
+    // low mantissa bits; only those bits are used when scaling the result.
+    HVX_Vector bias = tl_hvx_splat_f(0x1.8p23f);
+    ki = Q6_Vsf_vadd_VsfVsf(x, bias);
+    HVX_Vector kf = Q6_Vsf_vsub_VsfVsf(ki, bias);
+    f = Q6_Vsf_vsub_VsfVsf(x, kf);
+  }
   // 2^f via Horner in qf32:  ((((C5 f + C4) f + C3) f + C2) f + C1) f + C0
   HVX_Vector fq = Q6_Vqf32_vadd_VsfVsf(f, Q6_V_vzero()); // f as qf32
   HVX_Vector acc =
@@ -84,36 +87,29 @@ tl_hvx_exp_impl(HVX_Vector input) {
                                tl_hvx_splat_f(0.2402265069f));
   acc = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq),
                                tl_hvx_splat_f(0.6931471806f));
-  acc = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq),
-                               tl_hvx_splat_f(1.0000000000f));
-  HVX_Vector p = Q6_Vsf_equals_Vqf32(acc); // 2^f
+  HVX_Vector product = Q6_Vqf32_vmpy_Vqf32Vqf32(acc, fq);
   if constexpr (Bounded) {
+    HVX_Vector p = Q6_Vsf_equals_Vqf32(
+        Q6_Vqf32_vadd_Vqf32Vsf(product, tl_hvx_splat_f(1.0f)));
     // Reciprocal-based sigmoid/tanh need a finite exponent, including at
     // their saturated ends.
     HVX_Vector e = Q6_Vw_vasl_VwR(Q6_Vw_vadd_VwVw(ki, Q6_V_vsplat_R(127)), 23);
     return tl_hvx_mul_sf(p, e);
   }
-#if __HVX_ARCH__ < 79
-  // The qf32 constant term can round one ulp away from one at integral x.
-  HVX_Vector abs_f = Q6_V_vand_VV(f, Q6_V_vsplat_R(0x7fffffff));
-  p = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(abs_f, Q6_V_vzero()),
-                    tl_hvx_splat_f(1.0f), p);
-#endif
+  // Add the constant in fp32 so an integral exponent has exactly 2^f = 1.
+  HVX_Vector p =
+      Q6_Vsf_vadd_VsfVsf(Q6_Vsf_equals_Vqf32(product), tl_hvx_splat_f(1.0f));
+
   // Add k directly to the biased exponent. For k == 128 and f < 0 the
   // scaled polynomial still fits in fp32, although 2^k would overflow.
+  // For exp the first overflowing fp32 input times log2(e) rounds to 128.
   HVX_Vector r = Q6_Vw_vadd_VwVw(p, Q6_Vw_vasl_VwR(ki, 23));
-  if constexpr (!Base2) {
-    // The next fp32 after this input exceeds 128*ln(2), even when the
-    // multiplication by log2(e) rounds down.
-    HVX_VectorPred overflow =
-        Q6_Q_vcmp_gt_VsfVsf(input, tl_hvx_splat_f(88.72283172607421875f));
-    r = Q6_V_vmux_QVV(overflow, Q6_V_vsplat_R(0x7f800000), r);
-  }
   // min/max with a NaN can select the clamp bound. Keep NaNs distinct from
   // numerical overflow, including when the input was a signaling NaN.
-  HVX_Vector magnitude = Q6_V_vand_VV(input, Q6_V_vsplat_R(0x7fffffff));
-  return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(magnitude, Q6_V_vsplat_R(0x7f800000)),
-                       Q6_V_vsplat_R(0x7fc00000), r);
+  HVX_Vector magnitude = Q6_Vw_vasl_VwR(input, 1);
+  return Q6_V_vmux_QVV(
+      Q6_Q_vcmp_gt_VuwVuw(magnitude, Q6_V_vsplat_R(0xff000000)),
+      Q6_V_vsplat_R(0x7fc00000), r);
 }
 
 // ---------------------------------------------------------------------------
