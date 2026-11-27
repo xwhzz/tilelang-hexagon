@@ -4,11 +4,25 @@
 #include <stdio.h>
 #include <tl_templates/hexagon/hvx_math.h>
 
+// Clang pads a 96-lane native vector to 512 bytes. All three logical HVX
+// registers must remain usable by callers of the header template.
+static bool check_three_register_division() {
+  vec_type<float, 96> numerator(0x1p127f), denominator(0x1p127f);
+  denominator.v[95] = -0x1p127f;
+  auto quotient = tl_hvx_div(numerator, denominator);
+  for (int i = 0; i < 96; ++i)
+    if (quotient.v[i] != (i == 95 ? -1.0f : 1.0f))
+      return false;
+  return true;
+}
+
 int main(int argc, char **argv) {
   if (argc != 3)
     return 1;
   SIM_ACQUIRE_HVX;
   SIM_SET_HVX_DOUBLE_MODE;
+  if (!check_three_register_division())
+    return 7;
   FILE *in = fopen(argv[1], "rb"), *out = fopen(argv[2], "wb");
   if (!in || !out)
     return 2;

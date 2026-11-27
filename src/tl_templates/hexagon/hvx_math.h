@@ -884,16 +884,16 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
                                         const vec_type<float, N> &b) {
   static_assert(N % TL_HVX_F32_LANES == 0, "tl_hvx_div needs whole registers");
   constexpr int count = N / TL_HVX_F32_LANES;
-  struct Registers {
-    HVX_Vector v[count];
-  };
-  Registers x = __builtin_bit_cast(Registers, a.v),
-            y = __builtin_bit_cast(Registers, b.v), q;
+  // Clang rounds the storage size of a vector such as float96 up to a power
+  // of two. Only copy the registers that contain lanes.
+  HVX_Vector x[count], y[count], q[count];
+  __builtin_memcpy(x, &a.v, sizeof(x));
+  __builtin_memcpy(y, &b.v, sizeof(y));
   HVX_VectorPred flags[count], combined{};
 #pragma clang loop unroll(full)
   for (int i = 0; i < count; ++i) {
-    q.v[i] = tl_hvx_div_approx(x.v[i], y.v[i]);
-    flags[i] = tl_hvx_div_exceptional(x.v[i], y.v[i]);
+    q[i] = tl_hvx_div_approx(x[i], y[i]);
+    flags[i] = tl_hvx_div_exceptional(x[i], y[i]);
     combined = i == 0 ? flags[i] : Q6_Q_or_QQ(combined, flags[i]);
   }
   // Independent reciprocals can overlap while a wide vector shares one
@@ -902,9 +902,11 @@ TL_DEVICE vec_type<float, N> tl_hvx_div(const vec_type<float, N> &a,
 #pragma clang loop unroll(full)
     for (int i = 0; i < count; ++i)
       if (count == 1 || tl_hvx_div_has_exception(flags[i]))
-        q.v[i] = tl_hvx_div_repair(x.v[i], y.v[i], q.v[i], flags[i]);
+        q[i] = tl_hvx_div_repair(x[i], y[i], q[i], flags[i]);
   }
-  return __builtin_bit_cast(typename vec_type<float, N>::nat_t, q);
+  vec_type<float, N> out;
+  __builtin_memcpy(&out.v, q, sizeof(q));
+  return out;
 }
 
 template <int N>
