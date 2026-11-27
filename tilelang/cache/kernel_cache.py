@@ -596,7 +596,7 @@ class KernelCache:
             params_path = os.path.join(staging_path, self.params_path)
             if verbose:
                 self.logger.debug(f"Saving kernel parameters to disk: {params_path}")
-            KernelCache._safe_write_file(params_path, "w", lambda file: file.write(dump_kernel_params(kernel.params)))
+            KernelCache._safe_write_file(params_path, "w", lambda file: file.write(dump_kernel_params(kernel.params, func=func)))
 
             # Persist HIP kernel-resource-usage remarks
             usage = getattr(kernel, "_resource_usage", None) or {}
@@ -692,7 +692,7 @@ class KernelCache:
             if verbose:
                 self.logger.debug(f"Loading kernel parameters from file: {params_path}")
             with open(params_path) as f:
-                kernel_params = load_kernel_params(f.read())
+                kernel_params = load_kernel_params(f.read(), func=func)
         except Exception:
             self.logger.exception("Error loading kernel parameters from disk")
 

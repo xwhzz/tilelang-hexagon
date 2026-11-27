@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from dataclasses import dataclass
 
 from tvm import DataType
@@ -65,6 +66,18 @@ class BufferPlan:
     nbytes: int  # for buffers
     storage_axes: tuple[int, ...] | None = ()  # outermost to innermost for dense buffers, None otherwise
 
+    def scalar_word(self, value) -> int:
+        """Encode a by-value argument in the signed FastRPC wire word."""
+        if self.ctype == "float":
+            return struct.unpack("<i", struct.pack("<f", value))[0]
+        return int(value)
+
+    def scalar_expr(self, word: str) -> str:
+        """Convert a wire word into the C++ kernel argument."""
+        if self.ctype == "float":
+            return f"__builtin_bit_cast(float, (int32_t){word})"
+        return f"({self.ctype}){word}"
+
 
 def _plan(params, result_idx) -> list[BufferPlan]:
     out = set(result_idx)
@@ -72,12 +85,8 @@ def _plan(params, result_idx) -> list[BufferPlan]:
     for i, p in enumerate(params):
         if p.is_scalar():
             dt = str(p.dtype)
-            if dt not in ("int32", "uint32"):
-                raise NotImplementedError(
-                    f"Hexagon adapter: scalar param dtype '{dt}' is not supported yet "
-                    "(only int32/uint32). float/int64 scalars would be silently truncated "
-                    "across the FastRPC int32 boundary."
-                )
+            if dt not in ("int32", "uint32", "float32"):
+                raise NotImplementedError(f"Hexagon adapter: scalar param dtype '{dt}' cannot be passed in a 32-bit FastRPC word")
             plans.append(BufferPlan(i, f"s{i}", True, False, _ctype(p.dtype), 0))
         else:
             elements, axes = storage_layout(p)
@@ -142,10 +151,18 @@ KERNEL_STATUS = {
 }
 
 
-def run_kernel_entry(source: str) -> str:
+# These lines precede includes and imported text in the generated source.
+_RESOURCE_DECL = "// tilelang Hexagon (cDSP) kernel\n// compute resources: "
+NO_RESOURCES = _RESOURCE_DECL + "none\n"
+MANAGED_RESOURCES = _RESOURCE_DECL + "managed\n"
+
+
+def run_kernel_entry(source: str, *, managed_session: bool = False) -> str:
     """Choose a kernel's resource policy before sources share a translation unit."""
     if re.search(r"^#define TL_HEXAGON_USES_COOPERATIVE 1[ \t]*$", source, re.MULTILINE):
         return "tl_hexagon_run_kernel<true>"
+    if managed_session and source.startswith(NO_RESOURCES):
+        return "tl_hexagon_run_kernel<false, false>"
     return "tl_hexagon_run_kernel"
 
 
@@ -226,41 +243,32 @@ static inline int tl_hexagon_open(void) {{
 
 // A kernel's run, between take and give; a nonzero status comes back from
 // run() as KERNEL_STATUS_BASE + status, an error FastRPC passes through.
-template <bool Cooperative = false, typename Fn>
+template <bool Cooperative = false, bool NeedsResources = true, typename Fn>
 static AEEResult tl_hexagon_run_kernel(Fn&& fn) {{
 #if defined(TL_HEXAGON_USES_COOPERATIVE)
   int tl_rc = tl_resource_prepare(Cooperative);
   if (tl_rc != TL_OK) return (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
-  if constexpr (Cooperative) {{
-    if constexpr (std::is_void_v<decltype(fn())>)
-      fn();
-    else
-      tl_rc = (int)fn();
-  }} else {{
-    tl_rc = tl_hexagon_take();
-    if (tl_rc == TL_OK) {{
-      if constexpr (std::is_void_v<decltype(fn())>)
-        fn();
-      else
-        tl_rc = (int)fn();
-      // Publish the body status before cleanup can record a secondary error.
-      if (tl_rc != TL_OK) tl_resource_fail(&tl_resource_state, tl_rc);
-      int tl_cleanup = tl_hexagon_give();
-      if (tl_rc == TL_OK) tl_rc = tl_cleanup;
-    }}
-  }}
-  tl_rc = tl_resource_finish(tl_rc);
 #else
   static_assert(!Cooperative, "Cooperative kernel needs its runtime header");
-  int tl_rc = tl_hexagon_take();
+  int tl_rc = TL_OK;
+#endif
+  if constexpr (!Cooperative && NeedsResources) tl_rc = tl_hexagon_take();
   if (tl_rc == TL_OK) {{
     if constexpr (std::is_void_v<decltype(fn())>)
       fn();
     else
       tl_rc = (int)fn();
-    int tl_cleanup = tl_hexagon_give();
-    if (tl_rc == TL_OK) tl_rc = tl_cleanup;
+    if constexpr (!Cooperative && NeedsResources) {{
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+      // Publish the body status before cleanup can record a secondary error.
+      if (tl_rc != TL_OK) tl_resource_fail(&tl_resource_state, tl_rc);
+#endif
+      int tl_cleanup = tl_hexagon_give();
+      if (tl_rc == TL_OK) tl_rc = tl_cleanup;
+    }}
   }}
+#if defined(TL_HEXAGON_USES_COOPERATIVE)
+  tl_rc = tl_resource_finish(tl_rc);
 #endif
   return tl_rc == TL_OK ? AEE_SUCCESS : (AEEResult)({KERNEL_STATUS_BASE:#x} + tl_rc);
 }}
@@ -276,7 +284,7 @@ def gen_dsp(iface: str, kernel_name: str, kernel_source: str, plans: list[Buffer
     for pl in plans:
         if pl.is_scalar:
             skel_args.append(f"int32 {pl.name}")
-            call_args.append(f"({pl.ctype}){pl.name}")
+            call_args.append(pl.scalar_expr(pl.name))
         elif pl.is_output:
             # QAIC maps `rout sequence<uint8>` to (ptr, len); the length is fixed
             # by the caller and the buffer is copied back, so no written-length.
@@ -367,7 +375,7 @@ def gen_host(iface: str, plans: list[BufferPlan]) -> str:
     )
 
 
-def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
+def gen_cmake(iface: str, template_dir: str, agent: bool, kernel_files=()) -> str:
     # The DSP skel (skel + impl, compiled with HVX/HMX enabled) and, for a
     # session, its HLOS agent (stub + agent). ``template_dir`` is the parent
     # of ``tl_templates`` so the kernel's <tl_templates/hexagon/...> include
@@ -376,6 +384,7 @@ def gen_cmake(iface: str, template_dir: str, agent: bool) -> str:
     # Kernels clean up by scope (DMA queues, worker HMX scopes) and never throw;
     # -fno-exceptions keeps those destructors from importing the C++ unwinder,
     # which the DSP does not have.
+    dsp_sources = "\n        ".join(f"${{CMAKE_CURRENT_SOURCE_DIR}}/{name}" for name in (f"{iface}_dsp.cc", *kernel_files))
     agent_block = (
         """
     add_executable(IFACE_agent
@@ -419,7 +428,7 @@ if(${{OS_TYPE}} MATCHES "HLOS"){agent_block}
 else()
     add_library({iface}_skel SHARED
         ${{CMAKE_CURRENT_BINARY_DIR}}/{iface}_skel.c
-        ${{CMAKE_CURRENT_SOURCE_DIR}}/{iface}_dsp.cc
+        {dsp_sources}
     )
     build_idl({iface}.idl {iface}_skel)
     if(TL_HEXAGON_LEGACY_COMPUTE_RES)

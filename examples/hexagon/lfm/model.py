@@ -171,12 +171,16 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
 
 
-def rope_angles(positions: torch.Tensor, head_dim: int, theta: float, fraction: float) -> torch.Tensor:
-    """[positions, head_dim / 2]: the first fraction * head_dim / 2 frequencies
-    of the whole head's progression, zero past them."""
-    n = int(fraction * head_dim) // 2
+def rotary_pairs(head_dim: int, fraction: float) -> int:
+    return int(fraction * head_dim) // 2
+
+
+def rope_angles(positions: torch.Tensor, head_dim: int, theta: float, fraction: float, *, active_only: bool = False) -> torch.Tensor:
+    """Angles of the active head-half pairs, optionally padded to half a head."""
+    n = rotary_pairs(head_dim, fraction)
     inv = 1.0 / (theta ** (torch.arange(0, 2 * n, 2, dtype=torch.float64) / head_dim))
-    inv = torch.cat([inv, torch.zeros(head_dim // 2 - n, dtype=torch.float64)])
+    if not active_only:
+        inv = torch.cat([inv, torch.zeros(head_dim // 2 - n, dtype=torch.float64)])
     return positions.to(torch.float64)[:, None] * inv[None, :]
 
 

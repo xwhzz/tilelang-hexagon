@@ -28,21 +28,34 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 )
 
 
-def _check_dma_schedule(mod: IRModule) -> None:
-    """Reject automatic or parallel schedules around ``T.dma_copy``."""
+def _check_tile_ops(mod: IRModule) -> None:
+    """Validate Hexagon tile operations that depend on their enclosing TIR."""
     for func in mod.functions.values():
         if not isinstance(func, tirx.PrimFunc):
             continue
         calls = []
         loops = []
+        view_sensitive_ops = []
+        matched_data = set()
 
-        def collect(node, calls=calls, loops=loops):
-            if isinstance(node, tirx.Call) and getattr(node.op, "name", "") == "tl.tileop.dma_copy":
-                calls.append(node)
-            if isinstance(node, tirx.For):
+        def collect(node, calls=calls, loops=loops, view_sensitive_ops=view_sensitive_ops, matched_data=matched_data):
+            if isinstance(node, tirx.Call):
+                name = getattr(node.op, "name", "")
+                if name == "tl.tileop.dma_copy":
+                    calls.append(node)
+                elif name in ("tl.tileop.transpose", "tl.tileop.cumsum"):
+                    view_sensitive_ops.append(node)
+            elif isinstance(node, tirx.For):
                 loops.append(node)
+            elif isinstance(node, tirx.SBlock):
+                matched_data.update(match.buffer.data for match in node.match_buffers)
 
         tirx.stmt_functor.post_order_visit(func.body, collect)
+        if matched_data:
+            for call in view_sensitive_ops:
+                if any(region.args[0].buffer.data in matched_data for region in call.args[:2]):
+                    op = call.op.name.rsplit(".", 1)[-1]
+                    raise ValueError(f"Hexagon T.{op} on a match_buffer view requires passing its source buffer region directly")
         if calls:
             for loop in loops:
                 if any(str(key) == "num_stages" or str(key).startswith(("software_pipeline", "tl_pipeline")) for key in loop.annotations):
@@ -64,7 +77,7 @@ def _check_dma_schedule(mod: IRModule) -> None:
 
 
 def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
-    _check_dma_schedule(mod)
+    _check_tile_ops(mod)
     mod = tirx.transform.BindTarget(target)(mod)
     mod = tilelang.hexagon.transform.LowerKernelLaunch()(mod)
     mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=False, unsupported_annotations=["cluster_dims"])(mod)

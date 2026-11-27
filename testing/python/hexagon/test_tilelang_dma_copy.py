@@ -713,12 +713,91 @@ def test_async_scalar_access_is_not_silently_synchronous():
     assert "(uint32_t)2, (uint32_t)2, (uint32_t)2, (uint32_t)1, 3)" in call
 
 
-@pytest.mark.parametrize("shape,dtype", [((2, 8, 8), "float16"), ((256,), "float32")])
-def test_reject_unsupported_region_or_dtype(shape, dtype):
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+def test_dense_multiplane_dma_offsets(arch):
     @T.prim_func
-    def probe(A: T.Tensor(shape, dtype)):
+    def probe(A: T.StridedTensor((2, 4, 8, 128), (5000, 1024, 128, 1), "float16"), B: T.Tensor((4, 8, 128), "float16")):
         with T.Kernel(1):
-            s = T.alloc_shared(shape, "float16")
+            s = T.alloc_shared((4, 8, 128), "float16")
+            T.dma_copy(A[1, 1:3, :, :], s[2:4, :, :])
+            T.dma_wait()
+            T.dma_copy(s[2:4, :, :], B[1:3, :, :])
+            T.dma_wait()
+
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    calls = [line for line in source.splitlines() if "_submit(tl_dma_async," in line]
+    assert len(calls) == 2
+    assert "A[6024]" in calls[0] and "s[2048]" in calls[0]
+    assert "B[1024]" in calls[1] and "s[2048]" in calls[1]
+    assert all("(uint32_t)4096, (uint32_t)4096, (uint32_t)4096, (uint32_t)1," in call for call in calls)
+
+
+@pytest.mark.parametrize("arch", ["v73", "v75", "v79"])
+@pytest.mark.parametrize("rows,cols,uses_dma", [(8, 128, True), (8, 64, True), (8, 32, False), (9, 128, False)])
+def test_multiplane_pipeline_selection(arch, rows, cols, uses_dma):
+    @T.prim_func
+    def probe(A: T.Tensor((8, 2, rows, cols), "float16"), B: T.Tensor((8, 2, 8, cols), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((2, 8, cols), "float16")
+            for k in T.Pipelined(8, num_stages=2):
+                T.copy(A[k, :, 0:8, :], s)
+                T.copy(s, B[k, :, :, :])
+
+    source = lower(probe, {"kind": "hexagon", "mcpu": f"hexagon{arch}"})
+    calls = [line for line in source.splitlines() if "_submit(tl_dma_async," in line]
+    if uses_dma:
+        size = 2 * 8 * cols * 2
+        assert len(calls) == 2
+        assert all(f"(uint32_t){size}, (uint32_t){size}, (uint32_t){size}, (uint32_t)1," in call for call in calls)
+    else:
+        assert not calls
+
+
+def test_explicit_multiplane_dma_accepts_small_dense_region():
+    @T.prim_func
+    def probe(A: T.Tensor((2, 2, 2), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((2, 2, 2), "float16")
+            T.dma_copy(A, s)
+            T.dma_wait()
+
+    (call,) = [line for line in lower(probe).splitlines() if "_submit(tl_dma_async," in line]
+    assert "(uint32_t)16, (uint32_t)16, (uint32_t)16, (uint32_t)1," in call
+
+
+@pytest.mark.parametrize("gap", ["src", "dst"])
+def test_multiplane_dma_rejects_explicit_plane_stride(gap):
+    src_strides = (1152, 128, 1) if gap == "src" else (1024, 128, 1)
+    dst_strides = (1152, 128, 1) if gap == "dst" else (1024, 128, 1)
+
+    @T.prim_func
+    def probe(A: T.StridedTensor((2, 8, 128), src_strides, "float16")):
+        with T.Kernel(1):
+            s = T.sblock_alloc_buffer((2, 8, 128), "float16", strides=dst_strides, scope="shared.dyn")
+            T.dma_copy(A, s)
+            T.dma_wait()
+
+    with pytest.raises(Exception, match="contiguous multi-plane regions"):
+        lower(probe)
+
+
+def test_multiplane_dma_rejects_different_shapes_with_equal_element_counts():
+    @T.prim_func
+    def probe(A: T.Tensor((2, 8, 128), "float16")):
+        with T.Kernel(1):
+            s = T.alloc_shared((4, 4, 128), "float16")
+            T.dma_copy(A[:, :, :], s[:, :, :])
+            T.dma_wait()
+
+    with pytest.raises(Exception, match="matching region shapes"):
+        lower(probe)
+
+
+def test_reject_unsupported_dtype():
+    @T.prim_func
+    def probe(A: T.Tensor((256,), "float32")):
+        with T.Kernel(1):
+            s = T.alloc_shared((256,), "float16")
             T.dma_copy(A, s)
             T.dma_wait()
 

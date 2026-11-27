@@ -19,6 +19,7 @@
 #include <string.h>
 #include <tl_templates/hexagon/power.h> // the session's power requests
 #include <tl_templates/hexagon/resource.h>
+#include <tl_templates/hexagon/session_state.h>
 #include <tl_templates/hexagon/vtcm.h> // unified VTCM arena (shared with alloc_shared)
 #include <tl_templates/hexagon/worker.h> // HW-thread worker pool (multithreaded HMX/HVX)
 
@@ -27,7 +28,7 @@
 // ------------------------------ HMX lock ----------------------------------
 // HMX is part of the process's compute-resource context (vtcm.h), with the
 // VTCM its operands live in: tl_vtcm_open(1) asks for both.
-static int tl_hmx_spin;
+TL_HEXAGON_SESSION_STATE int tl_hmx_spin;
 // Per-thread HMX SHARED enable: each thread that issues HMX MACs must call this
 // once its run holds the context. Returns 0 if this thread now holds the lock,
 // non-zero on failure (incl. no context) so callers can refuse rather than run
@@ -114,8 +115,8 @@ TL_HMX_INLINE void tl_hmx_store_cvt(__fp16 *o) {
 // between. NOTE: the check-then-set of these globals is NOT internally
 // synchronized; it is safe because every caller invokes it single-threaded
 // BEFORE tl_parallel spawns workers.
-static int tl_hmx_inited;
-static qurt_thread_t
+TL_HEXAGON_SESSION_STATE int tl_hmx_inited;
+TL_HEXAGON_SESSION_STATE qurt_thread_t
     tl_hmx_run_tid; // the run's thread, whose HMX enable take holds
 static void tl_hmx_session_init(void) {
   if (tl_hmx_inited)

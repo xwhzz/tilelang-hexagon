@@ -24,7 +24,8 @@ const PanelLayoutNode *PanelOf(const tirx::Buffer &buffer,
 /*!
  * \brief Why `op` cannot be one User-DMA transfer between DDR and VTCM, or
  * an empty string: equal byte-addressable dtypes, row-major buffers, and a
- * static, in-bounds 1D or 2D region on each side. Between two buffers in the
+ * static, in-bounds regions. Multiple row-major planes must form a contiguous
+ * span on each side. Between two buffers in the
  * panel layout, the region instead covers whole panels of one matrix, which
  * move as rows of their column blocks; between two of one Crouton layout,
  * whole tiles of one matrix, which move as runs of tiles in their order.
@@ -41,7 +42,8 @@ Stmt LowerDMATransfer(const CopyNode &op, const LowerArgs &T,
 
 /*!
  * \brief Whether DMA moves the copy `op` from DDR faster than HVX loads do:
- * one contiguous block, or rows of at least 512 bytes. On v79 DMA moves
+ * a contiguous block (at least 2 KiB across multiple planes), or matrix
+ * rows of at least 512 bytes. On v79 DMA moves
  * 128-byte rows at 3 GB/s, 512-byte ones at 9 GB/s and contiguous blocks at
  * 23 GB/s, while HVX loads 128-byte rows at up to 14 GB/s. A software
  * pipeline's other copies stay HVX copies.

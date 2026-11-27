@@ -54,7 +54,7 @@ from tilelang.hexagon.intrinsics.panel import PanelLayout, make_hvx_panel_layout
 from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 
-from .gemm_hvx import _strides, scale_group
+from .gemm_hvx import _strides, group_major_sfb, scale_group
 
 GEMM_INST_HMX = "hexagon.hmx"
 GEMM_INST_HMX_BLOCK_SCALED = "hexagon.hmx.blockscaled"
@@ -327,13 +327,7 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
         panel_bytes = TILE * int(self.B.shape[-1]) * 4 // 8
         signed = str(self.B.dtype).startswith("int")
 
-        sfb_region = self.SFBRegion
-        sfb_origin = _origin(sfb_region)
-        if len(sfb_origin) < 2:
-            raise ValueError(f"{name}: SFB {sfb_region.buffer.name} is [K / {gb}, N], group-major")
-        ld_sfb = int(_strides(sfb_region.buffer)[-2])
-        sfb_first = sfb_origin[:-2] + (sfb_origin[-2] + first_b, sfb_origin[-1])
-        sfb = T.access_ptr(sfb_region.buffer[sfb_first], "r", (K // gb - 1) * ld_sfb + N)
+        read_sfb, ld_sfb = group_major_sfb(self.SFBRegion, layout_map, first_b, K // gb, N)
 
         sfa_region = self.SFARegion
         sfa_origin = _origin(sfa_region)
@@ -372,7 +366,7 @@ class GemmHMXBlockScaled(GemmBlockScaledMixin, GemmHMX):
                     a_row_tile,
                     b,
                     panel_bytes,
-                    sfb,
+                    read_sfb(),
                     ld_sfb,
                     gb,
                     sfa,

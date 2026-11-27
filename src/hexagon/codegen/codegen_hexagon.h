@@ -27,7 +27,7 @@ namespace codegen {
 class CodeGenTileLangHexagon : public CodeGenTileLangCBase {
 public:
   // Imported C and unrecognized text can affect every function in a module.
-  void CheckLoadOnlyDMAModule(const IRModule &module);
+  void CheckManagedCalls(const IRModule &module);
   CodeGenTileLangHexagon();
 
   /*! \brief Emit the preamble (template include) and initialize CodeGenC. */
@@ -40,8 +40,9 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   void PrintFuncPrefix(std::ostream &os) final;       // NOLINT(*)
 
-  void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
-  void VisitStmt_(const BindNode *op) final;        // NOLINT(*)
+  void VisitStmt_(const AllocBufferNode *op) final;                // NOLINT(*)
+  void VisitStmt_(const BindNode *op) final;                       // NOLINT(*)
+  void VisitExpr_(const FloatImmNode *op, std::ostream &os) final; // NOLINT(*)
   // Vectorized copy/fill emit broadcasts; mirror the CPU C backend's emission.
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   // Declare the DMA queue, and return the status of failing runtime calls.
@@ -99,6 +100,7 @@ private:
   bool dma_load_only_ = false;
   bool in_dma_program_ = false;
   bool dma_load_only_module_ = false;
+  bool has_only_managed_calls_ = true;
   /*!
    * \brief the template headers whose code the module calls, which its
    * preamble includes, and whether it uses HMX and VTCM, which the session

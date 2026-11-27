@@ -1,7 +1,7 @@
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tvm import IRModule
+from tvm import IRModule, tirx
 
 
 def test_annotate_readonly_bare_data_var():
@@ -47,6 +47,18 @@ def test_annotate_readonly_bare_data_var():
     readonly_indices = mod_annotated["pure_intrinsic_with_bare_data"].attrs.get("tl.readonly_param_indices")
     # A should remain readonly; pure intrinsics don't write even if they receive bare data vars
     assert list(readonly_indices) == [0], f"Expected [0], got {list(readonly_indices)}"
+
+
+def test_opaque_writes_follow_bound_pointer_bases_and_respect_read_masks():
+    x, y, offset = [tirx.decl_buffer((8,), "int32", name=name) for name in ("x", "y", "offset")]
+    alias = tirx.Var("alias", "handle")
+    selected = tirx.if_then_else(offset[0] > 0, x.data, y.data)
+    bound = tirx.Bind(alias, tirx.call_intrin("handle", "tirx.handle_add_byte_offset", selected, offset[1]))
+    read = offset.access_ptr("r")
+    call = tirx.Evaluate(tirx.call_extern("void", "update", alias, read))
+    f = tirx.PrimFunc([x, y, offset], tirx.SeqStmt([bound, call]))
+    result = tilelang.transform.AnnotateReadOnlyParams()(IRModule({"main": f}))
+    assert list(result["main"].attrs["tl.readonly_param_indices"]) == [2]
 
 
 if __name__ == "__main__":

@@ -54,6 +54,8 @@ std::string TypeName(DataType dtype) {
 } // namespace
 
 std::string HMXRejection(const GemmNode &op, bool pad) {
+  if (op.annotations_.count(kRowMajorGemm))
+    return "an operand has an explicit row-major layout";
   const DataType fp16 = DataType::Float(16);
   if (op.a_->dtype != fp16 || op.b_->dtype != fp16)
     return "HMX multiplies fp16 operands, not " + TypeName(op.a_->dtype) +

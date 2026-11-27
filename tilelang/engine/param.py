@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 from tilelang import tvm as tvm
-from tvm.tirx import Buffer, IntImm, Var, PrimExpr
+from tvm.tirx import Buffer, IntImm, Var, PrimExpr, PrimFunc
 import tilelang.language as T
 
 
@@ -23,6 +23,9 @@ class KernelParam:
     dtype: tvm.DataType  # Data type from buffer.dtype (supports all TVM types)
     shape: list[int | Var]  # List of dimensions, can be integers or TVM variables
     strides: list[int | PrimExpr] | None = None  # Explicit element strides, when supplied by the buffer
+
+    # Legacy constructors and records infer by-value scalars from an empty shape.
+    is_buffer: bool | None = None
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
@@ -50,7 +53,7 @@ class KernelParam:
             else:
                 raise ValueError(f"Unsupported dimension type: {type(s)} {s}")
         strides = [s.value if isinstance(s, IntImm) else s for s in buffer.strides]
-        return cls(dtype, shape, strides or None)
+        return cls(dtype, shape, strides or None, is_buffer=True)
 
     @classmethod
     def from_var(cls, var: Var):
@@ -67,16 +70,11 @@ class KernelParam:
         # Use var.dtype directly (tvm.DataType) to preserve all type information
         # var.dtype is already a tvm.DataType object, no conversion needed
         dtype = var.dtype
-        return cls(dtype, [])
+        return cls(dtype, [], is_buffer=False)
 
     def is_scalar(self) -> bool:
-        """
-        Checks if the parameter represents a scalar value.
-
-        Returns:
-            bool: True if parameter has no dimensions (empty shape), False otherwise
-        """
-        return len(self.shape) == 0
+        """Whether the argument is passed by value (including a scalar Var)."""
+        return not self.shape if self.is_buffer is None else not self.is_buffer
 
     def is_unsigned(self) -> bool:
         """
@@ -168,29 +166,48 @@ class CompiledArtifact:
     target_host: tvm.target.Target | None = None  # Normalized host target used for host codegen/export
 
 
-def dump_kernel_params(params: list[KernelParam]) -> str:
+def _declares_buffer(func: PrimFunc, index: int) -> bool:
+    params = func.params
+    return index < len(params) and params[index] in func.buffer_map
+
+
+def dump_kernel_params(params: list[KernelParam], *, func: PrimFunc | None = None) -> str:
     """Serialize kernel parameters to JSON text.
 
     Uses TVM's JSON reflection (``tvm.ir.save_json``) so symbolic shape
     expressions round-trip, including shared ``Var`` identity across params.
     The result contains only IR node data and can be loaded without executing
-    any code, unlike a pickle.
+    any code, unlike a pickle. When a disk cache supplies its PrimFunc,
+    omit buffer-kind flags that the legacy shape convention already represents.
     """
     records = []
-    for param in params:
+    for index, param in enumerate(params):
         record = {"dtype": str(param.dtype), "shape": list(param.shape)}
         if param.strides is not None:
             record["strides"] = param.strides
+        if isinstance(func, PrimFunc):
+            is_buffer = not param.is_scalar()
+            # Empty shapes also occur in old cache records. A reader with the
+            # PrimFunc resolves those using its buffer map, so an explicit
+            # by-value override of a declared pointer needs a false flag.
+            if is_buffer != bool(param.shape) or (not param.shape and _declares_buffer(func, index)):
+                record["is_buffer"] = is_buffer
+        elif param.is_buffer is not None:
+            record["is_buffer"] = param.is_buffer
         records.append(record)
     return tvm.ir.save_json(tvm.runtime.convert(records))
 
 
-def load_kernel_params(text: str) -> list[KernelParam]:
+def load_kernel_params(text: str, *, func: PrimFunc | None = None) -> list[KernelParam]:
     """Reconstruct kernel parameters written by :func:`dump_kernel_params`."""
     params = []
-    for record in tvm.ir.load_json(text):
+    for index, record in enumerate(tvm.ir.load_json(text)):
         dtype = tvm.DataType(str(record["dtype"]))
         shape = [dim if isinstance(dim, PrimExpr) else int(dim) for dim in record["shape"]]
         strides = list(record["strides"]) if "strides" in record else None
-        params.append(KernelParam(dtype, shape, strides))
+        is_buffer = bool(record["is_buffer"]) if "is_buffer" in record else None
+        if is_buffer is None and isinstance(func, PrimFunc):
+            # Old records described rank-zero buffers and by-value scalars identically.
+            is_buffer = bool(shape) or _declares_buffer(func, index)
+        params.append(KernelParam(dtype, shape, strides, is_buffer))
     return params

@@ -296,7 +296,7 @@ class OneShotKernel:
         argv, pulls = [str(self._domain)], []
         for i, p in enumerate(params):
             if p.is_scalar():
-                argv.append(str(int(values[i])))
+                argv.append(str(self._plans[i].scalar_word(values[i])))
                 continue
             fname = f"{self._iface}_p{i}.bin"
             local = os.path.join(self._workdir, fname)
