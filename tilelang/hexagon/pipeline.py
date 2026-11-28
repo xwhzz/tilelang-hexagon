@@ -18,6 +18,7 @@ from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
 import tilelang
+from tilelang.hexagon.transform.hmx_requant import fuse_hmx_requant
 from tilelang.hexagon.transform.panel_reduce import forward_panel_reductions
 from tilelang.backend.pass_pipeline.pipeline_utils import (
     LayoutVisual,
@@ -108,6 +109,7 @@ def HexagonPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = forward_panel_reductions(mod)
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
+    mod = fuse_hmx_requant(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.hexagon.transform.MarkDMACacheDirections()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)

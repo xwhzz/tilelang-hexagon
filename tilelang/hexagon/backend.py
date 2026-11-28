@@ -6,6 +6,7 @@ from tilelang.backend.pass_pipeline import PassPipeline
 from tilelang.backend.module import BackendModule, register_backend
 
 from . import codegen, execution_backend, pipeline
+from .transform.hmx_requant import normalize_local_hmx_requant
 
 BACKEND = register_backend(
     BackendModule(
@@ -21,6 +22,7 @@ BACKEND = register_backend(
             )
         },
         host_codegens=STANDARD_HOST_CODEGENS,
+        normalize_before_validation=normalize_local_hmx_requant,
         execution_backends=execution_backend.EXECUTION_BACKENDS,
     )
 )

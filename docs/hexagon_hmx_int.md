@@ -120,6 +120,44 @@ layouts (index maps) do not express. Quantized activations usually carry a
 zero point anyway. For `A = q + 128`, `A @ B^T = q @ B^T + 128 * colsum(B)`;
 the caller subtracts the column sums, which are constants for weights.
 
+## A per-column shift into int16
+
+An overwritten integer accumulator can feed an ordinary parallel map:
+
+```python
+ci = T.alloc_fragment((M, N), "int32")
+T.gemm(a, b, ci, transpose_B=True, clear_accum=True)
+for i, j in T.Parallel(M, N):
+    y[i, j] = T.Cast("int16", (ci[i, j] + bias[j]) >> shift[j])
+```
+
+Use int32 column vectors in VTCM and an int16 destination with contiguous columns.
+The map must immediately follow the GEMM, cover its entire output region and be
+the sole reader of the private accumulator. A shared accumulator also qualifies.
+A local used only by this pair can take fragment ownership. Accumulating into an
+existing C, reading C elsewhere or using row-dependent metadata keeps the
+ordinary GEMM and map. Stored int16 rows use the destination's leading dimension.
+
+For a shift `p` from 0 through 16, the exponents `24 - p` and `16 - p`
+select consecutive bytes of the biased sum. Both conversions use wrap mode,
+so int32 addition wraps and narrowing keeps the low 16 shifted bits. The
+caller can include a zero-point correction or a rounding offset in the bias.
+The compiler adds only the bias supplied by the map.
+
+Use shift counts from 0 through 31 for int32. The kernel checks them once
+per 32- or 64-column band. If any lane falls
+outside that range, HMX emits the four exact bytes for that band. HVX performs
+the original word add, arithmetic right shift and truncation in registers.
+For example, a shift of 31 preserves the sign of the wrapped sum. Both paths
+write the int16 destination directly and need at most one tile of four-plane
+scratch, independent of M and N.
+
+On v73, each byte conversion reloads the unit's single bank. On v79,
+ordinary panels use two banks for the two-byte path and paired panels use
+four. Workers reload their banks after acquiring the shared HMX unit and
+join the planes after releasing it. An exclusive caller can join one
+two-byte result while HMX multiplies its next row tile.
+
 ## Using it for a quantized prefill
 
 LFM2's prefill GEMMs keep fp16 activations today and dequantize the 4-bit

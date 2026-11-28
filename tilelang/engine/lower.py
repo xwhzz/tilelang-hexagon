@@ -133,6 +133,8 @@ def lower_to_host_device_ir(
             _is_host_call = get_host_call(direct_call_kind)
             _is_device_call = get_device_call(direct_call_kind)
 
+            if context.module.normalize_before_validation is not None:
+                mod = context.module.normalize_before_validation(mod)
             # Run backend-independent semantic checks before target-specific lowering.
             PreLowerSemanticCheck(mod)
 

@@ -164,6 +164,7 @@ multiple of the narrowest dtype's register lanes). A clean fp16 map (x*x) went 2
 |---|---|---|
 | fp16 × fp16 → fp16 or fp32 | HMX | VTCM operands with tile-aligned origins. The compiler can pad partial tiles. |
 | uint8 × int8 → int32 | HMX | VTCM operands, `transpose_B=True`, A untransposed. M is a multiple of 64, N and K of 32. A and C start on 64×32 tiles, B on 32×32 tiles for ordinary panels or 64×32 tiles for paired panels (N a multiple of 64). |
+| uint8 × int8 → private int32, followed by a per-column shift and int16 cast | HMX + HVX | The same whole tiles, with `clear_accum=True`. HMX adds VTCM column biases and emits two bytes for shifts 0–16. HVX joins them into ordinary int16 rows. |
 | Other supported float or integer GEMMs | HVX | Row-major operands, an fp16 weight-layout B, or an integer panel-layout B, as described below. |
 
 Integer HMX reads four interleaved rows per register of A. It infers paired B panels for whole

@@ -15,7 +15,9 @@ A C of another layout takes the product from a row-major matrix of its own,
 element by element.
 
 A uint8 A and int8 B in the panel layout multiply into a row-major int32 C
-(:class:`GemmHMXInt`). Each 64x32 output tile leaves HMX as four byte planes.
+(:class:`GemmHMXInt`). An exact 64x32 output tile leaves HMX as four byte
+planes. A fused column-bias and shift map takes two planes into int16 rows
+when the shifts allow it.
 
 In a worker pool, whose workers share HMX (``LowerKernelLaunch`` marks such
 calls), each output tile is a critical section of its own instead, and its
@@ -318,15 +320,54 @@ class GemmHMXInt(GemmHMX):
         a_row_tile = 64 * self.A.shape[-1]
         width = 64 if b_layout.paired else 32
         panel_bytes = width * self.B.shape[-1]
-        stage_bytes = 2 * (width // 32) * 4 * 2048
+        tile_bytes = (width // 32) * 4 * 2048
         a = T.access_ptr(_first(self.ARegion), "r", (M // 64 - 1) * a_row_tile + 64 * K)
         b = T.access_ptr(_first(self.BRegion), "r", (N // width - 1) * panel_bytes + width * K)
+        shared, paired = _flag(self._shared()), _flag(b_layout.paired)
+        output = self.gemm_node.annotations.get("hexagon.requant_output", None)
+        if output is not None:
+            dst, bias, shift = output
+            ldc = _strides(dst.buffer, compact=dst.buffer in layout_map)[-2]
+            c16 = T.access_ptr(dst, "w", (M - 1) * ldc + N)
+            biases = T.access_ptr(bias, "r", N)
+            shifts = T.access_ptr(shift, "r", N)
+            requant = tirx.op.Op.get("tl.hexagon_hmx_gemm_int_requant")
+            # Four planes also hold two ping-pong slots on the two-byte path.
+
+            @T.prim_func
+            def _gemm_hmx_requant() -> None:
+                config = T.alloc_shared((4 * CONFIG_WORDS,), "uint32", align=256)
+                stage = T.alloc_shared((tile_bytes,), "uint8", align=2048)
+                T.evaluate(
+                    tirx.call_intrin(
+                        "void",
+                        requant,
+                        shared,
+                        paired,
+                        M,
+                        N,
+                        K,
+                        c16,
+                        ldc,
+                        a,
+                        a_row_tile,
+                        b,
+                        panel_bytes,
+                        biases,
+                        shifts,
+                        T.access_ptr(stage[0], "rw", tile_bytes),
+                        T.access_ptr(config[0], "rw", 4 * CONFIG_WORDS),
+                    )
+                )
+
+            return _gemm_hmx_requant
+
         ldc = strides[-2]
         clear = self.clear_accum
         mode = "w" if isinstance(clear, tirx.IntImm) and bool(clear.value) else "rw"
         c = T.access_ptr(_first(self.CRegion), mode, (M - 1) * ldc + N)
         gemm = tirx.op.Op.get("tl.hexagon_hmx_gemm_int")
-        shared, paired = _flag(self._shared()), _flag(b_layout.paired)
+        stage_bytes = 2 * tile_bytes
 
         @T.prim_func
         def _gemm_hmx_int() -> None:

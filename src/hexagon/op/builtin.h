@@ -190,6 +190,8 @@ TVM_DLL const Op &hexagon_hmx_gemm();
 // b, panel_bytes, clear, stage, config): exact uint8 x int8 into row-major
 // int32.
 TVM_DLL const Op &hexagon_hmx_gemm_int();
+// Column-biased, shifted int16 output from the same integer MAC.
+TVM_DLL const Op &hexagon_hmx_gemm_int_requant();
 
 // tl_hexagon_hmx_gemm_blockscaled<signed, rows, aligned, scaled, shared,
 // normal>(M, N, K, c, ldc, a, a_row_tile, b, panel_bytes, sfb, ld_sfb, gb, sfa,

@@ -120,6 +120,8 @@ const HexagonBuiltin *FindHexagonBuiltin(const CallNode *call) {
        false, -1, 4},
       {tl::hexagon_hmx_gemm_int(), "tl_hexagon_hmx_gemm_int", "hmx_gemm_int.h",
        true, false, false, -1, 2},
+      {tl::hexagon_hmx_gemm_int_requant(), "tl_hexagon_hmx_gemm_int_requant",
+       "hmx_gemm_int.h", true, false, false, -1, 2},
       {tl::hexagon_hmx_gemm_blockscaled(), "tl_hexagon_hmx_gemm_blockscaled",
        "hmx_gemm.h", true, false, false, -1, 6},
       {tl::hexagon_hvx_gemm(), "tl_hvx_gemm", "hvx_gemm.h", false, false, false,
@@ -246,6 +248,7 @@ private:
         tl::hexagon_crouton_tile_store(),
         tl::hexagon_hmx_gemm(),
         tl::hexagon_hmx_gemm_int(),
+        tl::hexagon_hmx_gemm_int_requant(),
         tl::hexagon_hmx_gemm_blockscaled(),
         tl::sync_grid()};
     for (const auto &safe : without_arithmetic) {
@@ -406,6 +409,9 @@ bool IsKnownNonDMAOperation(const CallNode *call) {
   } else if (call->op.same_as(tl::hexagon_hmx_gemm_int())) {
     booleans = 2;
     arity = 14;
+  } else if (call->op.same_as(tl::hexagon_hmx_gemm_int_requant())) {
+    booleans = 2;
+    arity = 15;
   } else if (call->op.same_as(tl::hexagon_crouton_copy())) {
     booleans = 2;
     arity = 12;
